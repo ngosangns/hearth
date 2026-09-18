@@ -23,6 +23,7 @@ import {
   type OperationStatus,
   type OperationTraceEntry,
   type PersistedManagerState,
+  type ProcessIdentity,
   type ServiceLifecycleState,
   type ServiceOperationKind,
 } from "./state";
@@ -294,6 +295,46 @@ const isLifecycleState = (value: unknown, serviceKey: string): value is ServiceL
 const isPersistedManagerState = (value: unknown): value is PersistedManagerState =>
   isRecord(value) && hasExactKeys(value, ["version", "services"]) && value.version === STATE_VERSION && isRecord(value.services) && Object.entries(value.services).every(([key, state]) => isLifecycleState(state, key));
 
+const isProcessIdentityShape = (value: unknown): value is ProcessIdentity => {
+  if (
+    !isRecord(value) ||
+    typeof value.managerInstanceId !== "string" ||
+    typeof value.serviceId !== "string" ||
+    typeof value.startedAt !== "string" ||
+    typeof value.commandFingerprint !== "string" ||
+    !isFiniteInteger(value.generation, 0)
+  )
+    return false;
+  if ("containerId" in value) return typeof value.containerId === "string" && typeof value.containerName === "string" && typeof value.containerStartedAt === "string";
+  return isFiniteInteger(value.pid, 0) && isFiniteInteger(value.pgid, 0) && typeof value.startIdentity === "string";
+};
+
+const migrateLegacyIdentity = (identity: Record<string, unknown>, serviceId: string): ProcessIdentity | undefined => {
+  const { unitId: _legacyUnitId, ...rest } = identity;
+  const candidate = { ...rest, serviceId };
+  return isProcessIdentityShape(candidate) ? candidate : undefined;
+};
+
+/** A state file written by either predecessor copy of this tool (infra's `scripts/local-services-tui`,
+ * viclass's `tools/local-services-tui`) keys its services under `units` and names them `unitId`.
+ * Reading it matters at the moment a consumer switches onto this package: without the rewrite the file
+ * fails validation, gets quarantined, and every service that is *still running* reads as stopped — and
+ * a later start then refuses the port those orphaned processes hold. `serviceId` has to be rewritten
+ * into the identity too, or ownership checks fail and the process is written off as a stranger. */
+const migrateLegacyPersistedState = (value: unknown): PersistedManagerState | undefined => {
+  if (!isRecord(value) || !hasExactKeys(value, ["version", "units"]) || !isRecord(value.units)) return undefined;
+  const services: Record<string, ServiceLifecycleState> = {};
+  for (const [serviceId, unit] of Object.entries(value.units)) {
+    if (!isRecord(unit)) return undefined;
+    const { unitId, identity, ...rest } = unit as { unitId?: unknown; identity?: unknown };
+    const migratedIdentity = isRecord(identity) && typeof identity.unitId === "string" ? migrateLegacyIdentity(identity, identity.unitId) : undefined;
+    const candidate = { ...rest, serviceId, ...(migratedIdentity !== undefined ? { identity: migratedIdentity } : {}) };
+    if (typeof unitId !== "string" || !isLifecycleState(candidate, serviceId)) return undefined;
+    services[serviceId] = candidate;
+  }
+  return { version: STATE_VERSION, services };
+};
+
 export class AtomicStateStore {
   readonly path: string;
   constructor(
@@ -307,6 +348,11 @@ export class AtomicStateStore {
       const loaded = await readJson(this.io, this.path);
       if (loaded === undefined) return { version: STATE_VERSION, services: {} };
       if (isPersistedManagerState(loaded)) return loaded;
+      const migrated = migrateLegacyPersistedState(loaded);
+      if (migrated !== undefined) {
+        await this.save(migrated);
+        return migrated;
+      }
     } catch {}
     await this.io.quarantine(this.path, "corrupt");
     return { version: STATE_VERSION, services: {} };
