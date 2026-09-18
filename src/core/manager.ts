@@ -167,8 +167,21 @@ export async function readOwnedLockArtifacts(io: FileIo, path: string): Promise<
     return undefined;
   }
 }
+const liveManagerHealthcheckAttempts = 2;
+const liveManagerHealthcheckRetryDelayMs = 150;
+/** Liveness is the one question this protocol must never answer with a false negative: a live daemon
+ * that merely failed to answer in time gets its lock (and therefore its whole service pool) taken
+ * over, which is what produced a daemon storm. The PID check in `claimLock` is the primary guard;
+ * the retry here keeps a single slow/blocked response from being read as "no manager". */
 async function isLiveManager(metadata: ManagerMetadata, token: string): Promise<boolean> {
   if (!token || metadata.port === 0) return false;
+  for (let attempt = 0; attempt < liveManagerHealthcheckAttempts; attempt++) {
+    if (await managerAnswersHealthcheck(metadata, token)) return true;
+    if (attempt + 1 < liveManagerHealthcheckAttempts) await Bun.sleep(liveManagerHealthcheckRetryDelayMs);
+  }
+  return false;
+}
+async function managerAnswersHealthcheck(metadata: ManagerMetadata, token: string): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${metadata.port}/healthz`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(liveManagerHealthcheckTimeoutMs) });
     const body = (await response.json()) as Record<string, unknown>;
@@ -572,7 +585,12 @@ export class CursorLogStore {
     const rotatedPath = `${path}.${fromGeneration}`;
     await this.io.writeFile(journalPath, JSON.stringify(journal));
     await this.hooks.onRotationStep?.("pending");
-    await rename(path, rotatedPath);
+    // A second writer (another daemon sharing this runtime directory) may have rotated the same file
+    // first; the log is simply already gone, so appending recreates it. Throwing here would reject
+    // the append that triggered the rotation.
+    await rename(path, rotatedPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
     await this.hooks.onRotationStep?.("renamed");
     await this.io.writeFile(journalPath, JSON.stringify({ ...journal, phase: "committed" }));
     await this.hooks.onRotationStep?.("committed");
@@ -663,7 +681,9 @@ export class LocalServicesManager {
       manager.events.publish("manager.started", { instanceId: manager.instanceId });
       if (manager.catalog.services.some((service) => (service.ownership ?? "daemon") === "external")) {
         await manager.supervisor.syncExternalServices();
-        manager.externalSyncTimer = setInterval(() => void manager.supervisor.syncExternalServices(), 2000);
+        manager.externalSyncTimer = setInterval(() => {
+          manager.supervisor.syncExternalServices().catch((error: unknown) => manager.recordBackgroundError("syncExternalServices", error));
+        }, 2000);
       }
       return manager;
     } catch (error) {
@@ -704,6 +724,13 @@ export class LocalServicesManager {
   }
   publish(type: string, data: Record<string, unknown>): void {
     this.events.publish(type, data);
+  }
+  /** Sink for errors raised by fire-and-forget work (log forwarding, external-state polling) that
+   * must never reject into — or terminate — the daemon process. Surfaces them as manager events so a
+   * TUI/MCP client can see them without scraping logs. */
+  recordBackgroundError(scope: string, error: unknown): void {
+    const message = error instanceof Error && error.message ? error.message : String(error);
+    this.events.publish("manager.error", { scope, message });
   }
   serviceStates(): ServiceLifecycleState[] {
     const timestamp = now();
