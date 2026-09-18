@@ -1,0 +1,780 @@
+import { createHash } from "node:crypto";
+import { closeSync, ftruncateSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import { connect } from "node:net";
+import { join } from "node:path";
+
+import { isContainerCommand, type CommandSpec, type ReadinessSpec, type ServiceCatalog, type ServiceCommand, type ServiceDefinition, type ServiceId, type ServiceRunProfile, type VerifiedServiceRunProfile } from "./catalog";
+import { logsDir, rawLogPath, resolveRuntimeDirectory } from "./paths";
+import type { ActualServiceState, DockerContainerIdentity, PosixProcessIdentity, ProcessIdentity, ReadinessKind, ServiceLifecycleState, ServiceReadiness } from "./state";
+
+export type ProcessSignal = "SIGTERM" | "SIGKILL";
+export type PosixProcessRecord = Pick<PosixProcessIdentity, "pid" | "pgid" | "startIdentity" | "commandFingerprint">;
+export type DockerContainerRecord = Pick<DockerContainerIdentity, "containerName" | "containerId" | "containerStartedAt" | "commandFingerprint">;
+export type ObservedProcess = (PosixProcessRecord | DockerContainerRecord) & { alive: boolean };
+export type ManagedProcess = (PosixProcessRecord | DockerContainerRecord) & { exited: Promise<number> };
+export type SpawnInput = { command: ServiceCommand; commandFingerprint: string; serviceId: ServiceId; onOutput?: (data: string) => void };
+export interface ProcessAdapter {
+  spawn(input: SpawnInput): Promise<ManagedProcess>;
+  inspect(identity: ProcessIdentity): Promise<ObservedProcess | undefined>;
+  signalGroup(pgid: number, signal: ProcessSignal): Promise<void>;
+  stopContainer?(command: ServiceCommand, onOutput?: (data: string) => void): Promise<void>;
+  attachOutput?(serviceId: ServiceId, onOutput: (data: string) => void): () => void;
+}
+export interface PreparationAdapter {
+  prepare(serviceId: ServiceId, steps: readonly string[]): Promise<void>;
+}
+export interface ProbeAdapter {
+  tcp(port: number): Promise<boolean>;
+  http(url: string): Promise<boolean>;
+  container(containerName: string): Promise<boolean>;
+  tailnet(): Promise<boolean>;
+  portInUse?(port: number): Promise<boolean>;
+}
+export interface SupervisorClock {
+  now(): string;
+  sleep(milliseconds: number): Promise<void>;
+}
+export type SupervisorOptions = {
+  process: ProcessAdapter;
+  runBuild: (command: ServiceCommand, onOutput: (data: string) => void, signal: AbortSignal) => Promise<void>;
+  probes: ProbeAdapter;
+  preparation?: PreparationAdapter;
+  clock?: SupervisorClock;
+  readinessTimeoutMs?: number;
+  readinessBackoffMs?: number;
+  terminationGraceMs?: number;
+  isClosing?: () => boolean;
+};
+
+type Host = {
+  readonly instanceId: string;
+  readonly catalog: ServiceCatalog;
+  serviceStates(): ServiceLifecycleState[];
+  setServiceState(next: ServiceLifecycleState): Promise<void>;
+  appendLog(serviceId: ServiceId, data: string): Promise<void>;
+  publish(type: string, data: Record<string, unknown>): void;
+};
+type Active = { profile: VerifiedServiceRunProfile; app: ManagedProcess; identity: ProcessIdentity; token: number; stopped: boolean };
+type Changes = Partial<ServiceLifecycleState> & { clear?: Array<"identity" | "error" | "exitCode" | "exitedAt" | "currentOperationId"> };
+
+const clock: SupervisorClock = { now: () => new Date().toISOString(), sleep: (milliseconds) => Bun.sleep(milliseconds) };
+const activeStates: readonly ActualServiceState[] = ["queued-start", "preparing", "starting", "running", "running-unready", "ready", "stopping"];
+const isDockerIdentity = (identity: ProcessIdentity): identity is DockerContainerIdentity => "containerId" in identity;
+const isDockerIdentityRecord = (record: ManagedProcess): record is DockerContainerRecord & { exited: Promise<number> } => "containerId" in record;
+const isDockerObserved = (record: ObservedProcess): record is DockerContainerRecord & { alive: boolean } => "containerId" in record;
+/** A "task" command has no long-lived managed process to track — it runs once to bring external
+ * state (e.g. a tailnet serve config) into the desired shape. Generalizes infra's tailnet-task runner. */
+const isTaskCommand = (readiness: ReadinessSpec): boolean => readiness.kind === "tailnet";
+const readinessName = (readiness: ReadinessSpec): ReadinessKind => readiness.kind;
+
+const commandArgv = (spec: CommandSpec): { argv: string[]; exec: boolean } => ("argv" in spec ? { argv: [...spec.argv], exec: false } : { argv: ["sh", "-c", spec.shell], exec: spec.exec ?? false });
+// The fingerprint identifies the *logical* command (argv joined, or the bare shell text) — never the
+// "sh -c" spawn wrapper itself — so it matches `normalizeObservedCommandFingerprint`, which strips
+// that same wrapper back off a `ps`-observed command line.
+export const normalizeCommandFingerprint = (command: ServiceCommand): string => {
+  const text = "argv" in command.command ? command.command.argv.join(" ") : command.command.shell;
+  return createHash("sha256").update(text.trim().replace(/\s+/g, " ")).digest("hex");
+};
+export const normalizeObservedCommandFingerprint = (command: string): string => createHash("sha256").update(command.replace(/^(?:\/bin\/)?sh\s+-(?:l)?c\s+/, "").trim().replace(/\s+/g, " ")).digest("hex");
+
+const profileFor = (catalog: ServiceCatalog, serviceId: ServiceId): VerifiedServiceRunProfile => {
+  const profile = catalog.services.find((service) => service.id === serviceId)?.profiles.run;
+  if (!profile || profile.commandStatus !== "verified") throw new Error(`Unsupported service ${serviceId}`);
+  return profile;
+};
+const definitionFor = (catalog: ServiceCatalog, serviceId: ServiceId): ServiceDefinition | undefined => catalog.services.find((service) => service.id === serviceId);
+
+export class ProcessSupervisor {
+  private readonly active = new Map<ServiceId, Active>();
+  private readonly tokens = new Map<ServiceId, number>();
+  private readonly queues = new Map<ServiceId, Promise<void>>();
+  private readonly buildAborts = new Map<ServiceId, AbortController>();
+  private readonly buildSerials = new Map<string, Promise<void>>();
+  private readonly outputTails = new Map<ServiceId, () => void>();
+  private composeStartTail = Promise.resolve();
+  private readonly optionsClock: SupervisorClock;
+  private readonly timeout: number;
+  private readonly backoff: number;
+  private readonly grace: number;
+
+  constructor(
+    private readonly host: Host,
+    private readonly options: SupervisorOptions,
+  ) {
+    this.optionsClock = options.clock ?? clock;
+    this.timeout = options.readinessTimeoutMs ?? 10_000;
+    this.backoff = options.readinessBackoffMs ?? 100;
+    this.grace = options.terminationGraceMs ?? 5_000;
+  }
+
+  async start(serviceId: ServiceId, operationId?: string): Promise<void> {
+    return this.serial(serviceId, () => this.startLocked(serviceId, operationId));
+  }
+  async restart(serviceId: ServiceId, operationId?: string): Promise<void> {
+    this.cancel(serviceId);
+    this.abortBuild(serviceId);
+    return this.serial(serviceId, async () => {
+      await this.stopLocked(serviceId, operationId);
+      await this.startLocked(serviceId, operationId);
+    });
+  }
+  async stop(serviceId: ServiceId, operationId?: string): Promise<void> {
+    this.cancel(serviceId);
+    this.abortBuild(serviceId);
+    return this.serial(serviceId, () => this.stopLocked(serviceId, operationId));
+  }
+  async startGroup(group: string, operationId?: string): Promise<void> {
+    const members = this.host.catalog.groups[group];
+    if (!members) throw new Error(`Unknown service group ${group}`);
+    for (const serviceId of members) await this.start(serviceId, operationId);
+  }
+  beginShutdown(): void {
+    for (const serviceId of new Set([...this.tokens.keys(), ...this.buildAborts.keys(), ...this.host.serviceStates().map((state) => state.serviceId)])) {
+      this.cancel(serviceId);
+      this.abortBuild(serviceId);
+    }
+  }
+  async shutdown(): Promise<void> {
+    this.beginShutdown();
+    const daemonOwned = new Set(this.host.catalog.services.filter((service) => (service.ownership ?? "daemon") === "daemon").map((service) => service.id));
+    await Promise.all(this.host.serviceStates().filter((state) => daemonOwned.has(state.serviceId) && activeStates.includes(state.actualState)).map((state) => this.stop(state.serviceId)));
+    // A service can carry a verified POSIX identity from a prior generation while its current
+    // actualState says 'externally-owned' (e.g. a port conflict was detected at last start) — the
+    // first pass above skips it since that state isn't "active", but a lingering owned process must
+    // still be reaped on shutdown so it never leaks past this manager's lifetime.
+    await Promise.all(this.host.serviceStates().filter((state) => daemonOwned.has(state.serviceId)).map((state) => this.serial(state.serviceId, () => this.reapPersistedPosixIdentity(state.serviceId))));
+  }
+  private async reapPersistedPosixIdentity(serviceId: ServiceId): Promise<void> {
+    const state = this.state(serviceId);
+    if (!state?.identity || isDockerIdentity(state.identity) || !this.identityMatchesState(state)) return;
+    await this.terminatePersistedPosixIdentity(state.identity);
+  }
+  private async terminatePersistedPosixIdentity(identity: Exclude<ProcessIdentity, DockerContainerIdentity>): Promise<void> {
+    if (!(await this.observedMatches(identity))) return;
+    await this.options.process.signalGroup(identity.pgid, "SIGTERM");
+    const deadline = Date.parse(this.optionsClock.now()) + this.grace;
+    while (Date.parse(this.optionsClock.now()) < deadline) {
+      if (!(await this.observedMatches(identity))) return;
+      await this.optionsClock.sleep(this.backoff);
+    }
+    if (await this.observedMatches(identity)) await this.options.process.signalGroup(identity.pgid, "SIGKILL");
+  }
+
+  async status(serviceId: ServiceId): Promise<void> {
+    return this.serial(serviceId, async () => {
+      const state = this.state(serviceId);
+      if (!state?.identity || !activeStates.includes(state.actualState)) return;
+      if (!(await this.owns(state))) return this.orphan(state);
+      const profile = profileFor(this.host.catalog, serviceId);
+      if (profile.readiness.kind !== "process" && !(await this.probe(profile.readiness, serviceId))) {
+        await this.transition(serviceId, state.generation, "running-unready", "not-ready", { readinessKind: readinessName(profile.readiness), readinessDetail: "Readiness probe is currently unavailable" });
+      }
+    });
+  }
+
+  async reconcile(): Promise<void> {
+    for (const state of this.host.serviceStates()) {
+      if (!state.identity || !activeStates.includes(state.actualState)) continue;
+      await this.serial(state.serviceId, async () => {
+        const observed = await this.options.process.inspect(state.identity!);
+        if (!observed?.alive) {
+          return this.transition(state.serviceId, state.generation, state.desiredState === "running" ? "failed" : "stopped", "failed", { error: "Managed process is no longer alive", exitedAt: this.optionsClock.now() });
+        }
+        if (!this.identityMatchesState(state) || !(await this.observedMatches(state.identity!))) return this.orphan(state);
+        const identity = { ...state.identity!, managerInstanceId: this.host.instanceId };
+        await this.transition(state.serviceId, state.generation, "running-unready", "not-ready", { identity, clear: ["error"] });
+        this.attachOutput(state.serviceId, identity);
+        await this.readiness(state.serviceId, profileFor(this.host.catalog, state.serviceId), state.generation, identity, this.currentToken(state.serviceId), undefined, true);
+      });
+    }
+  }
+
+  /** Polls readiness of every `ownership: 'external'` service and adopts/releases it into this
+   * manager's own state machine when its external readiness appears/disappears — generalizes
+   * infra's docker/tailnet-task `syncExternalUnits`. */
+  async syncExternalServices(): Promise<void> {
+    for (const service of this.host.catalog.services) {
+      if ((service.ownership ?? "daemon") !== "external") continue;
+      if (this.active.has(service.id)) continue;
+      await this.serial(service.id, async () => {
+        if (this.active.has(service.id)) return;
+        const state = this.state(service.id);
+        const profile = service.profiles.run;
+        if (profile.commandStatus !== "verified") return;
+        const ready = await this.probe(profile.readiness, service.id);
+        if (ready && (state?.actualState === "stopped" || state?.actualState === "failed")) {
+          const generation = (state?.generation ?? 0) + 1;
+          await this.transition(service.id, generation, "ready", "ready", {
+            readinessKind: readinessName(profile.readiness),
+            readinessDetail: "adopted from external state",
+            desiredState: "running",
+            clear: ["error", "exitCode", "exitedAt", "identity"],
+          });
+        } else if (!ready && state && (state.actualState === "ready" || state.actualState === "running-unready")) {
+          await this.transition(service.id, state.generation, "stopped", "unknown", { desiredState: "stopped", exitedAt: this.optionsClock.now(), clear: ["error", "exitCode", "identity"] });
+        }
+      });
+    }
+  }
+
+  private async startLocked(serviceId: ServiceId, operationId?: string): Promise<void> {
+    if (this.options.isClosing?.()) return;
+    const profile = profileFor(this.host.catalog, serviceId);
+    const current = this.state(serviceId);
+    const existing = this.active.get(serviceId);
+    if (existing && !existing.stopped && current?.actualState !== "failed") return;
+    if (existing) await this.finalize(existing, true);
+    if (current?.identity && activeStates.includes(current.actualState) && (await this.owns(current))) return;
+    const retainedIdentity = current?.identity && !isDockerIdentity(current.identity) && this.identityMatchesState(current) && (await this.observedMatches(current.identity)) ? current.identity : undefined;
+    const generation = retainedIdentity?.generation ?? (current?.generation ?? 0) + 1;
+    const token = this.cancel(serviceId);
+    if (retainedIdentity) {
+      const identity = { ...retainedIdentity, managerInstanceId: this.host.instanceId };
+      await this.transition(serviceId, generation, "running-unready", "not-ready", { desiredState: "running", currentOperationId: operationId, identity, clear: ["error", "exitCode", "exitedAt"] });
+      this.attachOutput(serviceId, identity);
+      await this.readiness(serviceId, profile, generation, identity, token, operationId, true);
+      return;
+    }
+    await this.transition(serviceId, generation, "preparing", "unknown", { desiredState: "running", currentOperationId: operationId, clear: ["error", "exitCode", "exitedAt", "identity"] });
+    try {
+      if (profile.preparation?.length) await this.options.preparation?.prepare(serviceId, profile.preparation);
+    } catch {
+      await this.transitionIfCurrent(serviceId, generation, token, "failed", "failed", { error: "Preparation failed", currentOperationId: operationId });
+      throw new Error(`Preparation failed for ${serviceId}`);
+    }
+    if (!this.valid(serviceId, generation, token) || this.options.isClosing?.()) return;
+    const definition = definitionFor(this.host.catalog, serviceId);
+    if (definition?.profiles.build) await this.build(serviceId, definition, generation, token, operationId);
+    if (!this.valid(serviceId, generation, token) || this.options.isClosing?.()) return;
+    if (profile.readiness.kind === "tcp" && (await this.options.probes.portInUse?.(profile.readiness.port))) {
+      await this.transition(serviceId, generation, "externally-owned", "failed", { error: `Port ${profile.readiness.port} is held by an unowned process` });
+      throw new Error(`Port ${profile.readiness.port} is externally owned`);
+    }
+    await this.spawnAndWait(serviceId, profile, generation, token, operationId);
+  }
+
+  private async stopLocked(serviceId: ServiceId, operationId?: string): Promise<void> {
+    const state = this.state(serviceId);
+    if (!state || state.actualState === "stopped" || state.actualState === "externally-owned") return;
+    const active = this.active.get(serviceId);
+    if (!state.identity) {
+      if (state.actualState === "queued-start" || state.actualState === "preparing" || state.actualState === "starting" || this.options.isClosing?.()) {
+        await this.transition(serviceId, state.generation, "stopped", "unknown", { desiredState: "stopped", currentOperationId: operationId, exitedAt: this.optionsClock.now(), clear: ["error", "exitCode"] });
+      } else {
+        await this.orphan(state, operationId);
+      }
+      return;
+    }
+    if (!(await this.owns(state))) {
+      const observed = await this.options.process.inspect(state.identity);
+      if (!observed?.alive) {
+        if (active) this.active.delete(serviceId);
+        await this.transition(serviceId, state.generation, "stopped", "unknown", { desiredState: "stopped", exitedAt: this.optionsClock.now(), clear: ["error", "exitCode"] });
+        return;
+      }
+      return this.orphan(state, operationId);
+    }
+    await this.transition(serviceId, state.generation, "stopping", state.readiness, { desiredState: "stopped", currentOperationId: operationId });
+    if (active) active.stopped = true;
+    await this.terminate(state.identity, profileFor(this.host.catalog, serviceId).command);
+    if (active) this.active.delete(serviceId);
+    await this.transition(serviceId, state.generation, "stopped", "unknown", { desiredState: "stopped", exitedAt: this.optionsClock.now(), clear: ["error", "exitCode"] });
+  }
+
+  private async spawnAndWait(serviceId: ServiceId, profile: VerifiedServiceRunProfile, generation: number, token: number, operationId?: string): Promise<void> {
+    await this.transition(serviceId, generation, "starting", "not-ready", { desiredState: "running", currentOperationId: operationId, clear: ["identity"] });
+    if (!this.valid(serviceId, generation, token) || this.options.isClosing?.()) return;
+    const fingerprint = normalizeCommandFingerprint(profile.command);
+    let app: ManagedProcess;
+    try {
+      const input: SpawnInput = { command: profile.command, commandFingerprint: fingerprint, serviceId, onOutput: (data) => { if (this.valid(serviceId, generation, token)) void this.host.appendLog(serviceId, data); } };
+      if (isContainerCommand(profile.command)) {
+        const previous = this.composeStartTail.catch(() => undefined);
+        let release!: () => void;
+        const turn = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        this.composeStartTail = previous.then(() => turn);
+        try {
+          await previous;
+          app = await this.options.process.spawn(input);
+        } finally {
+          release();
+        }
+      } else {
+        app = await this.options.process.spawn(input);
+      }
+    } catch (error) {
+      if (!this.valid(serviceId, generation, token) || this.options.isClosing?.()) return;
+      const message = error instanceof Error && error.message ? error.message : "Service process failed to start";
+      await this.transitionIfCurrent(serviceId, generation, token, "failed", "failed", { error: message, currentOperationId: operationId, clear: ["identity"] });
+      throw error;
+    }
+    if (isTaskCommand(profile.readiness) && !isDockerIdentityRecord(app)) {
+      await this.transition(serviceId, generation, "running-unready", "not-ready", { clear: ["identity"] });
+      await this.readiness(serviceId, profile, generation, undefined, token, operationId);
+      return;
+    }
+    const identity: ProcessIdentity = isDockerIdentityRecord(app)
+      ? { managerInstanceId: this.host.instanceId, serviceId, generation, startedAt: this.optionsClock.now(), containerName: app.containerName, containerId: app.containerId, containerStartedAt: app.containerStartedAt, commandFingerprint: app.commandFingerprint }
+      : { managerInstanceId: this.host.instanceId, serviceId, generation, startedAt: this.optionsClock.now(), pid: app.pid, pgid: app.pgid, startIdentity: app.startIdentity, commandFingerprint: app.commandFingerprint };
+    if (!this.valid(serviceId, generation, token)) {
+      await this.terminate(identity, profile.command);
+      return;
+    }
+    const active: Active = { profile, app, identity, token, stopped: false };
+    this.active.set(serviceId, active);
+    this.attachOutput(serviceId, identity);
+    void app.exited.then((code) => this.onExit(serviceId, generation, token, code)).catch(() => this.onExit(serviceId, generation, token, -1));
+    await this.transition(serviceId, generation, "running-unready", "not-ready", { identity });
+    await this.readiness(serviceId, profile, generation, identity, token, operationId);
+  }
+
+  private async readiness(serviceId: ServiceId, profile: VerifiedServiceRunProfile, generation: number, identity: ProcessIdentity | undefined, token: number, operationId?: string, adopted = false): Promise<void> {
+    if (profile.readiness.kind === "process") {
+      if ((identity && !(await this.ownsIdentity(identity))) || !this.valid(serviceId, generation, token)) {
+        await this.fail(serviceId, generation, token, identity, "Process exited before liveness check", operationId);
+        throw new Error("Process exited before liveness check");
+      }
+      await this.transitionIfCurrent(serviceId, generation, token, "running-unready", "not-ready", { identity, readinessKind: "process", readinessDetail: "process-liveness-only" });
+      return;
+    }
+    const timeout = profile.readinessTimeoutMs ?? this.timeout;
+    const deadline = Date.parse(this.optionsClock.now()) + timeout;
+    while (Date.parse(this.optionsClock.now()) <= deadline) {
+      if (!this.valid(serviceId, generation, token)) return;
+      if (identity && !(await this.ownsIdentity(identity))) {
+        await this.fail(serviceId, generation, token, identity, "Process exited before readiness", operationId);
+        throw new Error("Process exited before readiness");
+      }
+      if (await this.probe(profile.readiness, serviceId)) {
+        await this.transitionIfCurrent(serviceId, generation, token, "ready", "ready", { identity, readinessKind: readinessName(profile.readiness), readinessDetail: adopted ? "adopted readiness verified" : "readiness verified", clear: ["error"] });
+        return;
+      }
+      await this.optionsClock.sleep(this.backoff);
+    }
+    await this.fail(serviceId, generation, token, identity, "Readiness timed out", operationId, { readinessKind: readinessName(profile.readiness), readinessDetail: `Readiness ${readinessName(profile.readiness)} probe timed out after ${timeout}ms` });
+    throw new Error("Readiness timed out");
+  }
+
+  private async fail(serviceId: ServiceId, generation: number, token: number, identity: ProcessIdentity | undefined, error: string, operationId?: string, changes: Pick<Changes, "readinessKind" | "readinessDetail"> = {}): Promise<void> {
+    if (!this.valid(serviceId, generation, token)) return;
+    await this.transitionIfCurrent(serviceId, generation, token, "failed", "failed", { identity, error, currentOperationId: operationId, ...changes });
+    this.cancel(serviceId);
+    const active = this.active.get(serviceId);
+    if (active?.identity.generation === generation) await this.finalize(active, true);
+  }
+  private async onExit(serviceId: ServiceId, generation: number, token: number, code: number): Promise<void> {
+    await this.serial(serviceId, async () => {
+      if (!this.valid(serviceId, generation, token)) return;
+      const state = this.state(serviceId);
+      const active = this.active.get(serviceId);
+      if (!state || state.generation !== generation || !active || active.stopped) return;
+      await this.transitionIfCurrent(serviceId, generation, token, "failed", "failed", { exitCode: code, exitedAt: this.optionsClock.now(), error: `Process exited with code ${code}` });
+      if (this.active.get(serviceId)?.identity.generation === generation) this.active.delete(serviceId);
+    });
+  }
+  private async finalize(active: Active, terminate: boolean): Promise<void> {
+    active.stopped = true;
+    if (terminate && (await this.ownsIdentity(active.identity))) await this.terminate(active.identity, active.profile.command);
+    if (this.active.get(active.identity.serviceId) === active) this.active.delete(active.identity.serviceId);
+  }
+  private async terminate(identity: ProcessIdentity, command: ServiceCommand): Promise<void> {
+    if (!(await this.ownsIdentity(identity))) return;
+    if (isDockerIdentity(identity)) {
+      if (!this.options.process.stopContainer) throw new Error("Docker container stop is unavailable");
+      await this.options.process.stopContainer(command);
+      return;
+    }
+    this.outputTails.get(identity.serviceId)?.();
+    this.outputTails.delete(identity.serviceId);
+    await this.options.process.signalGroup(identity.pgid, "SIGTERM");
+    const deadline = Date.parse(this.optionsClock.now()) + this.grace;
+    while (Date.parse(this.optionsClock.now()) < deadline) {
+      if (!(await this.ownsIdentity(identity))) return;
+      await this.optionsClock.sleep(this.backoff);
+    }
+    if (await this.ownsIdentity(identity)) await this.options.process.signalGroup(identity.pgid, "SIGKILL");
+  }
+  private async build(serviceId: ServiceId, definition: ServiceDefinition, generation: number, token: number, operationId?: string): Promise<void> {
+    const build = definition.profiles.build!;
+    const controller = new AbortController();
+    this.buildAborts.set(serviceId, controller);
+    const timeout = setTimeout(() => controller.abort(new Error("Build timed out")), build.timeoutMs ?? 15 * 60_000);
+    try {
+      const run = () => this.options.runBuild(build.command, (data) => { if (this.valid(serviceId, generation, token)) void this.host.appendLog(serviceId, data); }, controller.signal);
+      if (build.serializationKey) await this.serializedBuild(build.serializationKey, controller.signal, run);
+      else await run();
+    } catch (error) {
+      if (!this.valid(serviceId, generation, token) || this.options.isClosing?.()) return;
+      const message = controller.signal.aborted ? "Build timed out" : "Build failed";
+      await this.transitionIfCurrent(serviceId, generation, token, "failed", "failed", { error: message, currentOperationId: operationId });
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (this.buildAborts.get(serviceId) === controller) this.buildAborts.delete(serviceId);
+    }
+  }
+  private async serializedBuild(key: string, signal: AbortSignal, run: () => Promise<void>): Promise<void> {
+    const previous = (this.buildSerials.get(key) ?? Promise.resolve()).catch(() => undefined);
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.buildSerials.set(key, previous.then(() => turn));
+    await new Promise<void>((resolve, reject) => {
+      const abort = (): void => {
+        signal.removeEventListener("abort", abort);
+        reject(signal.reason);
+      };
+      if (signal.aborted) return abort();
+      signal.addEventListener("abort", abort, { once: true });
+      void previous.then(async () => {
+        signal.removeEventListener("abort", abort);
+        if (signal.aborted) return reject(signal.reason);
+        try {
+          resolve(await run());
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }).finally(release);
+  }
+  private abortBuild(serviceId: ServiceId): void {
+    this.buildAborts.get(serviceId)?.abort(new Error("Build cancelled"));
+  }
+  private async probe(readiness: ReadinessSpec, serviceId: ServiceId): Promise<boolean> {
+    if (readiness.kind === "tcp") return this.options.probes.tcp(readiness.port);
+    if (readiness.kind === "http") return this.options.probes.http(readiness.url);
+    if (readiness.kind === "tailnet") return this.options.probes.tailnet();
+    if (readiness.kind === "custom") return (await readiness.probe({ serviceId })) === "ready";
+    if (readiness.kind === "container") {
+      const profile = profileFor(this.host.catalog, serviceId);
+      return profile.command.containerName ? this.options.probes.container(profile.command.containerName) : false;
+    }
+    return false;
+  }
+  private attachOutput(serviceId: ServiceId, identity: ProcessIdentity): void {
+    if (isDockerIdentity(identity)) return;
+    this.outputTails.get(serviceId)?.();
+    this.outputTails.delete(serviceId);
+    const stop = this.options.process.attachOutput?.(serviceId, (data) => void this.host.appendLog(serviceId, data));
+    if (stop) this.outputTails.set(serviceId, stop);
+  }
+  private state(serviceId: ServiceId): ServiceLifecycleState | undefined {
+    return this.host.serviceStates().find((state) => state.serviceId === serviceId);
+  }
+  private currentToken(serviceId: ServiceId): number {
+    return this.tokens.get(serviceId) ?? 0;
+  }
+  private cancel(serviceId: ServiceId): number {
+    const token = this.currentToken(serviceId) + 1;
+    this.tokens.set(serviceId, token);
+    return token;
+  }
+  private valid(serviceId: ServiceId, generation: number, token: number): boolean {
+    return this.currentToken(serviceId) === token && this.state(serviceId)?.generation === generation;
+  }
+  private identityMatchesState(state: ServiceLifecycleState): boolean {
+    return state.identity !== undefined && state.identity.serviceId === state.serviceId && state.identity.generation === state.generation;
+  }
+  private async owns(state: ServiceLifecycleState): Promise<boolean> {
+    return this.identityMatchesState(state) && (await this.ownsIdentity(state.identity!));
+  }
+  private async observedMatches(identity: ProcessIdentity): Promise<boolean> {
+    const observed = await this.options.process.inspect(identity);
+    if (!observed?.alive || observed.commandFingerprint !== identity.commandFingerprint) return false;
+    if (isDockerIdentity(identity)) return isDockerObserved(observed) && observed.containerName === identity.containerName && observed.containerId === identity.containerId && observed.containerStartedAt === identity.containerStartedAt;
+    return !isDockerObserved(observed) && observed.pid === identity.pid && observed.pgid === identity.pgid && observed.startIdentity === identity.startIdentity;
+  }
+  private async ownsIdentity(identity: ProcessIdentity): Promise<boolean> {
+    return identity.managerInstanceId === this.host.instanceId && (await this.observedMatches(identity));
+  }
+  private async orphan(state: ServiceLifecycleState, operationId?: string): Promise<void> {
+    await this.transition(state.serviceId, state.generation, "orphaned", "failed", { error: "Process ownership identity no longer matches", currentOperationId: operationId });
+  }
+  private async transitionIfCurrent(serviceId: ServiceId, generation: number, token: number, actual: ActualServiceState, readiness: ServiceReadiness, changes: Changes): Promise<void> {
+    if (this.valid(serviceId, generation, token)) await this.transition(serviceId, generation, actual, readiness, changes);
+  }
+  private async transition(serviceId: ServiceId, generation: number, actualState: ActualServiceState, readiness: ServiceReadiness, changes: Changes): Promise<void> {
+    const previous = this.state(serviceId);
+    const clear = new Set(changes.clear ?? []);
+    const field = <K extends "error" | "exitCode" | "exitedAt" | "currentOperationId">(key: K): ServiceLifecycleState[K] => (clear.has(key) ? undefined : (changes[key] ?? previous?.[key])) as ServiceLifecycleState[K];
+    const next: ServiceLifecycleState = {
+      serviceId,
+      desiredState: changes.desiredState ?? previous?.desiredState ?? "running",
+      actualState,
+      readiness,
+      generation,
+      createdAt: previous?.createdAt ?? this.optionsClock.now(),
+      updatedAt: this.optionsClock.now(),
+      identity: clear.has("identity") ? undefined : (changes.identity ?? previous?.identity),
+      readinessKind: changes.readinessKind ?? previous?.readinessKind,
+      readinessDetail: changes.readinessDetail ?? previous?.readinessDetail,
+      exitedAt: field("exitedAt"),
+      exitCode: field("exitCode"),
+      error: field("error"),
+      currentOperationId: field("currentOperationId"),
+    };
+    await this.host.setServiceState(next);
+    this.host.publish("service.lifecycle", { serviceId, actualState, readiness, generation, operationId: next.currentOperationId ?? null });
+    if (next.error) await this.host.appendLog(serviceId, `${next.updatedAt} ${next.error}\n`);
+  }
+  private serial<T>(serviceId: ServiceId, work: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(serviceId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(work);
+    this.queues.set(
+      serviceId,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return next;
+  }
+}
+
+// -------------------------------------------------------------------------------------------
+// Default (production) adapters — POSIX/Docker process management via Bun + system tools.
+// -------------------------------------------------------------------------------------------
+
+type PosixChild = { pid: number; exited: Promise<number>; kill(signal: ProcessSignal): void };
+const stopUnverifiedChild = async (child: PosixChild): Promise<void> => {
+  child.kill("SIGTERM");
+  await Promise.race([child.exited.then(() => undefined), Bun.sleep(500)]);
+};
+export const forwardStream = async (stream: ReadableStream<Uint8Array> | null, onOutput?: (data: string) => void): Promise<void> => {
+  if (!stream) return;
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      if (chunk) onOutput?.(chunk);
+    }
+    const final = decoder.decode();
+    if (final) onOutput?.(final);
+  } finally {
+    reader.releaseLock();
+  }
+};
+const RAW_LOG_POLL_MS = 200;
+export function tailFile(path: string, onOutput: ((data: string) => void) | undefined): { stop: () => void } {
+  let stopped = false;
+  let offset = 0;
+  const decoder = new TextDecoder();
+  const drainOnce = (): void => {
+    try {
+      const size = statSync(path, { throwIfNoEntry: false })?.size ?? 0;
+      if (size <= offset) return;
+      const fd = openSync(path, "r");
+      try {
+        const length = size - offset;
+        const buffer = Buffer.alloc(length);
+        readSync(fd, buffer, 0, length, offset);
+        const text = decoder.decode(buffer, { stream: true });
+        if (text) onOutput?.(text);
+      } finally {
+        closeSync(fd);
+      }
+      // copytruncate: shrink the capture file back to empty so a long-lived service's raw output
+      // never grows unbounded between polls. The writer's fd is opened O_APPEND, so its next
+      // write always lands at the (now shorter) current end of file, never a stale offset.
+      const writeFd = openSync(path, "r+");
+      try {
+        ftruncateSync(writeFd, 0);
+      } finally {
+        closeSync(writeFd);
+      }
+      offset = 0;
+    } catch {}
+  };
+  const pump = async (): Promise<void> => {
+    while (!stopped) {
+      drainOnce();
+      await Bun.sleep(RAW_LOG_POLL_MS);
+    }
+  };
+  void pump();
+  return {
+    stop: () => {
+      stopped = true;
+      drainOnce();
+    },
+  };
+}
+const tcpProbe = (port: number): Promise<boolean> =>
+  new Promise((resolve) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    const done = (ready: boolean) => {
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    socket.setTimeout(250, () => done(false));
+  });
+const execIdentitySettleMs = 1_000;
+const observedSystemProcess = (pid: number): ObservedProcess | undefined => {
+  const result = Bun.spawnSync(["ps", "-o", "pid=", "-o", "pgid=", "-o", "lstart=", "-o", "command=", "-p", String(pid)]);
+  if (result.exitCode !== 0) return undefined;
+  const match = /^(\d+)\s+(\d+)\s+(.{24})\s+(.+)$/.exec(new TextDecoder().decode(result.stdout).trim());
+  if (!match) return undefined;
+  return { pid: Number(match[1]), pgid: Number(match[2]), startIdentity: match[3]!.trim(), commandFingerprint: normalizeObservedCommandFingerprint(match[4]!), alive: true };
+};
+const samePosixProcess = (expected: PosixProcessRecord, observed: ObservedProcess | undefined): observed is PosixProcessRecord & { alive: boolean } =>
+  observed !== undefined && !isDockerObserved(observed) && observed.pid === expected.pid && observed.pgid === expected.pgid && observed.startIdentity === expected.startIdentity;
+const observedStableExecProcess = async (child: PosixChild, expectedFingerprint: string): Promise<PosixProcessRecord> => {
+  let candidate: PosixProcessRecord | undefined;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await Bun.sleep(25);
+    const observed = observedSystemProcess(child.pid);
+    if (!observed || isDockerObserved(observed) || observed.commandFingerprint === expectedFingerprint) {
+      candidate = undefined;
+      continue;
+    }
+    if (!candidate || !samePosixProcess(candidate, observed) || candidate.commandFingerprint !== observed.commandFingerprint) {
+      candidate = observed;
+      continue;
+    }
+    await Bun.sleep(execIdentitySettleMs);
+    const settled = observedSystemProcess(child.pid);
+    if (settled && !isDockerObserved(settled) && samePosixProcess(candidate, settled) && settled.commandFingerprint === candidate.commandFingerprint) return settled;
+    candidate = undefined;
+  }
+  await stopUnverifiedChild(child);
+  throw new Error("Unable to establish stable POSIX exec process identity");
+};
+const processInspectionAvailable = (): boolean => Bun.spawnSync(["ps", "-o", "pid=", "-p", String(process.pid)]).exitCode === 0;
+const containerRunning = (containerName: string): boolean => new TextDecoder().decode(Bun.spawnSync(["docker", "inspect", "-f", "{{.State.Running}}", containerName]).stdout).trim() === "true";
+const containerRecord = (containerName: string, commandFingerprint: string): DockerContainerRecord | undefined => {
+  const output = new TextDecoder().decode(Bun.spawnSync(["docker", "inspect", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}", containerName]).stdout).trim().split("\t");
+  return output.length === 3 && output[1] === "true" && output[0] && output[2] ? { containerName, containerId: output[0], containerStartedAt: output[2], commandFingerprint } : undefined;
+};
+const sameContainerInstance = (expected: DockerContainerRecord, observed: DockerContainerRecord | undefined): boolean =>
+  observed !== undefined && observed.containerName === expected.containerName && observed.containerId === expected.containerId && observed.containerStartedAt === expected.containerStartedAt;
+const tailnetServing = (): boolean => {
+  const result = Bun.spawnSync(["tailscale", "serve", "status", "--json"]);
+  if (result.exitCode !== 0) return false;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(result.stdout)) as { Web?: Record<string, unknown> };
+    return Object.keys(parsed.Web ?? {}).length > 0;
+  } catch {
+    return false;
+  }
+};
+const runCommand = async (argv: readonly string[], cwd: string, env?: Record<string, string | undefined>, onOutput?: (data: string) => void): Promise<number> => {
+  const child = Bun.spawn([...argv], { cwd, env, stdout: "pipe", stderr: "pipe" });
+  void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]);
+  return child.exited;
+};
+
+export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDirectory: string = resolveRuntimeDirectory(root)): SupervisorOptions => ({
+  process: {
+    spawn: async ({ command, commandFingerprint, serviceId, onOutput }) => {
+      const { argv, exec } = commandArgv(command.command);
+      const env = command.environment ? { ...process.env, ...command.environment } : (process.env as Record<string, string>);
+      if (isContainerCommand(command)) {
+        const result = await runCommand(argv, join(root, command.cwd), env, onOutput);
+        if (result !== 0) throw new Error(`Docker service command exited with ${result}`);
+        const containerName = command.containerName!;
+        const record = containerRecord(containerName, commandFingerprint);
+        if (!record) throw new Error(`Docker container ${containerName} is not running after start`);
+        let finish: ((code: number) => void) | undefined;
+        const exited = new Promise<number>((resolve) => {
+          finish = resolve;
+        });
+        const timer = setInterval(() => {
+          if (!sameContainerInstance(record, containerRecord(containerName, commandFingerprint))) {
+            clearInterval(timer);
+            finish?.(0);
+          }
+        }, 500);
+        return { ...record, exited };
+      }
+      if (!processInspectionAvailable()) throw new Error("POSIX process inspection is unavailable; refusing to start an unverified service process");
+      // Managed dev processes must outlive the daemon that spawned them. Piping their stdout/stderr
+      // straight into this daemon made that a lie: once the daemon exits for any reason, the pipe's
+      // read end closes, and the child's next log write earns it a SIGPIPE — a real (non-Node)
+      // process almost always dies from that by default. Redirect to a plain file instead so the
+      // child's survival never depends on anyone draining a pipe; attachOutput tails that file.
+      mkdirSync(logsDir(runtimeDirectory), { recursive: true });
+      const raw = rawLogPath(runtimeDirectory, serviceId);
+      closeSync(openSync(raw, "w"));
+      const rawFd = openSync(raw, "a");
+      let child: ReturnType<typeof Bun.spawn>;
+      try {
+        child = Bun.spawn(argv, { cwd: join(root, command.cwd), env, stdout: rawFd, stderr: rawFd, detached: true });
+      } finally {
+        closeSync(rawFd);
+      }
+      if (exec) {
+        const record = await observedStableExecProcess(child, commandFingerprint);
+        return { ...record, exited: child.exited };
+      }
+      let observed: ObservedProcess | undefined;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        observed = observedSystemProcess(child.pid);
+        if (observed) break;
+        if (attempt < 3) await Bun.sleep(25);
+      }
+      if (!observed || isDockerObserved(observed)) {
+        await stopUnverifiedChild(child);
+        throw new Error("Unable to establish POSIX process ownership identity after 4 inspections");
+      }
+      return { ...observed, exited: child.exited };
+    },
+    inspect: async (identity) => {
+      if (isDockerIdentity(identity)) {
+        const record = containerRecord(identity.containerName, identity.commandFingerprint);
+        return record && sameContainerInstance(identity, record) ? { ...record, alive: true } : undefined;
+      }
+      if (identity.pid === 0) return { pid: 0, pgid: 0, startIdentity: "", commandFingerprint: identity.commandFingerprint, alive: false };
+      return observedSystemProcess(identity.pid);
+    },
+    signalGroup: async (pgid, signal) => {
+      if (pgid === 0) return;
+      try {
+        process.kill(-pgid, signal);
+      } catch {}
+    },
+    stopContainer: async (command, onOutput) => {
+      const { argv } = commandArgv(command.dockerStopCommand ?? { argv: ["docker", "compose", "stop"] });
+      const code = await runCommand(argv, root, process.env as Record<string, string>, onOutput);
+      if (code !== 0) throw new Error(`Docker service stop exited with ${code}`);
+    },
+    attachOutput: (serviceId, onOutput) => tailFile(rawLogPath(runtimeDirectory, serviceId), onOutput).stop,
+  },
+  runBuild: async (command, onOutput, signal) => {
+    const { argv } = commandArgv(command.command);
+    const env = command.environment ? { ...process.env, ...command.environment } : (process.env as Record<string, string>);
+    if (signal.aborted) throw signal.reason;
+    const child = Bun.spawn(argv, { cwd: join(root, command.cwd), env, stdout: "pipe", stderr: "pipe", detached: true });
+    void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]);
+    let stopping: Promise<void> | undefined;
+    const stop = (): void => {
+      stopping ??= (async () => {
+        try {
+          process.kill(-child.pid, "SIGTERM");
+        } catch {
+          child.kill("SIGTERM");
+        }
+        await Promise.race([child.exited.then(() => undefined), Bun.sleep(5_000)]);
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+        await child.exited;
+      })();
+    };
+    signal.addEventListener("abort", stop, { once: true });
+    const code = await child.exited;
+    signal.removeEventListener("abort", stop);
+    if (signal.aborted) throw signal.reason;
+    if (code !== 0) throw new Error(`Build command exited with ${code}`);
+  },
+  probes: { tcp: tcpProbe, http: async (url) => { try { return (await fetch(url, { signal: AbortSignal.timeout(250) })).ok; } catch { return false; } }, container: async (containerName) => containerRunning(containerName), tailnet: async () => tailnetServing(), portInUse: tcpProbe },
+});
