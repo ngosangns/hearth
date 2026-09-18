@@ -29,6 +29,23 @@ independently-forked internal copies of this tool (infra's `scripts/local-servic
   (argv joined, or the bare `shell` string) — never the physical `sh -c` spawn wrapper — so it matches
   `normalizeObservedCommandFingerprint`'s prefix-stripped `ps` output. Already fixed once during the
   initial port; a future refactor of `commandArgv` should re-check this pairing.
+- Stopping a service signals its **whole process tree**, snapshotted from `ps` before the first
+  signal (`ProcessSupervisor.processTree`): `air` runs the built server in its **own** process group,
+  so signalling only the tracked pgid leaves the real server alive and holding its port, and the next
+  start fails with `Port N is held by an unowned process`. The snapshot is only walked when the OS
+  table still shows the recorded `startIdentity` for the leader pid, so a stale/reused pid can never
+  pull an unrelated live tree into a signal or into the wait-for-death loop.
+- An adopted identity (`startLocked`'s `retainedIdentity`) is kept only while it still answers its
+  readiness probe; an alive-but-unresponsive one (air survives its child) is terminated and replaced
+  instead of being re-adopted on every start into a permanent `Readiness timed out`.
+- Fire-and-forget work (unit log forwarding, `syncExternalServices` polling) must never reject into
+  the daemon: Bun terminates the process on an unhandled rejection, orphaning every managed service
+  (its identity keeps the dead daemon's instance id, so the next daemon can only adopt it). Guarded
+  sinks report through the optional `Host.recordBackgroundError`, and `runDaemon` logs stray
+  rejections/exceptions to `<runtimeDir>/daemon.log` (one rotated copy) instead of dying.
+- A daemon whose lock was taken over stops itself (`LockOwnershipWatch` in `daemon.ts`) — it exits
+  without touching the winner's lock. Enforced from the losing side so two daemons can never fight
+  over one `state.json`.
 - `ProcessSupervisor.shutdown()` does two passes: an "active state" stop pass, then a second reap pass
   for daemon-owned services holding a stale POSIX identity in a non-"active" state (e.g.
   `externally-owned` after a port conflict). Don't collapse these back into one pass.

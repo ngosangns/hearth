@@ -53,9 +53,16 @@ type Host = {
   setServiceState(next: ServiceLifecycleState): Promise<void>;
   appendLog(serviceId: ServiceId, data: string): Promise<void>;
   publish(type: string, data: Record<string, unknown>): void;
+  /** Optional so a caller supplying its own host is never forced to grow this hook; when present it
+   * receives errors from fire-and-forget work (log forwarding, external-state polling) that must not
+   * take the daemon down. Without it those errors are dropped, which is strictly better than the
+   * Bun default: an unhandled rejection terminates the process, orphaning every managed service. */
+  recordBackgroundError?: (scope: string, error: unknown) => void;
 };
 type Active = { profile: VerifiedServiceRunProfile; app: ManagedProcess; identity: ProcessIdentity; token: number; stopped: boolean };
 type Changes = Partial<ServiceLifecycleState> & { clear?: Array<"identity" | "error" | "exitCode" | "exitedAt" | "currentOperationId"> };
+type ReadinessOutcome = { kind: "ready" } | { kind: "superseded" } | { kind: "exited"; message: string } | { kind: "timeout"; message: string; detail: string };
+type ProcessTreeEntry = { pid: number; pgid: number; startIdentity: string };
 
 const clock: SupervisorClock = { now: () => new Date().toISOString(), sleep: (milliseconds) => Bun.sleep(milliseconds) };
 const activeStates: readonly ActualServiceState[] = ["queued-start", "preparing", "starting", "running", "running-unready", "ready", "stopping"];
@@ -151,13 +158,14 @@ export class ProcessSupervisor {
   }
   private async terminatePersistedPosixIdentity(identity: Exclude<ProcessIdentity, DockerContainerIdentity>): Promise<void> {
     if (!(await this.observedMatches(identity))) return;
-    await this.options.process.signalGroup(identity.pgid, "SIGTERM");
+    const tree = await this.processTree(identity.pid, identity.startIdentity);
+    await this.signalProcessTree(tree, identity.pgid, "SIGTERM");
     const deadline = Date.parse(this.optionsClock.now()) + this.grace;
     while (Date.parse(this.optionsClock.now()) < deadline) {
-      if (!(await this.observedMatches(identity))) return;
+      if (!(await this.processTreeAlive(tree))) return;
       await this.optionsClock.sleep(this.backoff);
     }
-    if (await this.observedMatches(identity)) await this.options.process.signalGroup(identity.pgid, "SIGKILL");
+    if (await this.processTreeAlive(tree)) await this.signalProcessTree(tree, identity.pgid, "SIGKILL");
   }
 
   async status(serviceId: ServiceId): Promise<void> {
@@ -227,13 +235,19 @@ export class ProcessSupervisor {
     if (current?.identity && activeStates.includes(current.actualState) && (await this.owns(current))) return;
     const retainedIdentity = current?.identity && !isDockerIdentity(current.identity) && this.identityMatchesState(current) && (await this.observedMatches(current.identity)) ? current.identity : undefined;
     const generation = retainedIdentity?.generation ?? (current?.generation ?? 0) + 1;
-    const token = this.cancel(serviceId);
+    let token = this.cancel(serviceId);
     if (retainedIdentity) {
       const identity = { ...retainedIdentity, managerInstanceId: this.host.instanceId };
       await this.transition(serviceId, generation, "running-unready", "not-ready", { desiredState: "running", currentOperationId: operationId, identity, clear: ["error", "exitCode", "exitedAt"] });
       this.attachOutput(serviceId, identity);
-      await this.readiness(serviceId, profile, generation, identity, token, operationId, true);
-      return;
+      // An adopted identity is only worth keeping while it still answers its readiness probe. A live
+      // wrapper whose real server already died (air keeps the wrapper alive after its child exits) or
+      // that never came up would otherwise be re-adopted on every start, fail readiness, and leave the
+      // caller stuck with a permanent "Readiness timed out" and an unkillable zombie process.
+      const outcome = await this.awaitReadiness(serviceId, profile, generation, identity, token, true);
+      if (outcome.kind === "ready" || outcome.kind === "superseded") return;
+      token = this.cancel(serviceId);
+      await this.terminate(identity, profile.command);
     }
     await this.transition(serviceId, generation, "preparing", "unknown", { desiredState: "running", currentOperationId: operationId, clear: ["error", "exitCode", "exitedAt", "identity"] });
     try {
@@ -287,7 +301,7 @@ export class ProcessSupervisor {
     const fingerprint = normalizeCommandFingerprint(profile.command);
     let app: ManagedProcess;
     try {
-      const input: SpawnInput = { command: profile.command, commandFingerprint: fingerprint, serviceId, onOutput: (data) => { if (this.valid(serviceId, generation, token)) void this.host.appendLog(serviceId, data); } };
+      const input: SpawnInput = { command: profile.command, commandFingerprint: fingerprint, serviceId, onOutput: (data) => { if (this.valid(serviceId, generation, token)) this.appendOutput(serviceId, data); } };
       if (isContainerCommand(profile.command)) {
         const previous = this.composeStartTail.catch(() => undefined);
         let release!: () => void;
@@ -331,30 +345,36 @@ export class ProcessSupervisor {
   }
 
   private async readiness(serviceId: ServiceId, profile: VerifiedServiceRunProfile, generation: number, identity: ProcessIdentity | undefined, token: number, operationId?: string, adopted = false): Promise<void> {
+    const outcome = await this.awaitReadiness(serviceId, profile, generation, identity, token, adopted);
+    if (outcome.kind === "ready" || outcome.kind === "superseded") return;
+    await this.fail(serviceId, generation, token, identity, outcome.message, operationId, outcome.kind === "timeout" ? { readinessKind: readinessName(profile.readiness), readinessDetail: outcome.detail } : {});
+    throw new Error(outcome.message);
+  }
+  /** Non-throwing readiness wait. `superseded` means a newer operation (or a closing manager) took
+   * over this service's token, so the caller must stop quietly instead of reporting a failure. */
+  private async awaitReadiness(serviceId: ServiceId, profile: VerifiedServiceRunProfile, generation: number, identity: ProcessIdentity | undefined, token: number, adopted: boolean): Promise<ReadinessOutcome> {
     if (profile.readiness.kind === "process") {
-      if ((identity && !(await this.ownsIdentity(identity))) || !this.valid(serviceId, generation, token)) {
-        await this.fail(serviceId, generation, token, identity, "Process exited before liveness check", operationId);
-        throw new Error("Process exited before liveness check");
+      if (!this.valid(serviceId, generation, token)) return { kind: "superseded" };
+      if (identity && !(await this.ownsIdentity(identity))) {
+        return this.valid(serviceId, generation, token) ? { kind: "exited", message: "Process exited before liveness check" } : { kind: "superseded" };
       }
       await this.transitionIfCurrent(serviceId, generation, token, "running-unready", "not-ready", { identity, readinessKind: "process", readinessDetail: "process-liveness-only" });
-      return;
+      return { kind: "ready" };
     }
     const timeout = profile.readinessTimeoutMs ?? this.timeout;
     const deadline = Date.parse(this.optionsClock.now()) + timeout;
     while (Date.parse(this.optionsClock.now()) <= deadline) {
-      if (!this.valid(serviceId, generation, token)) return;
+      if (!this.valid(serviceId, generation, token)) return { kind: "superseded" };
       if (identity && !(await this.ownsIdentity(identity))) {
-        await this.fail(serviceId, generation, token, identity, "Process exited before readiness", operationId);
-        throw new Error("Process exited before readiness");
+        return this.valid(serviceId, generation, token) ? { kind: "exited", message: "Process exited before readiness" } : { kind: "superseded" };
       }
       if (await this.probe(profile.readiness, serviceId)) {
         await this.transitionIfCurrent(serviceId, generation, token, "ready", "ready", { identity, readinessKind: readinessName(profile.readiness), readinessDetail: adopted ? "adopted readiness verified" : "readiness verified", clear: ["error"] });
-        return;
+        return { kind: "ready" };
       }
       await this.optionsClock.sleep(this.backoff);
     }
-    await this.fail(serviceId, generation, token, identity, "Readiness timed out", operationId, { readinessKind: readinessName(profile.readiness), readinessDetail: `Readiness ${readinessName(profile.readiness)} probe timed out after ${timeout}ms` });
-    throw new Error("Readiness timed out");
+    return { kind: "timeout", message: "Readiness timed out", detail: `Readiness ${readinessName(profile.readiness)} probe timed out after ${timeout}ms` };
   }
 
   private async fail(serviceId: ServiceId, generation: number, token: number, identity: ProcessIdentity | undefined, error: string, operationId?: string, changes: Pick<Changes, "readinessKind" | "readinessDetail"> = {}): Promise<void> {
@@ -388,13 +408,80 @@ export class ProcessSupervisor {
     }
     this.outputTails.get(identity.serviceId)?.();
     this.outputTails.delete(identity.serviceId);
-    await this.options.process.signalGroup(identity.pgid, "SIGTERM");
+    const tree = await this.processTree(identity.pid, identity.startIdentity);
+    await this.signalProcessTree(tree, identity.pgid, "SIGTERM");
     const deadline = Date.parse(this.optionsClock.now()) + this.grace;
     while (Date.parse(this.optionsClock.now()) < deadline) {
-      if (!(await this.ownsIdentity(identity))) return;
+      if (!(await this.processTreeAlive(tree))) return;
       await this.optionsClock.sleep(this.backoff);
     }
-    if (await this.ownsIdentity(identity)) await this.options.process.signalGroup(identity.pgid, "SIGKILL");
+    if (await this.processTreeAlive(tree)) await this.signalProcessTree(tree, identity.pgid, "SIGKILL");
+  }
+  /** Snapshot of the managed process's whole tree, taken while the caller still owns the leader.
+   * Needed because a wrapper can hand its real server its own process group: `air` runs the built
+   * binary in a fresh pgid, so signalling only the tracked pgid leaves that server alive holding its
+   * port. Snapshotting first also survives the leader dying, which reparents its children to pid 1. */
+  private async processTree(leaderPid: number, leaderStartIdentity: string): Promise<ProcessTreeEntry[]> {
+    const { code, stdout } = await captureCommand(["ps", "-Ao", "pid=,ppid=,pgid=,lstart="]);
+    if (code !== 0) return [];
+    const rows: (ProcessTreeEntry & { ppid: number })[] = [];
+    for (const line of stdout.split("\n")) {
+      const match = /^(\d+)\s+(\d+)\s+(\d+)\s+(.{24})/.exec(line.trimStart());
+      if (match) rows.push({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), startIdentity: match[4]!.trim() });
+    }
+    // Walk the tree only when the OS table itself still identifies `leaderPid` as the process we
+    // recorded: a caller-supplied pid that no longer matches must never pull an unrelated live tree
+    // (pid reuse, or a test/stub identity) into a signal or into the wait-for-death loop.
+    if (rows.find((row) => row.pid === leaderPid)?.startIdentity !== leaderStartIdentity) return [];
+    const byPid = new Map(rows.map((row) => [row.pid, row]));
+    const byParent = new Map<number, (ProcessTreeEntry & { ppid: number })[]>();
+    for (const row of rows) byParent.set(row.ppid, [...(byParent.get(row.ppid) ?? []), row]);
+    const tree: ProcessTreeEntry[] = [];
+    const seen = new Set<number>([leaderPid]);
+    const queue = [leaderPid];
+    while (queue.length > 0) {
+      const pid = queue.shift()!;
+      const row = byPid.get(pid);
+      if (row) tree.push({ pid: row.pid, pgid: row.pgid, startIdentity: row.startIdentity });
+      for (const child of byParent.get(pid) ?? []) {
+        if (seen.has(child.pid)) continue;
+        seen.add(child.pid);
+        queue.push(child.pid);
+      }
+    }
+    return tree;
+  }
+  /** A pid is only counted as still-ours when its start time matches the snapshot, so a recycled pid
+   * can never keep a stop waiting (or, worse, earn a SIGKILL). */
+  private async processTreeAlive(tree: readonly ProcessTreeEntry[]): Promise<boolean> {
+    if (tree.length === 0) return false;
+    const { code, stdout } = await captureCommand(["ps", "-Ao", "pid=,lstart="]);
+    if (code !== 0) return false;
+    const alive = new Map<number, string>();
+    for (const line of stdout.split("\n")) {
+      const match = /^(\d+)\s+(.{24})/.exec(line.trimStart());
+      if (match) alive.set(Number(match[1]), match[2]!.trim());
+    }
+    return tree.some((entry) => alive.get(entry.pid) === entry.startIdentity);
+  }
+  private async signalProcessTree(tree: readonly ProcessTreeEntry[], leaderPgid: number, signal: ProcessSignal): Promise<void> {
+    await this.options.process.signalGroup(leaderPgid, signal);
+    const groups = new Map<number, ProcessTreeEntry[]>();
+    for (const entry of tree) {
+      if (entry.pgid === leaderPgid || entry.pgid <= 1) continue;
+      groups.set(entry.pgid, [...(groups.get(entry.pgid) ?? []), entry]);
+    }
+    for (const [pgid, members] of groups) {
+      let stillOurs = false;
+      for (const member of members) {
+        const observed = await observedSystemProcess(member.pid);
+        if (observed && !isDockerObserved(observed) && observed.startIdentity === member.startIdentity) {
+          stillOurs = true;
+          break;
+        }
+      }
+      if (stillOurs) await this.options.process.signalGroup(pgid, signal);
+    }
   }
   private async build(serviceId: ServiceId, definition: ServiceDefinition, generation: number, token: number, operationId?: string): Promise<void> {
     const build = definition.profiles.build!;
@@ -402,7 +489,7 @@ export class ProcessSupervisor {
     this.buildAborts.set(serviceId, controller);
     const timeout = setTimeout(() => controller.abort(new Error("Build timed out")), build.timeoutMs ?? 15 * 60_000);
     try {
-      const run = () => this.options.runBuild(build.command, (data) => { if (this.valid(serviceId, generation, token)) void this.host.appendLog(serviceId, data); }, controller.signal);
+      const run = () => this.options.runBuild(build.command, (data) => { if (this.valid(serviceId, generation, token)) this.appendOutput(serviceId, data); }, controller.signal);
       if (build.serializationKey) await this.serializedBuild(build.serializationKey, controller.signal, run);
       else await run();
     } catch (error) {
@@ -458,8 +545,14 @@ export class ProcessSupervisor {
     if (isDockerIdentity(identity)) return;
     this.outputTails.get(serviceId)?.();
     this.outputTails.delete(serviceId);
-    const stop = this.options.process.attachOutput?.(serviceId, (data) => void this.host.appendLog(serviceId, data));
+    const stop = this.options.process.attachOutput?.(serviceId, (data) => this.appendOutput(serviceId, data));
     if (stop) this.outputTails.set(serviceId, stop);
+  }
+  /** Log forwarding is fire-and-forget by design: a dropped or rejected append must never reject into
+   * the caller (Bun terminates the process on an unhandled rejection, orphaning every managed
+   * service). Failures surface through the host's background-error hook instead. */
+  private appendOutput(serviceId: ServiceId, data: string): void {
+    this.host.appendLog(serviceId, data).catch((error: unknown) => this.host.recordBackgroundError?.(`service-log:${serviceId}`, error));
   }
   private state(serviceId: ServiceId): ServiceLifecycleState | undefined {
     return this.host.serviceStates().find((state) => state.serviceId === serviceId);
@@ -617,10 +710,19 @@ const tcpProbe = (port: number): Promise<boolean> =>
     socket.setTimeout(250, () => done(false));
   });
 const execIdentitySettleMs = 1_000;
-const observedSystemProcess = (pid: number): ObservedProcess | undefined => {
-  const result = Bun.spawnSync(["ps", "-o", "pid=", "-o", "pgid=", "-o", "lstart=", "-o", "command=", "-p", String(pid)]);
-  if (result.exitCode !== 0) return undefined;
-  const match = /^(\d+)\s+(\d+)\s+(.{24})\s+(.+)$/.exec(new TextDecoder().decode(result.stdout).trim());
+/** Every diagnostic shell-out goes through an async spawn: this runs on the daemon's own event loop
+ * next to the loopback HTTP server, so a synchronous `Bun.spawnSync` (docker inspect x N per poll
+ * tick, tailscale, ps) stalls readiness probes and the manager's own health endpoint long enough for
+ * a client to conclude the daemon is dead and start a competing one. */
+const captureCommand = async (argv: readonly string[]): Promise<{ code: number; stdout: string }> => {
+  const child = Bun.spawn([...argv], { stdout: "pipe", stderr: "ignore" });
+  const stdout = await new Response(child.stdout).text();
+  return { code: await child.exited, stdout };
+};
+const observedSystemProcess = async (pid: number): Promise<ObservedProcess | undefined> => {
+  const result = await captureCommand(["ps", "-o", "pid=", "-o", "pgid=", "-o", "lstart=", "-o", "command=", "-p", String(pid)]);
+  if (result.code !== 0) return undefined;
+  const match = /^(\d+)\s+(\d+)\s+(.{24})\s+(.+)$/.exec(result.stdout.trim());
   if (!match) return undefined;
   return { pid: Number(match[1]), pgid: Number(match[2]), startIdentity: match[3]!.trim(), commandFingerprint: normalizeObservedCommandFingerprint(match[4]!), alive: true };
 };
@@ -630,7 +732,7 @@ const observedStableExecProcess = async (child: PosixChild, expectedFingerprint:
   let candidate: PosixProcessRecord | undefined;
   for (let attempt = 0; attempt < 20; attempt++) {
     await Bun.sleep(25);
-    const observed = observedSystemProcess(child.pid);
+    const observed = await observedSystemProcess(child.pid);
     if (!observed || isDockerObserved(observed) || observed.commandFingerprint === expectedFingerprint) {
       candidate = undefined;
       continue;
@@ -640,26 +742,26 @@ const observedStableExecProcess = async (child: PosixChild, expectedFingerprint:
       continue;
     }
     await Bun.sleep(execIdentitySettleMs);
-    const settled = observedSystemProcess(child.pid);
+    const settled = await observedSystemProcess(child.pid);
     if (settled && !isDockerObserved(settled) && samePosixProcess(candidate, settled) && settled.commandFingerprint === candidate.commandFingerprint) return settled;
     candidate = undefined;
   }
   await stopUnverifiedChild(child);
   throw new Error("Unable to establish stable POSIX exec process identity");
 };
-const processInspectionAvailable = (): boolean => Bun.spawnSync(["ps", "-o", "pid=", "-p", String(process.pid)]).exitCode === 0;
-const containerRunning = (containerName: string): boolean => new TextDecoder().decode(Bun.spawnSync(["docker", "inspect", "-f", "{{.State.Running}}", containerName]).stdout).trim() === "true";
-const containerRecord = (containerName: string, commandFingerprint: string): DockerContainerRecord | undefined => {
-  const output = new TextDecoder().decode(Bun.spawnSync(["docker", "inspect", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}", containerName]).stdout).trim().split("\t");
+const processInspectionAvailable = async (): Promise<boolean> => (await captureCommand(["ps", "-o", "pid=", "-p", String(process.pid)])).code === 0;
+const containerRunning = async (containerName: string): Promise<boolean> => (await captureCommand(["docker", "inspect", "-f", "{{.State.Running}}", containerName])).stdout.trim() === "true";
+const containerRecord = async (containerName: string, commandFingerprint: string): Promise<DockerContainerRecord | undefined> => {
+  const output = (await captureCommand(["docker", "inspect", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}", containerName])).stdout.trim().split("\t");
   return output.length === 3 && output[1] === "true" && output[0] && output[2] ? { containerName, containerId: output[0], containerStartedAt: output[2], commandFingerprint } : undefined;
 };
 const sameContainerInstance = (expected: DockerContainerRecord, observed: DockerContainerRecord | undefined): boolean =>
   observed !== undefined && observed.containerName === expected.containerName && observed.containerId === expected.containerId && observed.containerStartedAt === expected.containerStartedAt;
-const tailnetServing = (): boolean => {
-  const result = Bun.spawnSync(["tailscale", "serve", "status", "--json"]);
-  if (result.exitCode !== 0) return false;
+const tailnetServing = async (): Promise<boolean> => {
+  const result = await captureCommand(["tailscale", "serve", "status", "--json"]);
+  if (result.code !== 0) return false;
   try {
-    const parsed = JSON.parse(new TextDecoder().decode(result.stdout)) as { Web?: Record<string, unknown> };
+    const parsed = JSON.parse(result.stdout) as { Web?: Record<string, unknown> };
     return Object.keys(parsed.Web ?? {}).length > 0;
   } catch {
     return false;
@@ -667,7 +769,7 @@ const tailnetServing = (): boolean => {
 };
 const runCommand = async (argv: readonly string[], cwd: string, env?: Record<string, string | undefined>, onOutput?: (data: string) => void): Promise<number> => {
   const child = Bun.spawn([...argv], { cwd, env, stdout: "pipe", stderr: "pipe" });
-  void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]);
+  void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]).catch(() => undefined);
   return child.exited;
 };
 
@@ -680,21 +782,24 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
         const result = await runCommand(argv, join(root, command.cwd), env, onOutput);
         if (result !== 0) throw new Error(`Docker service command exited with ${result}`);
         const containerName = command.containerName!;
-        const record = containerRecord(containerName, commandFingerprint);
+        const record = await containerRecord(containerName, commandFingerprint);
         if (!record) throw new Error(`Docker container ${containerName} is not running after start`);
         let finish: ((code: number) => void) | undefined;
         const exited = new Promise<number>((resolve) => {
           finish = resolve;
         });
         const timer = setInterval(() => {
-          if (!sameContainerInstance(record, containerRecord(containerName, commandFingerprint))) {
-            clearInterval(timer);
-            finish?.(0);
-          }
+          void containerRecord(containerName, commandFingerprint)
+            .catch(() => undefined)
+            .then((current) => {
+              if (sameContainerInstance(record, current)) return;
+              clearInterval(timer);
+              finish?.(0);
+            });
         }, 500);
         return { ...record, exited };
       }
-      if (!processInspectionAvailable()) throw new Error("POSIX process inspection is unavailable; refusing to start an unverified service process");
+      if (!(await processInspectionAvailable())) throw new Error("POSIX process inspection is unavailable; refusing to start an unverified service process");
       // Managed dev processes must outlive the daemon that spawned them. Piping their stdout/stderr
       // straight into this daemon made that a lie: once the daemon exits for any reason, the pipe's
       // read end closes, and the child's next log write earns it a SIGPIPE — a real (non-Node)
@@ -716,7 +821,7 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
       }
       let observed: ObservedProcess | undefined;
       for (let attempt = 0; attempt < 4; attempt++) {
-        observed = observedSystemProcess(child.pid);
+        observed = await observedSystemProcess(child.pid);
         if (observed) break;
         if (attempt < 3) await Bun.sleep(25);
       }
@@ -728,11 +833,11 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
     },
     inspect: async (identity) => {
       if (isDockerIdentity(identity)) {
-        const record = containerRecord(identity.containerName, identity.commandFingerprint);
+        const record = await containerRecord(identity.containerName, identity.commandFingerprint);
         return record && sameContainerInstance(identity, record) ? { ...record, alive: true } : undefined;
       }
       if (identity.pid === 0) return { pid: 0, pgid: 0, startIdentity: "", commandFingerprint: identity.commandFingerprint, alive: false };
-      return observedSystemProcess(identity.pid);
+      return await observedSystemProcess(identity.pid);
     },
     signalGroup: async (pgid, signal) => {
       if (pgid === 0) return;
@@ -752,7 +857,7 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
     const env = command.environment ? { ...process.env, ...command.environment } : (process.env as Record<string, string>);
     if (signal.aborted) throw signal.reason;
     const child = Bun.spawn(argv, { cwd: join(root, command.cwd), env, stdout: "pipe", stderr: "pipe", detached: true });
-    void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]);
+    void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]).catch(() => undefined);
     let stopping: Promise<void> | undefined;
     const stop = (): void => {
       stopping ??= (async () => {
@@ -776,5 +881,5 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
     if (signal.aborted) throw signal.reason;
     if (code !== 0) throw new Error(`Build command exited with ${code}`);
   },
-  probes: { tcp: tcpProbe, http: async (url) => { try { return (await fetch(url, { signal: AbortSignal.timeout(250) })).ok; } catch { return false; } }, container: async (containerName) => containerRunning(containerName), tailnet: async () => tailnetServing(), portInUse: tcpProbe },
+  probes: { tcp: tcpProbe, http: async (url) => { try { return (await fetch(url, { signal: AbortSignal.timeout(250) })).ok; } catch { return false; } }, container: (containerName) => containerRunning(containerName), tailnet: () => tailnetServing(), portInUse: tcpProbe },
 });
