@@ -79,8 +79,25 @@ final class ManagerClient: Sendable {
 
     // MARK: - Transport
 
-    private func request(_ path: String) -> URLRequest {
-        var request = URLRequest(url: connection.baseURL.appendingPathComponent(path))
+    // `appendingPathComponent` percent-encodes `?`/`&` as literal path characters instead of treating
+    // them as a query delimiter — a `path` like `/v1/logs/kafka?limit=…` (see `logs()` above) would
+    // turn into a request for the path `/v1/logs/kafka%3Flimit=…`, which the daemon's router (matching
+    // on `url.pathname`) 404s as `service_not_found`. Splitting off the query and assigning it via
+    // `percentEncodedQuery` (its values here are already query-safe — numbers and a percent-encoded
+    // serviceId) keeps `path` callers passing a plain `"/foo?a=b"` string without needing URLComponents
+    // at each call site.
+    // `internal` (not `private`) so `ManagerClientTests` can assert on the built `URLRequest` directly
+    // — this is the one place a `?query` string embedded in `path` (see `logs()` above) gets parsed.
+    func request(_ path: String) -> URLRequest {
+        var pathOnly = path
+        var query: String?
+        if let index = path.firstIndex(of: "?") {
+            pathOnly = String(path[path.startIndex..<index])
+            query = String(path[path.index(after: index)...])
+        }
+        var components = URLComponents(url: connection.baseURL.appendingPathComponent(pathOnly), resolvingAgainstBaseURL: false)!
+        components.percentEncodedQuery = query
+        var request = URLRequest(url: components.url!)
         request.setValue("Bearer \(connection.token)", forHTTPHeaderField: "authorization")
         request.setValue(String(connection.protocolVersion), forHTTPHeaderField: "x-local-services-protocol")
         return request
