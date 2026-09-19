@@ -94,6 +94,11 @@ separately from the package's own `ci.yml`.
   executables, not a fixable code-signing detail. `apps/macos` runs `bun run src/bin/lsd.ts` instead
   for now (see `SidecarLocator.swift`); a real Developer-ID-signed + notarized compiled sidecar is
   future work, not a quick fix.
+- The registered `{self-hosted, macmini}` CI runner's Swift toolchain has no XCTest (`no such module
+  'XCTest'` — Command Line Tools only, no full Xcode.app), unlike a normal dev machine (confirmed:
+  `swift build` succeeds there, `swift test` fails). `apps/macos/.github/workflows/macos-app.yml` runs
+  `swift build` only; `apps/macos/Tests/LocalServicesAppTests` exists and passes locally but isn't in
+  CI. Don't re-add `swift test` to that workflow without first fixing the runner's Xcode install.
 
 ## Maintaining this file
 

@@ -73,8 +73,11 @@ swift build     # or: swift run
 
 ## CI
 
-`.github/workflows/macos-app.yml` runs `swift test` (`Tests/LocalServicesAppTests` — decode-fidelity
-tests against real captured JSON from a live daemon, plus a few pure-logic checks) on pull requests /
-pushes that touch `apps/macos/**`, path-filtered so it never runs for a change that's only in
-`src/`/`test/`, and separate from the package's own Bun `test`/`typecheck` job in
-`.github/workflows/ci.yml`.
+`.github/workflows/macos-app.yml` runs `swift build` on pull requests / pushes that touch
+`apps/macos/**`, path-filtered so it never runs for a change that's only in `src/`/`test/`, and
+separate from the package's own Bun `test`/`typecheck` job in `.github/workflows/ci.yml`.
+
+`Tests/LocalServicesAppTests` (`swift test`) — decode-fidelity tests against real captured JSON from a
+live daemon, plus a few pure-logic checks — is **not** wired into CI yet: the registered self-hosted
+runner's toolchain doesn't have XCTest (Command Line Tools only, no full Xcode.app install), unlike a
+normal dev machine. Run it locally with `swift test`; see `macos-app.yml`'s own comment.
