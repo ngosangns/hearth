@@ -1,0 +1,62 @@
+version: "3"
+
+vars:
+  MACOS_DIR: apps/macos
+  APP_NAME: Local Services.app
+
+tasks:
+  dev:
+    desc: Build, launch, and watch the macOS app — rebuilds and relaunches on every source change (fswatch)
+    dir: "{{.MACOS_DIR}}"
+    cmds:
+      - ./scripts/dev.sh
+
+  test:
+    desc: Run the package's Bun test suite (src/, test/)
+    cmds:
+      - bun test
+
+  typecheck:
+    desc: Type-check the package (tsc --noEmit)
+    cmds:
+      - bun run typecheck
+
+  ci:
+    desc: Everything the package's own CI job runs (test + typecheck)
+    cmds:
+      - task: test
+      - task: typecheck
+
+  macos:build:
+    desc: Build the macOS app (debug)
+    dir: "{{.MACOS_DIR}}"
+    cmds:
+      - swift build
+
+  macos:test:
+    desc: Run the macOS app's Swift test suite (local only — the CI runner has no XCTest)
+    dir: "{{.MACOS_DIR}}"
+    cmds:
+      - swift test
+
+  macos:icon:
+    desc: Regenerate AppIcon.icns from scripts/make-icon.swift
+    dir: "{{.MACOS_DIR}}"
+    cmds:
+      - ./scripts/generate-icon.sh
+
+  macos:package:
+    desc: Package a local ad-hoc-signed "Local Services.app" (release build)
+    dir: "{{.MACOS_DIR}}"
+    cmds:
+      - ./scripts/build-app.sh release
+
+  macos:install:
+    desc: Package the app and install it into /Applications, replacing any running/existing copy, then launch it
+    deps: [macos:package]
+    dir: "{{.MACOS_DIR}}"
+    cmds:
+      - pkill -f "{{.APP_NAME}}/Contents/MacOS/LocalServicesApp" || true
+      - rm -rf "/Applications/{{.APP_NAME}}"
+      - cp -R ".build/{{.APP_NAME}}" "/Applications/{{.APP_NAME}}"
+      - open "/Applications/{{.APP_NAME}}"
