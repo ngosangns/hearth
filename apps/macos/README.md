@@ -23,14 +23,27 @@ a managed process directly.
 - Xcode 15+ / Swift 5.10 toolchain (`swift build` works standalone, no `.xcodeproj` needed for dev).
 - [Bun](https://bun.sh) installed (`/opt/homebrew/bin/bun`, `/usr/local/bin/bun`, or `~/.bun/bin/bun`)
   — same requirement as the rest of this package. The app shells out to it; it does not bundle one.
-- **This app currently only runs built in place inside this repo.** `SidecarLocator.findLsdEntry()`
-  resolves `../../src/bin/lsd.ts` from its own source file's on-disk path at compile time — there is
-  no packaged/distributable build yet (see "Known limitations" below).
-
 ```bash
 cd apps/macos
-swift build     # or: swift run
+swift build     # or: swift run — a raw dev binary, resolves lsd.ts from this checkout (see below)
 ```
+
+## Packaging a local `.app`
+
+```bash
+apps/macos/scripts/build-app.sh          # release build (pass `debug` for a debug one)
+open "apps/macos/.build/Local Services.app"
+```
+
+Produces an ad-hoc-signed `Local Services.app` with a copy of `src/` bundled as a resource
+(`Contents/Resources/lsd/src`) — `SidecarLocator.findLsdEntry()` prefers that bundled copy over the
+dev-checkout fallback, so the packaged app works even if this repo checkout later moves, and can in
+principle be copied elsewhere on the *same* machine (still needs `bun` installed there). **This is
+local packaging, not distribution**: ad-hoc signing (no Developer ID) means Gatekeeper still treats it
+as untrusted on any *other* machine, and even locally a first Finder launch may need a right-click >
+Open. Set `LSD_DEBUG=1` in the environment to log which `bun`/`lsd.ts` paths it resolved to stderr —
+the first thing to check for a "manager unavailable" report, and how the bundled-resource path was
+confirmed to actually get picked (see `SidecarLocator.swift`).
 
 ## What's implemented (v0)
 
@@ -59,12 +72,12 @@ swift build     # or: swift run
 
 ## Known limitations / next steps
 
-- **No packaged `.app` for distribution.** Needs: bundling `lsd.ts` + its `src/` imports as an app
-  resource (or a *signed* `bun build --compile` sidecar — an *unsigned* one was tried and rejected,
-  see `SidecarLocator.swift`'s doc comment for why), a proper Info.plist/bundle ID, and Developer ID
-  signing + notarization for Gatekeeper. **This needs a real Apple Developer ID + notarization
-  credentials that only the project owner has — not something that can be finished by grinding through
-  more code.**
+- **No *distributable* `.app`** — local packaging exists (`scripts/build-app.sh`, see above), but it's
+  ad-hoc signed (no Developer ID), so it only really works on the machine that built it. A `bun build
+  --compile` sidecar was tried instead of bundling `src/` as a resource and rejected — see
+  `SidecarLocator.swift`'s doc comment for why. Real distribution needs a Developer ID cert +
+  notarization that only the project owner has — **not something that can be finished by grinding
+  through more code.**
 - **Polling, not SSE**, for service status — `/v1/events/stream` would lower latency and cut request
   volume; not done yet, see `ManagerClient.swift`.
 - **Config-reload failures surface as a dismissible banner, not a diff/preview** — an edit that breaks

@@ -23,13 +23,28 @@ final class WorkspaceStore: ObservableObject {
         return dir.appendingPathComponent("workspaces.json")
     }
 
+    /// ISO8601, not `JSONDecoder`'s default (seconds since the 2001 reference date) — matches the
+    /// ISO8601 timestamps this package's daemon itself uses everywhere (`state.ts`), and keeps
+    /// `workspaces.json` actually readable by hand, per this type's own doc comment above.
+    private static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }()
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
+    }()
+
     private func load() {
         guard let data = try? Data(contentsOf: fileURL) else { return }
-        workspaces = (try? JSONDecoder().decode([Workspace].self, from: data)) ?? []
+        workspaces = (try? Self.decoder.decode([Workspace].self, from: data)) ?? []
     }
 
     private func save() {
-        guard let data = try? JSONEncoder().encode(workspaces) else { return }
+        guard let data = try? Self.encoder.encode(workspaces) else { return }
         try? data.write(to: fileURL, options: .atomic)
     }
 
