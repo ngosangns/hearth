@@ -108,6 +108,16 @@ services:
     if (!result.ok) expect(result.errors.some((e) => e.includes("escapes the project root"))).toBe(true);
   });
 
+  test("coerces a bare numeric/boolean argv element to a string (YAML `[sleep, 30]` parses 30 as a number)", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), `version: 1\nservices:\n  sleeper:\n    run: { argv: [sleep, 30] }\n    readiness: { kind: process }\n`);
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(true);
+    if (result.ok && result.catalog.services[0]!.profiles.run.commandStatus === "verified") {
+      expect(result.catalog.services[0]!.profiles.run.command.command).toEqual({ argv: ["sleep", "30"] });
+    }
+  });
+
   test("rejects a command with both argv and shell, or neither", async () => {
     const root = await scratchRoot();
     await writeFile(join(root, "local-services.yaml"), `version: 1\nservices:\n  api:\n    run: { argv: [x], shell: "y" }\n    readiness: { kind: process }\n`);
