@@ -31,6 +31,11 @@ mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources/lsd"
 echo "==> assembling bundle at $app_bundle"
 cp "$executable" "$app_bundle/Contents/MacOS/LocalServicesApp"
 cp "$app_root/Info.plist" "$app_bundle/Contents/Info.plist"
+if [ -f "$app_root/AppIcon.icns" ]; then
+  cp "$app_root/AppIcon.icns" "$app_bundle/Contents/Resources/AppIcon.icns"
+else
+  echo "warning: $app_root/AppIcon.icns not found — run scripts/generate-icon.sh first" >&2
+fi
 # Only src/ — not node_modules, not test/. This app only ever runs the `lsd` commands that touch
 # core/cli (manager ensure/reload/stop, start/stop/restart, status, logs), none of which need tui's or
 # mcp's dependencies; see SidecarLocator.swift's doc comment.
