@@ -239,7 +239,8 @@ export async function waitOperation(client: Client, id: string, runtime: Localct
   }
 }
 
-const print = (value: unknown, json: boolean, runtime: LocalctlRuntime): void => output(runtime, json ? JSON.stringify(value) : String(value));
+const print = (value: unknown, json: boolean, runtime: LocalctlRuntime): void =>
+  output(runtime, json ? JSON.stringify(value) : typeof value === "string" ? value : JSON.stringify(value, null, 2));
 const serviceRows = async (client: Client, runtime: LocalctlRuntime): Promise<ServiceLifecycleState[]> => ((await request(client, "/v1/services", {}, runtime)) as { services: ServiceLifecycleState[] }).services;
 const textState = (state: ServiceLifecycleState | undefined): string =>
   state?.actualState === "ready" ? "ready" : state?.actualState === "queued-start" ? "queued-start" : state && ["running", "running-unready", "starting", "preparing"].includes(state.actualState) ? "running" : "stopped";

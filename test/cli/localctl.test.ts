@@ -62,6 +62,18 @@ describe("localctl", () => {
     expect(requests).toEqual([{ path: "/v1/manager/shutdown", protocol: "1" }]);
   });
 
+  test("prints non-json object results as readable JSON, not [object Object]", async () => {
+    const output: string[] = [];
+    const runtime: LocalctlRuntime = {
+      discover: async () => live(),
+      request: async () => ({ operation: operation("stop") }),
+      output: (line) => output.push(line),
+    };
+    expect(await main(options, ["manager", "stop"], runtime)).toBe(0);
+    expect(output).toEqual([JSON.stringify(operation("stop"), null, 2)]);
+    expect(output.join("")).not.toContain("[object Object]");
+  });
+
   test("discovers an authenticated v3 lock as incompatible, not unavailable", async () => {
     const root = await mkdtemp(join(tmpdir(), "localctl-"));
     try {
