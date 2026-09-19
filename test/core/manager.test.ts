@@ -474,4 +474,34 @@ describe("local services manager", () => {
       await rm(runtime, { recursive: true, force: true });
     }
   });
+
+  test("accepts echoing back generation 0 for a service that has never started", async () => {
+    const runtime = await tempRuntime("local-services-log-generation-zero-");
+    try {
+      const portalOnlyCatalog: ServiceCatalog = {
+        startFailurePolicy: "stop-on-first-failure-keep-started",
+        groups: {},
+        services: [{ id: "portal", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["portal"] }, cwd: "." }, readiness: { kind: "process" } } } }],
+      };
+      const manager = await LocalServicesManager.bootstrap({ runtimeDirectory: runtime, catalog: portalOnlyCatalog, logTailBytes: 8, logMaxBytes: 8 });
+      try {
+        const headers = { authorization: `Bearer ${manager.bearerToken}`, "x-local-services-protocol": String(managerProtocolVersion) };
+        // A service that has never had a lifecycle transition has no entry in `state.services`, so
+        // `lifecycleGeneration` legitimately returns 0 and the response echoes `generation: 0` — a
+        // client (the TUI) that stores this and sends it back on the next poll must not be rejected.
+        const initialResponse = await fetch(`${manager.baseUrl}/v1/logs/portal?limit=8`, { headers });
+        const initial = (await initialResponse.json()) as { generation: number };
+        expect(initialResponse.ok).toBe(true);
+        expect(initial.generation).toBe(0);
+
+        const followUpResponse = await fetch(`${manager.baseUrl}/v1/logs/portal?generation=0&cursor=0&limit=8`, { headers });
+        expect(followUpResponse.ok).toBe(true);
+        expect(((await followUpResponse.json()) as { generation: number }).generation).toBe(0);
+      } finally {
+        await manager.shutdown("stop-services");
+      }
+    } finally {
+      await rm(runtime, { recursive: true, force: true });
+    }
+  });
 });

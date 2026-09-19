@@ -1088,7 +1088,7 @@ export class LocalServicesManager {
     const generation = generationValue === null ? undefined : Number(generationValue);
     if (cursor !== undefined && (!Number.isInteger(cursor) || cursor < 0)) throw new ManagerHttpError(400, "invalid_cursor", "cursor must be a non-negative integer");
     if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) throw new ManagerHttpError(400, "invalid_limit", "limit must be a positive integer");
-    if (generation !== undefined && (!Number.isInteger(generation) || generation < 1)) throw new ManagerHttpError(400, "invalid_generation", "generation must be a positive integer");
+    if (generation !== undefined && (!Number.isInteger(generation) || generation < 0)) throw new ManagerHttpError(400, "invalid_generation", "generation must be a non-negative integer");
     return this.json(await this.logs.read(rawServiceId, cursor, limit, this.lifecycleGeneration(rawServiceId), generation));
   }
   private async shutdownRequest(request: Request): Promise<Response> {
