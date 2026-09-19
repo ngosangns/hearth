@@ -64,6 +64,19 @@ final class ManagerClient: Sendable {
         return try await post("/v1/operations", body: body, as: OperationResponse.self).operation
     }
 
+    /// `POST /v1/operations/bulk-start` — brings up `targets` in dependency order, stopping on the
+    /// first failure (same policy the CLI's `start <group> --wait` uses). There's no bulk-stop
+    /// endpoint on the daemon (see AGENTS.md); stopping several services is a client-side loop of
+    /// individual `perform(.stop, ...)` calls instead — see `WorkspaceController.stopAll`.
+    @discardableResult
+    func bulkStart(targets: [String]) async throws -> Operation {
+        var req = request("/v1/operations/bulk-start")
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["requestId": UUID().uuidString, "targets": targets])
+        return try await send(req, as: OperationResponse.self).operation
+    }
+
     // MARK: - Transport
 
     private func request(_ path: String) -> URLRequest {

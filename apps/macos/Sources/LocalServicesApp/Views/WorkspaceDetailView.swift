@@ -22,6 +22,10 @@ struct WorkspaceDetailView: View {
         }
         .navigationTitle(workspace.displayName)
         .toolbar {
+            if workspace.trusted, controller.phase == .connected {
+                ToolbarItem { Button("Start All") { Task { await controller.startAll() } } }
+                ToolbarItem { Button("Stop All") { Task { await controller.stopAll() } } }
+            }
             ToolbarItem {
                 Menu {
                     Button("Reveal in Finder") {

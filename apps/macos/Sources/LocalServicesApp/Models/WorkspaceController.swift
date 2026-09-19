@@ -119,4 +119,32 @@ final class WorkspaceController: ObservableObject {
             lastActionError = error.localizedDescription
         }
     }
+
+    /// Every catalog service, dependency order handled server-side (`/v1/operations/bulk-start`) —
+    /// same "stop on first failure" policy `lsd start <group> --wait` uses.
+    func startAll() async {
+        guard let client, let catalog, !catalog.services.isEmpty else { return }
+        let targets = catalog.services.map(\.id)
+        actionsInFlight.formUnion(targets)
+        defer { actionsInFlight.subtract(targets) }
+        do {
+            _ = try await client.bulkStart(targets: targets)
+            await refresh()
+        } catch {
+            lastActionError = error.localizedDescription
+        }
+    }
+
+    /// No bulk-stop endpoint on the daemon (see AGENTS.md's sharp edges) — stops every currently
+    /// non-stopped service concurrently, client-side, the same way the TUI's `s` "stop all" key does.
+    func stopAll() async {
+        guard client != nil else { return }
+        let targets = services.filter { !["stopped", "queued-start"].contains($0.actualState) }.map(\.serviceId)
+        guard !targets.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for serviceId in targets {
+                group.addTask { [weak self] in await self?.perform(.stop, serviceId: serviceId) }
+            }
+        }
+    }
 }

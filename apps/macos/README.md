@@ -52,23 +52,29 @@ swift build     # or: swift run
   doc comment for why directory-level rather than the exact filename): editing
   `local-services.yaml`/`.yml`/`.json`/`.config.ts` triggers `lsd manager reload` automatically,
   debounced.
+- "Start All" / "Stop All" — in the main window's toolbar and in each menu bar dropdown row. Start
+  goes through `/v1/operations/bulk-start` (dependency-ordered, stops on first failure, same as
+  `lsd start <group> --wait`); there's no bulk-stop endpoint on the daemon (see AGENTS.md), so Stop All
+  is a client-side concurrent loop over individual stops, the same way the TUI's `s` key works.
 
 ## Known limitations / next steps
 
 - **No packaged `.app` for distribution.** Needs: bundling `lsd.ts` + its `src/` imports as an app
   resource (or a *signed* `bun build --compile` sidecar — an *unsigned* one was tried and rejected,
   see `SidecarLocator.swift`'s doc comment for why), a proper Info.plist/bundle ID, and Developer ID
-  signing + notarization for Gatekeeper.
+  signing + notarization for Gatekeeper. **This needs a real Apple Developer ID + notarization
+  credentials that only the project owner has — not something that can be finished by grinding through
+  more code.**
 - **Polling, not SSE**, for service status — `/v1/events/stream` would lower latency and cut request
   volume; not done yet, see `ManagerClient.swift`.
-- **No inline start/stop from the menu bar dropdown** — it's read-only status today; per-service
-  actions are only in the main window.
 - **Config-reload failures surface as a dismissible banner, not a diff/preview** — an edit that breaks
   the catalog (e.g. a bad readiness kind) shows the daemon's validation error in
   `WorkspaceController.lastActionError`, but there's no "here's what changed" view.
 
 ## CI
 
-`.github/workflows/macos-app.yml` builds this target (`swift build`) on pull requests / pushes that
-touch `apps/macos/**`, path-filtered so it never runs for a change that's only in `src/`/`test/`, and
-separate from the package's own Bun `test`/`typecheck` job in `.github/workflows/ci.yml`.
+`.github/workflows/macos-app.yml` runs `swift test` (`Tests/LocalServicesAppTests` — decode-fidelity
+tests against real captured JSON from a live daemon, plus a few pure-logic checks) on pull requests /
+pushes that touch `apps/macos/**`, path-filtered so it never runs for a change that's only in
+`src/`/`test/`, and separate from the package's own Bun `test`/`typecheck` job in
+`.github/workflows/ci.yml`.

@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         // tools-version 5.10 already defaults every target to the Swift 5 language mode (no Swift 6
         // strict-concurrency checking) — nothing extra to opt out of.
-        .executableTarget(name: "LocalServicesApp")
+        .executableTarget(name: "LocalServicesApp"),
+        .testTarget(name: "LocalServicesAppTests", dependencies: ["LocalServicesApp"]),
     ]
 )

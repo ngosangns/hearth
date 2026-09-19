@@ -79,6 +79,10 @@ struct MenuBarContentView: View {
                 Text(statusText(for: workspace, controller: controller)).font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
+            if let controller, controller.phase == .connected {
+                Button("Start All") { Task { await controller.startAll() } }.controlSize(.small)
+                Button("Stop All") { Task { await controller.stopAll() } }.controlSize(.small)
+            }
         }
         .padding(.horizontal, 12).padding(.vertical, 6)
     }
