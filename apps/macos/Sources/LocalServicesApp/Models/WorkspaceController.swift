@@ -1,0 +1,89 @@
+import Foundation
+
+/// One workspace's live connection state: ensures a daemon, holds the resulting `ManagerClient`, and
+/// polls `/v1/services` on a timer while `.connected` (see `ManagerClient`'s doc comment for why
+/// polling rather than SSE in this first pass). One instance per open workspace detail view — created
+/// and torn down by SwiftUI's `@StateObject`, not shared/cached across the app.
+@MainActor
+final class WorkspaceController: ObservableObject {
+    enum Phase: Equatable {
+        case idle
+        case connecting
+        case connected
+        case failed(String)
+    }
+
+    let workspace: Workspace
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var services: [ServiceLifecycleState] = []
+    @Published private(set) var catalog: ServiceCatalogSummary?
+    @Published private(set) var actionsInFlight: Set<String> = []
+    @Published var lastActionError: String?
+
+    private var client: ManagerClient?
+    private var pollTask: Task<Void, Never>?
+    private let pollInterval: Duration
+
+    init(workspace: Workspace, pollInterval: Duration = .seconds(2)) {
+        self.workspace = workspace
+        self.pollInterval = pollInterval
+    }
+
+    deinit {
+        pollTask?.cancel()
+    }
+
+    func connect() async {
+        guard phase != .connecting else { return }
+        phase = .connecting
+        do {
+            let connection = try await DaemonConnection.ensure(root: workspace.path)
+            let client = ManagerClient(connection: connection)
+            self.client = client
+            catalog = try? await client.catalog() // best-effort — service status doesn't depend on it
+            services = try await client.services()
+            phase = .connected
+            startPolling()
+        } catch {
+            phase = .failed(error.localizedDescription)
+        }
+    }
+
+    func stop() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self, pollInterval] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: pollInterval)
+                if Task.isCancelled { return }
+                await self.refresh()
+            }
+        }
+    }
+
+    private func refresh() async {
+        guard let client else { return }
+        do {
+            services = try await client.services()
+            if case .failed = phase { phase = .connected } // recovered from a transient blip
+        } catch {
+            phase = .failed(error.localizedDescription)
+        }
+    }
+
+    func perform(_ action: ManagerAction, serviceId: String) async {
+        guard let client else { return }
+        actionsInFlight.insert(serviceId)
+        defer { actionsInFlight.remove(serviceId) }
+        do {
+            _ = try await client.perform(action, serviceId: serviceId)
+            await refresh()
+        } catch {
+            lastActionError = error.localizedDescription
+        }
+    }
+}

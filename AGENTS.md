@@ -24,6 +24,12 @@ inherits for free from `process.env` — plumbed into `defaultSupervisorOptions`
 (`baseEnvironment`) argument, `process.env` if omitted, so every existing terminal-launched consumer
 is unaffected.
 
+`apps/macos` is that desktop-app on-ramp actually being built: a SwiftUI client that spawns
+`bun run src/bin/lsd.ts ... manager ensure --json` per workspace folder (see its own README for
+architecture/status). It only builds in place inside this checkout — no packaged/distributable build
+yet. Its `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`) runs `swift build`
+separately from the package's own `ci.yml`.
+
 ## Build, test, release
 
 - Bun-only, no build step: `src/**/index.ts` is published as TypeScript source and resolved natively
@@ -80,6 +86,14 @@ is unaffected.
   existing `SupervisorOptions` test fixture predates it, and `ProcessSupervisor.probe()` degrades to
   `false` (normal readiness-timeout path, never a throw) when it's absent instead of forcing every
   fixture to grow one.
+- A `bun build --compile` sidecar (a standalone `lsd` executable the macOS app could bundle instead of
+  shelling out to `bun run <ts file>`) was tried and rejected: on the `self-hosted, macmini` CI/dev
+  machine, a freshly-compiled, ad-hoc-signed Bun executable gets SIGKILLed on launch — reproduces even
+  with a trivial "hello world" compile, while the long-installed system `bun` (also only ad-hoc
+  signed) runs fine, so it reads as an endpoint-security heuristic against newly-written unsigned
+  executables, not a fixable code-signing detail. `apps/macos` runs `bun run src/bin/lsd.ts` instead
+  for now (see `SidecarLocator.swift`); a real Developer-ID-signed + notarized compiled sidecar is
+  future work, not a quick fix.
 
 ## Maintaining this file
 

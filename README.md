@@ -258,6 +258,13 @@ from `/core` as the one place a daemon and its TUI/CLI/MCP clients read it from.
 client built against different `PROTOCOL_VERSION`s refuse to talk to each other rather than silently
 misbehaving. A `PROTOCOL_VERSION` bump is always a **major** release.
 
+## macOS app
+
+`apps/macos` is a native SwiftUI front door — add a folder, trust it, manage its services from a
+window instead of a terminal. Same architecture, just another client of a per-folder daemon; see
+[apps/macos/README.md](apps/macos/README.md) for what's implemented, what isn't yet, and how to build
+it.
+
 ## Development
 
 ```bash
