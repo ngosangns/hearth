@@ -83,48 +83,68 @@ private struct TrustPromptView: View {
     }
 }
 
+/// A master-detail split: the service list on the left drives a live log panel on the right for
+/// whichever row is focused/selected — no separate button-into-modal-sheet step. This also closes the
+/// bug class a modal log sheet had: a sheet captured a serviceId once, at the moment it was opened, so
+/// a service removed from the catalog underneath it (a config-file edit + hot-reload) left the sheet
+/// polling a dead id forever, surfacing a raw `service_not_found` error with no way to recover short
+/// of closing it. Selection here is just a `String?` re-checked against the live `controller.services`
+/// on every update (`onChange` below), so a vanished service clears itself automatically.
 private struct ServiceListView: View {
     @ObservedObject var controller: WorkspaceController
-    @State private var logTarget: (id: String, label: String)?
+    @State private var selectedServiceId: String?
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let error = controller.lastActionError {
-                HStack {
-                    Image(systemName: "exclamationmark.circle").foregroundStyle(.red)
-                    Text(error).font(.callout).lineLimit(2)
-                    Spacer()
-                    Button("Dismiss") { controller.lastActionError = nil }
+        HSplitView {
+            VStack(spacing: 0) {
+                if let error = controller.lastActionError {
+                    HStack {
+                        Image(systemName: "exclamationmark.circle").foregroundStyle(.red)
+                        Text(error).font(.callout).lineLimit(2)
+                        Spacer()
+                        Button("Dismiss") { controller.lastActionError = nil }
+                    }
+                    .padding(8)
+                    .background(.red.opacity(0.1))
                 }
-                .padding(8)
-                .background(.red.opacity(0.1))
+                List(controller.services, selection: $selectedServiceId) { service in
+                    ServiceRow(
+                        service: service,
+                        label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
+                        busy: controller.actionsInFlight.contains(service.serviceId),
+                        onAction: { action in Task { await controller.perform(action, serviceId: service.serviceId) } }
+                    )
+                    .tag(service.serviceId)
+                }
+                .listStyle(.inset)
             }
-            List(controller.services) { service in
-                let label = controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId
-                ServiceRow(
-                    service: service,
-                    label: label,
-                    busy: controller.actionsInFlight.contains(service.serviceId),
-                    onAction: { action in Task { await controller.perform(action, serviceId: service.serviceId) } },
-                    onShowLogs: { logTarget = (service.serviceId, label) }
-                )
-            }
-            .listStyle(.inset)
+            .frame(minWidth: 320)
+
+            logPanel
+                .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
         }
-        .sheet(item: Binding(get: { logTarget.map(LogTarget.init) }, set: { logTarget = $0.map { ($0.id, $0.label) } })) { target in
-            if let logController = controller.makeLogController(serviceId: target.id) {
-                LogSheetView(serviceLabel: target.label, controller: logController)
+        // A hot-reloaded catalog can drop the selected service between polls (see this type's own
+        // doc comment) — never leave the panel pointed at an id that no longer exists.
+        .onChange(of: controller.services) { services in
+            if let id = selectedServiceId, !services.contains(where: { $0.serviceId == id }) {
+                selectedServiceId = nil
             }
         }
     }
-}
 
-private struct LogTarget: Identifiable {
-    let id: String
-    let label: String
-    init(_ pair: (id: String, label: String)) {
-        id = pair.id
-        label = pair.label
+    @ViewBuilder
+    private var logPanel: some View {
+        if let selectedServiceId, let logController = controller.makeLogController(serviceId: selectedServiceId) {
+            let label = controller.catalog?.services.first(where: { $0.id == selectedServiceId })?.displayName ?? selectedServiceId
+            ServiceLogPanel(serviceLabel: label, controller: logController)
+                .id(selectedServiceId) // fresh LogController (and its poll loop) per selected service
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "doc.plaintext").font(.system(size: 32)).foregroundStyle(.secondary)
+                Text("Select a service to view its logs").foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 }
 
@@ -133,7 +153,6 @@ private struct ServiceRow: View {
     let label: String
     let busy: Bool
     let onAction: (ManagerAction) -> Void
-    let onShowLogs: () -> Void
 
     var body: some View {
         HStack {
@@ -151,9 +170,6 @@ private struct ServiceRow: View {
                 }
             }
             Spacer()
-            Button(action: onShowLogs) { Image(systemName: "doc.plaintext") }
-                .buttonStyle(.borderless)
-                .help("View logs")
             if busy {
                 ProgressView().controlSize(.small)
             } else {
@@ -161,6 +177,7 @@ private struct ServiceRow: View {
             }
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle()) // the whole row is clickable/selectable, not just the text
     }
 
     @ViewBuilder

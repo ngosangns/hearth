@@ -1,9 +1,12 @@
 import SwiftUI
 
-struct LogSheetView: View {
+/// An inline (not modal) live log tail for whichever service is selected in `ServiceListView`'s
+/// split view. One instance per selection — the parent gives it a fresh `LogController` (and resets
+/// SwiftUI identity via `.id(selectedServiceId)`) every time the selection changes, so there is never
+/// a stale poll loop running for a service that's no longer focused.
+struct ServiceLogPanel: View {
     let serviceLabel: String
     @StateObject private var log: LogController
-    @Environment(\.dismiss) private var dismiss
 
     init(serviceLabel: String, controller: LogController) {
         self.serviceLabel = serviceLabel
@@ -16,9 +19,11 @@ struct LogSheetView: View {
                 Text(serviceLabel).font(.headline)
                 Spacer()
                 if let error = log.lastError {
-                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(1)
+                    Label(error, systemImage: log.isGone ? "questionmark.circle" : "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(log.isGone ? Color.secondary : Color.red)
+                        .lineLimit(1)
                 }
-                Button("Done") { dismiss() }
             }
             .padding()
             Divider()
@@ -37,7 +42,6 @@ struct LogSheetView: View {
                 }
             }
         }
-        .frame(minWidth: 560, minHeight: 360)
         .onAppear { log.start() }
         .onDisappear { log.stop() }
     }
