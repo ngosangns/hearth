@@ -331,7 +331,17 @@ export async function main(options: LocalctlOptions, argv = process.argv.slice(2
     if (command === "manager") {
       const flags = parseCommandFlags(rest, ["json"]);
       const [subcommand] = flags.positionals;
-      if (flags.positionals.length !== 1 || !["ensure", "status", "stop"].includes(subcommand!)) usage("usage: local-services manager ensure|status|stop [--json]");
+      if (flags.positionals.length !== 1 || !["ensure", "status", "stop", "reload"].includes(subcommand!)) usage("usage: local-services manager ensure|status|stop|reload [--json]");
+      if (subcommand === "reload") {
+        // Whatever `options.catalog` is *right now* — for a project whose entry point re-reads a
+        // config file per invocation (see `lsd.ts`), that's always fresh from disk; for a static
+        // TS-authored catalog it's just the same catalog again, a harmless no-op reload. Either way
+        // this command needs no config-file knowledge of its own: `main()` stays catalog-shape-agnostic.
+        const client = await requireClient(root, options, runtime);
+        const result = await request(client, "/v1/manager/reload", { method: "POST", body: JSON.stringify({ requestId: randomUUID(), catalog: options.catalog }), headers: { "content-type": "application/json" } }, runtime, client.metadata.protocolVersion);
+        print(result, flags.json, runtime);
+        return 0;
+      }
       if (subcommand === "ensure") {
         const client = await ensure(root, options, runtime);
         // A generic client (a desktop app's connection layer, not this process) needs the bearer

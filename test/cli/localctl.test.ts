@@ -62,6 +62,21 @@ describe("localctl", () => {
     expect(requests).toEqual([{ path: "/v1/manager/shutdown", protocol: "1" }]);
   });
 
+  test("manager reload POSTs the current in-process catalog and prints the result", async () => {
+    const requests: Array<{ path: string; body?: string }> = [];
+    const runtime: LocalctlRuntime = {
+      discover: async () => live(),
+      request: async (_client, path, init) => {
+        requests.push({ path, body: init?.body?.toString() });
+        if (path === "/v1/manager") return {};
+        return { stopped: [], changed: ["metadata"] };
+      },
+    };
+    expect(await main(options, ["manager", "reload", "--json"], runtime)).toBe(0);
+    const reloadRequest = requests.find((r) => r.path === "/v1/manager/reload")!;
+    expect(JSON.parse(reloadRequest.body!)).toEqual({ requestId: expect.any(String), catalog: options.catalog });
+  });
+
   test("prints non-json object results as readable JSON, not [object Object]", async () => {
     const output: string[] = [];
     const runtime: LocalctlRuntime = {
