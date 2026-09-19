@@ -60,3 +60,18 @@ export {
   type DoctorReport,
 } from "./doctor";
 export { DaemonLifecycle, runDaemon, terminateAfterManagerShutdown } from "./daemon";
+export {
+  configFileNames,
+  findConfigFile,
+  loadCatalog,
+  loadCatalogFromFile,
+  type ConfigFileLoadResult,
+  type ConfigFileName,
+} from "./config-file";
+export {
+  clearLoginShellEnvCacheForTests,
+  loadEnvFile,
+  resolveBaseEnvironment,
+  resolveLoginShellEnv,
+  type BaseEnvironmentOptions,
+} from "./env";

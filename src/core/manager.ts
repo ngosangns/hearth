@@ -6,7 +6,7 @@ import { dependencyLevels, validateCatalog, type ServiceCatalog, type ServiceId 
 import { createFileIo, isRecord, removeDirectory, type FileIo } from "./file-io";
 import { resolveRuntimeDirectory } from "./paths";
 import { isPidAlive, requireSupportedLocalServicesPlatform, type LocalServicesPlatform } from "./platform";
-import { defaultSupervisorOptions, ProcessSupervisor, type SupervisorOptions } from "./supervisor";
+import { activeStates, defaultSupervisorOptions, ProcessSupervisor, type SupervisorOptions } from "./supervisor";
 import {
   lockOwnershipProofName,
   lockReleaseMarkerName,
@@ -674,12 +674,16 @@ export class LocalServicesManager {
   readonly logs: CursorLogStore;
   readonly stateStore: AtomicStateStore;
   readonly supervisor: ProcessSupervisor;
-  readonly catalog: ServiceCatalog;
+  /** Not `readonly`: `reloadCatalog` swaps this reference. Every reader (the supervisor via `Host`,
+   * every HTTP handler) re-reads `this.catalog`/`this.host.catalog` on each use rather than caching
+   * it, so a swap takes effect for the very next operation. */
+  catalog: ServiceCatalog;
   readonly runtimeDirectory: string;
   private readonly io: FileIo;
   private readonly lock: LockHandle;
   private readonly token: string;
   private readonly lifecycle = new AsyncSerial();
+  private readonly catalogReloadSerial = new AsyncSerial();
   private server: ReturnType<typeof Bun.serve> | undefined;
   private externalSyncTimer: ReturnType<typeof setInterval> | undefined;
   private state: PersistedManagerState = { version: STATE_VERSION, services: {} };
@@ -785,6 +789,41 @@ export class LocalServicesManager {
     );
   }
 
+  /** Swaps in a new catalog after validating it. A service removed from the new catalog that is
+   * currently active gets stopped first — using the *old* catalog, since `ProcessSupervisor` needs
+   * the service's definition to know how to stop it — and only then does the swap happen, so a
+   * removed-but-still-stopping service is never briefly invisible from `serviceStates()`/`/v1/services`
+   * while its process is still alive. `external`-owned removed services are left alone, same as
+   * every other operation in this package. A service that stays present but whose definition changed
+   * (command, readiness, ...) is left running as-is — reload never restarts a healthy service out
+   * from under a developer — and is reported back in `changed` so a caller can decide whether/when to
+   * restart it. Rejects (without swapping or stopping anything) when the new catalog fails
+   * `validateCatalog`, or while the manager is shutting down. Serialized against itself (not against
+   * `this.lifecycle`, which `supervisor.stop`'s own state writes run through — nesting into that
+   * from here would deadlock). */
+  async reloadCatalog(nextCatalog: ServiceCatalog): Promise<{ ok: true; stopped: ServiceId[]; changed: ServiceId[] } | { ok: false; errors: string[] }> {
+    return this.catalogReloadSerial.run(async () => {
+      if (this.closing) return { ok: false, errors: ["manager is shutting down"] };
+      const validation = validateCatalog(nextCatalog);
+      if (validation.errors.length) return { ok: false, errors: validation.errors };
+      const previous = this.catalog;
+      const nextById = new Map(nextCatalog.services.map((service) => [service.id, service]));
+      const removedIds = previous.services.filter((service) => !nextById.has(service.id)).map((service) => service.id);
+      const changed = previous.services.filter((service) => { const next = nextById.get(service.id); return next !== undefined && JSON.stringify(next) !== JSON.stringify(service); }).map((service) => service.id);
+      const stopped: ServiceId[] = [];
+      for (const serviceId of removedIds) {
+        if (definitionOwnership(previous, serviceId) !== "daemon") continue;
+        const state = this.state.services[serviceId];
+        if (!state || !activeStates.includes(state.actualState)) continue;
+        await this.supervisor.stop(serviceId);
+        stopped.push(serviceId);
+      }
+      this.catalog = nextCatalog;
+      this.events.publish("manager.catalog-reloaded", { removed: removedIds, changed, stopped });
+      return { ok: true, stopped, changed };
+    });
+  }
+
   private async queueStoppedServicesForStart(serviceIds: readonly ServiceId[], operationId: string): Promise<void> {
     await this.lifecycle.run(async () => {
       if (this.closed) return;
@@ -861,6 +900,8 @@ export class LocalServicesManager {
       this.requireAuthorized(request);
       this.requireProtocol(request);
       if (url.pathname === "/v1/manager" && request.method === "GET") return this.json(this.info);
+      if (url.pathname === "/v1/catalog" && request.method === "GET") return this.json({ catalog: this.catalog });
+      if (url.pathname === "/v1/manager/reload" && request.method === "POST") return await this.reloadRequest(request);
       if (url.pathname === "/v1/services" && request.method === "GET") return this.json({ services: this.serviceStates() });
       if (url.pathname === "/v1/operations" && request.method === "POST") return await this.createServiceOperation(request);
       if (url.pathname === "/v1/operations/bulk-start" && request.method === "POST") return await this.createBulkStartOperation(request);
@@ -1112,6 +1153,18 @@ export class LocalServicesManager {
     const operation = this.operations.schedule(scheduleInput, async () => undefined);
     void this.operations.wait(operation).then(releaseOwner, releaseOwner);
     return this.json({ operation }, 202);
+  }
+  private async reloadRequest(request: Request): Promise<Response> {
+    if (this.closing) throw new ManagerHttpError(409, "manager_closing", "Manager is shutting down");
+    const body = await this.strictBody(request, ["requestId", "catalog"], ["requestId", "catalog"]);
+    if (typeof body.requestId !== "string" || body.requestId.length === 0) throw new ManagerHttpError(400, "invalid_request", "requestId must be a non-empty string");
+    const catalog = body.catalog;
+    if (!isRecord(catalog) || !Array.isArray(catalog.services) || !isRecord(catalog.groups) || typeof catalog.startFailurePolicy !== "string") {
+      throw new ManagerHttpError(400, "invalid_catalog", "catalog must be a ServiceCatalog: { services: [...], groups: {...}, startFailurePolicy }");
+    }
+    const result = await this.reloadCatalog(catalog as unknown as ServiceCatalog);
+    if (!result.ok) throw new ManagerHttpError(422, "invalid_catalog", result.errors.join("; "));
+    return this.json({ stopped: result.stopped, changed: result.changed });
   }
   private async strictBody(request: Request, allowed: readonly string[], required: readonly string[]): Promise<Record<string, unknown>> {
     let body: unknown;

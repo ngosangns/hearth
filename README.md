@@ -29,14 +29,15 @@ shell out to it via `@gnasdev/local-services/node-bridge` (see below).
 
 | Subpath | What it is |
 |---|---|
-| `@gnasdev/local-services/core` | `LocalServicesManager` (the daemon engine), catalog types + `validateCatalog`/`dependencyLevels`, `runDoctor`, `runDaemon`/`DaemonLifecycle` |
+| `@gnasdev/local-services/core` | `LocalServicesManager` (the daemon engine), catalog types + `validateCatalog`/`dependencyLevels`, `runDoctor`, `runDaemon`/`DaemonLifecycle`, `loadCatalog`/`findConfigFile` (declarative config), `resolveBaseEnvironment` (login-shell/`.env` resolution) |
 | `@gnasdev/local-services/cli` | `main()` — the `localctl`-style command surface (`status`, `logs`, `start`/`stop`/`restart`, `operation`, `doctor`, `cleanup`, `manager`, `tui`) |
 | `@gnasdev/local-services/tui` | `runTui()` — a [`pi-tui`](https://www.npmjs.com/package/@oh-my-pi/pi-tui)-based terminal app, just another HTTP+SSE client of the daemon |
 | `@gnasdev/local-services/mcp` | `createLocalServicesMcpServer()` — a 5-tool MCP server (status/logs/trace/events/manage) for AI agents |
 | `@gnasdev/local-services/node-bridge` | A ~20-line Node-only adapter so a Node/oclif task runner can shell out to this Bun-only tool without depending on Bun itself |
+| `lsd` (`bin`) | A generic CLI+daemon binary for a project that authors its catalog as `local-services.yaml` — see [§ Declarative config](#declarative-config-local-servicesyaml-and-the-lsd-binary) — instead of writing its own `catalog.ts`/`daemon.ts`/`cli.ts` |
 
-All five ship as TypeScript source (no build step) and are resolved natively by Bun — see
-[§ Versioning](#versioning) for why.
+All five subpaths ship as TypeScript source (no build step) and are resolved natively by Bun — see
+[§ Versioning](#versioning) for why. `lsd` is the same: a `#!/usr/bin/env bun` script, run directly.
 
 ## Minimal consumer example
 
@@ -125,6 +126,80 @@ const server = createLocalServicesMcpServer(new ManagerApiClient(process.cwd(), 
 await server.connect(new StdioServerTransport());
 ```
 
+## Declarative config: `local-services.yaml` and the `lsd` binary
+
+The "one file per consumer" pattern above is still the full-power option, but a project that doesn't
+need a `custom` readiness probe closure or computed service lists can skip writing `catalog.ts` /
+`daemon.ts` / `cli.ts` entirely. Drop a `local-services.yaml` (`.yml`/`.json` also work; JSON is valid
+YAML) in the project root:
+
+```yaml
+version: 1
+env: { NODE_ENV: development } # merged into every service's environment
+groups:
+  all: [redis, api]
+services:
+  redis:
+    kind: infrastructure
+    ownership: external
+    container: myapp-redis
+    run: { argv: [docker, compose, up, -d, redis] }
+    readiness: { kind: container }
+  api:
+    dependsOn: [redis]
+    cwd: apps/api
+    build: { argv: [go, build, ./...], timeoutMs: 120000, serializationKey: go }
+    run: { shell: "air -c .air.toml", exec: true }
+    readiness: { kind: tcp, port: 8080 }
+    ports: [{ port: 6060, label: pprof }]
+```
+
+and drive it with this package's own `lsd` binary (installed as this package's `bin`; `bunx
+@gnasdev/local-services lsd status`, or `lsd` directly once installed) — it loads the catalog from
+that file and behaves exactly like a project-authored `cli.ts`/`daemon.ts` pair:
+
+```bash
+lsd status              # one-shot status of every service
+lsd start api --wait    # start api (and its redis dependency)
+lsd manager ensure --json   # spawn the daemon if needed; print {instanceId, port, token, protocolVersion, runtimeDirectory, root}
+lsd daemon --root .     # the daemon entrypoint lsd spawns itself, detached — not usually invoked by hand
+```
+
+`manager ensure --json` is the connection contract for a non-Bun client (a desktop app's sidecar
+process, say): it ensures a daemon is running for `--root` and prints everything needed to talk to it
+directly over HTTP+SSE, without that client re-implementing this package's lock-file discovery.
+
+For anything the declarative shape can't express, drop to `local-services.config.ts` instead (same
+filename slot, checked last) — it must `export const catalog` (or a default export) as a hand-authored
+`ServiceCatalog`, same as the `catalog.ts` in the example above.
+
+Two related, independently-usable pieces from `/core`:
+
+- **`{ kind: "command" }` readiness** — a declarative, JSON-serializable stand-in for `custom`: exit
+  code 0 means ready, anything else means not-ready-yet (never a terminal failure; it keeps retrying
+  the same way `tcp`/`http` do until the readiness timeout). `readiness: { kind: "command", command: {
+  argv: [...] }, cwd?: "..." }`.
+- **`resolveBaseEnvironment` (`./env`)** — a daemon started from a GUI (Finder/Dock/a LaunchAgent, as a
+  desktop app's sidecar would be) inherits a bare `PATH`, not the login-shell customization (`nvm`,
+  Homebrew, project `.env` files) a terminal-launched daemon gets for free from `process.env`. Resolve
+  it once and pass it into `defaultSupervisorOptions(root, runtimeDirectory, baseEnvironment)` so every
+  spawned service sees the same environment regardless of how the daemon itself was started — `lsd
+  daemon` already does this.
+
+## Hot-reloading the catalog
+
+`POST /v1/manager/reload` (body: `{ requestId, catalog }`, a full `ServiceCatalog` as plain JSON — so
+it cannot carry a `custom` readiness closure, only what a declarative config can already express)
+validates the new catalog and swaps it in. A service removed from the new catalog that is currently
+active gets stopped (using the *old* catalog to do it, so a removed-but-still-stopping service is
+never briefly invisible from `/v1/services` while its process is still alive); `external`-owned
+services are never touched. A service that stays present but whose definition changed is left running
+as-is — reload never restarts a healthy service out from under a developer — and its id is reported
+back in the response's `changed` array so a caller can decide whether/when to restart it itself. The
+same logic is available in-process as `LocalServicesManager#reloadCatalog(catalog)`, for a daemon that
+watches its own config file (e.g. via FSEvents) and wants to reload without a self-HTTP round trip.
+`GET /v1/catalog` returns the catalog currently in effect.
+
 ## `CommandSpec` — argv vs. shell
 
 ```ts
@@ -141,6 +216,7 @@ command itself execs into the long-running process.
 type ReadinessSpec =
   | { kind: "process" } | { kind: "tcp"; port: number } | { kind: "http"; url: string }
   | { kind: "container" } | { kind: "tailnet" }
+  | { kind: "command"; command: CommandSpec; cwd?: string } // exit 0 = ready; JSON-serializable, so config-file-friendly
   | { kind: "custom"; name: string; probe: (ctx: { serviceId: string }) => Promise<"ready" | "not-ready" | "failed"> };
 ```
 

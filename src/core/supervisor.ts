@@ -29,6 +29,10 @@ export interface ProbeAdapter {
   container(containerName: string): Promise<boolean>;
   tailnet(): Promise<boolean>;
   portInUse?(port: number): Promise<boolean>;
+  /** Backs `{ kind: "command" }` readiness. Optional so every existing `SupervisorOptions` fixture
+   * (none of which exercise command readiness) keeps compiling; a catalog that declares one without
+   * this adapter present simply never becomes ready (probe returns false, times out normally). */
+  command?(command: CommandSpec, cwd?: string): Promise<boolean>;
 }
 export interface SupervisorClock {
   now(): string;
@@ -65,7 +69,7 @@ type ReadinessOutcome = { kind: "ready" } | { kind: "superseded" } | { kind: "ex
 type ProcessTreeEntry = { pid: number; pgid: number; startIdentity: string };
 
 const clock: SupervisorClock = { now: () => new Date().toISOString(), sleep: (milliseconds) => Bun.sleep(milliseconds) };
-const activeStates: readonly ActualServiceState[] = ["queued-start", "preparing", "starting", "running", "running-unready", "ready", "stopping"];
+export const activeStates: readonly ActualServiceState[] = ["queued-start", "preparing", "starting", "running", "running-unready", "ready", "stopping"];
 const isDockerIdentity = (identity: ProcessIdentity): identity is DockerContainerIdentity => "containerId" in identity;
 const isDockerIdentityRecord = (record: ManagedProcess): record is DockerContainerRecord & { exited: Promise<number> } => "containerId" in record;
 const isDockerObserved = (record: ObservedProcess): record is DockerContainerRecord & { alive: boolean } => "containerId" in record;
@@ -535,6 +539,7 @@ export class ProcessSupervisor {
     if (readiness.kind === "http") return this.options.probes.http(readiness.url);
     if (readiness.kind === "tailnet") return this.options.probes.tailnet();
     if (readiness.kind === "custom") return (await readiness.probe({ serviceId })) === "ready";
+    if (readiness.kind === "command") return (await this.options.probes.command?.(readiness.command, readiness.cwd)) ?? false;
     if (readiness.kind === "container") {
       const profile = profileFor(this.host.catalog, serviceId);
       return profile.command.containerName ? this.options.probes.container(profile.command.containerName) : false;
@@ -773,11 +778,15 @@ const runCommand = async (argv: readonly string[], cwd: string, env?: Record<str
   return child.exited;
 };
 
-export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDirectory: string = resolveRuntimeDirectory(root)): SupervisorOptions => ({
+/** `baseEnvironment` defaults to `process.env` — i.e. whatever spawned the daemon. A daemon launched
+ * from a GUI (Finder/Dock/LaunchAgent) inherits a bare `PATH` with no login-shell customization, so a
+ * generic host process should resolve one itself (see `resolveBaseEnvironment` in `./env`) and pass
+ * it here rather than relying on this default. */
+export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDirectory: string = resolveRuntimeDirectory(root), baseEnvironment: Record<string, string> = process.env as Record<string, string>): SupervisorOptions => ({
   process: {
     spawn: async ({ command, commandFingerprint, serviceId, onOutput }) => {
       const { argv, exec } = commandArgv(command.command);
-      const env = command.environment ? { ...process.env, ...command.environment } : (process.env as Record<string, string>);
+      const env = command.environment ? { ...baseEnvironment, ...command.environment } : baseEnvironment;
       if (isContainerCommand(command)) {
         const result = await runCommand(argv, join(root, command.cwd), env, onOutput);
         if (result !== 0) throw new Error(`Docker service command exited with ${result}`);
@@ -847,14 +856,14 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
     },
     stopContainer: async (command, onOutput) => {
       const { argv } = commandArgv(command.dockerStopCommand ?? { argv: ["docker", "compose", "stop"] });
-      const code = await runCommand(argv, root, process.env as Record<string, string>, onOutput);
+      const code = await runCommand(argv, root, baseEnvironment, onOutput);
       if (code !== 0) throw new Error(`Docker service stop exited with ${code}`);
     },
     attachOutput: (serviceId, onOutput) => tailFile(rawLogPath(runtimeDirectory, serviceId), onOutput).stop,
   },
   runBuild: async (command, onOutput, signal) => {
     const { argv } = commandArgv(command.command);
-    const env = command.environment ? { ...process.env, ...command.environment } : (process.env as Record<string, string>);
+    const env = command.environment ? { ...baseEnvironment, ...command.environment } : baseEnvironment;
     if (signal.aborted) throw signal.reason;
     const child = Bun.spawn(argv, { cwd: join(root, command.cwd), env, stdout: "pipe", stderr: "pipe", detached: true });
     void Promise.all([forwardStream(child.stdout, onOutput), forwardStream(child.stderr, onOutput)]).catch(() => undefined);
@@ -881,5 +890,12 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
     if (signal.aborted) throw signal.reason;
     if (code !== 0) throw new Error(`Build command exited with ${code}`);
   },
-  probes: { tcp: tcpProbe, http: async (url) => { try { return (await fetch(url, { signal: AbortSignal.timeout(250) })).ok; } catch { return false; } }, container: (containerName) => containerRunning(containerName), tailnet: () => tailnetServing(), portInUse: tcpProbe },
+  probes: {
+    tcp: tcpProbe,
+    http: async (url) => { try { return (await fetch(url, { signal: AbortSignal.timeout(250) })).ok; } catch { return false; } },
+    container: (containerName) => containerRunning(containerName),
+    tailnet: () => tailnetServing(),
+    portInUse: tcpProbe,
+    command: async (command, cwd) => (await runCommand(commandArgv(command).argv, join(root, cwd ?? "."), baseEnvironment)) === 0,
+  },
 });
