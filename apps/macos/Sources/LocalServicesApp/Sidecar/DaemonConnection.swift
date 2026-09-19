@@ -36,6 +36,13 @@ enum DaemonConnection {
         _ = try await runLsd(root: root, args: ["manager", "stop", "--json"])
     }
 
+    /// Re-reads `root`'s config file and pushes it to the running daemon — `lsd manager reload`
+    /// (src/cli/localctl.ts's `manager reload`, which loads fresh from disk on every `lsd`
+    /// invocation). Used by `ConfigFileWatcher` to react to a `local-services.yaml` edit.
+    static func reload(root: String) async throws {
+        _ = try await runLsd(root: root, args: ["manager", "reload", "--json"])
+    }
+
     private static func runLsd(root: String, args: [String]) async throws -> String {
         guard let bun = SidecarLocator.findBun() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.bunNotFound) }
         guard let lsdEntry = SidecarLocator.findLsdEntry() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.lsdEntryNotFound("<unresolved>")) }

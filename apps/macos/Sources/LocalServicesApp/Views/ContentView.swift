@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
+    @EnvironmentObject private var registry: WorkspaceControllerRegistry
     @State private var selection: UUID?
 
     var body: some View {
@@ -25,8 +26,11 @@ struct ContentView: View {
             }
         } detail: {
             if let selection, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }) {
-                WorkspaceDetailView(workspace: workspace)
-                    .id(workspace.id) // forces a fresh WorkspaceController per selected workspace
+                // The controller is resolved here (where `registry` — an @EnvironmentObject — is
+                // actually available) and passed down, rather than WorkspaceDetailView resolving it
+                // itself in an `init`, where @EnvironmentObject cannot be read yet.
+                WorkspaceDetailView(controller: registry.controller(for: workspace), workspace: workspace)
+                    .id(workspace.id) // resets per-view state (e.g. an open log sheet) on selection change
             } else {
                 ContentUnavailableViewCompat(title: "Select a workspace", message: "Choose a folder from the sidebar.", systemImage: "folder")
             }

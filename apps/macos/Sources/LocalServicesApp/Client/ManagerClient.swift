@@ -46,6 +46,18 @@ final class ManagerClient: Sendable {
         try await get("/v1/manager", as: ManagerInfo.self)
     }
 
+    /// `cursor`/`generation` mirror what `src/core/manager.ts`'s `/v1/logs/:serviceId` expects — pass
+    /// back the previous slice's `nextCursor`/`generation` to continue tailing; omit both for the
+    /// initial fetch. A `reset: true` slice (the log rotated or the caller's `generation` was stale)
+    /// means the caller should replace its buffer, not append.
+    func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int = 16_384) async throws -> LogSlice {
+        let escaped = serviceId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? serviceId
+        var path = "/v1/logs/\(escaped)?limit=\(limit)"
+        if let cursor { path += "&cursor=\(cursor)" }
+        if let generation { path += "&generation=\(generation)" }
+        return try await get(path, as: LogSlice.self)
+    }
+
     @discardableResult
     func perform(_ action: ManagerAction, serviceId: String) async throws -> Operation {
         let body: [String: String] = ["requestId": UUID().uuidString, "serviceId": serviceId, "action": action.rawValue]

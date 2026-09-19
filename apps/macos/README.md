@@ -40,6 +40,18 @@ swift build     # or: swift run
 - Connect (spawn-or-adopt the daemon via `lsd manager ensure`), list services with live status
   (polling `/v1/services` every 2s — see `ManagerClient.swift`'s doc comment for why polling and not
   SSE in this first pass), start/stop/restart per service.
+- Per-service log viewer (a sheet, polling `/v1/logs/:serviceId`, following the same cursor/generation
+  protocol the CLI's `logs --follow` uses).
+- A workspace's live connection lives in `WorkspaceControllerRegistry` at the app level, not per-view
+  — every *trusted* workspace auto-connects on launch (and stays connected across sidebar navigation),
+  which is also what makes the menu bar summary meaningful even when the main window isn't showing
+  that workspace.
+- `MenuBarExtra` — a global "ready/total" (and failure count) summary across every trusted workspace,
+  with a dropdown listing each one's status and a way to bring the main window forward.
+- FSEvents-ish config watch (`ConfigFileWatcher`, a `DispatchSource` on the workspace root — see its
+  doc comment for why directory-level rather than the exact filename): editing
+  `local-services.yaml`/`.yml`/`.json`/`.config.ts` triggers `lsd manager reload` automatically,
+  debounced.
 
 ## Known limitations / next steps
 
@@ -49,15 +61,14 @@ swift build     # or: swift run
   signing + notarization for Gatekeeper.
 - **Polling, not SSE**, for service status — `/v1/events/stream` would lower latency and cut request
   volume; not done yet, see `ManagerClient.swift`.
-- **No log viewer** — `/v1/logs/:serviceId` is unused so far.
-- **No MenuBarExtra** — this is a normal window app for now; a menu-bar summary (todo per the
-  original plan) is unimplemented.
-- **No FSEvents watch on `local-services.yaml`** — editing a workspace's config file doesn't trigger
-  `POST /v1/manager/reload` yet; the daemon-side reload endpoint exists (`src/core/manager.ts`), this
-  app just doesn't call it.
+- **No inline start/stop from the menu bar dropdown** — it's read-only status today; per-service
+  actions are only in the main window.
+- **Config-reload failures surface as a dismissible banner, not a diff/preview** — an edit that breaks
+  the catalog (e.g. a bad readiness kind) shows the daemon's validation error in
+  `WorkspaceController.lastActionError`, but there's no "here's what changed" view.
 
 ## CI
 
-`.github/workflows/ci.yml` builds this target (`swift build`) on pull requests / pushes that touch
-`apps/macos/**`, alongside (not instead of) the existing Bun `test`/`typecheck` job for the package
-itself.
+`.github/workflows/macos-app.yml` builds this target (`swift build`) on pull requests / pushes that
+touch `apps/macos/**`, path-filtered so it never runs for a change that's only in `src/`/`test/`, and
+separate from the package's own Bun `test`/`typecheck` job in `.github/workflows/ci.yml`.

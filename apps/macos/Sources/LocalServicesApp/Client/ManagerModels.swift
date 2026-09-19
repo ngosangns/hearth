@@ -119,6 +119,16 @@ struct ManagerInfo: Codable {
     let runtimeDirectory: String
 }
 
+struct LogSlice: Codable {
+    let serviceId: String
+    let generation: Int
+    let cursor: Int
+    let nextCursor: Int
+    let data: String
+    let reset: Bool
+    let truncated: Bool
+}
+
 struct ManagerErrorEnvelope: Codable {
     struct Body: Codable { let code: String; let message: String }
     let error: Body

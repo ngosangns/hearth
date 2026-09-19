@@ -23,6 +23,7 @@ final class WorkspaceController: ObservableObject {
     private var client: ManagerClient?
     private var pollTask: Task<Void, Never>?
     private let pollInterval: Duration
+    private var configWatcher: ConfigFileWatcher?
 
     init(workspace: Workspace, pollInterval: Duration = .seconds(2)) {
         self.workspace = workspace
@@ -31,6 +32,7 @@ final class WorkspaceController: ObservableObject {
 
     deinit {
         pollTask?.cancel()
+        configWatcher?.stop()
     }
 
     func connect() async {
@@ -44,6 +46,7 @@ final class WorkspaceController: ObservableObject {
             services = try await client.services()
             phase = .connected
             startPolling()
+            startConfigWatcher()
         } catch {
             phase = .failed(error.localizedDescription)
         }
@@ -52,6 +55,28 @@ final class WorkspaceController: ObservableObject {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+        configWatcher?.stop()
+        configWatcher = nil
+    }
+
+    private func startConfigWatcher() {
+        let root = workspace.path
+        configWatcher = ConfigFileWatcher(directory: root) { [weak self] in
+            Task { @MainActor in await self?.handleConfigChanged(root: root) }
+        }
+        configWatcher?.start()
+    }
+
+    /// A config edit never tears down the live connection on failure (a bad edit — invalid YAML, a
+    /// dependency cycle — is exactly when a developer most wants the app to keep showing them the
+    /// last-known-good state, with the error surfaced, not a blank/disconnected screen).
+    private func handleConfigChanged(root: String) async {
+        do {
+            try await DaemonConnection.reload(root: root)
+            await refresh()
+        } catch {
+            lastActionError = "Config reload failed: \(error.localizedDescription)"
+        }
     }
 
     private func startPolling() {
@@ -73,6 +98,14 @@ final class WorkspaceController: ObservableObject {
         } catch {
             phase = .failed(error.localizedDescription)
         }
+    }
+
+    /// `nil` before a successful `connect()` — a log sheet should only ever be offered once
+    /// `phase == .connected`, so callers do not need to distinguish "not connected yet" from "will
+    /// never have a client" here.
+    func makeLogController(serviceId: String) -> LogController? {
+        guard let client else { return nil }
+        return LogController(client: client, serviceId: serviceId)
     }
 
     func perform(_ action: ManagerAction, serviceId: String) async {

@@ -3,13 +3,11 @@ import SwiftUI
 
 struct WorkspaceDetailView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
-    @StateObject private var controller: WorkspaceController
+    /// Resolved by the caller (`ContentView`) from the shared `WorkspaceControllerRegistry` — this
+    /// view never creates its own; the registry owns the connection's lifetime so it survives the
+    /// user switching away and back, and so the menu bar sees the same live state.
+    @ObservedObject var controller: WorkspaceController
     let workspace: Workspace
-
-    init(workspace: Workspace) {
-        self.workspace = workspace
-        _controller = StateObject(wrappedValue: WorkspaceController(workspace: workspace))
-    }
 
     var body: some View {
         Group {
@@ -83,6 +81,7 @@ private struct TrustPromptView: View {
 
 private struct ServiceListView: View {
     @ObservedObject var controller: WorkspaceController
+    @State private var logTarget: (id: String, label: String)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -97,15 +96,31 @@ private struct ServiceListView: View {
                 .background(.red.opacity(0.1))
             }
             List(controller.services) { service in
+                let label = controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId
                 ServiceRow(
                     service: service,
-                    label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
+                    label: label,
                     busy: controller.actionsInFlight.contains(service.serviceId),
-                    onAction: { action in Task { await controller.perform(action, serviceId: service.serviceId) } }
+                    onAction: { action in Task { await controller.perform(action, serviceId: service.serviceId) } },
+                    onShowLogs: { logTarget = (service.serviceId, label) }
                 )
             }
             .listStyle(.inset)
         }
+        .sheet(item: Binding(get: { logTarget.map(LogTarget.init) }, set: { logTarget = $0.map { ($0.id, $0.label) } })) { target in
+            if let logController = controller.makeLogController(serviceId: target.id) {
+                LogSheetView(serviceLabel: target.label, controller: logController)
+            }
+        }
+    }
+}
+
+private struct LogTarget: Identifiable {
+    let id: String
+    let label: String
+    init(_ pair: (id: String, label: String)) {
+        id = pair.id
+        label = pair.label
     }
 }
 
@@ -114,6 +129,7 @@ private struct ServiceRow: View {
     let label: String
     let busy: Bool
     let onAction: (ManagerAction) -> Void
+    let onShowLogs: () -> Void
 
     var body: some View {
         HStack {
@@ -131,6 +147,9 @@ private struct ServiceRow: View {
                 }
             }
             Spacer()
+            Button(action: onShowLogs) { Image(systemName: "doc.plaintext") }
+                .buttonStyle(.borderless)
+                .help("View logs")
             if busy {
                 ProgressView().controlSize(.small)
             } else {
