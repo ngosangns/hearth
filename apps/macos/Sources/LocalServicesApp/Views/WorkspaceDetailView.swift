@@ -118,7 +118,7 @@ private struct ServiceListView: View {
                 }
                 .listStyle(.inset)
             }
-            .frame(minWidth: 320)
+            .frame(minWidth: 220, idealWidth: 240, maxWidth: 320)
 
             logPanel
                 .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
