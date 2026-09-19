@@ -6,11 +6,23 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 ## Architecture
 
-One package, five subpath exports (`/core`, `/cli`, `/tui`, `/mcp`, `/node-bridge`) — see README.md
-for the full design and a minimal consumer example. No default `ServiceCatalog` ships anywhere;
-every entry point takes a caller-supplied catalog as a parameter. Ported and generalized from two
-independently-forked internal copies of this tool (infra's `scripts/local-services-tui`, viclass's
-`tools/local-services-tui`) per `/Users/ngosangns/Github/firstmate/data/smp-npm-plan/report.md`.
+One package, five subpath exports (`/core`, `/cli`, `/tui`, `/mcp`, `/node-bridge`) plus a `lsd` bin —
+see README.md for the full design and a minimal consumer example. No default `ServiceCatalog` ships
+anywhere; every entry point takes a caller-supplied catalog as a parameter. Ported and generalized
+from two independently-forked internal copies of this tool (infra's `scripts/local-services-tui`,
+viclass's `tools/local-services-tui`) per `/Users/ngosangns/Github/firstmate/data/smp-npm-plan/report.md`.
+
+A project can skip authoring its own `catalog.ts`/`daemon.ts`/`cli.ts` entirely: `src/core/config-file.ts`
+maps a `local-services.yaml`/`.yml`/`.json` (or a `.config.ts` escape hatch) onto `ServiceCatalog`, and
+the `lsd` bin (`src/bin/lsd.ts`, README § "Declarative config") wraps that loader around `main()`/`runDaemon`
+the same way a hand-written `cli.ts`/`daemon.ts` would. This is also the on-ramp for a non-Bun/non-TS
+client (e.g. a desktop app) — `lsd manager ensure --json` prints everything (`token`, `port`,
+`runtimeDirectory`, ...) a generic HTTP+SSE client needs, without it reimplementing lock-file discovery.
+`src/core/env.ts` resolves the daemon's own base environment (login shell + `.env` file) for exactly
+this case: a daemon launched from a GUI has none of the `PATH` customization a terminal-launched one
+inherits for free from `process.env` — plumbed into `defaultSupervisorOptions`'s optional third
+(`baseEnvironment`) argument, `process.env` if omitted, so every existing terminal-launched consumer
+is unaffected.
 
 ## Build, test, release
 
@@ -55,6 +67,19 @@ independently-forked internal copies of this tool (infra's `scripts/local-servic
 - Phase 2 (switching infra's `scripts/local-services-tui` onto this package) and Phase 4 (porting
   viclass) are out of scope for this repo — separate follow-up work in those repos, per the plan
   report's phased migration (§4).
+- `LocalServicesManager.reloadCatalog` (`POST /v1/manager/reload`) stops a removed-but-active service
+  using the *old* catalog, and only swaps `this.catalog` to the new one afterward — `ProcessSupervisor`
+  needs the old definition to know how to stop it, and swapping first would make that service briefly
+  vanish from `serviceStates()`/`/v1/services` while its process was still alive. It's serialized
+  against itself via its own `catalogReloadSerial` (not `this.lifecycle`, which `supervisor.stop`'s own
+  state writes run through) — nesting into `this.lifecycle` from inside a call already running through
+  it would deadlock `AsyncSerial.run`.
+- `{ kind: "command" }` readiness (`src/core/catalog.ts`) is the JSON-serializable stand-in for
+  `custom` — needed because a `custom` probe is a closure and can't travel over `POST
+  /v1/manager/reload` or a YAML file. Its `ProbeAdapter.command` is optional on purpose: every
+  existing `SupervisorOptions` test fixture predates it, and `ProcessSupervisor.probe()` degrades to
+  `false` (normal readiness-timeout path, never a throw) when it's absent instead of forcing every
+  fixture to grow one.
 
 ## Maintaining this file
 

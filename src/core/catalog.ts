@@ -24,6 +24,12 @@ export type ReadinessSpec =
   | { readonly kind: "http"; readonly url: string }
   | { readonly kind: "container" }
   | { readonly kind: "tailnet" }
+  /** A declarative, JSON-serializable stand-in for `custom` (exit code 0 = ready, anything else =
+   * not-ready-yet — never "failed", so it retries the same way tcp/http do until the readiness
+   * timeout). Exists so a config-file-authored catalog (no closures) can still express an arbitrary
+   * check, and so that catalog can travel over `POST /v1/manager/reload` as plain JSON. `cwd` is
+   * relative to the manager's root; omitted defaults to the root itself. */
+  | { readonly kind: "command"; readonly command: CommandSpec; readonly cwd?: string }
   | { readonly kind: "custom"; readonly name: string; readonly probe: (ctx: ReadinessProbeContext) => Promise<"ready" | "not-ready" | "failed"> };
 
 export type ServiceOwnership = "daemon" | "external";

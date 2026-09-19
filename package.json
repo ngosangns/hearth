@@ -20,6 +20,9 @@
     "src",
     "README.md"
   ],
+  "bin": {
+    "lsd": "./src/bin/lsd.ts"
+  },
   "exports": {
     "./core": {
       "types": "./src/core/index.ts",

@@ -334,7 +334,12 @@ export async function main(options: LocalctlOptions, argv = process.argv.slice(2
       if (flags.positionals.length !== 1 || !["ensure", "status", "stop"].includes(subcommand!)) usage("usage: local-services manager ensure|status|stop [--json]");
       if (subcommand === "ensure") {
         const client = await ensure(root, options, runtime);
-        print({ instanceId: client.metadata.instanceId, port: client.metadata.port }, flags.json, runtime);
+        // A generic client (a desktop app's connection layer, not this process) needs the bearer
+        // token and runtime directory to talk to the daemon directly over HTTP+SSE — it has no other
+        // way to discover them without re-implementing lock-file discovery itself. This is no more
+        // exposed than the lock directory already is: those same fields sit in `manager.lock/*` on
+        // disk, readable by anyone who could read this stdout in the first place.
+        print({ instanceId: client.metadata.instanceId, port: client.metadata.port, token: client.token, protocolVersion: client.metadata.protocolVersion, runtimeDirectory: client.runtimeDirectory, root: client.root }, flags.json, runtime);
         return 0;
       }
       const discovered = await discover(root, options, runtime);

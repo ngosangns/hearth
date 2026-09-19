@@ -583,3 +583,37 @@ describe("process supervisor", () => {
     expect(fixture.host.states.get("metadata")?.identity).toBeUndefined();
   });
 });
+
+describe("command readiness", () => {
+  const commandCatalog: ServiceCatalog = {
+    startFailurePolicy: "stop-on-first-failure-keep-started",
+    services: [{ id: "metadata", profiles: { run: { commandStatus: "verified", command: shellCommand("serve metadata"), readiness: { kind: "command", command: { argv: ["check"] }, cwd: "infra" } } } }],
+    groups: {},
+  };
+
+  test("becomes ready when the command probe adapter reports success, passing the readiness command and cwd through untouched", async () => {
+    let seen: { command: CommandSpec; cwd: string | undefined } | undefined;
+    const fixture = setup(
+      { probes: { tcp: async () => false, http: async () => false, container: async () => false, tailnet: async () => false, portInUse: async () => false, command: async (command, cwd) => { seen = { command, cwd }; return true; } } },
+      commandCatalog,
+    );
+    await fixture.supervisor.start("metadata");
+    expect(fixture.host.states.get("metadata")).toMatchObject({ actualState: "ready", readiness: "ready", readinessKind: "command" });
+    expect(seen).toEqual({ command: { argv: ["check"] }, cwd: "infra" });
+  });
+
+  test("stays not-ready (never throws) when no command probe adapter is configured, and times out normally", async () => {
+    const fixture = setup({ readinessTimeoutMs: 0, probes: { tcp: async () => false, http: async () => false, container: async () => false, tailnet: async () => false, portInUse: async () => false } }, commandCatalog);
+    await expect(fixture.supervisor.start("metadata")).rejects.toThrow("Readiness timed out");
+    expect(fixture.host.states.get("metadata")).toMatchObject({ actualState: "failed", readiness: "failed" });
+  });
+});
+
+describe("default supervisor options — command readiness probe", () => {
+  test("resolves true/false from the spawned command's real exit code", async () => {
+    const root = await scratchRoot();
+    const options = defaultSupervisorOptions(root);
+    expect(await options.probes.command!({ argv: ["true"] })).toBe(true);
+    expect(await options.probes.command!({ argv: ["false"] })).toBe(false);
+  }, 10_000);
+});

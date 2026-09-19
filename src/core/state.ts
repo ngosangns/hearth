@@ -16,7 +16,7 @@ export type ActualServiceState = "stopped" | "queued-start" | "preparing" | "sta
 export type ServiceReadiness = "unknown" | "not-ready" | "ready" | "failed";
 export type ServiceOperationKind = "start" | "stop" | "restart" | "status";
 export type OperationStatus = "queued" | "running" | "succeeded" | "failed";
-export type ReadinessKind = "process" | "tcp" | "http" | "container" | "tailnet" | "custom";
+export type ReadinessKind = "process" | "tcp" | "http" | "container" | "tailnet" | "command" | "custom";
 
 export type PosixProcessIdentity = {
   managerInstanceId: string;
