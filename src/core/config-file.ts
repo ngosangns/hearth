@@ -100,11 +100,15 @@ function readCommandSpec(value: unknown, path: string, errors: string[]): { spec
     return undefined;
   }
   if (hasArgv) {
-    if (!isStringArray(value.argv) || value.argv.length === 0) {
-      errors.push(`${path}.argv must be a non-empty array of strings`);
+    // A bare numeric/boolean argv element (`argv: [sleep, 30]`) parses as a YAML number/boolean, not
+    // a string — extremely easy to author by accident (port numbers, `sleep 30`) and always safe to
+    // coerce, since every argv element ends up as a string on `Bun.spawn`'s argv regardless.
+    const argv = Array.isArray(value.argv) && value.argv.every((entry) => typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") ? value.argv.map((entry) => String(entry)) : undefined;
+    if (!argv || argv.length === 0) {
+      errors.push(`${path}.argv must be a non-empty array of strings (numbers/booleans are coerced to strings)`);
       return undefined;
     }
-    return { spec: { argv: value.argv } };
+    return { spec: { argv } };
   }
   if (typeof value.shell !== "string" || !value.shell.trim()) {
     errors.push(`${path}.shell must be a non-empty string`);
