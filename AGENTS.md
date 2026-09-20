@@ -44,7 +44,16 @@ separately from the package's own `ci.yml`.
   every one of its ~220 tests had only ever been run manually, never gated in CI. Since the
   Docker/tailnet real-adapter tests noted under Phase 2 below, `rust-test` also needs a working
   `docker` (daemon running) and `tailscale` on the runner, on top of the `bun` it already needed for
-  the `.config.ts` escape hatch tests.
+  the `.config.ts` escape hatch tests. **Currently red on the real registered runner** (confirmed via
+  `gh run view` after the `v0.3.0` tag push): `cargo test --workspace` exits 127 ("command not
+  found") — the runner's own PATH for Actions steps doesn't include wherever `cargo` lives on that
+  machine (this session's own shell has it at `/opt/homebrew/bin/cargo`, but no registered runner
+  process/install directory was found on *this* machine, so it's a different physical box, not
+  something fixable from inside this repo). `publish` doesn't depend on `rust-test` (only on `test`),
+  so this hasn't blocked any release, but it means `rust-test` isn't actually gating anything today —
+  needs the runner's own environment (its Actions runner service config, not this repo) to add
+  `cargo`'s bin directory to PATH. Same category as the Swift/XCTest runner limitation two entries
+  below: a real gap in the runner machine, not something to try to route around in the workflow YAML.
 - Semver doubles as the protocol-compatibility signal: `PROTOCOL_VERSION` (src/core/state.ts) is the
   one place a daemon and its TUI/CLI/MCP clients read it from — a bump there must be a major release.
 
