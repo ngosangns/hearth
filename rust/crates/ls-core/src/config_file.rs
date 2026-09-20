@@ -317,6 +317,23 @@ fn read_readiness(value: &Value, path: &str, errors: &mut Vec<String>) -> Option
     }
 }
 
+fn read_preparation_command(value: &Value, path: &str, errors: &mut Vec<String>) -> Option<crate::catalog::PreparationCommand> {
+    let Some(obj) = value.as_object() else {
+        errors.push(format!("{path} must be an object with `command` (and optional `cwd`)"));
+        return None;
+    };
+    let command = read_command_spec(obj.get("command").unwrap_or(&Value::Null), &format!("{path}.command"), errors);
+    let cwd = match obj.get("cwd") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            errors.push(format!("{path}.cwd must be a string"));
+            None
+        }
+    };
+    Some(crate::catalog::PreparationCommand { command: command?.spec, cwd })
+}
+
 fn read_ports(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<Vec<ServicePort>> {
     let Some(value) = value else { return Some(Vec::new()) };
     let Some(array) = value.as_array() else {
@@ -478,12 +495,13 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
         let cwd = resolve_service_cwd(obj.get("cwd").and_then(Value::as_str), &svc_path, &mut errors);
         let readiness = obj.get("readiness").and_then(|r| read_readiness(r, &format!("{svc_path}.readiness"), &mut errors));
         let ports = read_ports(obj.get("ports"), &format!("{svc_path}.ports"), &mut errors);
+        let preparation_command = obj.get("preparationCommand").and_then(|v| read_preparation_command(v, &format!("{svc_path}.preparationCommand"), &mut errors));
 
         let mut profile_run: Option<ServiceRunProfile> = None;
         match obj.get("run") {
             None => {
                 if let Some(readiness) = readiness.clone() {
-                    profile_run = Some(ServiceRunProfile::Unresolved { readiness, readiness_timeout_ms: None, preparation: None });
+                    profile_run = Some(ServiceRunProfile::Unresolved { readiness, readiness_timeout_ms: None, preparation: None, preparation_command: preparation_command.clone() });
                 }
             }
             Some(run_value) => {
@@ -504,6 +522,7 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
                         readiness,
                         readiness_timeout_ms: None,
                         preparation: None,
+                        preparation_command,
                     });
                 }
             }
@@ -842,6 +861,36 @@ services:
             ReadinessSpec::Command { cwd, .. } => assert_eq!(cwd.as_deref(), Some("sub")),
             _ => panic!("expected command readiness"),
         }
+    }
+
+    #[test]
+    fn maps_a_declarative_preparation_command_alongside_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "local-services.yaml",
+            "version: 1\nservices:\n  sync:\n    run: { argv: [task, sync] }\n    readiness: { kind: process }\n    preparationCommand: { command: { argv: [task, \"sync:prepare\"] }, cwd: infra }\n",
+        );
+        let loaded = load_catalog(dir.path()).expect("should load");
+        match &loaded.catalog.services[0].profiles.run {
+            ServiceRunProfile::Verified { preparation_command, .. } => {
+                assert_eq!(preparation_command.as_ref().unwrap().command, CommandSpec::Argv { argv: vec!["task".to_string(), "sync:prepare".to_string()] });
+                assert_eq!(preparation_command.as_ref().unwrap().cwd.as_deref(), Some("infra"));
+            }
+            _ => panic!("expected a verified run profile"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_malformed_preparation_command() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "local-services.yaml",
+            "version: 1\nservices:\n  sync:\n    run: { argv: [task, sync] }\n    readiness: { kind: process }\n    preparationCommand: \"not-an-object\"\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("preparationCommand")), "{:?}", err.errors);
     }
 
     #[test]

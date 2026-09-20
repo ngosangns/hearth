@@ -658,6 +658,7 @@ mod tests {
                     readiness: ReadinessSpec::Tcp { port },
                     readiness_timeout_ms: Some(5_000),
                     preparation: None,
+                    preparation_command: None,
                 },
                 build: None,
             },
@@ -788,6 +789,7 @@ mod tests {
                     readiness: ReadinessSpec::Container,
                     readiness_timeout_ms: Some(30_000),
                     preparation: None,
+                    preparation_command: None,
                 },
                 build: None,
             },
@@ -832,6 +834,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&runtime_dir);
         stop_result.expect("stop should succeed");
         assert!(!container_running(&container_name).await, "the real container must be stopped/removed after stop()");
+    }
+
+    /// Real end-to-end test of the declarative `preparation_command` (the JSON-serializable
+    /// stand-in for a bespoke `PreparationAdapter` added to unblock a `.config.ts`/YAML-only
+    /// consumer whose real services depend on a prepare step — see AGENTS.md's Rust-rewrite status
+    /// for the `viclass` cutover this was built to unblock). Proves the whole real chain: catalog
+    /// declares a command, the engine calls the real `DefaultProbeAdapter::command` (the same
+    /// adapter method `ReadinessSpec::Command` readiness already exercises elsewhere), which really
+    /// spawns a shell command — here, one that writes a marker file — *before* the service's own
+    /// run command starts.
+    #[tokio::test]
+    async fn real_process_supervisor_runs_a_real_preparation_command_before_starting_the_service() {
+        use crate::catalog::{
+            CommandSpec as Spec, PreparationCommand, ReadinessSpec, ServiceCatalog, ServiceCommand as Cmd, ServiceDefinition, ServiceKind, ServiceProfiles,
+            ServiceRunProfile, StartFailurePolicy,
+        };
+        use crate::state::{ActualServiceState, DesiredServiceState, ServiceLifecycleState, ServiceReadiness};
+        use crate::supervisor::Host;
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+
+        struct TestHost {
+            catalog: Arc<ServiceCatalog>,
+            states: StdMutex<Map<String, ServiceLifecycleState>>,
+        }
+        #[async_trait]
+        impl Host for TestHost {
+            fn instance_id(&self) -> String {
+                "real-preparation-command-test".to_string()
+            }
+            fn catalog(&self) -> Arc<ServiceCatalog> {
+                self.catalog.clone()
+            }
+            fn service_states(&self) -> Vec<ServiceLifecycleState> {
+                let states = self.states.lock().unwrap();
+                self.catalog
+                    .services
+                    .iter()
+                    .map(|s| {
+                        states.get(&s.id).cloned().unwrap_or(ServiceLifecycleState {
+                            service_id: s.id.clone(),
+                            desired_state: DesiredServiceState::Stopped,
+                            actual_state: ActualServiceState::Stopped,
+                            readiness: ServiceReadiness::Unknown,
+                            generation: 0,
+                            identity: None,
+                            readiness_kind: None,
+                            readiness_detail: None,
+                            created_at: "2024-01-01T00:00:00.000Z".to_string(),
+                            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+                            exited_at: None,
+                            exit_code: None,
+                            error: None,
+                            current_operation_id: None,
+                        })
+                    })
+                    .collect()
+            }
+            async fn set_service_state(&self, next: ServiceLifecycleState) {
+                self.states.lock().unwrap().insert(next.service_id.clone(), next);
+            }
+            async fn append_log(&self, _service_id: &str, _data: &str) {}
+            fn publish(&self, _event_type: &str, _data: serde_json::Value) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("prepared.marker");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+
+        let service = ServiceDefinition {
+            id: "prepped-server".to_string(),
+            label: None,
+            kind: Some(ServiceKind::Application),
+            ownership: None,
+            dependencies: None,
+            profiles: ServiceProfiles {
+                run: ServiceRunProfile::Verified {
+                    command: Cmd { command: Spec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
+                    readiness: ReadinessSpec::Tcp { port },
+                    readiness_timeout_ms: Some(5_000),
+                    preparation: None,
+                    preparation_command: Some(PreparationCommand { command: Spec::Shell { shell: format!("touch '{}'", marker.display()), exec: None }, cwd: None }),
+                },
+                build: None,
+            },
+            ports: None,
+        };
+        let catalog = ServiceCatalog { services: vec![service], groups: Map::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: None };
+        let host = Arc::new(TestHost { catalog: Arc::new(catalog), states: StdMutex::new(Map::new()) });
+
+        let runtime_dir = std::env::temp_dir().join(format!("ls-core-real-preparation-command-test-{}", uuid::Uuid::new_v4()));
+        let options = default_supervisor_options(PathBuf::from("/tmp"), Some(runtime_dir.clone()), None);
+        let supervisor = ProcessSupervisor::new(host.clone(), options);
+
+        assert!(!marker.exists(), "sanity check: the marker must not exist before start()");
+        supervisor.start(&"prepped-server".to_string(), None).await.expect("real service with a real preparation command should start and become ready");
+        assert!(marker.exists(), "the real preparation command should have run before the service started");
+        assert_eq!(host.service_states().into_iter().find(|s| s.service_id == "prepped-server").unwrap().actual_state, ActualServiceState::Ready);
+
+        supervisor.stop(&"prepped-server".to_string(), None).await.expect("stop should succeed");
+        let _ = std::fs::remove_dir_all(&runtime_dir);
     }
 
     /// Real (read-only) test of `tailnet_serving`/`DefaultProbeAdapter::tailnet` against whatever

@@ -996,6 +996,7 @@ mod tests {
                     readiness: ReadinessSpec::Tcp { port },
                     readiness_timeout_ms: Some(5_000),
                     preparation: None,
+                    preparation_command: None,
                 },
                 build: None,
             },

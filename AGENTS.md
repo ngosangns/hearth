@@ -428,28 +428,43 @@ Status:
   resolution order), and `scripts/build-app.sh` bundles that compiled binary so a packaged app needs
   no `bun` at all for the common path.
 
-  **`infra` cut over; `viclass` deliberately did not — a real, functional gap, not caution for its
-  own sake.** `infra`'s `scripts/local-services-tui` scripts (`localctl`, `mcp`, `start`) now call the
-  installed `lsd` binary directly, verified against its real, already-running daemon (`lsd status`/
-  `lsd doctor`/`lsd mcp`'s `tools/list` all reporting correctly against its real 21-service catalog)
-  — safe because `infra`'s own `daemon.ts` has no logic beyond the generic engine `lsd daemon` already
-  provides. `viclass`'s does not: its `daemon.ts` wires a custom `PreparationAdapter` (`scripts/
-  local-services.sh prepare <serviceId>`) that real services depend on (`jitsi`'s `local-jitsi-
-  runtime`/`local-jitsi-network`, `sync`'s `runtime-config:vinet/sync`) — and `PreparationAdapter` is
-  a closure like `custom` readiness, so it can't cross a `.config.ts`/YAML boundary any more than a
-  `custom` probe can (same limitation this file's own `.config.ts` entry documents). The generic `lsd`
-  binary's `spawn_daemon` is hardcoded to `lsd daemon --root <root>` (no preparation adapter) — so if
-  `viclass` had been switched and its already-running daemon ever needed restarting (the normal case
-  after a reboot, or `manager stop`), the *next* `ensure()` call from any `lsd` command **or the MCP
-  tool** would silently spawn a daemon missing that adapter: those three services would come up
-  without their required prep step, with no error surfaced anywhere. Found before editing anything
-  in `viclass` (a real end-to-end `lsd doctor`/`status` dry run against it was clean; the daemon.ts
-  diff read is what caught this), so nothing there was touched. Resolving it for real needs one of:
-  a declarative, JSON-serializable stand-in for preparation (mirroring `{ kind: "command" }` for
-  readiness) that a `.config.ts`/YAML catalog could express generically, or a way to override what
-  `spawn_daemon` runs (e.g. an env var `lsd` checks before falling back to `lsd daemon`) so `viclass`
-  could keep pointing it at its own `daemon.ts`. Neither is implemented; this is an open, real gap,
-  not yet decided which way to close.
+  **`infra` cut over; `viclass` deliberately did not yet — a real, functional gap, not caution for
+  its own sake.** `infra`'s `scripts/local-services-tui` scripts (`localctl`, `mcp`, `start`) now call
+  the installed `lsd` binary directly, verified against its real, already-running daemon (`lsd
+  status`/`lsd doctor`/`lsd mcp`'s `tools/list` all reporting correctly against its real 21-service
+  catalog) — safe because `infra`'s own `daemon.ts` has no logic beyond the generic engine `lsd daemon`
+  already provides. `viclass`'s does not: its `daemon.ts` wires a custom `PreparationAdapter`
+  (`scripts/local-services.sh prepare <serviceId>`) that real services depend on (`jitsi`'s
+  `local-jitsi-runtime`/`local-jitsi-network`, `sync`'s `runtime-config:vinet/sync`) — and
+  `PreparationAdapter` is a closure like `custom` readiness, so it can't cross a `.config.ts`/YAML
+  boundary any more than a `custom` probe can. The generic `lsd` binary's `spawn_daemon` is hardcoded
+  to `lsd daemon --root <root>` (no custom preparation adapter) — so switching `viclass` without
+  fixing this would mean the *next* `ensure()`-triggered daemon spawn (after a reboot, or `manager
+  stop`) silently starts those three services without their required prep step, no error surfaced
+  anywhere. Found before editing anything in `viclass` (a real end-to-end `lsd doctor`/`status` dry
+  run against it was clean; the `daemon.ts` diff read is what caught this).
+
+  **Resolved**: `ServiceRunProfile` gained `preparationCommand?: { command: CommandSpec; cwd?:
+  string }` (`src/core/catalog.ts` / `catalog.rs`'s `PreparationCommand`) — a declarative,
+  JSON-serializable stand-in for a bespoke `PreparationAdapter`, mirroring exactly why `{ kind:
+  "command" }` readiness exists. The engine (`src/core/supervisor.ts` / `ls-core`'s `engine.rs`) runs
+  it via `ProbeAdapter.command`/`probes.command()` — the *same* adapter method `{ kind: "command" }`
+  readiness already uses — independently of the opaque `preparation` marker list, so a service may
+  declare either, both, or neither. Declarative YAML/`.config.ts` catalogs can now express a prepare
+  step with no closure at all. Critically, **`default_supervisor_options`/`defaultSupervisorOptions`
+  needed no changes** — both already wire a real `DefaultProbeAdapter`/`command` adapter (for
+  readiness), so `lsd daemon`'s stock setup picks up a catalog's `preparationCommand` automatically.
+  The remaining step to actually unblock `viclass` is entirely catalog-side: migrate its 3
+  prep-dependent services from the opaque marker list to `preparationCommand: { command: { shell:
+  "scripts/local-services.sh prepare <id>" } }` (or equivalent) in `viclass`'s own `catalog.ts` — not
+  yet done, since that's an edit to `viclass`'s real catalog and worth a real end-to-end check against
+  its actual running services before landing, same as `infra`'s cutover was. Proven on both sides:
+  TS (`test/core/supervisor.test.ts`'s "declarative preparation command" describe block,
+  `test/core/config-file.test.ts`'s two new mapping tests) and Rust (3 fakes-based `engine.rs` tests
+  covering success/failure/no-adapter-configured, a `config_file.rs` YAML-mapping test pair, and a
+  real end-to-end test spawning an actual shell preparation command — writes a marker file — through
+  a real `ProcessSupervisor` before a real `nc`-backed service starts). 236 tests total in the Rust
+  workspace, 181 in the TS suite, both clippy/typecheck-clean.
 
   Neither `infra`'s nor `viclass`'s own commits/pushes are this repo's to make — `infra`'s package.json
   edit sits uncommitted in that repo pending its owner's confirmation to push.

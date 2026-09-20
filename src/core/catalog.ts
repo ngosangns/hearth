@@ -35,12 +35,22 @@ export type ReadinessSpec =
 export type ServiceOwnership = "daemon" | "external";
 export type ServiceKind = "application" | "infrastructure";
 
+/** A declarative, JSON-serializable stand-in for a bespoke `PreparationAdapter` (exit code 0 =
+ * prepared, anything else = failed) — exists for exactly the same reason `{ kind: "command" }`
+ * readiness exists: a config-file-authored catalog has no closures, and this needs to travel over
+ * `POST /v1/manager/reload` or a YAML file as plain JSON. Runs via `ProbeAdapter.command` (the same
+ * adapter `{ kind: "command" }` readiness already uses), independently of the opaque `preparation`
+ * marker list above — a service may use either, both, or neither. `cwd` is relative to the manager's
+ * root; omitted defaults to the root itself. */
+export type PreparationCommand = { readonly command: CommandSpec; readonly cwd?: string };
+
 export type VerifiedServiceRunProfile = {
   readonly command: ServiceCommand;
   readonly commandStatus: "verified";
   readonly readiness: ReadinessSpec;
   readonly readinessTimeoutMs?: number;
   readonly preparation?: readonly string[];
+  readonly preparationCommand?: PreparationCommand;
 };
 export type UnresolvedServiceRunProfile = {
   readonly command?: undefined;
@@ -48,6 +58,7 @@ export type UnresolvedServiceRunProfile = {
   readonly readiness: ReadinessSpec;
   readonly readinessTimeoutMs?: number;
   readonly preparation?: readonly string[];
+  readonly preparationCommand?: PreparationCommand;
 };
 export type ServiceRunProfile = VerifiedServiceRunProfile | UnresolvedServiceRunProfile;
 

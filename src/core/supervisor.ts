@@ -256,6 +256,10 @@ export class ProcessSupervisor {
     await this.transition(serviceId, generation, "preparing", "unknown", { desiredState: "running", currentOperationId: operationId, clear: ["error", "exitCode", "exitedAt", "identity"] });
     try {
       if (profile.preparation?.length) await this.options.preparation?.prepare(serviceId, profile.preparation);
+      if (profile.preparationCommand) {
+        const ok = await this.options.probes.command?.(profile.preparationCommand.command, profile.preparationCommand.cwd);
+        if (ok !== true) throw new Error("preparation command failed");
+      }
     } catch {
       await this.transitionIfCurrent(serviceId, generation, token, "failed", "failed", { error: "Preparation failed", currentOperationId: operationId });
       throw new Error(`Preparation failed for ${serviceId}`);

@@ -609,6 +609,39 @@ describe("command readiness", () => {
   });
 });
 
+describe("declarative preparation command", () => {
+  const preparationCatalog: ServiceCatalog = {
+    startFailurePolicy: "stop-on-first-failure-keep-started",
+    services: [{ id: "metadata", profiles: { run: { commandStatus: "verified", command: shellCommand("serve metadata"), readiness: { kind: "tcp", port: 1166 }, preparationCommand: { command: { argv: ["prepare"] }, cwd: "infra" } } } }],
+    groups: {},
+  };
+
+  test("runs before the service starts, passing the command and cwd through untouched, independent of the opaque preparation marker list", async () => {
+    let seen: { command: CommandSpec; cwd: string | undefined } | undefined;
+    const fixture = setup(
+      { probes: { tcp: async () => true, http: async () => false, container: async () => false, tailnet: async () => false, portInUse: async () => false, command: async (command, cwd) => { seen = { command, cwd }; return true; } } },
+      preparationCatalog,
+    );
+    await fixture.supervisor.start("metadata");
+    expect(fixture.host.states.get("metadata")).toMatchObject({ actualState: "ready" });
+    expect(seen).toEqual({ command: { argv: ["prepare"] }, cwd: "infra" });
+  });
+
+  test("fails the start (not just readiness) when the preparation command probe reports failure", async () => {
+    const fixture = setup(
+      { probes: { tcp: async () => true, http: async () => false, container: async () => false, tailnet: async () => false, portInUse: async () => false, command: async () => false } },
+      preparationCatalog,
+    );
+    await expect(fixture.supervisor.start("metadata")).rejects.toThrow("Preparation failed for metadata");
+    expect(fixture.host.states.get("metadata")).toMatchObject({ actualState: "failed", readiness: "failed", error: "Preparation failed" });
+  });
+
+  test("fails the start when a preparationCommand is set but no command probe adapter is configured", async () => {
+    const fixture = setup({ probes: { tcp: async () => true, http: async () => false, container: async () => false, tailnet: async () => false, portInUse: async () => false } }, preparationCatalog);
+    await expect(fixture.supervisor.start("metadata")).rejects.toThrow("Preparation failed for metadata");
+  });
+});
+
 describe("default supervisor options — command readiness probe", () => {
   test("resolves true/false from the spawned command's real exit code", async () => {
     const root = await scratchRoot();

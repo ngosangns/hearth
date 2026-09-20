@@ -81,6 +81,21 @@ pub enum ServiceKind {
     Infrastructure,
 }
 
+/// A declarative, JSON-serializable stand-in for a bespoke `PreparationAdapter` (exit code 0 =
+/// prepared, anything else = failed) — exists for exactly the same reason `ReadinessSpec::Command`
+/// exists: a config-file-authored catalog has no closures, and this needs to travel over `POST
+/// /v1/manager/reload` or a YAML file as plain JSON. Runs via `ProbeAdapter::command` (the same
+/// adapter `ReadinessSpec::Command` readiness already uses), independently of the opaque
+/// `preparation` marker list on `ServiceRunProfile` — a service may use either, both, or neither.
+/// `cwd` is relative to the manager's root; omitted defaults to the root itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparationCommand {
+    pub command: CommandSpec,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "commandStatus", rename_all = "lowercase", rename_all_fields = "camelCase")]
 pub enum ServiceRunProfile {
@@ -91,6 +106,8 @@ pub enum ServiceRunProfile {
         readiness_timeout_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preparation: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preparation_command: Option<PreparationCommand>,
     },
     Unresolved {
         readiness: ReadinessSpec,
@@ -98,6 +115,8 @@ pub enum ServiceRunProfile {
         readiness_timeout_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preparation: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preparation_command: Option<PreparationCommand>,
     },
 }
 
@@ -394,6 +413,7 @@ mod tests {
                     readiness: ReadinessSpec::Process,
                     readiness_timeout_ms: None,
                     preparation: None,
+                    preparation_command: None,
                 },
                 build: None,
             },
@@ -427,6 +447,7 @@ mod tests {
                     readiness: ReadinessSpec::Tcp { port },
                     readiness_timeout_ms: None,
                     preparation: None,
+                    preparation_command: None,
                 },
                 build: None,
             },
@@ -499,7 +520,7 @@ mod tests {
                 ownership: None,
                 dependencies: None,
                 profiles: ServiceProfiles {
-                    run: ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None },
+                    run: ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
                     build: None,
                 },
                 ports: None,
@@ -584,7 +605,7 @@ mod tests {
         let json = serde_json::to_value(&command).unwrap();
         assert!(json.get("containerName").is_some(), "{json:?}");
 
-        let profile = ServiceRunProfile::Verified { command, readiness: ReadinessSpec::Process, readiness_timeout_ms: Some(1000), preparation: None };
+        let profile = ServiceRunProfile::Verified { command, readiness: ReadinessSpec::Process, readiness_timeout_ms: Some(1000), preparation: None, preparation_command: None };
         let json = serde_json::to_value(&profile).unwrap();
         assert!(json.get("readinessTimeoutMs").is_some(), "{json:?}");
         assert_eq!(json.get("commandStatus").and_then(|v| v.as_str()), Some("verified"));

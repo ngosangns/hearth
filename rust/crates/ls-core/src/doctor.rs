@@ -208,7 +208,7 @@ mod tests {
                 ownership: None,
                 dependencies: None,
                 profiles: ServiceProfiles {
-                    run: ServiceRunProfile::Unresolved { readiness: crate::catalog::ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None },
+                    run: ServiceRunProfile::Unresolved { readiness: crate::catalog::ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
                     build: None,
                 },
                 ports: None,

@@ -156,6 +156,25 @@ services:
     if (result.ok) expect(result.catalog.services[0]!.profiles.run.readiness).toEqual({ kind: "command", command: { argv: ["task", "db:check"] }, cwd: "infra" });
   });
 
+  test("maps a declarative preparationCommand alongside readiness", async () => {
+    const root = await scratchRoot();
+    await writeFile(
+      join(root, "local-services.yaml"),
+      `version: 1\nservices:\n  sync:\n    run: { argv: [task, sync] }\n    readiness: { kind: process }\n    preparationCommand: { command: { argv: [task, "sync:prepare"] }, cwd: infra }\n`,
+    );
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.catalog.services[0]!.profiles.run).toMatchObject({ preparationCommand: { command: { argv: ["task", "sync:prepare"] }, cwd: "infra" } });
+  });
+
+  test("rejects a malformed preparationCommand", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), `version: 1\nservices:\n  sync:\n    run: { argv: [task, sync] }\n    readiness: { kind: process }\n    preparationCommand: "not-an-object"\n`);
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors.some((e) => e.includes("preparationCommand"))).toBe(true);
+  });
+
   test("reports a missing config file", async () => {
     const result = await loadCatalog(await scratchRoot());
     expect(result.ok).toBe(false);

@@ -56,11 +56,12 @@ fn readiness_kind_of(readiness: &ReadinessSpec) -> ReadinessKind {
 fn profile_for(catalog: &ServiceCatalog, service_id: &str) -> Result<VerifiedProfile, SupervisorError> {
     let service = catalog.services.iter().find(|s| s.id == service_id);
     match service.map(|s| &s.profiles.run) {
-        Some(ServiceRunProfile::Verified { command, readiness, readiness_timeout_ms, preparation }) => Ok(VerifiedProfile {
+        Some(ServiceRunProfile::Verified { command, readiness, readiness_timeout_ms, preparation, preparation_command }) => Ok(VerifiedProfile {
             command: command.clone(),
             readiness: readiness.clone(),
             readiness_timeout_ms: *readiness_timeout_ms,
             preparation: preparation.clone(),
+            preparation_command: preparation_command.clone(),
         }),
         _ => Err(SupervisorError(format!("Unsupported service {service_id}"))),
     }
@@ -78,6 +79,7 @@ pub struct VerifiedProfile {
     pub readiness: ReadinessSpec,
     pub readiness_timeout_ms: Option<u64>,
     pub preparation: Option<Vec<String>>,
+    pub preparation_command: Option<crate::catalog::PreparationCommand>,
 }
 
 struct Active {
@@ -540,23 +542,38 @@ impl ProcessSupervisor {
         )
         .await;
 
+        let mut preparation_failed = false;
         if let Some(preparation) = &profile.preparation {
             if !preparation.is_empty() {
                 if let Some(adapter) = &self.options.preparation {
                     if adapter.prepare(service_id, preparation).await.is_err() {
-                        self.transition_if_current(
-                            service_id,
-                            generation,
-                            token,
-                            ActualServiceState::Failed,
-                            ServiceReadiness::Failed,
-                            Changes { error: Patch::Set("Preparation failed".to_string()), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
-                        )
-                        .await;
-                        return Err(SupervisorError(format!("Preparation failed for {service_id}")));
+                        preparation_failed = true;
                     }
                 }
             }
+        }
+        // Independent of the opaque marker list above — a service may declare either, both, or
+        // neither. Reuses `ProbeAdapter::command`, the same adapter `ReadinessSpec::Command`
+        // readiness already uses, so a bespoke `PreparationAdapter` is no longer the only way to
+        // express "run this before starting" in a catalog that has no closures (`.config.ts`/YAML).
+        if !preparation_failed {
+            if let Some(prep_command) = &profile.preparation_command {
+                if self.options.probes.command(&prep_command.command, prep_command.cwd.as_deref()).await != Some(true) {
+                    preparation_failed = true;
+                }
+            }
+        }
+        if preparation_failed {
+            self.transition_if_current(
+                service_id,
+                generation,
+                token,
+                ActualServiceState::Failed,
+                ServiceReadiness::Failed,
+                Changes { error: Patch::Set("Preparation failed".to_string()), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+            )
+            .await;
+            return Err(SupervisorError(format!("Preparation failed for {service_id}")));
         }
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
             return Ok(());
@@ -1704,11 +1721,19 @@ mod tests {
                     readiness,
                     readiness_timeout_ms: None,
                     preparation: None,
+                    preparation_command: None,
                 },
                 build: None,
             },
             ports: None,
         }
+    }
+
+    fn with_preparation_command(mut service: ServiceDefinition, prep: crate::catalog::PreparationCommand) -> ServiceDefinition {
+        if let ServiceRunProfile::Verified { preparation_command, .. } = &mut service.profiles.run {
+            *preparation_command = Some(prep);
+        }
+        service
     }
 
     fn one_service_catalog(service: ServiceDefinition) -> ServiceCatalog {
@@ -1999,6 +2024,60 @@ mod tests {
         assert_eq!(host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
     }
 
+    fn preparation_catalog() -> ServiceCatalog {
+        let service = with_preparation_command(
+            argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
+            crate::catalog::PreparationCommand { command: CommandSpec::Argv { argv: vec!["prepare".to_string()] }, cwd: Some("infra".to_string()) },
+        );
+        one_service_catalog(service)
+    }
+
+    #[tokio::test]
+    async fn preparation_command_runs_before_start_and_succeeds_when_the_probe_reports_ready() {
+        let host = FakeHost::new(preparation_catalog());
+        let process = FakeProcessAdapter::new();
+        let inner_probes = FakeProbeAdapter::new();
+        inner_probes.set_tcp_ready(8080, true);
+        let probes = Arc::new(CommandCapableProbeAdapter { inner: inner_probes, result: std::sync::Mutex::new(Some(true)) });
+        let run_build = FakeRunBuild::new();
+        let clock = FakeClock::new();
+        let supervisor = ProcessSupervisor::new(
+            host.clone(),
+            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+        );
+        supervisor.start(&"api".to_string(), None).await.unwrap();
+        assert_eq!(host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+    }
+
+    #[tokio::test]
+    async fn preparation_command_failure_fails_the_start_not_just_readiness() {
+        let host = FakeHost::new(preparation_catalog());
+        let process = FakeProcessAdapter::new();
+        let inner_probes = FakeProbeAdapter::new();
+        let probes = Arc::new(CommandCapableProbeAdapter { inner: inner_probes, result: std::sync::Mutex::new(Some(false)) });
+        let run_build = FakeRunBuild::new();
+        let clock = FakeClock::new();
+        let supervisor = ProcessSupervisor::new(
+            host.clone(),
+            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+        );
+        let err = supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        assert_eq!(err.0, "Preparation failed for api");
+        let state = host.state_of("api").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Failed);
+        assert_eq!(state.error.as_deref(), Some("Preparation failed"));
+    }
+
+    #[tokio::test]
+    async fn preparation_command_with_no_command_probe_configured_fails_the_start_immediately() {
+        // Unlike command *readiness* (which degrades to a normal timeout with no adapter), a
+        // preparation command with no way to run it can never succeed by waiting longer, so it
+        // fails the start right away instead.
+        let h = build_harness_with_timeout(preparation_catalog(), 20);
+        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        assert_eq!(err.0, "Preparation failed for api");
+    }
+
     #[tokio::test]
     async fn sync_external_services_adopts_on_ready_and_releases_on_not_ready() {
         let mut service = argv_verified("cache", ReadinessSpec::Tcp { port: 6379 });
@@ -2032,6 +2111,7 @@ mod tests {
             readiness: ReadinessSpec::Container,
             readiness_timeout_ms: None,
             preparation: None,
+            preparation_command: None,
         };
         let h = build_harness(one_service_catalog(service));
         h.process.register_container(

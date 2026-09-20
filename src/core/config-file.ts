@@ -15,7 +15,7 @@
 
 import { isAbsolute, join, relative } from "node:path";
 
-import type { CommandSpec, ReadinessSpec, ServiceCatalog, ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership, ServicePort } from "./catalog";
+import type { CommandSpec, PreparationCommand, ReadinessSpec, ServiceCatalog, ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership, ServicePort } from "./catalog";
 import { validateCatalog } from "./catalog";
 import { isRecord } from "./file-io";
 import { loadEnvFile } from "./env";
@@ -157,6 +157,17 @@ function readReadiness(value: unknown, path: string, errors: string[]): Readines
   return { kind: "command", command: command.spec, cwd: value.cwd as string | undefined };
 }
 
+function readPreparationCommand(value: unknown, path: string, errors: string[]): PreparationCommand | undefined {
+  if (!isRecord(value)) {
+    errors.push(`${path} must be an object with \`command\` (and optional \`cwd\`)`);
+    return undefined;
+  }
+  const command = readCommandSpec(value.command, `${path}.command`, errors);
+  if (value.cwd !== undefined && typeof value.cwd !== "string") errors.push(`${path}.cwd must be a string`);
+  if (!command) return undefined;
+  return { command: command.spec, cwd: value.cwd as string | undefined };
+}
+
 function readPorts(value: unknown, path: string, errors: string[]): ServicePort[] | undefined {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
@@ -234,9 +245,11 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
     const readiness = readReadiness(value.readiness, `${svcPath}.readiness`, errors);
     const ports = readPorts(value.ports, `${svcPath}.ports`, errors);
 
+    const preparationCommand = value.preparationCommand === undefined ? undefined : readPreparationCommand(value.preparationCommand, `${svcPath}.preparationCommand`, errors);
+
     let profileRun: ServiceDefinition["profiles"]["run"] | undefined;
     if (value.run === undefined) {
-      if (readiness) profileRun = { commandStatus: "unresolved", readiness };
+      if (readiness) profileRun = { commandStatus: "unresolved", readiness, preparationCommand };
     } else {
       const run = readCommandSpec(value.run, `${svcPath}.run`, errors);
       const stop = value.stop === undefined ? undefined : readCommandSpec(value.stop, `${svcPath}.stop`, errors);
@@ -245,6 +258,7 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
         profileRun = {
           commandStatus: "verified",
           readiness,
+          preparationCommand,
           command: { command: run.spec, cwd, environment: Object.keys(environment).length ? environment : undefined, containerName: value.container as string | undefined, dockerStopCommand: stop?.spec },
         };
       }
