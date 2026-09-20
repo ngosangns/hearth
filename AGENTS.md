@@ -539,6 +539,24 @@ Status:
   `.kiro/settings/mcp.json`) — a schema with *extra* fields (like infra's `.agent/mcp.json`) still
   works because the merge only ever touches `command`/`args`.
 
+  **Two real bugs found dogfooding this against infra's actual `.agent/mcp.json`, both fixed
+  same-day:** (1) infra's file uses `"servers"` as its top-level key, not the standard
+  `"mcpServers"` every plain MCP host config shares — assumed too soon that shape was universal.
+  Fixed with a `--key <name>` flag (default `mcpServers`) rather than hardcoding infra's own
+  schema into this generic binary. (2) `serde_json::Value`'s object type is a `BTreeMap` unless
+  the crate's `preserve_order` feature is on, so the first real run **silently alphabetized every
+  key in the entire file**, turning a one-entry command/args change into a huge unreviewable diff
+  of a hand-maintained file — caught only by inspecting the actual diff before committing it, not
+  by any test (none of the original tests asserted on raw key order, only on parsed field values).
+  Fixed by enabling `preserve_order` workspace-wide in `rust/Cargo.toml` (validated safe: all 246
+  pre-existing tests still passed after the switch, since none depend on `serde_json::Value`'s
+  default alphabetical order) and adding a dedicated regression test
+  (`mcp_install_preserves_the_original_key_order_of_a_human_maintained_file`) that writes a file
+  with deliberately non-alphabetical key order and asserts it survives a merge unchanged. One
+  known, accepted residual: `serde_json::to_string_pretty` still can't preserve an original
+  compact-array style (`"args": ["x"]` on one line) — a merged file's untouched entries get their
+  arrays expanded to multi-line, a cosmetic diff with no effect on keys, values, or order.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

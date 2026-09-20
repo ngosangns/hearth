@@ -1,5 +1,6 @@
 ---
 name: local-services
+kind: playbook
 description: Operate this project's local dev services (start/stop/status/logs) through the local-services daemon instead of raw kill/pkill/docker/task dev.
 ---
 

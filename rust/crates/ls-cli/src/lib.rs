@@ -89,6 +89,7 @@ pub enum FlagName {
     Tail,
     Name,
     Dest,
+    Key,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -100,6 +101,7 @@ pub struct Flags {
     pub tail: Option<u64>,
     pub name: Option<String>,
     pub dest: Option<String>,
+    pub key: Option<String>,
 }
 
 pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> LocalctlResult<Flags> {
@@ -121,6 +123,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
             "tail" => (FlagName::Tail, "tail"),
             "name" => (FlagName::Name, "name"),
             "dest" => (FlagName::Dest, "dest"),
+            "key" => (FlagName::Key, "key"),
             _ => return usage_err(format!("unknown flag: {argument}")),
         };
         if !allowed.contains(&flag) {
@@ -153,6 +156,13 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
                 match arguments.get(index).filter(|v| !v.is_empty()) {
                     Some(value) => result.dest = Some(value.clone()),
                     None => return usage_err("--dest requires a value"),
+                }
+            }
+            FlagName::Key => {
+                index += 1;
+                match arguments.get(index).filter(|v| !v.is_empty()) {
+                    Some(value) => result.key = Some(value.clone()),
+                    None => return usage_err("--key requires a value"),
                 }
             }
         }
@@ -730,21 +740,22 @@ async fn mcp_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlR
 /// never clobber those) and every other entry in the file. Creates the file (as `{}`) if it
 /// doesn't exist yet, so a first-time install needs no pre-existing scaffold.
 async fn mcp_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
-    let flags = parse_command_flags(rest, &[FlagName::Name, FlagName::Json])?;
+    let flags = parse_command_flags(rest, &[FlagName::Name, FlagName::Key, FlagName::Json])?;
     if flags.positionals.is_empty() {
-        return usage_err("usage: local-services mcp install [--name <name>] [--json] <config-file>...");
+        return usage_err("usage: local-services mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>...");
     }
     let name = flags.name.clone().unwrap_or_else(|| "local-services".to_string());
+    let key = flags.key.clone().unwrap_or_else(|| "mcpServers".to_string());
     let exe = std::env::current_exe()
         .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not resolve the running lsd binary's own path: {e}") })?;
     let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let command = exe.to_string_lossy().to_string();
     let args = vec!["--root".to_string(), resolved_root.to_string_lossy().to_string(), "mcp".to_string()];
     for config_file in &flags.positionals {
-        install_mcp_entry(Path::new(config_file), &name, &command, &args)?;
+        install_mcp_entry(Path::new(config_file), &key, &name, &command, &args)?;
     }
     if flags.json {
-        (io.out)(&print_value(&json!({ "server": name, "command": command, "args": args, "files": flags.positionals }), true));
+        (io.out)(&print_value(&json!({ "key": key, "server": name, "command": command, "args": args, "files": flags.positionals }), true));
     } else {
         for config_file in &flags.positionals {
             (io.out)(&format!("installed mcp server \"{name}\" into {config_file}"));
@@ -753,7 +764,13 @@ async fn mcp_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> L
     Ok(0)
 }
 
-fn install_mcp_entry(path: &Path, name: &str, command: &str, args: &[String]) -> LocalctlResult<()> {
+/// Merges `<key>.<name>` (default key: `mcpServers`, the shape every standard MCP host config
+/// shares — Claude Code's `.mcp.json`, Kiro's `.kiro/settings/mcp.json`) into `path`, touching
+/// only `command`/`args` on that entry. `serde_json`'s `preserve_order` feature is load-bearing
+/// here: without it, `Value`'s object type is a `BTreeMap` and silently alphabetizes every key in
+/// the *entire* document on write, turning a one-entry change into a huge, unreviewable diff of a
+/// human-maintained file (caught the hard way against a real file mid-development — see AGENTS.md).
+fn install_mcp_entry(path: &Path, key: &str, name: &str, command: &str, args: &[String]) -> LocalctlResult<()> {
     let io_err = |context: String| move |e: std::io::Error| LocalctlError { exit_code: EXIT_FAILED, message: format!("{context}: {e}") };
     let mut document: Value = if path.exists() {
         let text = std::fs::read_to_string(path).map_err(io_err(format!("could not read {}", path.display())))?;
@@ -764,10 +781,10 @@ fn install_mcp_entry(path: &Path, name: &str, command: &str, args: &[String]) ->
     };
     let not_an_object = |what: &str| LocalctlError { exit_code: EXIT_FAILED, message: format!("{}'s {what} is not a JSON object", path.display()) };
     let root_object = document.as_object_mut().ok_or_else(|| not_an_object("top level"))?;
-    let servers = root_object.entry("mcpServers").or_insert_with(|| json!({}));
-    let servers_object = servers.as_object_mut().ok_or_else(|| not_an_object("\"mcpServers\""))?;
+    let servers = root_object.entry(key.to_string()).or_insert_with(|| json!({}));
+    let servers_object = servers.as_object_mut().ok_or_else(|| not_an_object(&format!("\"{key}\"")))?;
     let entry = servers_object.entry(name.to_string()).or_insert_with(|| json!({}));
-    let entry_object = entry.as_object_mut().ok_or_else(|| not_an_object(&format!("\"mcpServers.{name}\"")))?;
+    let entry_object = entry.as_object_mut().ok_or_else(|| not_an_object(&format!("\"{key}.{name}\"")))?;
     entry_object.insert("command".to_string(), json!(command));
     entry_object.insert("args".to_string(), json!(args));
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -1139,6 +1156,56 @@ mod tests {
         assert_eq!(entry["skill"], json!("local-dev"));
         assert_eq!(entry["notes"], json!(["some historical note"]));
         assert_ne!(entry["args"], json!(["old-wrapper.mjs"]));
+    }
+
+    #[tokio::test]
+    async fn mcp_install_preserves_the_original_key_order_of_a_human_maintained_file() {
+        // Deliberately non-alphabetical key order, matching how a hand-maintained file is grouped
+        // rather than sorted — without serde_json's `preserve_order` feature, `Value`'s object
+        // type is a BTreeMap and silently alphabetizes every key in the document on write, turning
+        // a one-entry change into a huge, unreviewable diff (a real bug hit against infra's own
+        // .agent/mcp.json mid-development — see AGENTS.md).
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("mcp.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "mcpServers": {
+    "zebra-server": { "command": "node", "args": ["z.mjs"] },
+    "local-services": { "command": "node", "args": ["old-wrapper.mjs"] },
+    "apple-server": { "command": "node", "args": ["a.mjs"] }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let (code, _out, _err) = run_cli(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]).await;
+        assert_eq!(code, 0);
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let zebra_pos = written.find("zebra-server").unwrap();
+        let local_pos = written.find("\"local-services\"").unwrap();
+        let apple_pos = written.find("apple-server").unwrap();
+        assert!(zebra_pos < local_pos && local_pos < apple_pos, "key order was not preserved:\n{written}");
+    }
+
+    #[tokio::test]
+    async fn mcp_install_supports_a_custom_top_level_key() {
+        // infra's own .agent/mcp.json uses "servers" as its top-level key, not the standard
+        // "mcpServers" every plain MCP host config shares — --key makes that schema installable
+        // through the same generic merge instead of a repo-specific special case in this binary.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("agent-mcp.json");
+        std::fs::write(&config_path, json!({ "servers": { "local-services": { "skill": "local-dev", "command": "node", "args": ["old.mjs"] } } }).to_string()).unwrap();
+
+        let (code, _out, _err) = run_cli(dir.path(), &["mcp", "install", "--key", "servers", config_path.to_str().unwrap()]).await;
+        assert_eq!(code, 0);
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(written.get("mcpServers").is_none(), "must not create a stray \"mcpServers\" key when --key targets a different one");
+        let entry = &written["servers"]["local-services"];
+        assert_eq!(entry["skill"], json!("local-dev"));
+        assert_ne!(entry["args"], json!(["old.mjs"]));
     }
 
     #[tokio::test]
