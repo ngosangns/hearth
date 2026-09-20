@@ -163,6 +163,11 @@ pub struct ProcessSupervisor {
     build_serials: KeyedLock<String>,
     preparation_serials: KeyedLock<String>,
     output_tails: Mutex<HashMap<ServiceId, Box<dyn FnOnce() + Send>>>,
+    /// One ordered log-forwarding channel per service. Chunks used to be forwarded by spawning a
+    /// task each, which then contended for the same per-service append lock and won it in arbitrary
+    /// order — so two chunks emitted in order could land in the log file reversed, or interleaved
+    /// mid-line. A single draining task per service preserves emission order by construction.
+    log_forwarders: Mutex<HashMap<ServiceId, tokio::sync::mpsc::UnboundedSender<String>>>,
     compose_start_tail: tokio::sync::Mutex<()>,
 }
 
@@ -178,6 +183,7 @@ impl ProcessSupervisor {
             build_serials: KeyedLock::new(),
             preparation_serials: KeyedLock::new(),
             output_tails: Mutex::new(HashMap::new()),
+            log_forwarders: Mutex::new(HashMap::new()),
             compose_start_tail: tokio::sync::Mutex::new(()),
         })
     }
@@ -1146,7 +1152,11 @@ impl ProcessSupervisor {
                 if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
                     return Ok(());
                 }
-                let message = if timed_out.load(std::sync::atomic::Ordering::SeqCst) { "Build timed out" } else { "Build failed" };
+                // An externally cancelled build (a restart or stop calling `abort_build`) reports
+                // "Build timed out" too: the TS source keys this off the abort signal having fired
+                // at all, not off a timeout specifically, and this string is surfaced to the user.
+                let aborted = timed_out.load(std::sync::atomic::Ordering::SeqCst) || cancel.is_cancelled();
+                let message = if aborted { "Build timed out" } else { "Build failed" };
                 self.transition_if_current(
                     service_id,
                     generation,
@@ -1217,7 +1227,7 @@ impl ProcessSupervisor {
         }
     }
 
-    fn attach_output(&self, service_id: &ServiceId, identity: &ProcessIdentity) {
+    fn attach_output(self: &Arc<Self>, service_id: &ServiceId, identity: &ProcessIdentity) {
         if matches!(identity, ProcessIdentity::Docker(_)) {
             return;
         }
@@ -1227,15 +1237,10 @@ impl ProcessSupervisor {
         // `attach_output` is one of the "optional" ProcessAdapter methods (default adapters not yet
         // ported) — a `None` result (no attachment support) is a normal, expected outcome here.
         let on_output: OnOutput = {
-            let sup_host = self.host.clone();
+            let this = self.clone();
             let sid = service_id.clone();
             Arc::new(move |data: &str| {
-                let sup_host = sup_host.clone();
-                let sid = sid.clone();
-                let data = data.to_string();
-                tokio::spawn(async move {
-                    sup_host.append_log(&sid, &data).await;
-                });
+                this.append_output(&sid, data);
             })
         };
         if let Some(stop) = self.options.process.attach_output(service_id, on_output) {
@@ -1244,17 +1249,31 @@ impl ProcessSupervisor {
     }
 
     /// Log forwarding is fire-and-forget by design: a failure must never propagate into the caller.
+    /// It is also strictly ordered — chunks go through this service's single forwarder task, so the
+    /// order they were emitted in is the order they reach the log file.
     fn append_output(&self, service_id: &ServiceId, data: &str) {
-        let host = self.host.clone();
-        let service_id = service_id.clone();
-        let data = data.to_string();
-        tokio::spawn(async move {
-            host.append_log(&service_id, &data).await;
-        });
+        let sender = {
+            let mut forwarders = self.log_forwarders.lock().unwrap();
+            forwarders
+                .entry(service_id.clone())
+                .or_insert_with(|| {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let host = self.host.clone();
+                    let service_id = service_id.clone();
+                    tokio::spawn(async move {
+                        while let Some(chunk) = rx.recv().await {
+                            host.append_log(&service_id, &chunk).await;
+                        }
+                    });
+                    tx
+                })
+                .clone()
+        };
+        let _ = sender.send(data.to_string());
     }
 
     fn state(&self, service_id: &ServiceId) -> Option<ServiceLifecycleState> {
-        self.host.service_states().into_iter().find(|s| &s.service_id == service_id)
+        self.host.service_state(service_id)
     }
 
     fn current_token(&self, service_id: &ServiceId) -> u64 {

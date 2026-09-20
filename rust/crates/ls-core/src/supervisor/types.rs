@@ -227,6 +227,16 @@ pub trait Host: Send + Sync {
     fn instance_id(&self) -> String;
     fn catalog(&self) -> Arc<ServiceCatalog>;
     fn service_states(&self) -> Vec<ServiceLifecycleState>;
+    /// One service's state, without cloning every other service's.
+    ///
+    /// The supervisor asks for a single service's state on every log chunk, every readiness-poll
+    /// iteration and every transition; routing those through `service_states()` deep-cloned the
+    /// whole catalog's states (each with ~8 `String`s) to then discard all but one — hundreds of
+    /// allocations per log line on a 30-service catalog. The default implementation preserves that
+    /// behaviour for any `Host` that doesn't override it.
+    fn service_state(&self, service_id: &ServiceId) -> Option<ServiceLifecycleState> {
+        self.service_states().into_iter().find(|s| &s.service_id == service_id)
+    }
     async fn set_service_state(&self, next: ServiceLifecycleState);
     async fn append_log(&self, service_id: &str, data: &str);
     fn publish(&self, event_type: &str, data: serde_json::Value);

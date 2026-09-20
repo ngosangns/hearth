@@ -32,8 +32,16 @@ final class WorkspaceControllerRegistry: ObservableObject {
         }
         for workspace in workspaces {
             let controller = controller(for: workspace)
-            if workspace.trusted, controller.phase == .idle {
+            // `.failed` is retried, not just `.idle`: a workspace whose daemon happened to be down
+            // at launch would otherwise stay failed for the life of the process, recoverable only
+            // by selecting it and clicking Retry. `connect()` guards against re-entering while
+            // already connecting, so this cannot stack up.
+            guard workspace.trusted else { continue }
+            switch controller.phase {
+            case .idle, .failed:
                 Task { await controller.connect() }
+            case .connecting, .connected:
+                break
             }
         }
     }

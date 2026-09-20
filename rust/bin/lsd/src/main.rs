@@ -39,7 +39,7 @@ async fn run_daemon_subcommand(argv: &[String]) -> i32 {
     let runtime_directory = ls_core::paths::resolve_runtime_directory(&root, loaded.catalog.runtime_directory.as_deref());
     let base_environment = ls_core::env::resolve_base_environment(ls_core::env::BaseEnvironmentOptions { root: Some(root.clone()), ..Default::default() });
     let supervisor = ls_core::supervisor::default_supervisor_options(root.clone(), Some(runtime_directory.clone()), Some(base_environment));
-    ls_core::daemon::run_daemon(
+    let started = ls_core::daemon::run_daemon(
         ls_core::manager::LocalServicesManagerOptions {
             runtime_directory: Some(runtime_directory),
             root: Some(root),
@@ -53,7 +53,13 @@ async fn run_daemon_subcommand(argv: &[String]) -> i32 {
         false,
     )
     .await;
-    0
+    // A bootstrap failure must exit non-zero: `lsd daemon` is spawned by `ensure()`, and exiting 0
+    // after failing to start made a broken daemon indistinguishable from a healthy one.
+    if started {
+        0
+    } else {
+        1
+    }
 }
 
 /// Re-invokes this same binary as `lsd daemon --root <root>`, detached (own process group, stdio

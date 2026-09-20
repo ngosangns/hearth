@@ -295,8 +295,14 @@ pub async fn claim_lock(io: &dyn FileIo, runtime_directory: &Path, bootstrap_met
         };
 
         if artifacts.metadata.port == 0 {
-            let started_age_ms = (now_millis() - crate::supervisor::types::parse_iso8601_millis(&artifacts.metadata.started_at).unwrap_or(now_millis())).max(0) as u64;
-            if started_age_ms < MANAGER_STARTUP_GRACE_MS || is_pid_alive(artifacts.metadata.pid) {
+            // An UNPARSEABLE `startedAt` must not count as "started just now". Defaulting it to the
+            // current time made `started_age_ms` zero, so the grace check was always true and this
+            // loop spun every 25ms forever with no way out — `lsd daemon`/`manager ensure` hanging
+            // instead of erroring. Treat it as outside the grace window and let the liveness check
+            // below decide, which is what `Date.parse` -> NaN makes the TS source do.
+            let within_startup_grace = crate::supervisor::types::parse_iso8601_millis(&artifacts.metadata.started_at)
+                .is_some_and(|started| ((now_millis() - started).max(0) as u64) < MANAGER_STARTUP_GRACE_MS);
+            if within_startup_grace || is_pid_alive(artifacts.metadata.pid) {
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 continue;
             }

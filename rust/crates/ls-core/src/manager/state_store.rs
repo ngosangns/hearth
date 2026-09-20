@@ -143,18 +143,21 @@ fn migrate_legacy_persisted_state(value: &Value) -> Option<PersistedManagerState
         let unit_id = unit_obj.get("unitId")?.as_str()?;
         let mut candidate = unit_obj.clone();
         candidate.remove("unitId");
+        // The legacy identity is dropped unconditionally and only put back if it migrates cleanly.
+        // Leaving the original in place when it has no `unitId` to rewrite meant the candidate kept
+        // a `unitId`-shaped identity, failed validation, and aborted the migration for the WHOLE
+        // file — quarantining it and losing every service's identity, which is precisely the
+        // orphaned-process/port-conflict failure this migration exists to prevent. The TS source
+        // destructures `identity` out and re-adds it only on success; this matches that.
+        candidate.remove("identity");
         candidate.insert("serviceId".to_string(), Value::String(service_id.clone()));
-        if let Some(identity) = unit_obj.get("identity") {
-            if let Some(identity_obj) = identity.as_object() {
-                if let Some(identity_unit_id) = identity_obj.get("unitId").and_then(Value::as_str) {
-                    let mut migrated_identity = identity_obj.clone();
-                    migrated_identity.remove("unitId");
-                    migrated_identity.insert("serviceId".to_string(), Value::String(identity_unit_id.to_string()));
-                    if is_process_identity_shape(&Value::Object(migrated_identity.clone())) {
-                        candidate.insert("identity".to_string(), Value::Object(migrated_identity));
-                    } else {
-                        candidate.remove("identity");
-                    }
+        if let Some(identity_obj) = unit_obj.get("identity").and_then(Value::as_object) {
+            if let Some(identity_unit_id) = identity_obj.get("unitId").and_then(Value::as_str) {
+                let mut migrated_identity = identity_obj.clone();
+                migrated_identity.remove("unitId");
+                migrated_identity.insert("serviceId".to_string(), Value::String(identity_unit_id.to_string()));
+                if is_process_identity_shape(&Value::Object(migrated_identity.clone())) {
+                    candidate.insert("identity".to_string(), Value::Object(migrated_identity));
                 }
             }
         }
@@ -350,5 +353,35 @@ mod tests {
         services.insert("api".to_string(), bad);
         let result = store.save(&PersistedManagerState { version: STATE_VERSION, services });
         assert!(result.is_err());
+    }
+
+    /// A legacy unit whose `identity` carries no `unitId` has that identity DROPPED and still
+    /// migrates. Leaving the un-migratable identity on the candidate made it fail validation and
+    /// aborted the migration for the whole file — quarantining every service's identity, which is
+    /// exactly the orphaned-process/port-conflict failure this migration exists to prevent.
+    #[test]
+    fn a_legacy_identity_without_a_unit_id_is_dropped_rather_than_failing_the_migration() {
+        let value: Value = serde_json::from_str(
+            r#"{
+              "version": 1,
+              "units": {
+                "api": {
+                  "unitId": "api",
+                  "desiredState": "running",
+                  "actualState": "ready",
+                  "readiness": "ready",
+                  "generation": 3,
+                  "identity": { "somethingElse": true },
+                  "createdAt": "2026-01-01T00:00:00.000Z",
+                  "updatedAt": "2026-01-01T00:00:00.000Z"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let migrated = migrate_legacy_persisted_state(&value).expect("must migrate, not quarantine");
+        let api = migrated.services.get("api").expect("api survived");
+        assert!(api.identity.is_none(), "the un-migratable identity should be dropped");
+        assert_eq!(api.generation, 3, "the rest of the record must survive intact");
     }
 }

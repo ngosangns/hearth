@@ -253,6 +253,13 @@ impl Host for LocalServicesManager {
         let state = self.state.lock().unwrap();
         self.catalog.read().unwrap().services.iter().map(|s| default_state_or(state.services.get(&s.id), &s.id, &timestamp)).collect()
     }
+    fn service_state(&self, service_id: &ServiceId) -> Option<ServiceLifecycleState> {
+        let catalog = self.catalog.read().unwrap();
+        let definition = catalog.services.iter().find(|s| &s.id == service_id)?;
+        let timestamp = now();
+        let state = self.state.lock().unwrap();
+        Some(default_state_or(state.services.get(&definition.id), &definition.id, &timestamp))
+    }
     async fn set_service_state(&self, next: ServiceLifecycleState) {
         let _guard = self.lifecycle.lock().await;
         if self.closed.load(Ordering::SeqCst) {
@@ -450,7 +457,15 @@ pub fn router(manager: Arc<LocalServicesManager>) -> Router {
         .route("/v1/manager/shutdown", post(post_shutdown))
         .route_layer(middleware::from_fn_with_state(manager.clone(), require_authorized_and_protocol));
 
-    Router::new().route("/healthz", get(get_healthz)).merge(authorized_routes).with_state(manager)
+    // Unmatched paths and wrong methods get the same `{error:{code,message}}` envelope every other
+    // failure uses. Axum's own 404/405 have an empty body, so a client parsing the error shape got
+    // nothing to parse — the TS source returns a proper `not_found` for both.
+    Router::new()
+        .route("/healthz", get(get_healthz))
+        .merge(authorized_routes)
+        .fallback(|| async { ManagerHttpError::new(StatusCode::NOT_FOUND, "not_found", "Not found").into_response() })
+        .method_not_allowed_fallback(|| async { ManagerHttpError::new(StatusCode::NOT_FOUND, "not_found", "Not found").into_response() })
+        .with_state(manager)
 }
 
 async fn require_authorized_and_protocol(State(manager): State<Arc<LocalServicesManager>>, headers: HeaderMap, request: axum::extract::Request, next: Next) -> Response {
@@ -743,10 +758,29 @@ async fn post_bulk_start_inner(manager: Arc<LocalServicesManager>, bytes: Bytes)
 /// node's own future awaiting only its direct (also-selected) dependencies — so independent branches
 /// of the graph proceed concurrently rather than waiting for an entire dependency "level" to finish.
 async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[ServiceId], operation: &super::operations::OperationHandle) -> Result<(), OperationError> {
+    /// Three distinct non-ready outcomes, not one `ready: bool`. Only `Failed` makes the operation
+    /// fail: a node `Blocked` behind a dependency that didn't come up, or `Skipped` because its
+    /// start was cancelled mid-flight, is a normal result the TS source reports as success.
+    /// Collapsing all three into "not ready" made a cancelled start report the whole bulk start as
+    /// failed.
+    #[derive(Clone, PartialEq)]
+    enum StartOutcome {
+        Ready,
+        Blocked,
+        Skipped,
+        Failed(String),
+    }
+
     #[derive(Clone)]
     struct StartResult {
         service_id: ServiceId,
-        ready: bool,
+        outcome: StartOutcome,
+    }
+
+    impl StartResult {
+        fn is_ready(&self) -> bool {
+            self.outcome == StartOutcome::Ready
+        }
     }
     let selected_set: std::collections::HashSet<ServiceId> = selected.iter().cloned().collect();
     let catalog = manager.catalog();
@@ -759,15 +793,15 @@ async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[Ser
         let service_id_owned = service_id.clone();
         let fut: BoxFuture<'static, StartResult> = async move {
             let dependency_results = futures::future::join_all(dependency_futures).await;
-            let unavailable: Vec<ServiceId> = dependency_results.iter().filter(|r| !r.ready).map(|r| r.service_id.clone()).collect();
+            let unavailable: Vec<ServiceId> = dependency_results.iter().filter(|r| !r.is_ready()).map(|r| r.service_id.clone()).collect();
             if !unavailable.is_empty() {
                 manager.operations.trace(&operation, &format!("Blocked: {service_id_owned} (dependencies not ready: {})", unavailable.join(", ")));
-                return StartResult { service_id: service_id_owned, ready: false };
+                return StartResult { service_id: service_id_owned, outcome: StartOutcome::Blocked };
             }
             let desired_running = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| s.desired_state == crate::state::DesiredServiceState::Running).unwrap_or(false);
             if !desired_running {
                 manager.operations.trace(&operation, &format!("Skipped: {service_id_owned} (start cancelled)"));
-                return StartResult { service_id: service_id_owned, ready: false };
+                return StartResult { service_id: service_id_owned, outcome: StartOutcome::Skipped };
             }
             let already_ready = manager
                 .state
@@ -779,7 +813,7 @@ async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[Ser
                 .unwrap_or(false);
             if already_ready {
                 manager.operations.trace(&operation, &format!("Ready: {service_id_owned} (already ready)"));
-                return StartResult { service_id: service_id_owned, ready: true };
+                return StartResult { service_id: service_id_owned, outcome: StartOutcome::Ready };
             }
             manager.operations.trace(&operation, &format!("Starting: {service_id_owned}"));
             let operation_id = operation.lock().unwrap().id.clone();
@@ -790,15 +824,15 @@ async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[Ser
                     }).unwrap_or(false);
                     if settled {
                         manager.operations.trace(&operation, &format!("Ready: {service_id_owned}"));
-                        StartResult { service_id: service_id_owned, ready: true }
+                        StartResult { service_id: service_id_owned, outcome: StartOutcome::Ready }
                     } else {
                         manager.operations.trace(&operation, &format!("Failed: {service_id_owned} (did not become ready)"));
-                        StartResult { service_id: service_id_owned, ready: false }
+                        StartResult { service_id: service_id_owned, outcome: StartOutcome::Failed("did not become ready".to_string()) }
                     }
                 }
                 Err(error) => {
                     manager.operations.trace(&operation, &format!("Failed: {service_id_owned} ({})", error.0));
-                    StartResult { service_id: service_id_owned, ready: false }
+                    StartResult { service_id: service_id_owned, outcome: StartOutcome::Failed(error.0) }
                 }
             }
         }
@@ -806,10 +840,16 @@ async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[Ser
         tasks.insert(service_id.clone(), fut.shared());
     }
     let results = futures::future::join_all(selected.iter().map(|id| tasks[id].clone())).await;
-    let failures: Vec<&StartResult> = results.iter().filter(|r| !r.ready).collect();
+    let failures: Vec<&StartResult> = results.iter().filter(|r| matches!(r.outcome, StartOutcome::Failed(_))).collect();
     if !failures.is_empty() {
         let summary = failures.iter().map(|r| r.service_id.clone()).collect::<Vec<_>>().join(", ");
-        return Err(OperationError { code: "operation_failed".to_string(), message: format!("Dependency startup failed: {summary}") });
+        // The first failure's own cause is appended, as the TS source does — without it the caller
+        // only learns *which* service failed, never why.
+        let cause = match &failures[0].outcome {
+            StartOutcome::Failed(message) if !message.is_empty() => format!(" ({message})"),
+            _ => String::new(),
+        };
+        return Err(OperationError { code: "operation_failed".to_string(), message: format!("Dependency startup failed: {summary}{cause}") });
     }
     Ok(())
 }
@@ -862,13 +902,42 @@ async fn get_events_stream(State(manager): State<Arc<LocalServicesManager>>, Que
             break;
         }
     }
-    let tx_for_listener = tx.clone();
+
+    // On overflow the stream is CLOSED, not silently thinned. A client that merely stops receiving
+    // some frames has no way to know it missed them: it keeps applying deltas to state that is now
+    // permanently wrong (the TUI's service list, the app's status). Closing makes it reconnect with
+    // its cursor and take a `reset` replay, which is the whole point of having a cursor. This
+    // mirrors the TS source's `stop()` on a full queue.
+    //
+    // Closing means dropping every `Sender`: the one the listener holds (taken out of the slot
+    // below) and the one the watchdog holds. `Notify` is what lets the listener, which is a sync
+    // closure, wake the async watchdog to do its half.
+    let overflowed = Arc::new(tokio::sync::Notify::new());
+    let overflowed_for_listener = overflowed.clone();
+    let watchdog_tx = tx.clone();
+    let sender_slot = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let listener_slot = sender_slot.clone();
     let unsubscribe = manager.events.subscribe(Arc::new(move |event| {
-        let _ = tx_for_listener.try_send(Ok(event_to_sse(event)));
+        let mut guard = listener_slot.lock().unwrap();
+        let full = match guard.as_ref() {
+            Some(sender) => sender.try_send(Ok(event_to_sse(event))).is_err(),
+            None => return,
+        };
+        if full {
+            guard.take();
+            overflowed_for_listener.notify_one();
+        }
     }));
     tokio::spawn(async move {
-        tx.closed().await;
+        tokio::select! {
+            // The client hung up.
+            _ = watchdog_tx.closed() => {}
+            // We overflowed and are hanging up on the client.
+            _ = overflowed.notified() => {}
+        }
         unsubscribe();
+        sender_slot.lock().unwrap().take();
+        drop(watchdog_tx);
     });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Sse::new(stream).keep_alive(KeepAlive::default()).into_response()

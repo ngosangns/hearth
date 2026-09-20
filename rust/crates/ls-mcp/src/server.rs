@@ -106,12 +106,25 @@ fn optional_integer(value: Option<&Value>, name: &str, minimum: i64, maximum: Op
         };
         format!("{name} must be an integer {range}")
     };
+    // Matches JavaScript's `Number.isSafeInteger`, which is what the TS server validates with —
+    // and what every MCP host's JSON layer ultimately produces. Two ways this used to diverge:
+    // a host that serializes numbers as floats sent `1000.0`, which `as_i64()` rejects even though
+    // it is an integer; and a value beyond 2^53 was accepted here while the TS server rejected it
+    // as unrepresentable. Both made the same tool call succeed on one implementation and fail on
+    // the other.
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
     match value {
         None => Ok(None),
-        Some(Value::Number(number)) => match number.as_i64() {
-            Some(int) if int >= minimum && maximum.is_none_or(|max| int <= max) => Ok(Some(int)),
-            _ => Err(range_error()),
-        },
+        Some(Value::Number(number)) => {
+            let candidate = match number.as_i64() {
+                Some(int) => Some(int),
+                None => number.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64),
+            };
+            match candidate {
+                Some(int) if int.abs() <= MAX_SAFE_INTEGER && int >= minimum && maximum.is_none_or(|max| int <= max) => Ok(Some(int)),
+                _ => Err(range_error()),
+            }
+        }
         _ => Err(range_error()),
     }
 }

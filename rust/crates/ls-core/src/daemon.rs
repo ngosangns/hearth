@@ -183,7 +183,9 @@ pub async fn terminate_after_manager_shutdown<M: ShutdownManager + 'static>(life
 /// rather than panicking, so this gap is narrower than it looks; documented here rather than papered
 /// over with a global panic hook that would itself be a divergence from the TS design.
 #[cfg(unix)]
-pub async fn run_daemon(options: LocalServicesManagerOptions, stop_services: bool) {
+/// Returns `false` when bootstrap failed, so the caller can exit non-zero. Losing a race to another
+/// daemon is a normal, successful outcome (`true`) — that daemon is now serving this root.
+pub async fn run_daemon(options: LocalServicesManagerOptions, stop_services: bool) -> bool {
     let root = options.root.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
     let runtime_directory = options.runtime_directory.clone().unwrap_or_else(|| crate::paths::resolve_runtime_directory(&root, options.catalog.runtime_directory.as_deref()));
     let log = create_daemon_log(&runtime_directory);
@@ -192,11 +194,11 @@ pub async fn run_daemon(options: LocalServicesManagerOptions, stop_services: boo
         Ok(manager) => manager,
         Err(BootstrapError::ClaimLock(ClaimLockError::AlreadyRunning { .. })) => {
             log("bootstrap raced another daemon");
-            return;
+            return true;
         }
         Err(error) => {
             log(&format!("bootstrap failed: {error}"));
-            return;
+            return false;
         }
     };
     log(&format!("listening on 127.0.0.1:{}, root={}", manager.info().port, root.display()));
@@ -249,6 +251,7 @@ pub async fn run_daemon(options: LocalServicesManagerOptions, stop_services: boo
     });
 
     terminate_after_manager_shutdown(&lifecycle, |_code| {}).await;
+    true
 }
 
 #[cfg(test)]

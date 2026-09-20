@@ -182,6 +182,7 @@ impl OperationScheduler {
         let scheduler = self.clone();
         let kind = operation.kind;
         let target_for_task = target.clone();
+        let operation_id_for_task = operation.id.clone();
         let handle_for_task = handle.clone();
         tokio::spawn(async move {
             let lock = scheduler.queues.get(&target_for_task);
@@ -204,21 +205,34 @@ impl OperationScheduler {
                     }
                 }
             }
-            scheduler.active_targets.lock().unwrap().remove(&target_for_task);
+            // Only clear the slot if it is still OURS. A later operation on the same target
+            // overwrites this entry, and removing it unconditionally made `drain_services()` see an
+            // empty map and return while that newer operation was still running — so
+            // `LocalServicesManager::shutdown` raced a start in flight. Mirrors the TS source's
+            // `if (this.queues.get(target) === current)` guard.
+            {
+                let mut active = scheduler.active_targets.lock().unwrap();
+                if active.get(&target_for_task).map(String::as_str) == Some(operation_id_for_task.as_str()) {
+                    active.remove(&target_for_task);
+                }
+            }
             let _ = done_tx.send(true);
         });
         Ok(operation)
     }
 
     pub fn trace(&self, handle: &OperationHandle, message: &str) {
-        let (id, service_id) = {
+        let (id, service_id, status) = {
             let mut op = handle.lock().unwrap();
             op.updated_at = now();
             let at = op.updated_at.clone();
             op.trace.push(OperationTraceEntry { at, message: message.to_string() });
-            (op.id.clone(), op.service_id.clone())
+            (op.id.clone(), op.service_id.clone(), op.status)
         };
-        self.publish_updated(&id, OperationStatus::Running, &service_id);
+        // The operation's REAL status, not a hardcoded `Running` — a trace entry appended while an
+        // operation is queued or already settled would otherwise tell every subscriber it is
+        // running.
+        self.publish_updated(&id, status, &service_id);
     }
 
     fn transition(&self, handle: &OperationHandle, status: OperationStatus, message: &str) {

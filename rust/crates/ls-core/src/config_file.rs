@@ -358,6 +358,13 @@ fn read_ports(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Op
             errors.push(format!("{entry_path} must be {{ port: number, label: string }}"));
             continue;
         };
+        // An out-of-range port is an ERROR, not something to silently wrap into a u16. `70000 as
+        // u16` is 4464 — the catalog would have loaded, advertised a port nobody asked for, and
+        // the mistake would only surface as a confusing conflict much later.
+        if !(1..=u16::MAX as i64).contains(&port) {
+            errors.push(format!("{entry_path}.port must be between 1 and 65535, got {port}"));
+            continue;
+        }
         let requires_running = match obj.and_then(|o| o.get("requiresRunning")) {
             None => None,
             Some(Value::Bool(b)) => Some(*b),
@@ -946,5 +953,19 @@ services:
         let loaded = load_catalog(dir.path()).expect("loads");
         let ids: Vec<&str> = loaded.catalog.services.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["zebra", "alpha", "middle"], "alphabetizing here diverges from the TS loader");
+    }
+
+    /// An out-of-range port used to be wrapped into a u16 (`70000` -> `4464`), loading a catalog
+    /// that advertised a port nobody authored.
+    #[test]
+    fn an_out_of_range_port_is_an_error_not_a_silent_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "local-services.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    ports: [{ port: 70000, label: http }]\n",
+        );
+        let error = load_catalog(dir.path()).expect_err("must not load");
+        assert!(format!("{error:?}").contains("65535"), "{error:?}");
     }
 }

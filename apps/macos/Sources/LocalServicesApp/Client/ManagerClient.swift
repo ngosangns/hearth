@@ -15,12 +15,16 @@ enum ManagerClientError: Error, LocalizedError {
     case http(status: Int, code: String, message: String)
     case decoding(Error)
     case transport(Error)
+    /// An operation the daemon accepted (202) and then settled as `failed`. Its message is the
+    /// daemon's own — e.g. `Dependency startup failed: db (…)`.
+    case operationFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .http(_, let code, let message): return "\(code): \(message)"
         case .decoding(let error): return "malformed manager response: \(error)"
         case .transport(let error): return "manager unavailable: \(error.localizedDescription)"
+        case .operationFailed(let message): return message
         }
     }
 }
@@ -68,6 +72,36 @@ final class ManagerClient: Sendable {
     /// first failure (same policy the CLI's `start <group> --wait` uses). There's no bulk-stop
     /// endpoint on the daemon (see AGENTS.md); stopping several services is a client-side loop of
     /// individual `perform(.stop, ...)` calls instead — see `WorkspaceController.stopAll`.
+    /// `GET /v1/operations/:id` — the daemon accepts an operation with `202` and runs it
+    /// asynchronously, so its outcome is only ever visible by reading it back.
+    func operation(id: String) async throws -> Operation {
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        return try await get("/v1/operations/\(escaped)", as: OperationResponse.self).operation
+    }
+
+    /// Polls an accepted operation until it reaches a terminal status, mirroring the CLI's
+    /// `waitOperation`. Throws `ManagerClientError.operationFailed` when it settles as `failed`, so
+    /// callers surface the daemon's own reason rather than silently treating a `202` as success.
+    func waitForOperation(id: String, pollInterval: Duration = .milliseconds(250), timeout: Duration = .seconds(180)) async throws -> Operation {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while true {
+            try Task.checkCancellation()
+            let current = try await operation(id: id)
+            switch current.status {
+            case "succeeded":
+                return current
+            case "failed":
+                throw ManagerClientError.operationFailed(current.error?.message ?? "Operation failed")
+            default:
+                break
+            }
+            if ContinuousClock.now >= deadline {
+                throw ManagerClientError.operationFailed("Operation did not finish within \(timeout)")
+            }
+            try await Task.sleep(for: pollInterval)
+        }
+    }
+
     @discardableResult
     func bulkStart(targets: [String]) async throws -> Operation {
         var req = request("/v1/operations/bulk-start")

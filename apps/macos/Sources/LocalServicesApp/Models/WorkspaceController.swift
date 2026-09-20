@@ -2,8 +2,9 @@ import Foundation
 
 /// One workspace's live connection state: ensures a daemon, holds the resulting `ManagerClient`, and
 /// polls `/v1/services` on a timer while `.connected` (see `ManagerClient`'s doc comment for why
-/// polling rather than SSE in this first pass). One instance per open workspace detail view — created
-/// and torn down by SwiftUI's `@StateObject`, not shared/cached across the app.
+/// polling rather than SSE in this first pass). Owned by `WorkspaceControllerRegistry` at the app
+/// level — one per workspace, created and torn down only by its `sync(_:)`, so a connection outlives
+/// the detail view and the menu bar can read live status with no window open.
 @MainActor
 final class WorkspaceController: ObservableObject {
     enum Phase: Equatable {
@@ -108,15 +109,24 @@ final class WorkspaceController: ObservableObject {
         return LogController(client: client, serviceId: serviceId)
     }
 
+    /// Waits for the operation to actually settle. `POST /v1/operations` returns `202 Accepted`
+    /// with a *pending* operation — the work runs asynchronously on the daemon — so returning as
+    /// soon as the POST completes cleared the busy state within milliseconds while the service was
+    /// still starting, re-enabled the buttons mid-flight, and discarded the failure reason
+    /// entirely (it only ever lands on the settled operation's `error`).
     func perform(_ action: ManagerAction, serviceId: String) async {
         guard let client else { return }
         actionsInFlight.insert(serviceId)
         defer { actionsInFlight.remove(serviceId) }
         do {
-            _ = try await client.perform(action, serviceId: serviceId)
+            let accepted = try await client.perform(action, serviceId: serviceId)
+            // Refresh while it runs so the UI tracks the intermediate states, then again after.
+            await refresh()
+            _ = try await client.waitForOperation(id: accepted.id)
             await refresh()
         } catch {
             lastActionError = error.localizedDescription
+            await refresh()
         }
     }
 
@@ -128,10 +138,13 @@ final class WorkspaceController: ObservableObject {
         actionsInFlight.formUnion(targets)
         defer { actionsInFlight.subtract(targets) }
         do {
-            _ = try await client.bulkStart(targets: targets)
+            let accepted = try await client.bulkStart(targets: targets)
+            await refresh()
+            _ = try await client.waitForOperation(id: accepted.id)
             await refresh()
         } catch {
             lastActionError = error.localizedDescription
+            await refresh()
         }
     }
 

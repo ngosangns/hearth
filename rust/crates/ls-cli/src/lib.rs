@@ -405,7 +405,15 @@ pub async fn logs(mut client: Client, service_id: &str, tail: u64, follow: bool,
                 let tail_lines: &[&str] = if lines.len() as u64 > tail { &lines[lines.len() - tail as usize..] } else { &lines };
                 let joined = if lines.is_empty() { String::new() } else { format!("{}\n", tail_lines.join("\n")) };
                 if json_output {
-                    write(&json!({"serviceId": service_id, "generation": response_generation, "cursor": cursor, "nextCursor": next_cursor, "data": joined, "reset": reset}).to_string());
+                    // `cursor` is the server's echoed cursor, not the client's previous one (which
+                    // is null on a first poll), and `truncated` is carried through. The TS CLI
+                    // prints the server's whole `LogSlice`, so both fields were simply missing or
+                    // wrong here.
+                    let mut slice = json!({"serviceId": service_id, "generation": response_generation, "cursor": body.get("cursor").cloned().unwrap_or(Value::Null), "nextCursor": next_cursor, "data": joined, "reset": reset});
+                    if let Some(truncated) = body.get("truncated") {
+                        slice["truncated"] = truncated.clone();
+                    }
+                    write(&slice.to_string());
                 } else {
                     if reset {
                         write_err(&format!("log reset {service_id} generation {response_generation}"));
@@ -527,7 +535,14 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
                         ls_core::state::ProcessIdentity::Posix(p) => Some(p.pid),
                         ls_core::state::ProcessIdentity::Docker(_) => None,
                     });
-                    json!({ "serviceId": service_id, "state": text_state(row), "pid": pid })
+                    // `pid` is OMITTED when there isn't one, rather than emitted as null — the
+                    // TS CLI builds the object the same way, and a consumer doing
+                    // `"pid" in service` sees a different answer between the two otherwise.
+                    let mut entry = json!({ "serviceId": service_id, "state": text_state(row) });
+                    if let Some(pid) = pid {
+                        entry["pid"] = json!(pid);
+                    }
+                    entry
                 })
                 .collect();
             if flags.json {
@@ -632,8 +647,14 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
         _ => {
             // "stop"
             let discovered = discover(root, &options.catalog).await;
+            // `Incompatible` is deliberately included: shutting the old daemon down is THE
+            // documented recovery path after a `PROTOCOL_VERSION` bump, so it is exactly the case
+            // where `manager stop` has to work. The request below is sent with the daemon's own
+            // `protocol_version`, not ours, so the old daemon accepts it. Excluding it here sent
+            // this through `require_client`, which then failed with exit 4 — leaving a user whose
+            // daemon predates a protocol bump no way to stop it.
             let client = match discovered {
-                Discovery::Live { client } | Discovery::Stale { client } => client,
+                Discovery::Live { client } | Discovery::Stale { client } | Discovery::Incompatible { client } => client,
                 _ => require_client(root, options).await?,
             };
             let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "mode": "stop-services" });

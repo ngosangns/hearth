@@ -236,8 +236,17 @@ fn drain_raw_log_once(path: &Path, offset: &AtomicU64, on_output: &OnOutput) {
         // output never grows unbounded between polls. The writer's fd is opened append-mode, so
         // its next write always lands at the (now shorter) current end of file.
         let write_file = std::fs::OpenOptions::new().write(true).open(path)?;
-        write_file.set_len(0)?;
-        offset.store(0, Ordering::SeqCst);
+        // Only truncate if the file is still exactly the size we read. The child writes to this
+        // file continuously and independently, so anything it appended between the `read_exact`
+        // above and this call would be destroyed by a blind `set_len(0)` — silently dropping log
+        // lines on every poll of a chatty service. When it has grown, leave the bytes alone and
+        // just advance our read offset; whichever later poll catches the file quiescent truncates.
+        if write_file.metadata()?.len() == size {
+            write_file.set_len(0)?;
+            offset.store(0, Ordering::SeqCst);
+        } else {
+            offset.store(size, Ordering::SeqCst);
+        }
         Ok(())
     })();
 }
