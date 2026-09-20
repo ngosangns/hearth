@@ -37,7 +37,11 @@ separately from the package's own `ci.yml`.
   that decision.
 - `bun test` / `bun run typecheck` (tsc --noEmit, strict + `noUncheckedIndexedAccess` +
   `verbatimModuleSyntax`). CI (`.github/workflows/ci.yml`) runs both on PRs on `{self-hosted, macmini}`
-  and publishes to GitHub Packages only on a `vX.Y.Z` tag matching `package.json`'s version.
+  and publishes to GitHub Packages only on a `vX.Y.Z` tag matching `package.json`'s version. A
+  separate `rust-test` job in the same workflow runs `cargo test --workspace` and `cargo clippy
+  --workspace --all-targets -- -D warnings` from `rust/` (unconditionally, not path-filtered, same
+  as the TS `test` job) — added once Phase 7 closed out the Rust rewrite below, since until then
+  every one of its ~220 tests had only ever been run manually, never gated in CI.
 - Semver doubles as the protocol-compatibility signal: `PROTOCOL_VERSION` (src/core/state.ts) is the
   one place a daemon and its TUI/CLI/MCP clients read it from — a bump there must be a major release.
 

@@ -19,6 +19,18 @@ jobs:
       - run: bun run typecheck
       - run: bun test
 
+  # The in-progress Rust rewrite (`rust/`, see AGENTS.md "Rust rewrite") — a separate job so a
+  # rust/-only regression can't be missed just because the TS suite above is green, and vice versa.
+  rust-test:
+    runs-on: [self-hosted, macmini]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
