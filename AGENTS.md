@@ -127,8 +127,22 @@ Status:
   This blocks a real cutover for those two repos until resolved — options noted in `config_file.rs`'s
   module doc comment (shell out to `bun` to dump JSON, or migrate those two files to YAML since their
   catalogs are already pure data) are not yet decided.
-- **Not started**: Phase 2 (`ProcessSupervisor` — the highest-risk phase, see the plan's risk
-  register), Phase 3 (`LocalServicesManager`/daemon), Phase 4 (`ls-cli`), Phase 5 (`lsd` bin),
+- **Phase 2 (`ProcessSupervisor`): in progress.** Ported so far, deliberately first (the plan calls
+  this the highest-risk phase — get the sharp edges right before building the stateful supervisor on
+  top of them): `rust/crates/ls-core/src/supervisor/fingerprint.rs`
+  (`normalize_command_fingerprint`/`normalize_observed_command_fingerprint`, the argv/shell fingerprint
+  pairing sharp edge) and `.../supervisor/process_tree.rs` (the whole-process-tree snapshot/BFS/
+  pid-reuse-guard logic), including a real OS-level port of
+  `terminate-tree-regression.test.ts` that spawns a `set -m; sleep 60 & wait` shell and proves the
+  tree-walk+signal logic actually kills a child that forked into its own process group — 5/5 clean
+  runs, no flakiness observed. **Sharp edge hit while porting this test**: the spawned shell must be
+  given its own process group via `process_group(0)` (`setpgid(0,0)`, mirroring the real adapter's
+  `detached: true` spawn) — without it, the child inherits the *test harness's own* pgid, and the
+  test's `killpg` calls signal the whole cargo-test process group instead of the subtree under test.
+  Not yet ported: the stateful `ProcessSupervisor` struct itself (start/stop/restart, readiness
+  probing per kind, adoption/external-ownership, build serialization, the two-pass shutdown) and the
+  rest of `supervisor.test.ts`'s ~40 scenarios.
+- **Not started**: Phase 3 (`LocalServicesManager`/daemon), Phase 4 (`ls-cli`), Phase 5 (`lsd` bin),
   Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
 ## Maintaining this file

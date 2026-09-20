@@ -12,6 +12,7 @@ pub mod file_io;
 pub mod paths;
 pub mod platform;
 pub mod state;
+pub mod supervisor;
 
 pub use catalog::{
     dependency_levels, is_container_command, validate_catalog, CatalogValidation, CommandSpec,
