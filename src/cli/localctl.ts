@@ -62,6 +62,21 @@ export class LocalctlError extends Error {
   }
 }
 
+/** A failure talking to the daemon: transport, timeout, or a non-2xx response.
+ *
+ * Distinct from a plain `Error` so `main` can map it to `localctlExit.unavailable` (3) — the same
+ * exit code the Rust CLI produces for these — instead of rethrowing. Rethrowing made every
+ * unwrapped call site (`status`, `manager reload|status|stop`, `start|stop|restart`,
+ * `operation get`, `waitOperation`) surface a daemon that is merely down as an unhandled rejection:
+ * a stack trace and exit 1. It stays a distinct class rather than a blanket catch-all in `main` so
+ * a genuine programming bug still escapes loudly instead of being reported as "unavailable". */
+export class ManagerRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManagerRequestError";
+  }
+}
+
 function fail(exitCode: number, message: string): never {
   throw new LocalctlError(exitCode, message);
 }
@@ -123,11 +138,11 @@ export async function request(client: Client, path: string, init: RequestInit = 
   try {
     response = await fetch(`http://127.0.0.1:${client.metadata.port}${path}`, { ...requestInit, signal: AbortSignal.timeout(managerRequestTimeoutMs) });
   } catch (cause) {
-    if (cause instanceof Error && (cause.name === "AbortError" || cause.name === "TimeoutError")) throw new Error(`manager request timed out after ${managerRequestTimeoutMs}ms`);
-    throw new Error("manager unavailable");
+    if (cause instanceof Error && (cause.name === "AbortError" || cause.name === "TimeoutError")) throw new ManagerRequestError(`manager request timed out after ${managerRequestTimeoutMs}ms`);
+    throw new ManagerRequestError("manager unavailable");
   }
   const body = (await response.json().catch(() => ({}))) as { error?: { code?: string; message?: string } };
-  if (!response.ok) throw new Error(`${body.error?.code ?? "request_failed"}:${body.error?.message ?? response.status}`);
+  if (!response.ok) throw new ManagerRequestError(`${body.error?.code ?? "request_failed"}:${body.error?.message ?? response.status}`);
   return body;
 }
 
@@ -433,6 +448,10 @@ export async function main(options: LocalctlOptions, argv = process.argv.slice(2
     if (cause instanceof LocalctlError) {
       error(runtime, cause.message);
       return cause.exitCode;
+    }
+    if (cause instanceof ManagerRequestError) {
+      error(runtime, cause.message);
+      return localctlExit.unavailable;
     }
     throw cause;
   }

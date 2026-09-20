@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { discover, localctlExit, main, managerRequestTimeoutMs, parseCommandFlags, request, targets, waitOperation, type Client, type Discovery, type LocalctlOptions, type LocalctlRuntime } from "../../src/cli/localctl";
+import { discover, localctlExit, main, ManagerRequestError, managerRequestTimeoutMs, parseCommandFlags, request, targets, waitOperation, type Client, type Discovery, type LocalctlOptions, type LocalctlRuntime } from "../../src/cli/localctl";
 import { managerProtocolVersion } from "../../src/core/manager";
 import type { ManagerMetadata, Operation } from "../../src/core/state";
 import type { ServiceCatalog } from "../../src/core/catalog";
@@ -202,5 +202,26 @@ describe("localctl", () => {
     expect(targets(catalog(), undefined)).not.toContain("frontend");
     const errors: string[] = [];
     expect(main(options, ["start", "core"], { error: (message) => errors.push(message) })).resolves.toBe(localctlExit.usage);
+  });
+});
+
+describe("daemon-unreachable exit code", () => {
+  // A daemon that is merely down used to escape `main` as an unhandled rejection — a stack trace
+  // and exit 1 — because `request` threw a plain Error and `main` rethrew anything that wasn't a
+  // LocalctlError. The Rust CLI exits 3 for the same situation.
+  test("a failing manager request exits unavailable rather than throwing", async () => {
+    const errors: string[] = [];
+    const runtime: LocalctlRuntime = {
+      discover: async () => live(),
+      request: async () => {
+        throw new ManagerRequestError("manager unavailable");
+      },
+      error: (message) => errors.push(message),
+    };
+    // `manager stop` reaches `request` with the discovered client directly (the same path the
+    // "incompatible manager" test above exercises), so the thrown ManagerRequestError is what
+    // reaches `main` — previously rethrown as an unhandled rejection.
+    expect(await main(options, ["manager", "stop"], runtime)).toBe(localctlExit.unavailable);
+    expect(errors.join("\n")).toContain("manager unavailable");
   });
 });
