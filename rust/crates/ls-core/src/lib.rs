@@ -9,6 +9,7 @@ pub mod config_file;
 pub mod doctor;
 pub mod env;
 pub mod file_io;
+pub mod manager;
 pub mod paths;
 pub mod platform;
 pub mod state;
