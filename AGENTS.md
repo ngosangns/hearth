@@ -425,13 +425,47 @@ Status:
   own scope" — that changed once the rewrite reached parity and the project owner asked for it):
   `apps/macos`'s `SidecarLocator`/`DaemonConnection` now prefer a real compiled `lsd` over `bun run
   lsd.ts` (see `apps/macos/README.md` and `SidecarLocator.swift`'s own doc comment for the full
-  resolution order), `scripts/build-app.sh` bundles that compiled binary so a packaged app needs no
-  `bun` at all for the common path, and both real downstream consumers' own daemon/CLI/MCP entry
-  points (`infra`'s `scripts/local-services-tui`, `viclass`'s `tools/local-services-tui`) were
-  switched to call the installed `lsd` binary directly instead of their own `bun run src/{daemon,
-  localctl,mcp}.ts` wrappers — verified against each repo's real, already-running daemon (`lsd status`
-  reporting real live services) before editing anything. Those two repos' own commits/pushes are
-  theirs to make, not this repo's.
+  resolution order), and `scripts/build-app.sh` bundles that compiled binary so a packaged app needs
+  no `bun` at all for the common path.
+
+  **`infra` cut over; `viclass` deliberately did not — a real, functional gap, not caution for its
+  own sake.** `infra`'s `scripts/local-services-tui` scripts (`localctl`, `mcp`, `start`) now call the
+  installed `lsd` binary directly, verified against its real, already-running daemon (`lsd status`/
+  `lsd doctor`/`lsd mcp`'s `tools/list` all reporting correctly against its real 21-service catalog)
+  — safe because `infra`'s own `daemon.ts` has no logic beyond the generic engine `lsd daemon` already
+  provides. `viclass`'s does not: its `daemon.ts` wires a custom `PreparationAdapter` (`scripts/
+  local-services.sh prepare <serviceId>`) that real services depend on (`jitsi`'s `local-jitsi-
+  runtime`/`local-jitsi-network`, `sync`'s `runtime-config:vinet/sync`) — and `PreparationAdapter` is
+  a closure like `custom` readiness, so it can't cross a `.config.ts`/YAML boundary any more than a
+  `custom` probe can (same limitation this file's own `.config.ts` entry documents). The generic `lsd`
+  binary's `spawn_daemon` is hardcoded to `lsd daemon --root <root>` (no preparation adapter) — so if
+  `viclass` had been switched and its already-running daemon ever needed restarting (the normal case
+  after a reboot, or `manager stop`), the *next* `ensure()` call from any `lsd` command **or the MCP
+  tool** would silently spawn a daemon missing that adapter: those three services would come up
+  without their required prep step, with no error surfaced anywhere. Found before editing anything
+  in `viclass` (a real end-to-end `lsd doctor`/`status` dry run against it was clean; the daemon.ts
+  diff read is what caught this), so nothing there was touched. Resolving it for real needs one of:
+  a declarative, JSON-serializable stand-in for preparation (mirroring `{ kind: "command" }` for
+  readiness) that a `.config.ts`/YAML catalog could express generically, or a way to override what
+  `spawn_daemon` runs (e.g. an env var `lsd` checks before falling back to `lsd daemon`) so `viclass`
+  could keep pointing it at its own `daemon.ts`. Neither is implemented; this is an open, real gap,
+  not yet decided which way to close.
+
+  Neither `infra`'s nor `viclass`'s own commits/pushes are this repo's to make — `infra`'s package.json
+  edit sits uncommitted in that repo pending its owner's confirmation to push.
+  A latent bug was found and fixed while dogfooding `infra`'s real `.config.ts`: `load_typescript_catalog`
+  handed `bun -e`'s `import()` a *relative* path verbatim (e.g. `--root ../..`, the exact shape
+  `infra`'s own scripts use) — `import()` from an eval'd script has no natural "importer" file to
+  resolve a relative specifier against, so it fell into node_modules-style resolution instead and
+  failed to find the file at all. Fixed by canonicalizing the path before handing it to bun; a
+  regression test (`config_ts_resolves_a_relative_path_before_handing_it_to_bun`) reproduces the
+  original failure by mutating the test process's own cwd, since only a genuinely relative specifier
+  triggers it. A second, unrelated snag while dogfooding: `bun run` prepends `node_modules/.bin` to
+  `PATH`, and `@gnasdev/local-services` ships its own `bin: {lsd: "./src/bin/lsd.ts"}` — so a bare
+  `lsd` inside a package.json script resolves to *that* (the old TS shim, missing `mcp` entirely)
+  before it ever reaches the real installed binary. `infra`'s scripts now reference
+  `/opt/homebrew/bin/lsd` directly to sidestep the shadowing; worth knowing before assuming a bare
+  `lsd` in any consumer's package.json script means what it looks like it means.
 
 ## Maintaining this file
 

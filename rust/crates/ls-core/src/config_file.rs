@@ -117,6 +117,14 @@ pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog,
 /// ServiceCatalog as \`catalog\` or a default export`) so error text stays the same across both
 /// implementations.
 fn load_typescript_catalog(path: &Path) -> Result<ServiceCatalog, ConfigFileLoadError> {
+    // `import()` of a *relative* specifier from a `bun -e` eval script doesn't resolve the way a
+    // shell would resolve a relative path against the process's cwd — bun has no natural "importer"
+    // file for an eval'd script to resolve a relative specifier against, and ends up trying
+    // node_modules-style resolution instead (reproduced with `--root ../..`: it tried to resolve the
+    // config path from *inside* this very crate's own installed npm package). Canonicalizing first
+    // sidesteps the whole ambiguity — `path` is already known to exist (the caller found it on disk),
+    // so this can't fail for a reason a caller could act on.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let path_display = path.display().to_string();
     // A JSON string literal is also a valid JS string literal (JSON's escaping is a subset of JS's),
     // so this embeds the path directly into the script rather than threading it through argv, where
@@ -786,6 +794,39 @@ services:
         );
         let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("does not match the expected ServiceCatalog shape")), "{:?}", err.errors);
+    }
+
+    #[test]
+    fn config_ts_resolves_a_relative_path_before_handing_it_to_bun() {
+        // Regression test for a real bug found dogfooding this against a real project (a package
+        // whose scripts invoke `lsd --root ../..`, matching this repo's own `apps/macos`-style
+        // layout two directories below the actual project root): `bun -e`'s `import()` of a
+        // *relative* specifier doesn't resolve against the process's cwd the way a shell resolves a
+        // relative path — it attempts node_modules-style resolution instead, so a relative `--root`
+        // failed to import a real `.config.ts` even though the identical file loaded fine given an
+        // absolute path. `load_typescript_catalog` now canonicalizes before handing bun the path;
+        // this reproduces the original failure mode by mutating the process's own cwd for the
+        // duration of the test (restored via `original_cwd`, since `import()` needs a *relative*
+        // specifier — an absolute one never triggered the bug in the first place).
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("scripts/local-services-tui");
+        std::fs::create_dir_all(&sub).unwrap();
+        write(
+            &dir,
+            "local-services.config.ts",
+            r#"export const catalog = {
+  services: [{ id: "api", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["sleep", "30"] }, cwd: "." }, readiness: { kind: "process" } } } }],
+  groups: {},
+  startFailurePolicy: "stop-on-first-failure-keep-started",
+};
+"#,
+        );
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&sub).unwrap();
+        let result = load_catalog_from_file(Path::new("../../local-services.config.ts"), Path::new("../.."));
+        std::env::set_current_dir(&original_cwd).unwrap();
+        let loaded = result.expect("should load a .config.ts referenced by a relative path");
+        assert_eq!(loaded.catalog.services[0].id, "api");
     }
 
     #[test]
