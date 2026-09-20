@@ -2,14 +2,20 @@
 //! `.yml`/`.json`) file sitting in a project's root is mapped onto the same `ServiceCatalog` every
 //! other entry point takes.
 //!
-//! **Known gap vs. the TypeScript implementation**: the `.config.ts` escape hatch (a TypeScript
-//! module dynamically `import()`-ed to produce a ready-made `ServiceCatalog`, for anything the
-//! declarative shape can't express) has no Rust equivalent — this loader cannot evaluate TypeScript.
-//! Both real downstream consumers (`viclass`, `infra`) currently author exactly this kind of file at
-//! their project root. This is flagged as an open decision in the Rust-rewrite migration plan
-//! (options: shell out to `bun` to evaluate it and dump JSON, or migrate those two files to YAML
-//! since their underlying catalogs are already pure data) — not resolved here. `load_catalog_from_file`
-//! returns a clear, specific error for a `.config.ts` path rather than pretending to support it.
+//! **The `.config.ts` escape hatch** (a TypeScript module exporting a ready-made `ServiceCatalog` as
+//! `catalog` or as its default export, for anything the declarative shape can't express) has no
+//! direct Rust equivalent — this crate cannot evaluate TypeScript. Both real downstream consumers
+//! (`viclass`, `infra`) currently author exactly this kind of file at their project root, so simply
+//! refusing it would block a real cutover for either one. Resolved here by shelling out to `bun`
+//! (already a dependency of any project that would author a `.config.ts` file in the first place) to
+//! `import()` the module and print the exported catalog as JSON, which is then deserialized directly
+//! into `ServiceCatalog` — bypassing the declarative mapper below entirely, exactly like
+//! `loadTypeScriptCatalog` in the TS source does. **This does not, and cannot, support a `custom`
+//! readiness probe** (a `(ctx) => Promise<...>` closure) — `ReadinessSpec` has no `Custom` variant in
+//! this crate (see its own doc comment: `{ kind: "command" }` is the JSON-serializable stand-in), and
+//! a closure cannot cross a JSON boundary regardless. A `.config.ts` catalog that uses `custom`
+//! readiness fails deserialization with a clear error rather than silently dropping the probe; both
+//! real consumers' catalogs are pure data today, so this does not block their eventual cutover.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -60,15 +66,12 @@ pub fn load_catalog(root: &Path) -> Result<LoadedCatalog, ConfigFileLoadError> {
 
 pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog, ConfigFileLoadError> {
     if path.extension().and_then(|e| e.to_str()) == Some("ts") {
-        return Err(ConfigFileLoadError {
-            path: Some(path.to_path_buf()),
-            errors: vec![format!(
-                "{}: `.config.ts` catalogs are not supported by this (Rust) implementation — see \
-                 config_file.rs's module doc comment for the open decision on how to resolve this \
-                 for real consumers",
-                path.display()
-            )],
-        });
+        let catalog = load_typescript_catalog(path)?;
+        let validation = validate_catalog(&catalog);
+        if !validation.errors.is_empty() {
+            return Err(ConfigFileLoadError { path: Some(path.to_path_buf()), errors: validation.errors });
+        }
+        return Ok(LoadedCatalog { catalog, path: path.to_path_buf() });
     }
 
     let text = std::fs::read_to_string(path).map_err(|e| ConfigFileLoadError {
@@ -105,6 +108,51 @@ pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog,
         return Err(ConfigFileLoadError { path: Some(path.to_path_buf()), errors: validation.errors });
     }
     Ok(LoadedCatalog { catalog, path: path.to_path_buf() })
+}
+
+/// Evaluates a `.config.ts` module through a real `bun` subprocess and returns its exported
+/// `catalog` (or default export) as a `ServiceCatalog` — the Rust equivalent of the TS source's
+/// `loadTypeScriptCatalog`, which does this in-process via `await import(path)`. The script mirrors
+/// that function's own two failure messages (`failed to import ...` / `... must export a
+/// ServiceCatalog as \`catalog\` or a default export`) so error text stays the same across both
+/// implementations.
+fn load_typescript_catalog(path: &Path) -> Result<ServiceCatalog, ConfigFileLoadError> {
+    let path_display = path.display().to_string();
+    // A JSON string literal is also a valid JS string literal (JSON's escaping is a subset of JS's),
+    // so this embeds the path directly into the script rather than threading it through argv, where
+    // bun's own argv-splitting rules for `-e ... -- ...` would need to be gotten exactly right.
+    let path_literal = serde_json::to_string(&path_display).unwrap();
+    let script = format!(
+        r#"try {{
+  const mod = await import({path_literal});
+  const catalog = mod.catalog ?? mod.default;
+  if (!catalog || typeof catalog !== "object" || !Array.isArray(catalog.services)) {{
+    console.error({path_literal} + " must export a ServiceCatalog as `catalog` or a default export");
+    process.exit(1);
+  }}
+  process.stdout.write(JSON.stringify(catalog));
+}} catch (cause) {{
+  console.error("failed to import " + {path_literal} + ": " + (cause instanceof Error ? cause.message : String(cause)));
+  process.exit(1);
+}}
+"#
+    );
+
+    let output = std::process::Command::new("bun").arg("-e").arg(&script).output().map_err(|error| ConfigFileLoadError {
+        path: Some(path.to_path_buf()),
+        errors: vec![format!("failed to run `bun` to evaluate {path_display}: {error} (is bun installed and on PATH?)")],
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() { format!("bun exited with {} while evaluating {path_display}", output.status) } else { stderr };
+        return Err(ConfigFileLoadError { path: Some(path.to_path_buf()), errors: vec![message] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<ServiceCatalog>(stdout.trim()).map_err(|error| ConfigFileLoadError {
+        path: Some(path.to_path_buf()),
+        errors: vec![format!("{path_display}: exported catalog does not match the expected ServiceCatalog shape: {error}")],
+    })
 }
 
 // -------------------------------------------------------------------------------------------
@@ -668,12 +716,76 @@ services:
         assert!(err.errors.iter().any(|e| e.contains("failed to parse")), "{:?}", err.errors);
     }
 
+    // These tests shell out to a real `bun` (same as `load_typescript_catalog` itself), matching
+    // this repo's own `bun test` requirement on every machine that runs the Rust suite — `bun` is
+    // already on PATH in CI (see `rust-test` in `.github/workflows/ci.yml`) and in dev.
+
     #[test]
-    fn config_ts_returns_a_clear_unsupported_error() {
+    fn config_ts_loads_a_named_catalog_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            "local-services.config.ts",
+            r#"export const catalog = {
+  services: [{ id: "api", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["sleep", "30"] }, cwd: "." }, readiness: { kind: "process" } } } }],
+  groups: {},
+  startFailurePolicy: "stop-on-first-failure-keep-started",
+};
+"#,
+        );
+        let loaded = load_catalog_from_file(&path, dir.path()).expect("should load");
+        assert_eq!(loaded.catalog.services.len(), 1);
+        assert_eq!(loaded.catalog.services[0].id, "api");
+    }
+
+    #[test]
+    fn config_ts_loads_a_default_catalog_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            "local-services.config.ts",
+            r#"export default {
+  services: [{ id: "web", profiles: { run: { commandStatus: "verified", command: { command: { shell: "exec sleep 30" }, cwd: "." }, readiness: { kind: "process" } } } }],
+  groups: {},
+  startFailurePolicy: "stop-on-first-failure-keep-started",
+};
+"#,
+        );
+        let loaded = load_catalog_from_file(&path, dir.path()).expect("should load");
+        assert_eq!(loaded.catalog.services[0].id, "web");
+    }
+
+    #[test]
+    fn config_ts_reports_a_clear_error_when_the_export_is_not_a_service_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(&dir, "local-services.config.ts", "export const catalog = {}");
         let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
-        assert!(err.errors.iter().any(|e| e.contains("not supported")), "{:?}", err.errors);
+        assert!(err.errors.iter().any(|e| e.contains("must export a ServiceCatalog")), "{:?}", err.errors);
+    }
+
+    #[test]
+    fn config_ts_reports_a_clear_error_when_the_module_throws() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(&dir, "local-services.config.ts", "throw new Error('boom');\nexport const catalog = {};\n");
+        let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("failed to import") && e.contains("boom")), "{:?}", err.errors);
+    }
+
+    #[test]
+    fn config_ts_reports_a_clear_error_for_a_custom_readiness_probe_since_a_closure_cannot_cross_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            "local-services.config.ts",
+            r#"export const catalog = {
+  services: [{ id: "api", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["sleep", "30"] }, cwd: "." }, readiness: { kind: "custom", name: "probe", probe: async () => "ready" } } } }],
+  groups: {},
+  startFailurePolicy: "stop-on-first-failure-keep-started",
+};
+"#,
+        );
+        let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("does not match the expected ServiceCatalog shape")), "{:?}", err.errors);
     }
 
     #[test]

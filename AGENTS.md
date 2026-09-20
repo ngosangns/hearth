@@ -123,14 +123,24 @@ Status:
 - **Phase 1 (`ls-core` types + config-file loader): done.** `rust/crates/ls-core/src/{catalog,state,
   paths,platform,file_io,env,doctor,config_file}.rs` — 48 tests passing (`cargo test` from `rust/`),
   including a 1:1 port of `test/core/catalog.test.ts`. Clippy-clean.
-- **Known gap, not yet resolved**: `config_file.rs` has no equivalent of the TypeScript loader's
-  `.config.ts` escape hatch (dynamic `import()` of a TS module) — Rust can't evaluate TypeScript.
-  Both real downstream consumers (`viclass`, `infra`) currently author exactly this kind of file at
-  their project root (`local-services.config.ts`, a one-line re-export of a pure-data catalog). A
-  `.config.ts` path returns a clear "not supported" error today rather than silently misbehaving.
-  This blocks a real cutover for those two repos until resolved — options noted in `config_file.rs`'s
-  module doc comment (shell out to `bun` to dump JSON, or migrate those two files to YAML since their
-  catalogs are already pure data) are not yet decided.
+- **`.config.ts` escape hatch: resolved.** `config_file.rs`'s `load_typescript_catalog` shells out to
+  a real `bun -e <script>` subprocess that `import()`s the module and prints its exported `catalog`
+  (or default export) as JSON, which is then deserialized straight into `ServiceCatalog` — the same
+  "shell out to bun" option the migration plan had left open, chosen over migrating `viclass`'s and
+  `infra`'s `.config.ts` files to YAML since that would be follow-up work in *their* repos rather
+  than something resolvable here. Error text mirrors the TS source's own two messages (`failed to
+  import ...` / `... must export a ServiceCatalog as \`catalog\` or a default export`) since the
+  script constructs them itself before Rust ever sees stderr. **Real, standing limitation, not a
+  porting gap**: a `custom` readiness probe (a `(ctx) => Promise<...>` closure) cannot cross the JSON
+  boundary this needs, and `ReadinessSpec` has no `Custom` variant in this crate at all (see its own
+  doc comment) — a `.config.ts` catalog using `custom` fails deserialization with a clear error
+  rather than silently dropping the probe. Both real consumers' catalogs are pure data today, so this
+  doesn't block their eventual cutover. 5 new tests (named export, default export, non-catalog
+  export, a throwing module, and the `custom`-readiness deserialization failure), all shelling out to
+  a real `bun` exactly like the production code path — 226 tests total in the workspace now, cargo
+  test/clippy repeated 5/5 clean. This is also the first place the Rust workspace *requires* `bun` on
+  PATH at runtime (not just in dev/CI) — narrowly, only for a project that opts into a `.config.ts`
+  catalog; every YAML/JSON-catalog consumer still needs no Bun at all.
 - **Phase 2 (`ProcessSupervisor`): in progress.** Ported so far, deliberately first (the plan calls
   this the highest-risk phase — get the sharp edges right before building the stateful supervisor on
   top of them): `rust/crates/ls-core/src/supervisor/fingerprint.rs`
@@ -375,12 +385,13 @@ Status:
   `ls-mcp` preserves. Adding an `lsd mcp` subcommand would be new scope beyond what was ported.
 
   **This closes out the Rust-rewrite plan's Phase 0–7 checklist.** Everything below "Sharp edges" in
-  the Rust rewrite section is now settled to the extent this repo's own scope requires; the two
-  standing, deliberate gaps are the `.config.ts` escape hatch (Phase 1) and the untested Docker/
-  tailnet integration paths (Phase 2) — both already called out above, still open, still explicitly
-  flagged. Real cutover of any of the three downstream consumers (`apps/macos`, `viclass`, `infra`)
-  onto this Rust implementation is separate follow-up work, not part of this repo's own scope (see
-  the Phase 2/4-scope sharp-edge note above).
+  the Rust rewrite section is now settled to the extent this repo's own scope requires; the one
+  standing, deliberate gap is the untested Docker/tailnet integration paths (Phase 2) — already
+  called out above, still open, still explicitly flagged (the `.config.ts` escape hatch, Phase 1's
+  other open item, was resolved after this phase — see its own entry above). Real cutover of any of
+  the three downstream consumers (`apps/macos`, `viclass`, `infra`) onto this Rust implementation is
+  separate follow-up work, not part of this repo's own scope (see the Phase 2/4-scope sharp-edge note
+  above).
 
 ## Maintaining this file
 
