@@ -4,3 +4,4 @@ node_modules/
 .claude/settings.local.json
 apps/macos/.build/
 apps/macos/.swiftpm/
+rust/target/

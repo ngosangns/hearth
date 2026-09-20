@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/ls-core"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"

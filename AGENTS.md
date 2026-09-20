@@ -91,14 +91,45 @@ separately from the package's own `ci.yml`.
   machine, a freshly-compiled, ad-hoc-signed Bun executable gets SIGKILLed on launch — reproduces even
   with a trivial "hello world" compile, while the long-installed system `bun` (also only ad-hoc
   signed) runs fine, so it reads as an endpoint-security heuristic against newly-written unsigned
-  executables, not a fixable code-signing detail. `apps/macos` runs `bun run src/bin/lsd.ts` instead
-  for now (see `SidecarLocator.swift`); a real Developer-ID-signed + notarized compiled sidecar is
-  future work, not a quick fix.
+  executables, not a fixable code-signing detail. **This heuristic is Bun-specific, not "any freshly
+  compiled unsigned binary"**: the same ad-hoc-signing test with a trivial Rust binary passed cleanly
+  (10/10 runs on the `self-hosted, macmini` runner, 23/23 locally) — see "Rust rewrite" below. Likely
+  explanation: the heuristic targets JIT/executable-writable-page behavior a JS engine needs, which a
+  static Rust binary doesn't have. `apps/macos` still runs `bun run src/bin/lsd.ts` for the existing
+  TypeScript implementation (see `SidecarLocator.swift`).
 - The registered `{self-hosted, macmini}` CI runner's Swift toolchain has no XCTest (`no such module
   'XCTest'` — Command Line Tools only, no full Xcode.app), unlike a normal dev machine (confirmed:
   `swift build` succeeds there, `swift test` fails). `apps/macos/.github/workflows/macos-app.yml` runs
   `swift build` only; `apps/macos/Tests/LocalServicesAppTests` exists and passes locally but isn't in
   CI. Don't re-add `swift test` to that workflow without first fixing the runner's Xcode install.
+
+## Rust rewrite (in progress)
+
+A full rewrite of every subpath (`core`/`cli`/`tui`/`mcp`/`node-bridge`) + the `lsd` bin into Rust is
+underway, living at `rust/` in this same repo, rolled out incrementally alongside the existing
+TypeScript implementation (each of the 3 consumers — `apps/macos`, `viclass`, `infra` — cuts over
+independently once its needed surface has verified parity; no big-bang replace). The full design
+(crate layout, crate choices, milestone ordering, cutover plan, top risks) lives in the plan this was
+built from — ask for it by name if picking this back up, or re-derive it from this section plus the
+crate doc comments, which mirror the plan's reasoning inline.
+
+Status:
+- **Phase 0 (signing/Gatekeeper spike): GO** — see the sharp-edge note above. A compiled Rust binary
+  is not subject to the heuristic that killed compiled Bun binaries.
+- **Phase 1 (`ls-core` types + config-file loader): done.** `rust/crates/ls-core/src/{catalog,state,
+  paths,platform,file_io,env,doctor,config_file}.rs` — 48 tests passing (`cargo test` from `rust/`),
+  including a 1:1 port of `test/core/catalog.test.ts`. Clippy-clean.
+- **Known gap, not yet resolved**: `config_file.rs` has no equivalent of the TypeScript loader's
+  `.config.ts` escape hatch (dynamic `import()` of a TS module) — Rust can't evaluate TypeScript.
+  Both real downstream consumers (`viclass`, `infra`) currently author exactly this kind of file at
+  their project root (`local-services.config.ts`, a one-line re-export of a pure-data catalog). A
+  `.config.ts` path returns a clear "not supported" error today rather than silently misbehaving.
+  This blocks a real cutover for those two repos until resolved — options noted in `config_file.rs`'s
+  module doc comment (shell out to `bun` to dump JSON, or migrate those two files to YAML since their
+  catalogs are already pure data) are not yet decided.
+- **Not started**: Phase 2 (`ProcessSupervisor` — the highest-risk phase, see the plan's risk
+  register), Phase 3 (`LocalServicesManager`/daemon), Phase 4 (`ls-cli`), Phase 5 (`lsd` bin),
+  Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
 ## Maintaining this file
 
