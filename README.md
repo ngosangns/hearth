@@ -19,11 +19,27 @@ the list of services, how to start them, and how to tell when they're ready — 
 every entry point below. The catalog is the one thing every layer takes as a parameter; nothing in
 this package hardcodes a project's services.
 
+## Two implementations
+
+This repo ships the product twice, and both are live:
+
+- **TypeScript (`src/`)** — what this README documents, and what the npm package publishes.
+- **Rust (`rust/`)** — a full rewrite at feature parity, compiled to a standalone `lsd` binary. It
+  speaks the same HTTP+SSE protocol and reads/writes the same state, so it is a drop-in replacement
+  for a consumer that would rather install one binary than depend on Bun. `apps/macos` and `infra`
+  use it; `viclass` is still on the TypeScript build.
+
+The Rust binary additionally has `lsd mcp` (serve MCP over stdio), `lsd mcp install` and
+`lsd skill install`, which the TypeScript CLI does not. See [AGENTS.md](AGENTS.md) for how the two
+relate, how to build and install the binary, and which differences are deliberate.
+
 ## Requirements
 
 Bun-only, v1. This package uses `Bun.serve`, `Bun.spawn` (detached, argv-only, process-group
 signaling) and `bun:test` directly — there is no Node runtime fallback. Node projects can still
-shell out to it via `@gnasdev/local-services/node-bridge` (see below).
+shell out to it via `@gnasdev/local-services/node-bridge` (see below), or spawn the compiled Rust
+`lsd` binary, which needs no Bun at all unless the project's catalog uses the `.config.ts` escape
+hatch.
 
 ## Subpath exports
 
@@ -273,8 +289,26 @@ bun test
 bun run typecheck
 ```
 
+The Rust workspace is separate, and needs `bun`, a running `docker`, and `tailscale` on the machine
+for its real-adapter tests:
+
+```bash
+cd rust
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`task --list` shows both, plus `task rust:install` (build the `lsd` binary in release mode, install
+it to `/opt/homebrew/bin`, ad-hoc sign it) and the `macos:*` targets.
+
+> **Careful with a bare `lsd` in a package.json script.** `bun run` prepends `node_modules/.bin` to
+> PATH and this package ships its own `lsd` bin, so a bare `lsd` resolves to the TypeScript shim —
+> not the installed Rust binary, which has a different command surface. Use an absolute path.
+
 ## CI / publishing
 
-PRs run `bun test` against `{ self-hosted, macmini }`. Pushing a version tag (`vX.Y.Z`) publishes to
+PRs run `bun test` and `bun run typecheck` against `{ self-hosted, macmini }`, plus a separate
+`rust-test` job (`cargo test` + `cargo clippy`). Pushing a version tag (`vX.Y.Z`) publishes to
 GitHub Packages (`https://npm.pkg.github.com`) — publishing is not automatic on every merge to
-`main`, only on a tag.
+`main`, only on a tag, and it depends only on the TypeScript jobs. The Rust binary has no
+distribution process of its own yet: it is installed by hand or bundled into the macOS app.

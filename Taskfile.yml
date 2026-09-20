@@ -21,11 +21,35 @@ tasks:
     cmds:
       - bun run typecheck
 
+  rust:test:
+    desc: Run the Rust workspace test suite (needs bun, docker running, tailscale, nc, ps)
+    dir: rust
+    cmds:
+      - cargo test --workspace
+
+  rust:clippy:
+    desc: Lint the Rust workspace exactly as CI does (warnings are errors)
+    dir: rust
+    cmds:
+      - cargo clippy --workspace --all-targets -- -D warnings
+
+  rust:install:
+    desc: Build the lsd binary in release mode and install it to /opt/homebrew/bin (ad-hoc signed)
+    dir: rust
+    cmds:
+      - cargo build --release -p lsd
+      - cp target/release/lsd /opt/homebrew/bin/lsd
+      # Required after every copy on macOS, or the binary won't launch.
+      - codesign --sign - --force /opt/homebrew/bin/lsd
+      - /opt/homebrew/bin/lsd --help >/dev/null && echo "installed $(/opt/homebrew/bin/lsd --version 2>/dev/null || echo lsd)"
+
   ci:
-    desc: Everything the package's own CI job runs (test + typecheck)
+    desc: Everything CI runs (TS test + typecheck, plus the Rust test and clippy jobs)
     cmds:
       - task: test
       - task: typecheck
+      - task: rust:test
+      - task: rust:clippy
 
   macos:build:
     desc: Build the macOS app (debug)

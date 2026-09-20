@@ -22,7 +22,7 @@ a managed process directly.
 finds one (bundled, installed, or built in this checkout) before ever falling back to `bun run
 <repo>/src/bin/lsd.ts` against the original TypeScript source. See `SidecarLocator.swift`'s own doc
 comment for the full resolution order and why the compiled binary is preferred (it was tried and
-rejected for exactly this once, before the Rust rewrite reached parity — the ad-hoc-signing/Gatekiller
+rejected for exactly this once, before the Rust rewrite reached parity — the ad-hoc-signing/Gatekeeper
 heuristic that killed a compiled Bun executable doesn't apply to a compiled Rust one).
 
 ## Requirements to build/run
@@ -86,7 +86,7 @@ design; `build-app.sh` just copies the committed `.icns` into the bundle.
   debounced.
 - "Start All" / "Stop All" — in the main window's toolbar and in each menu bar dropdown row. Start
   goes through `/v1/operations/bulk-start` (dependency-ordered, stops on first failure, same as
-  `lsd start <group> --wait`); there's no bulk-stop endpoint on the daemon (see AGENTS.md), so Stop All
+  `lsd start <group> --wait`); the daemon has no bulk-stop endpoint, so Stop All
   is a client-side concurrent loop over individual stops, the same way the TUI's `s` key works.
 
 ## Known limitations / next steps
@@ -94,7 +94,7 @@ design; `build-app.sh` just copies the committed `.icns` into the bundle.
 - **No *distributable* `.app`** — local packaging exists (`scripts/build-app.sh`, see above), and it
   now bundles a real compiled `lsd` (the Rust rewrite) rather than shelling out to `bun run lsd.ts`
   (a `bun build --compile` sidecar was tried for the *TypeScript* binary specifically and rejected —
-  see `rust/AGENTS.md`'s Phase 0 sharp edge for why; the Rust rewrite's own compiled binary doesn't
+  see AGENTS.md's "Rejected approaches" sharp edge for why; the Rust rewrite's own compiled binary doesn't
   hit that same issue, which is why it can be bundled directly). Still ad-hoc signed (no Developer
   ID) though, so it only really works on the machine that built it. Real distribution to *other*
   machines needs a Developer ID cert + notarization that only the project owner has — **not

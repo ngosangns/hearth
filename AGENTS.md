@@ -1,561 +1,264 @@
 # Project agent memory
 
-This file is the project's committed home for project-intrinsic agent knowledge: build, test, release, architecture, and sharp-edge notes that should travel with the code.
+Project-intrinsic knowledge that should travel with the code: orientation, build/test/release,
+architecture, and sharp edges. Add durable notes here as real work discovers them.
 
-- Add durable project-specific notes here as they are discovered through real work.
+## Orientation
+
+This repo ships **two implementations of the same product**, both live:
+
+| | TypeScript (`src/`) | Rust (`rust/`) |
+| --- | --- | --- |
+| What it is | The published npm package, `@gnasdev/local-services` | A full rewrite, compiled to the `lsd` binary |
+| Consumers | `viclass` | `apps/macos`, `infra` |
+| Surfaces | `/core` `/cli` `/tui` `/mcp` `/node-bridge` subpath exports + an `lsd` bin shim | `ls-core` `ls-cli` `ls-tui` `ls-mcp` crates + `rust/bin/lsd` |
+| Status | Maintained; still the published artifact | Feature-complete, at parity, and what new consumers should use |
+
+They speak the same loopback HTTP+SSE protocol, write the same `state.json` and lock file, and share
+`PROTOCOL_VERSION`, so a daemon from one and a client from the other can legitimately meet. **A change
+to wire shape, persisted state, or catalog schema must land on both sides**, or a consumer running
+mixed versions breaks silently. `src/core/state.ts` and `rust/crates/ls-core/src/state.rs` are the
+authoritative pair.
+
+There is no Rust counterpart to `/node-bridge` (a Node-only shim letting a Node task runner shell out
+to the Bun CLI) and there does not need to be — a Node caller spawns the `lsd` binary directly.
 
 ## Architecture
 
-One package, five subpath exports (`/core`, `/cli`, `/tui`, `/mcp`, `/node-bridge`) plus a `lsd` bin —
-see README.md for the full design and a minimal consumer example. No default `ServiceCatalog` ships
-anywhere; every entry point takes a caller-supplied catalog as a parameter. Ported and generalized
-from two independently-forked internal copies of this tool (infra's `scripts/local-services-tui`,
-viclass's `tools/local-services-tui`) per `/Users/ngosangns/Github/firstmate/data/smp-npm-plan/report.md`.
+One package, five subpath exports plus a `lsd` bin — see README.md for the full design and a minimal
+consumer example. **No default `ServiceCatalog` ships anywhere**; every entry point takes a
+caller-supplied catalog.
 
-A project can skip authoring its own `catalog.ts`/`daemon.ts`/`cli.ts` entirely: `src/core/config-file.ts`
-maps a `local-services.yaml`/`.yml`/`.json` (or a `.config.ts` escape hatch) onto `ServiceCatalog`, and
-the `lsd` bin (`src/bin/lsd.ts`, README § "Declarative config") wraps that loader around `main()`/`runDaemon`
-the same way a hand-written `cli.ts`/`daemon.ts` would. This is also the on-ramp for a non-Bun/non-TS
-client (e.g. a desktop app) — `lsd manager ensure --json` prints everything (`token`, `port`,
-`runtimeDirectory`, ...) a generic HTTP+SSE client needs, without it reimplementing lock-file discovery.
-`src/core/env.ts` resolves the daemon's own base environment (login shell + `.env` file) for exactly
-this case: a daemon launched from a GUI has none of the `PATH` customization a terminal-launched one
-inherits for free from `process.env` — plumbed into `defaultSupervisorOptions`'s optional third
-(`baseEnvironment`) argument, `process.env` if omitted, so every existing terminal-launched consumer
-is unaffected.
+A project can skip authoring its own `catalog.ts`/`daemon.ts`/`cli.ts` entirely: `local-services.yaml`
+(or `.yml`/`.json`, or a `.config.ts` escape hatch) is mapped onto `ServiceCatalog` by
+`src/core/config-file.ts` / `config_file.rs`, and the `lsd` bin wraps that loader around
+`main()`/`runDaemon`. This is also the on-ramp for a non-Bun/non-TS client: `lsd manager ensure --json`
+prints everything (`token`, `port`, `runtimeDirectory`, …) a generic HTTP+SSE client needs, without it
+reimplementing lock-file discovery. `env.ts`/`env.rs` resolves the daemon's own base environment
+(login shell + `.env`) for exactly that case — a daemon launched from a GUI has none of the `PATH`
+customization a terminal-launched one inherits for free from `process.env`.
 
-`apps/macos` is that desktop-app on-ramp actually being built: a SwiftUI client that spawns
-`bun run src/bin/lsd.ts ... manager ensure --json` per workspace folder (see its own README for
-architecture/status). It only builds in place inside this checkout — no packaged/distributable build
-yet. Its `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`) runs `swift build`
-separately from the package's own `ci.yml`.
+`apps/macos` is that desktop on-ramp: a SwiftUI client running one daemon per workspace folder.
+`SidecarLocator` prefers a **compiled `lsd`** — env override, then the app's bundled copy, then known
+install locations, then this checkout's `cargo build` output, then the login shell's PATH — and falls
+back to `bun run src/bin/lsd.ts` only if none is found. `SidecarLocator.swift`'s own doc comment is
+authoritative on the order.
+`scripts/build-app.sh` packages an ad-hoc-signed `Local Services.app` with that binary bundled, so a
+packaged app needs no `bun` for the common path. Not notarized — distribution to another machine is
+the one packaging step still missing. See `apps/macos/README.md`.
 
 ## Build, test, release
 
-- Bun-only, no build step: `src/**/index.ts` is published as TypeScript source and resolved natively
-  by Bun (see `exports` in package.json). Do not add a bundler/tsc-emit step without also revisiting
-  that decision.
-- `bun test` / `bun run typecheck` (tsc --noEmit, strict + `noUncheckedIndexedAccess` +
-  `verbatimModuleSyntax`). CI (`.github/workflows/ci.yml`) runs both on PRs on `{self-hosted, macmini}`
-  and publishes to GitHub Packages only on a `vX.Y.Z` tag matching `package.json`'s version. A
-  separate `rust-test` job in the same workflow runs `cargo test --workspace` and `cargo clippy
-  --workspace --all-targets -- -D warnings` from `rust/` (unconditionally, not path-filtered, same
-  as the TS `test` job) — added once Phase 7 closed out the Rust rewrite below, since until then
-  every one of its ~220 tests had only ever been run manually, never gated in CI. Since the
-  Docker/tailnet real-adapter tests noted under Phase 2 below, `rust-test` also needs a working
-  `docker` (daemon running) and `tailscale` on the runner, on top of the `bun` it already needed for
-  the `.config.ts` escape hatch tests. **Currently red on the real registered runner** (confirmed via
-  `gh run view` after the `v0.3.0` tag push): `cargo test --workspace` exits 127 ("command not
-  found") — the runner's own PATH for Actions steps doesn't include wherever `cargo` lives on that
-  machine (this session's own shell has it at `/opt/homebrew/bin/cargo`, but no registered runner
-  process/install directory was found on *this* machine, so it's a different physical box, not
-  something fixable from inside this repo). `publish` doesn't depend on `rust-test` (only on `test`),
-  so this hasn't blocked any release, but it means `rust-test` isn't actually gating anything today —
-  needs the runner's own environment (its Actions runner service config, not this repo) to add
-  `cargo`'s bin directory to PATH. Same category as the Swift/XCTest runner limitation two entries
-  below: a real gap in the runner machine, not something to try to route around in the workflow YAML.
-- Semver doubles as the protocol-compatibility signal: `PROTOCOL_VERSION` (src/core/state.ts) is the
-  one place a daemon and its TUI/CLI/MCP clients read it from — a bump there must be a major release.
+**TypeScript.** Bun-only, no build step: `src/**/index.ts` is published as TypeScript source and
+resolved natively by Bun (see `exports` in package.json). Do not add a bundler/tsc-emit step without
+revisiting that decision. `bun test` / `bun run typecheck` (strict + `noUncheckedIndexedAccess` +
+`verbatimModuleSyntax`).
+
+**Rust.** From `rust/`: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D
+warnings`. Also `task rust:test` / `task rust:clippy`.
+
+*The Rust suite needs real tools on the machine*: `bun` (for the `.config.ts` escape-hatch tests),
+`docker` with its daemon running and `tailscale` (for the real-adapter tests), plus `nc`, `ps`, `sh`.
+Same assumption every real-tool test in the crate already makes, not a new category of fragility.
+
+**Installing/refreshing the `lsd` binary** after a Rust change — `task rust:install`, or by hand from
+`rust/`:
+```
+cargo build --release -p lsd && cp target/release/lsd /opt/homebrew/bin/lsd && codesign --sign - --force /opt/homebrew/bin/lsd
+```
+The ad-hoc re-sign is required after every copy on macOS.
+
+**macOS app.** `task macos:build` / `macos:test` / `macos:package` / `macos:install`.
+
+**Current test counts are whatever the suites report** — run them. Counts are deliberately not
+recorded here; every number this file used to carry had gone stale.
+
+**Release.** CI (`.github/workflows/ci.yml`) runs the TS `test` + `typecheck` jobs and a separate
+`rust-test` job on PRs, and publishes to GitHub Packages only on a `vX.Y.Z` tag matching
+package.json's version. The Rust binary has no release/distribution process of its own yet
+(`publish = false` in the workspace); it is built and installed by hand, or bundled into the macOS
+app. `apps/macos`'s workflow is `.github/workflows/macos-app.yml` (repo root, path-filtered to
+`apps/macos/**`) and runs `swift build` only.
+
+**Semver doubles as the protocol-compatibility signal**: `PROTOCOL_VERSION` is the one place a daemon
+and its TUI/CLI/MCP clients read it from — a bump there must be a major release.
+
+### Two standing runner limitations (not fixable from this repo)
+
+- **`rust-test` is red on the registered `{self-hosted, macmini}` runner**: `cargo test` exits 127
+  because that runner's PATH for Actions steps doesn't include `cargo`. It's a different physical box
+  than any dev machine here, so the fix belongs to its own Actions service config. `publish` depends
+  only on `test`, so this has never blocked a release — but `rust-test` is not gating anything today.
+- **That runner's Swift toolchain has no XCTest** (Command Line Tools only, no full Xcode.app), so
+  `apps/macos/Tests/` passes locally but is not in CI. Don't re-add `swift test` to that workflow
+  without first fixing the runner's Xcode install.
 
 ## Sharp edges
 
-- `src/core/supervisor.ts`'s `normalizeCommandFingerprint` must hash the *logical* command text
-  (argv joined, or the bare `shell` string) — never the physical `sh -c` spawn wrapper — so it matches
-  `normalizeObservedCommandFingerprint`'s prefix-stripped `ps` output. Already fixed once during the
-  initial port; a future refactor of `commandArgv` should re-check this pairing.
+Applies to both implementations unless noted.
+
+**Process supervision**
+
+- `normalizeCommandFingerprint` must hash the *logical* command text (argv joined, or the bare
+  `shell` string) — never the physical `sh -c` spawn wrapper — so it matches
+  `normalizeObservedCommandFingerprint`'s prefix-stripped `ps` output. A future refactor of
+  `commandArgv` should re-check this pairing.
 - Stopping a service signals its **whole process tree**, snapshotted from `ps` before the first
-  signal (`ProcessSupervisor.processTree`): `air` runs the built server in its **own** process group,
-  so signalling only the tracked pgid leaves the real server alive and holding its port, and the next
-  start fails with `Port N is held by an unowned process`. The snapshot is only walked when the OS
-  table still shows the recorded `startIdentity` for the leader pid, so a stale/reused pid can never
-  pull an unrelated live tree into a signal or into the wait-for-death loop.
-- An adopted identity (`startLocked`'s `retainedIdentity`) is kept only while it still answers its
-  readiness probe; an alive-but-unresponsive one (air survives its child) is terminated and replaced
-  instead of being re-adopted on every start into a permanent `Readiness timed out`.
+  signal. `air` runs the built server in its **own** process group, so signalling only the tracked
+  pgid leaves the real server alive holding its port, and the next start fails with `Port N is held
+  by an unowned process`. The snapshot is only walked while the OS table still shows the recorded
+  `startIdentity` for the leader pid, so a stale/reused pid can never pull an unrelated live tree
+  into a signal or into the wait-for-death loop.
+- An adopted identity is kept only while it still answers its readiness probe; an alive-but-
+  unresponsive one (air survives its child) is terminated and replaced, rather than re-adopted on
+  every start into a permanent `Readiness timed out`.
+- `ProcessSupervisor.shutdown()` does two passes: an "active state" stop pass, then a reap pass for
+  daemon-owned services holding a stale POSIX identity in a non-active state (e.g. `externally-owned`
+  after a port conflict). Don't collapse these into one.
+- A failed container stop must propagate, not be swallowed — the caller transitions the service to
+  `stopped` immediately after, which would record a stopped service whose container is still running.
+
+**Daemon / state**
+
 - Fire-and-forget work (unit log forwarding, `syncExternalServices` polling) must never reject into
   the daemon: Bun terminates the process on an unhandled rejection, orphaning every managed service
   (its identity keeps the dead daemon's instance id, so the next daemon can only adopt it). Guarded
-  sinks report through the optional `Host.recordBackgroundError`, and `runDaemon` logs stray
-  rejections/exceptions to `<runtimeDir>/daemon.log` (one rotated copy) instead of dying.
-- A daemon whose lock was taken over stops itself (`LockOwnershipWatch` in `daemon.ts`) — it exits
-  without touching the winner's lock. Enforced from the losing side so two daemons can never fight
-  over one `state.json`.
-- `ProcessSupervisor.shutdown()` does two passes: an "active state" stop pass, then a second reap pass
-  for daemon-owned services holding a stale POSIX identity in a non-"active" state (e.g.
-  `externally-owned` after a port conflict). Don't collapse these back into one pass.
-- `ownership: 'external'` services are this package's own generalization (no equivalent in either
-  source repo) of infra's docker/tailnet-task external-adoption carve-out — see
-  `test/core/external-ownership.test.ts` for the only coverage of `syncExternalServices()`.
-- Phase 2 (switching infra's `scripts/local-services-tui` onto this package) and Phase 4 (porting
-  viclass) are out of scope for this repo — separate follow-up work in those repos, per the plan
-  report's phased migration (§4).
-- `LocalServicesManager.reloadCatalog` (`POST /v1/manager/reload`) stops a removed-but-active service
-  using the *old* catalog, and only swaps `this.catalog` to the new one afterward — `ProcessSupervisor`
-  needs the old definition to know how to stop it, and swapping first would make that service briefly
-  vanish from `serviceStates()`/`/v1/services` while its process was still alive. It's serialized
-  against itself via its own `catalogReloadSerial` (not `this.lifecycle`, which `supervisor.stop`'s own
-  state writes run through) — nesting into `this.lifecycle` from inside a call already running through
-  it would deadlock `AsyncSerial.run`.
-- `{ kind: "command" }` readiness (`src/core/catalog.ts`) is the JSON-serializable stand-in for
-  `custom` — needed because a `custom` probe is a closure and can't travel over `POST
-  /v1/manager/reload` or a YAML file. Its `ProbeAdapter.command` is optional on purpose: every
-  existing `SupervisorOptions` test fixture predates it, and `ProcessSupervisor.probe()` degrades to
-  `false` (normal readiness-timeout path, never a throw) when it's absent instead of forcing every
-  fixture to grow one.
-- A `bun build --compile` sidecar (a standalone `lsd` executable the macOS app could bundle instead of
-  shelling out to `bun run <ts file>`) was tried and rejected: on the `self-hosted, macmini` CI/dev
-  machine, a freshly-compiled, ad-hoc-signed Bun executable gets SIGKILLed on launch — reproduces even
-  with a trivial "hello world" compile, while the long-installed system `bun` (also only ad-hoc
-  signed) runs fine, so it reads as an endpoint-security heuristic against newly-written unsigned
-  executables, not a fixable code-signing detail. **This heuristic is Bun-specific, not "any freshly
-  compiled unsigned binary"**: the same ad-hoc-signing test with a trivial Rust binary passed cleanly
-  (10/10 runs on the `self-hosted, macmini` runner, 23/23 locally) — see "Rust rewrite" below. Likely
-  explanation: the heuristic targets JIT/executable-writable-page behavior a JS engine needs, which a
-  static Rust binary doesn't have. `apps/macos` still runs `bun run src/bin/lsd.ts` for the existing
-  TypeScript implementation (see `SidecarLocator.swift`).
-- The registered `{self-hosted, macmini}` CI runner's Swift toolchain has no XCTest (`no such module
-  'XCTest'` — Command Line Tools only, no full Xcode.app), unlike a normal dev machine (confirmed:
-  `swift build` succeeds there, `swift test` fails). `apps/macos/.github/workflows/macos-app.yml` runs
-  `swift build` only; `apps/macos/Tests/LocalServicesAppTests` exists and passes locally but isn't in
-  CI. Don't re-add `swift test` to that workflow without first fixing the runner's Xcode install.
+  sinks report through `Host.recordBackgroundError`, and `runDaemon` logs stray
+  rejections/exceptions to `<runtimeDir>/daemon.log` instead of dying. Rust has no global equivalent
+  of Bun's `unhandledRejection` hook (a panicking task is caught at its own `JoinHandle`) — narrower
+  than it sounds, because fire-and-forget work here already routes through `record_background_error`.
+- A daemon whose lock was taken over stops itself (`LockOwnershipWatch`) and exits without touching
+  the winner's lock. Enforced from the losing side so two daemons can never fight over one
+  `state.json`.
+- `reloadCatalog` stops a removed-but-active service using the **old** catalog and only swaps
+  `this.catalog` afterward — the supervisor needs the old definition to know how to stop it, and
+  swapping first would make that service briefly vanish from `serviceStates()` while its process was
+  still alive. It is serialized against itself via its own `catalogReloadSerial`, not `this.lifecycle`:
+  nesting into `lifecycle` from inside a call already running through it would deadlock.
+- Never build a client-facing state string with `format!("{:?}", state)` — `Debug` gives
+  `QueuedStart`, the wire encoding is `queued-start`. Use `ActualServiceState::as_wire_str()` /
+  `ReadinessKind::as_wire_str()`, which are pinned to the serde encoding by test.
+- `state.json` quarantines rather than trusts: a shape check that passes but then fails to
+  deserialize must fall through to quarantine, never panic — a panic in `load()` kills the daemon at
+  bootstrap, the opposite of what quarantining exists for.
+- A `reset` from the event store returns the **whole** buffer, not an empty list. `reset` means the
+  client's cursor is unusable, so the reply is the snapshot it resynchronizes from.
 
-## Rust rewrite (in progress)
+**Catalog**
 
-A full rewrite of every subpath (`core`/`cli`/`tui`/`mcp`/`node-bridge`) + the `lsd` bin into Rust is
-underway, living at `rust/` in this same repo, rolled out incrementally alongside the existing
-TypeScript implementation (each of the 3 consumers — `apps/macos`, `viclass`, `infra` — cuts over
-independently once its needed surface has verified parity; no big-bang replace). The full design
-(crate layout, crate choices, milestone ordering, cutover plan, top risks) lives in the plan this was
-built from — ask for it by name if picking this back up, or re-derive it from this section plus the
-crate doc comments, which mirror the plan's reasoning inline.
+- `{ kind: "command" }` readiness is the JSON-serializable stand-in for `custom` — a `custom` probe
+  is a closure and can't travel over `POST /v1/manager/reload` or a YAML file. Its
+  `ProbeAdapter.command` is optional on purpose: every pre-existing `SupervisorOptions` fixture
+  predates it, and `probe()` degrades to `false` (normal readiness-timeout path, never a throw) when
+  it's absent, instead of forcing every fixture to grow one.
+- `preparationCommand` (with `serializationKey`) is the same idea for a bespoke `PreparationAdapter`,
+  run via the *same* `command` adapter that `{ kind: "command" }` readiness uses, independently of
+  the opaque `preparation` marker list. Services sharing a key run their preparation one at a time,
+  reusing the `KeyedLock` primitive `ServiceBuildProfile.serializationKey` already uses.
+  **`viclass`'s ~27 prep-dependent services must all share one key** to reproduce its old
+  global-queue behaviour: `ensure_local_certificates` is a check-then-generate race with no locking
+  of its own, and concurrent first-time prepares (e.g. `filestore` + `math` + `portal`, which share
+  those certs) would corrupt the cert file. `defaultSupervisorOptions`/`default_supervisor_options`
+  need no changes for any of this — both already wire a real `command` adapter for readiness.
+- `ownership: 'external'` is this package's own generalization of infra's docker/tailnet-task
+  adoption carve-out. `test/core/external-ownership.test.ts` is the only coverage of
+  `syncExternalServices()`.
+- Service order from a config file is **document order**, not sorted — it's user-visible in
+  `/v1/catalog`, `lsd status`, both TUIs, and within-level start order.
+- A missing/invalid `readiness` must fail the load, not skip the service. Skipping let a typo
+  silently delete a service from an otherwise-fine catalog.
 
-Status:
-- **Phase 0 (signing/Gatekeeper spike): GO** — see the sharp-edge note above. A compiled Rust binary
-  is not subject to the heuristic that killed compiled Bun binaries.
-- **Phase 1 (`ls-core` types + config-file loader): done.** `rust/crates/ls-core/src/{catalog,state,
-  paths,platform,file_io,env,doctor,config_file}.rs` — 48 tests passing (`cargo test` from `rust/`),
-  including a 1:1 port of `test/core/catalog.test.ts`. Clippy-clean.
-- **`.config.ts` escape hatch: resolved.** `config_file.rs`'s `load_typescript_catalog` shells out to
-  a real `bun -e <script>` subprocess that `import()`s the module and prints its exported `catalog`
-  (or default export) as JSON, which is then deserialized straight into `ServiceCatalog` — the same
-  "shell out to bun" option the migration plan had left open, chosen over migrating `viclass`'s and
-  `infra`'s `.config.ts` files to YAML since that would be follow-up work in *their* repos rather
-  than something resolvable here. Error text mirrors the TS source's own two messages (`failed to
-  import ...` / `... must export a ServiceCatalog as \`catalog\` or a default export`) since the
-  script constructs them itself before Rust ever sees stderr. **Real, standing limitation, not a
-  porting gap**: a `custom` readiness probe (a `(ctx) => Promise<...>` closure) cannot cross the JSON
-  boundary this needs, and `ReadinessSpec` has no `Custom` variant in this crate at all (see its own
-  doc comment) — a `.config.ts` catalog using `custom` fails deserialization with a clear error
-  rather than silently dropping the probe. Both real consumers' catalogs are pure data today, so this
-  doesn't block their eventual cutover. 5 new tests (named export, default export, non-catalog
-  export, a throwing module, and the `custom`-readiness deserialization failure), all shelling out to
-  a real `bun` exactly like the production code path — 226 tests total in the workspace now, cargo
-  test/clippy repeated 5/5 clean. This is also the first place the Rust workspace *requires* `bun` on
-  PATH at runtime (not just in dev/CI) — narrowly, only for a project that opts into a `.config.ts`
-  catalog; every YAML/JSON-catalog consumer still needs no Bun at all.
-- **Phase 2 (`ProcessSupervisor`): in progress.** Ported so far, deliberately first (the plan calls
-  this the highest-risk phase — get the sharp edges right before building the stateful supervisor on
-  top of them): `rust/crates/ls-core/src/supervisor/fingerprint.rs`
-  (`normalize_command_fingerprint`/`normalize_observed_command_fingerprint`, the argv/shell fingerprint
-  pairing sharp edge) and `.../supervisor/process_tree.rs` (the whole-process-tree snapshot/BFS/
-  pid-reuse-guard logic), including a real OS-level port of
-  `terminate-tree-regression.test.ts` that spawns a `set -m; sleep 60 & wait` shell and proves the
-  tree-walk+signal logic actually kills a child that forked into its own process group — 5/5 clean
-  runs, no flakiness observed. **Sharp edge hit while porting this test**: the spawned shell must be
-  given its own process group via `process_group(0)` (`setpgid(0,0)`, mirroring the real adapter's
-  `detached: true` spawn) — without it, the child inherits the *test harness's own* pgid, and the
-  test's `killpg` calls signal the whole cargo-test process group instead of the subtree under test.
+**Consumers and the `lsd` binary**
 
-  **The stateful `ProcessSupervisor` struct itself is now ported** (`.../supervisor/engine.rs`,
-  ~1300 lines incl. tests): start/stop/restart/status/reconcile/`sync_external_services`/shutdown,
-  readiness probing per kind (process/tcp/http/container/tailnet/command, matching the "no adapter
-  configured degrades to timeout, never throws" sharp edge), retained-identity adoption with the
-  liveness re-check, build execution with timeout + external cancellation +
-  `serializationKey`-based one-at-a-time serialization, and the two-pass shutdown (active-state stop,
-  then persisted-identity reap). Driven entirely through the `ProcessAdapter`/`ProbeAdapter`/
-  `PreparationAdapter`/`RunBuild`/`Host`/`SupervisorClock` traits so it's testable without real OS
-  processes — 22 tests using fakes (a representative subset of `supervisor.test.ts`'s ~40 scenarios,
-  not an exhaustive 1:1 port: happy-path start/restart/stop, readiness timeout, TCP port-conflict
-  refusal, the shutdown two-pass reap, fingerprint-mismatch orphaning, spawn/build failure, build
-  serialization-by-key, command-readiness-with-no-adapter, container identity, external-ownership
-  adopt/release, externally-killed-process reconciliation). 84 tests total in the crate, clippy-clean,
-  5/5 clean repeated full-suite runs (no flakiness observed).
+- `bun run` prepends `node_modules/.bin` to PATH, and this package ships
+  `bin: {lsd: "./src/bin/lsd.ts"}` — so a bare `lsd` in a consumer's package.json script resolves to
+  the **TS shim** (which has no `mcp` subcommand), not the installed Rust binary. Reference
+  `/opt/homebrew/bin/lsd` by absolute path in consumer scripts.
+- `.config.ts` requires `bun` on PATH at runtime (narrowly — a YAML/JSON-catalog consumer needs no
+  Bun at all), and `load_typescript_catalog` must canonicalize the path before handing it to
+  `bun -e`: `import()` from an eval'd script has no importer file to resolve a relative specifier
+  against, and falls into node_modules-style resolution instead.
+- `serde_json`'s `preserve_order` feature is on workspace-wide and is load-bearing: without it
+  `Value`'s object type is a `BTreeMap`, and `lsd mcp install` silently alphabetizes every key in any
+  hand-maintained config file it touches.
+- `lsd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
+  `mcpServers`. The merge only ever touches `command`/`args`, preserving every other field on the
+  entry and every other entry in the file. A residual limitation: `to_string_pretty` can't preserve a
+  compact single-line array, so untouched entries' arrays get expanded — cosmetic, no key/value/order
+  effect.
 
-  **Default (production) adapters are now ported too** (`.../supervisor/default_adapters.rs`):
-  real `tokio::process::Command`-based spawning (own process group via `.process_group(0)`, raw-file
-  stdout/stderr capture + `tail_file` copytruncate polling for `attach_output`, exactly mirroring
-  the TS "don't pipe into the daemon, a dead daemon would SIGPIPE the child" reasoning), real `ps`
-  inspection (`observed_system_process`), the exec-fingerprint settling loop
-  (`observed_stable_exec_process`), Docker container spawn/inspect/stop via `docker
-  compose`/`docker inspect`, tailnet probing via `tailscale serve status --json`, TCP probing via
-  `tokio::net::TcpStream`, HTTP probing via `reqwest` (rustls, not the system TLS/OpenSSL, for
-  portability), and build execution with real cancellation (SIGTERM the process group, wait, then
-  SIGKILL). `default_supervisor_options(root, runtime_directory, base_environment)` wires all of it
-  together, mirroring `defaultSupervisorOptions`. 6 new tests, including a real end-to-end one that
-  starts an actual `ProcessSupervisor` with these real adapters, spawns a real `nc`-backed TCP
-  service, waits for real `tcp` readiness against a real bound port, stops it, and asserts the real
-  OS process is gone (`kill(pid, 0)` fails) afterward — this is the strongest evidence so far that
-  the ported engine and its real adapters work together, not just against fakes. 90 tests total,
-  clippy-clean, 5/5 clean repeated full-suite runs.
+**Testing gotchas**
 
-  **Not yet ported** (tracked here as the actual remaining checklist, not "the rest of the file"):
-  the remaining `supervisor.test.ts` scenarios this pass didn't cover (queued-start cancellation
-  mid-flight, exact persisted-identity reclaim without respawn, PID-reused-but-port-held
-  externally-owned retention, Docker Compose concurrent-start serialization exercised against a
-  real `docker compose` project, abort-in-flight-build-before-restart, stop-a-preparing-service-
-  cleanly).
+- A spawned test shell needs its own process group (`process_group(0)` / `setpgid(0,0)`, mirroring
+  the real adapter's `detached: true`), or it inherits the *cargo-test harness's own* pgid and the
+  test's `killpg` calls signal the whole test run.
+- `nc -l <port>` without `-k` exits after accepting one connection — and the TCP readiness probe's
+  own `connect()` **is** that connection, so the service goes ready then immediately failed.
+- An in-process `rmcp` client/server pair deadlocks if both `.serve()` calls are awaited
+  sequentially: `initialize` is a real round trip, so drive them with `tokio::join!`.
 
-  **Docker/tailnet real integration coverage: resolved in a later pass** (`default_adapters.rs`,
-  after Phase 7 closed out the rest of the rewrite). Two new tests:
-  `real_process_supervisor_starts_and_stops_a_real_docker_compose_service` drives a real
-  `docker compose` project (a throwaway `alpine` service, unique-per-run project name) through a
-  real `ProcessSupervisor`/`DefaultProcessAdapter` — start, verify `ActualServiceState::Ready` with
-  a real `ProcessIdentity::Docker` and `docker inspect` agreeing it's running, stop, verify
-  `docker inspect` agrees it's really gone — always tearing the compose project down (even on a
-  failed assertion) so a broken test run never leaves a live container behind.
-  `tailnet_serving_agrees_with_the_real_tailscale_serve_status` calls the real
-  `tailnet_serving`/`DefaultProbeAdapter::tailnet` against whatever `tailscale serve` state already
-  exists on the test machine — deliberately **read-only**, never calling `tailscale serve` to add or
-  remove anything, since that would mutate a real (and on a dev machine, possibly shared/personal)
-  Tailscale configuration outside the test's control. Instead it independently re-derives the same
-  "does `Web` have any entries" check from a fresh `tailscale serve status --json` and asserts the
-  production function agrees, so the assertion is grounded in live system state rather than a
-  hardcoded `true`/`false` that would silently stop meaning anything if the machine's Tailscale
-  setup ever changes. **New, real requirement**: both tests need a working `docker` (daemon running)
-  and `tailscale` on the machine running `cargo test` — confirmed present on this session's own
-  machine (the same kind of environment as the `{self-hosted, macmini}` CI runner) before writing
-  them; every other real-tool-dependent test in this crate (`nc`, `ps`, `sh`) makes the same
-  assumption, so this isn't a new category of fragility, just a new pair of tools in that category.
-  228 tests total in the workspace, clippy-clean, 5/5 clean repeated runs, no leftover containers
-  after any run.
-- **Phase 3 (`LocalServicesManager`/daemon): substantially done.** Built bottom-up, each piece
-  tested in isolation before wiring into HTTP: `manager/event_store.rs` (the SSE ring buffer,
-  deliberately kept simple — see below), `manager/operations.rs` (per-target operation
-  serialization; hit and fixed a real `wait()`/`drain_services()` race where re-acquiring a
-  `tokio::sync::Mutex` from outside raced against `tokio::spawn` merely *scheduling* the task,
-  fixed with a per-operation `watch` channel), `manager/state_store.rs` (`state.json` load/save +
-  legacy `units`/`unitId` migration), `manager/lock.rs` (HMAC ownership proofs + the `claim_lock`
-  protocol — the "a healthcheck timeout is never death" 263-daemon-incident guard, tested against a
-  real axum server standing in for a live manager), `manager/log_store.rs` (crash-safe two-phase
-  rotation journal + UTF-8-safe cursor tailing). `manager/http.rs` then ties all of it plus a
-  `ProcessSupervisor` together behind a real `axum` server on a loopback OS-assigned port,
-  including the full route table (`/healthz`, `/v1/manager`, `/v1/catalog`,
-  `/v1/manager/reload`, `/v1/services`, `/v1/operations`, `/v1/operations/bulk-start`,
-  `/v1/operations/:id`, `/v1/events`, `/v1/events/stream` (SSE), `/v1/logs/:id`,
-  `/v1/manager/shutdown`), the `startSelectedDag` concurrent-per-node dependency scheduler (via
-  `futures::future::Shared`, not naive level-by-level batching — preserves the same
-  finer-grained parallelism the TS version gets from per-node promise memoization), and
-  bootstrap/shutdown. Proven with a real end-to-end test: a real bootstrapped manager, a real `nc
-  -lk`-backed TCP service, driven entirely over real HTTP (start → poll operation → verify ready →
-  read logs/events → stop → verify the real OS process is gone → shut the manager down) — the same
-  category of capstone test that closed out Phase 2. 143 tests total in the workspace, clippy-clean,
-  5/5 clean repeated runs. **Sharp edge hit while writing that test**: plain `nc -l <port>` (no
-  `-k`) exits after accepting one connection — and the TCP readiness probe's own `connect()` IS that
-  one connection, so the service went `ready` and then immediately `failed` (exit-watcher fired)
-  before the test's next assertion ran. Not a bug in the port; a test-double gotcha worth remembering
-  for any future test that needs a TCP service to actually stay up.
-  **Deliberately simplified, not yet fully faithful**: `/v1/events/stream`'s SSE backpressure is a
-  bounded `tokio::sync::mpsc` channel gated by frame *count* (64, matching `maxSseQueueFrames`) —
-  the TS source's additional cumulative *byte-size* ceiling (`maxSseQueueBytes`) isn't separately
-  tracked. Given SSE frames here are small JSON, frame-count bounding already caps memory to a small
-  multiple in practice, but a future pass should add the byte tracking for full parity if a real
-  workload ever produces unusually large events.
-  **`daemon.rs` (the daemon-*process* glue around `LocalServicesManager`) is also ported**:
-  `create_daemon_log` (rotated diagnostics file), `read_lock_instance_id` (the three-way missing/
-  unreadable/found distinction — a transient read failure must never be mistaken for losing the
-  lock), `LockOwnershipWatch` (the losing-side lock-takeover self-stop), `DaemonLifecycle`
-  (memoized shutdown-once, via a `ShutdownManager` trait so it's testable without a real manager),
-  and `run_daemon` (bootstrap + SIGINT/SIGTERM/SIGHUP wiring). One documented, deliberate gap: Bun's
-  global `unhandledRejection`/`uncaughtException` hooks have no direct Rust equivalent (a panicking
-  spawned task is caught at that task's own `JoinHandle`, not globally) — narrower than it looks
-  since fire-and-forget work in this codebase already routes errors through
-  `Host::record_background_error` rather than panicking; noted rather than papered over with a
-  global panic hook that would itself diverge from the TS design. `run_daemon` itself doesn't yet
-  have a dedicated test (needs a real long-running process context that will come naturally once
-  the `lsd` bin exists in Phase 5); its constituent pieces (log rotation, lock-watch, lifecycle
-  memoization) are independently tested — 8 new tests. **Phase 3 is now essentially complete**:
-  151 tests total in the workspace, clippy-clean, stable across repeated runs.
-- **Phase 4 (`ls-cli`): done.** New crate `rust/crates/ls-cli`, porting `src/cli/localctl.ts` in
-  full: lock-file discovery (`discover`/`ensure`/`require_client`, reusing `ls-core`'s own
-  ownership-proof verification so a Rust CLI and a Rust daemon agree on what a valid lock looks
-  like), the `doctor`/`cleanup`/`manager ensure|status|stop|reload`/`status`/`start|stop|restart`/
-  `operation get|watch`/`logs` commands, and the same exit-code scheme (usage=2, unavailable=3,
-  protocol=4, failed=5, timeout=6, unauthorized=7). One simplification worth knowing about:
-  `operation_id`'s URL-encoding step is skipped, because the validating regex
-  (`^[A-Za-z0-9._~-]{1,128}$`) only accepts RFC 3986 "unreserved" characters, which by definition
-  never need percent-encoding — the TS `encodeURIComponent` call there is a no-op in practice, not
-  a behavior this port is missing.
+**Rejected approaches (don't re-litigate)**
 
-  Tested against **real bootstrapped `LocalServicesManager`s** (not mocks) end-to-end through
-  `main()`'s actual argv dispatch: `status --json`, `start api --wait --json` (verifies the real
-  process reaches `ready`), `manager ensure --json`, `doctor`, an unknown command, and `status`
-  against no running manager at all (→ exit 3). One test also drives `ensure()`'s "spawn if
-  absent" path by wiring `spawn_daemon` to a real `ls_core::daemon::run_daemon` call — the same
-  lock-file discovery this CLI does independently finds the daemon it just spawned, which is the
-  actual contract that matters (a real consumer's `spawn_daemon` closure looks exactly like this).
-  164 tests total in the workspace (151 `ls-core` + 13 `ls-cli`), clippy-clean, stable across
-  repeated runs.
-- **Phase 5 (`lsd` bin): done.** New binary crate `rust/bin/lsd`, porting `src/bin/lsd.ts`: `lsd
-  daemon --root <path>` (loads the catalog, resolves the base environment, calls
-  `ls_core::daemon::run_daemon` directly — this invocation *is* the daemon process body once
-  spawned detached) and every other subcommand delegating to `ls_cli::main` after loading the
-  catalog, with the exact same `--root`-extraction contract in both places so the two never
-  disagree on which project root an invocation means. `spawn_daemon` re-invokes
-  `std::env::current_exe()` as `lsd daemon --root <root>` with its own process group and discarded
-  stdio — Rust has no `Bun.spawn(...).unref()` equivalent to reach for; the same effect (the parent
-  can exit without waiting for or killing the child) falls out for free from just not calling
-  `.wait()` on the spawned `Child` and letting the handle drop. `tui` is deliberately not wired yet
-  (Phase 6 doesn't exist as a crate to depend on) — `ls_cli::main`'s own `tui` command already
-  surfaces a clear "not available" message rather than silently doing nothing.
+- A `bun build --compile` sidecar: on the `self-hosted, macmini` machine a freshly compiled, ad-hoc
+  signed Bun executable is SIGKILLed on launch — reproducing even for a trivial hello-world, while
+  the long-installed system `bun` (also only ad-hoc signed) runs fine. Reads as an endpoint-security
+  heuristic against newly written unsigned executables with the JIT/writable-exec pages a JS engine
+  needs. **It is Bun-specific**: the same ad-hoc-signing test with a trivial Rust binary passed 10/10
+  on that runner and 23/23 locally, which is what made the Rust rewrite viable in the first place.
 
-  Proven two ways: a real end-to-end subprocess test (`rust/bin/lsd/tests/end_to_end.rs`, the
-  closest equivalent to `test/bin/lsd.test.ts`) drives the actual compiled binary through
-  `manager ensure --json` → `start --wait --json` → `status --json` → `logs` → `manager stop
-  --json` → a fresh `manager ensure` proving the old instance is really gone — and a dedicated
-  test that ad-hoc signs the real (not hello-world) compiled binary and confirms it still runs,
-  reconfirming Phase 0's signing spike against the actual multi-thousand-line artifact a real
-  consumer would ship, not just a trivial stand-in. 169 tests total in the workspace, clippy-clean,
-  stable across repeated runs.
-- **Phase 6 (`ls-tui`): done.** New crate `rust/crates/ls-tui`, porting all of `src/tui/*.ts`:
-  `state.rs` (`TuiState`/`ServiceSelection`, the connection/request/selection fence machinery),
-  `text_utils.rs` (`sanitize_terminal_text`, `visible_width`, `truncate_to_width`), `actions.rs`
-  (`keyboard_action`), `screen.rs` (`ServiceScreen`, the cached `(state, geometry) -> lines` layout
-  engine), `client.rs` (`ManagerTuiClient` — reuses `ls_cli::{discover, request, require_client,
-  wait_operation}` directly rather than re-implementing HTTP plumbing a second time), and `run.rs`
-  (`run_tui`, the terminal event-loop orchestration). Wired into `lsd tui` (`rust/bin/lsd/src/
-  main.rs`), which intercepts that subcommand itself before delegating to `ls_cli::main` — `ls-cli`
-  can't depend on `ls-tui` (that would be circular), so there's no TS-style injectable
-  `LocalctlRuntime.tui` handler; the binary that depends on both crates is the natural place to
-  wire the concrete implementation in. 45 new tests (214 total in the workspace), clippy-clean,
-  5/5 clean repeated full-suite runs.
+## Rust port: deviations from the TS source
 
-  **`crossterm`+`unicode-width` chosen over `ratatui`**, confirmed by an earlier research pass: the
-  TS TUI only uses `pi-tui` at a low level (raw mode, SGR mouse parsing, key matching), never a
-  widget-tree framework, so there was no framework-level API to match — `crossterm`'s structured
-  `KeyEvent`/`MouseEvent` types mean `actions.rs` takes one directly instead of re-deriving pi-tui's
-  raw-byte key matching (a deliberate, documented deviation, not a corner cut).
+Deliberate, and each a real behavioural difference worth knowing before debugging a mismatch.
 
-  **Two primitives had no vendored source to port from.** pi-tui's `DEFAULT_TAB_WIDTH` and its
-  `truncateToWidth`/`visibleWidth` delegate to a native (compiled) addon (`@oh-my-pi/pi-natives`)
-  whose Rust source isn't published in this checkout's `node_modules` — both were reverse-engineered
-  by probing the real compiled functions directly (`bun -e 'import { truncateToWidth } from
-  "@oh-my-pi/pi-tui"; ...'`) rather than read from source. Findings: the tab width is a **fixed
-  3-space replacement per tab, not a tab-stop calculation** (confirmed by expanding tabs after
-  prefixes of several different lengths — every tab always becomes exactly 3 spaces regardless of
-  the column it starts at); `truncate_to_width`'s SGR-colour handling around a truncation cut point
-  reproduces every case probed (~a dozen inputs covering open/reset colours before, at, and after
-  the cut) but the native engine may special-case inputs outside that probing — see the extensive
-  doc comment on `truncate_to_width` in `text_utils.rs` for the exact reproduced rule. None of the
-  ported TUI tests exercise the unprobed edge cases, so this is unlikely to matter for real service
-  log output, but it is a real fidelity gap distinct from every other "documented simplification" in
-  this file, which were all judgment calls made *with* the source in hand.
+- **No `Custom` readiness variant.** A closure can't cross the JSON boundary `.config.ts` loading
+  needs, so a catalog using `custom` fails deserialization with a clear error rather than silently
+  dropping the probe. Both real consumers' catalogs are pure data today.
+- **SSE backpressure is frame-count only** (64 frames). The TS source additionally enforces a
+  cumulative byte ceiling (`maxSseQueueBytes`). Frames here are small JSON, so count-bounding caps
+  memory in practice, but full parity needs the byte tracking.
+- **`.config.ts` is evaluated by shelling out to a real `bun -e` subprocess** rather than in-process.
+  Error text mirrors the TS source's own two messages, since the script constructs them itself before
+  Rust ever sees stderr.
+- **`crossterm` + `unicode-width` instead of `pi-tui`.** The TS TUI only uses `pi-tui` at a low level
+  (raw mode, SGR mouse parsing, key matching), never as a widget framework, so there was no
+  framework-level API to match. `actions.rs` takes a structured `KeyEvent` directly instead of
+  re-deriving pi-tui's raw-byte key matching.
+- **`ls-tui`'s `run.rs` has no automated coverage** (it owns a real terminal and a real reconnect
+  loop) and deviates three ways, each noted in its own module doc: full clear+redraw instead of
+  incremental diffing; action dispatch runs to completion inline rather than fire-and-forget; and the
+  structured-input deviation above.
+- **`truncateToWidth`/`visibleWidth`/`DEFAULT_TAB_WIDTH` were reverse-engineered**, not ported —
+  pi-tui delegates them to a native addon whose Rust source isn't in this checkout. Probed against
+  the real compiled functions: the tab width is a **fixed 3-space replacement, not a tab-stop
+  calculation**, and the SGR-colour handling around a cut point reproduces every case probed (~a
+  dozen covering open/reset colours before, at and after the cut). Inputs outside that probing may be
+  special-cased by the native engine — a real fidelity gap, distinct from every other deviation here,
+  which were judgement calls made *with* the source in hand. See `truncate_to_width`'s doc comment.
+- **`ls-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: those
+  generate a tool's name and schema at compile time, but this server's names carry a runtime-
+  configurable prefix and its schemas embed an enum of the caller's actual `knownServiceIds`.
+- **`lsd mcp` and `lsd tui` are intercepted in the binary**, not in `ls-cli`: `ls-cli` can't depend on
+  `ls-mcp`/`ls-tui` without a dependency cycle, so the crate that depends on both wires them.
+  `lsd mcp install` / `lsd skill install` are pure file manipulation and do live in `ls-cli`.
+- **Rust's `state.json` timestamp validation is a non-empty-string check**, not the ISO round-trip the
+  TS source performs.
 
-  **`run.rs` (the terminal event-loop orchestration) is the one piece with no automated test
-  coverage** — it owns a real terminal and a real reconnect loop, which is exactly the parity bar
-  the original migration plan set for this phase ("ported unit tests pass + a manual smoke pass,
-  rendering isn't cleanly auto-diffable"). Three deliberate deviations from the TS source, each
-  called out in `run.rs`'s own module doc comment: no incremental-diffing renderer (`pi-tui`'s
-  `TUI`/`ProcessTerminal` diff the terminal; this does a full clear + redraw every frame via plain
-  ANSI — more flicker-prone under a very fast event stream, functionally equivalent otherwise);
-  action dispatch (`start`/`stop`/`restart`/`start all`) runs to completion inline in the same loop
-  that reads input, instead of the TS source's fire-and-forget that lets input keep being processed
-  mid-request (Rust's single-owner `TuiApp` makes true concurrent mutation awkward without
-  message-passing the whole action back in, not worth it for an already-`busy`-gated, typically
-  sub-second HTTP round trip); and the `crossterm`-vs-raw-bytes input deviation noted above.
-- **Phase 7 (`ls-mcp`): done — the last phase of the rewrite.** New crate `rust/crates/ls-mcp`,
-  porting `src/mcp/mcp-server.ts` on top of `rmcp` 3.4.0 (the official Rust MCP SDK): `client.rs`
-  (the `LocalServicesMcpClient` trait — `async-trait`-boxed, matching this codebase's existing
-  object-safe-trait pattern, e.g. `ls-core`'s `Host` — plus `ManagerApiClient`, built on `ls-cli`'s
-  own `require_client`/`request`/`runnable_targets` rather than a third HTTP re-implementation) and
-  `server.rs` (`LocalServicesMcpServer`, argument validation, secret-key/Bearer-token redaction).
-  `rmcp` was evaluated shallowly in an earlier pass and deep-dived only now, per the original plan.
+## Consumer cutover status
 
-  **Hand-implements `ServerHandler`** (`get_info`/`list_tools`/`call_tool`) rather than using
-  `rmcp`'s declarative `#[tool]`/`#[tool_router]` macros — those generate a tool's name and JSON
-  schema at compile time, but this server's tool names carry a runtime-configurable prefix and the
-  `status`/`logs`/`manage` schemas embed an `enum` of the caller's actual `knownServiceIds`, known
-  only at construction time. Every other `ServerHandler` method (resources, prompts, subscriptions,
-  tasks, discover) is left at its provided default, mirroring how the TS `Server` only ever
-  registers `ListToolsRequestSchema`/`CallToolRequestSchema` handlers.
+| Consumer | Uses | Remaining work |
+| --- | --- | --- |
+| `apps/macos` | Compiled `lsd`, bundled into the app | — |
+| `infra` | Compiled `lsd` at an absolute path, for both CLI and MCP | — |
+| `viclass` | TypeScript | Migrate its ~27 prep-dependent services from the opaque `preparation` marker list to `preparationCommand`, all sharing one `serializationKey` (see Sharp edges). Every one dispatches through the same `bash scripts/local-services.sh prepare <id>` call keyed on its own case statement — the marker array's *contents* were never read — so the mapping is mechanical. |
 
-  **`rmcp` 3.4.0 implements the 2026-07-28 MCP spec revision** (server discovery, tasks,
-  multi-round-trip requests, response caching — none of which this server or the TS source use),
-  so `ServerHandler`'s method list is much larger than the TS SDK's; only the three methods above
-  needed overriding; `CallToolRequestParams`/`CallToolResponse`/`ListToolsResult`/`ServerConfig`
-  (`= InitializeResult`) are all `#[non_exhaustive]`, so built through their constructor/builder
-  methods (`Tool::new`, `ListToolsResult::with_all_items`, `ServerConfig::new(...)
-  .with_server_info(...)`, `CallToolResult::success`/`::error`) rather than struct-literal syntax.
+Neither `infra`'s nor `viclass`'s commits are this repo's to make.
 
-  **One small upstream fix in `ls-core`** was needed to make this crate's `Arc<dyn
-  LocalServicesMcpClient + Send + Sync>` compile at all: `ls_core::doctor`'s
-  `DoctorCheckPredicate`/`DoctorCheckDetailFormatter` closures (unused by any real caller today)
-  were `Box<dyn Fn(...)>` with no `Send + Sync` bound, which transitively made all of
-  `LocalctlOptions` — and therefore `ManagerApiClient`, which owns one — not `Sync`. Widened to
-  `Box<dyn Fn(...) + Send + Sync>`; free, since nothing constructs one of these closures yet.
-
-  Tested two ways: 7 in-crate tests (a 1:1 port of `mcp-server.test.ts`'s scenarios — confirm-gating
-  by default and when disabled, unknown-service/extra-argument rejection, prefix-qualified tool
-  names and ordering) driving a real in-process client/server pair connected over a
-  `tokio::io::duplex` transport (this codebase's Rust equivalent of the TS SDK's
-  `InMemoryTransport.createLinkedPair()`), and a real end-to-end test
-  (`rust/crates/ls-mcp/tests/end_to_end.rs`) against a real bootstrapped `LocalServicesManager` and
-  a real `nc -lk`-backed TCP service: `status` (stopped) → `manage` start (waits on real TCP
-  readiness, returns the real pid) → `logs` → `events` (asserts a real `service.lifecycle` event
-  landed) → `trace` on a made-up operation id (asserts a tool-level error, not a protocol error) →
-  `manage` stop (asserts the real OS process is gone) — the same capstone-test category that closed
-  out every earlier phase. 222 tests total in the workspace, clippy-clean, 5/5 clean repeated runs.
-
-  **Sharp edge hit while writing the in-crate tests**: `service.serve(transport)` performs the
-  `initialize` handshake as a real round trip — each side's call blocks until it hears from the
-  other — so awaiting the server's and the client's `.serve()` calls *sequentially* deadlocks
-  forever (confirmed the hard way: a test hung indefinitely, 0% CPU, no compile activity). Fixed by
-  driving both concurrently with `tokio::join!`. Worth remembering for any future in-process
-  client/server test against any `rmcp`-based service, not just this one.
-
-  **`lsd mcp`: added in a later pass, once real cutover started.** Originally left unwired
-  deliberately (the TS source has no `mcp` subcommand in `localctl.ts`/`lsd.ts` either — every real
-  consumer hand-rolls a ~20-line `src/mcp.ts` wrapper around `createLocalServicesMcpServer` + a stdio
-  transport instead). Once `infra` and `viclass` both needed exactly that wrapper rewritten in Rust,
-  duplicating it a second time per consumer stopped making sense — `lsd mcp` (`rust/bin/lsd/src/
-  main.rs`) now does it once, generically: loads the root's catalog the same way every other `lsd`
-  subcommand does, fixes `tool_prefix` at `local_services_` (the convention both real consumers had
-  already independently chosen), and serves over `rmcp::transport::stdio()`. Proven by a real
-  end-to-end test (`rust/bin/lsd/tests/end_to_end.rs`) that spawns the actual compiled binary as a
-  child process over stdio (`rmcp`'s `TokioChildProcess` — the same transport a real MCP host uses),
-  lists tools, and calls `status` against a real daemon it also spawned via `manager ensure`. 229
-  tests total in the workspace, clippy-clean.
-
-  **This closes out the Rust-rewrite plan's Phase 0–7 checklist.** Everything below "Sharp edges" in
-  the Rust rewrite section is now settled to the extent this repo's own scope requires — both open
-  items from earlier phases (the `.config.ts` escape hatch, Phase 1; the untested Docker/tailnet
-  integration paths, Phase 2) were resolved in passes after this one; see their own entries above.
-
-  **Real cutover has since started** (previously "separate follow-up work... not part of this repo's
-  own scope" — that changed once the rewrite reached parity and the project owner asked for it):
-  `apps/macos`'s `SidecarLocator`/`DaemonConnection` now prefer a real compiled `lsd` over `bun run
-  lsd.ts` (see `apps/macos/README.md` and `SidecarLocator.swift`'s own doc comment for the full
-  resolution order), and `scripts/build-app.sh` bundles that compiled binary so a packaged app needs
-  no `bun` at all for the common path.
-
-  **`infra` cut over; `viclass` deliberately did not yet — a real, functional gap, not caution for
-  its own sake.** `infra`'s `scripts/local-services-tui` scripts (`localctl`, `mcp`, `start`) now call
-  the installed `lsd` binary directly, verified against its real, already-running daemon (`lsd
-  status`/`lsd doctor`/`lsd mcp`'s `tools/list` all reporting correctly against its real 21-service
-  catalog) — safe because `infra`'s own `daemon.ts` has no logic beyond the generic engine `lsd daemon`
-  already provides. `viclass`'s does not: its `daemon.ts` wires a custom `PreparationAdapter`
-  (`scripts/local-services.sh prepare <serviceId>`) that real services depend on (`jitsi`'s
-  `local-jitsi-runtime`/`local-jitsi-network`, `sync`'s `runtime-config:vinet/sync`) — and
-  `PreparationAdapter` is a closure like `custom` readiness, so it can't cross a `.config.ts`/YAML
-  boundary any more than a `custom` probe can. The generic `lsd` binary's `spawn_daemon` is hardcoded
-  to `lsd daemon --root <root>` (no custom preparation adapter) — so switching `viclass` without
-  fixing this would mean the *next* `ensure()`-triggered daemon spawn (after a reboot, or `manager
-  stop`) silently starts those three services without their required prep step, no error surfaced
-  anywhere. Found before editing anything in `viclass` (a real end-to-end `lsd doctor`/`status` dry
-  run against it was clean; the `daemon.ts` diff read is what caught this).
-
-  **Resolved**: `ServiceRunProfile` gained `preparationCommand?: { command: CommandSpec; cwd?:
-  string; serializationKey?: string }` (`src/core/catalog.ts` / `catalog.rs`'s `PreparationCommand`)
-  — a declarative, JSON-serializable stand-in for a bespoke `PreparationAdapter`, mirroring exactly
-  why `{ kind: "command" }` readiness exists. The engine (`src/core/supervisor.ts` / `ls-core`'s
-  `engine.rs`) runs it via `ProbeAdapter.command`/`probes.command()` — the *same* adapter method
-  `{ kind: "command" }` readiness already uses — independently of the opaque `preparation` marker
-  list, so a service may declare either, both, or neither. Declarative YAML/`.config.ts` catalogs can
-  now express a prepare step with no closure at all. Critically,
-  **`default_supervisor_options`/`defaultSupervisorOptions` needed no changes** — both already wire a
-  real `DefaultProbeAdapter`/`command` adapter (for readiness), so `lsd daemon`'s stock setup picks up
-  a catalog's `preparationCommand` automatically.
-
-  **Re-reading `viclass`'s actual `prepare_service()` dispatch before migrating anything surfaced two
-  things the first pass underestimated.** First, it isn't 3 services — **27 of `viclass`'s ~30
-  services** carry a non-empty `preparation` marker, and *every one* dispatches through the exact same
-  shell call (`bash scripts/local-services.sh prepare <serviceId>`, keyed entirely by its own
-  case-statement on `$1`; the marker array's *contents* were never inspected by the adapter, only its
-  non-emptiness) — so mapping to `preparationCommand` is mechanical for all 27, not a 3-service
-  special case. Second, and more importantly: `viclass`'s current `serializedPreparation` wrapper
-  serializes *every* prepare call **globally, across all services**, because some of the underlying
-  work is a check-then-generate race with no locking of its own — `ensure_local_certificates` in
-  particular (`[[ -f cert ]] && return`, else regenerate) would corrupt a shared cert file if two
-  first-time-prepared services (e.g. `filestore` + `math` + `portal`, all sharing those certs) ran
-  concurrently, e.g. during `start all`. The original `preparationCommand` design (independent
-  per-service, no cross-service coordination) would have silently dropped that protection.
-  `PreparationCommand` gained `serializationKey`, reusing the exact same `KeyedLock` primitive
-  `ServiceBuildProfile.serializationKey` already uses for a shared-Gradle-daemon build queue —
-  services sharing a key run their preparation command one at a time. `viclass`'s eventual migration
-  should give every prep-dependent service the same key (reproducing the old global-queue behavior
-  exactly), not per-service keys.
-
-  The remaining step to actually unblock `viclass` is entirely catalog-side: migrate its ~27
-  prep-dependent services from the opaque marker list to `preparationCommand: { command: { shell:
-  "scripts/local-services.sh prepare <id>" }, serializationKey: "<one shared key>" }` in `viclass`'s
-  own `catalog.ts` — not yet done, since that's an edit to `viclass`'s real catalog and worth a real
-  end-to-end check against its actual running services before landing, same as `infra`'s cutover was.
-  Proven on both sides: TS (`test/core/supervisor.test.ts`'s "declarative preparation command"
-  describe block, including a serialization-by-key test; `test/core/config-file.test.ts`'s three new
-  mapping tests) and Rust (4 fakes-based `engine.rs` tests covering success/failure/
-  no-adapter-configured/serialization-by-key, a `config_file.rs` YAML-mapping test pair, and a real
-  end-to-end test spawning an actual shell preparation command — writes a marker file — through a real
-  `ProcessSupervisor` before a real `nc`-backed service starts). 237 tests total in the Rust workspace,
-  183 in the TS suite (one, unrelated real-process test flaked once under load across several repeated
-  runs — the same pre-existing category of flakiness as the Rust workspace's own real-process tests,
-  not a regression from this change), both clippy/typecheck-clean.
-
-  Neither `infra`'s nor `viclass`'s own commits/pushes are this repo's to make — `infra`'s package.json
-  edit sits uncommitted in that repo pending its owner's confirmation to push.
-  A latent bug was found and fixed while dogfooding `infra`'s real `.config.ts`: `load_typescript_catalog`
-  handed `bun -e`'s `import()` a *relative* path verbatim (e.g. `--root ../..`, the exact shape
-  `infra`'s own scripts use) — `import()` from an eval'd script has no natural "importer" file to
-  resolve a relative specifier against, so it fell into node_modules-style resolution instead and
-  failed to find the file at all. Fixed by canonicalizing the path before handing it to bun; a
-  regression test (`config_ts_resolves_a_relative_path_before_handing_it_to_bun`) reproduces the
-  original failure by mutating the test process's own cwd, since only a genuinely relative specifier
-  triggers it. A second, unrelated snag while dogfooding: `bun run` prepends `node_modules/.bin` to
-  `PATH`, and `@gnasdev/local-services` ships its own `bin: {lsd: "./src/bin/lsd.ts"}` — so a bare
-  `lsd` inside a package.json script resolves to *that* (the old TS shim, missing `mcp` entirely)
-  before it ever reaches the real installed binary. `infra`'s scripts now reference
-  `/opt/homebrew/bin/lsd` directly to sidestep the shadowing; worth knowing before assuming a bare
-  `lsd` in any consumer's package.json script means what it looks like it means.
-
-  **`lsd mcp install` / `lsd skill install`: added once both real consumers needed the same
-  hand-rolled wrapper a third time.** Each consumer used to hand-author its own ~20-line Node
-  wrapper spawning `lsd mcp` (to dodge the `node_modules/.bin` shadowing above and the MCP host's
-  possibly-minimal `PATH`) plus hand-edit its own MCP client config JSON — `mcp install <config-
-  file>...` (`ls-cli`'s `mcp_command`/`mcp_install_command`) replaces both: it resolves
-  `std::env::current_exe()` (the *running* `lsd` binary's own real path) and merges a
-  `{command, args: [--root, <canonical root>, mcp]}` entry into any file matching the standard
-  `{mcpServers: {name: {command, args, ...}}}` shape, touching only those two fields and
-  preserving every other field already on that entry (needed because infra's own MCP registry
-  schema — `.agent/mcp.json`, `task agent:sync`-generated into `.mcp.json`/`.grok/config.toml` —
-  carries `skill`/`summary`/`env`/`mutateGate`/`notes` alongside `command`/`args`) and every other
-  server entry in the file untouched. `skill install --dest <path>` writes a generic, project-
-  agnostic Markdown doc (`rust/crates/ls-cli/skill/local-services-mcp.md`, embedded via
-  `include_str!`) describing the 5 MCP tools' contract and mutate-gate policy — deliberately no
-  catalog/service-list content, since that varies per consumer and stays in that consumer's own
-  supplementary docs. Both subcommands are pure file manipulation (no `ls-mcp`/`ls-tui` runtime
-  needed), so unlike bare `mcp`/`tui` they live in `ls_cli::main` itself rather than being
-  intercepted in the `lsd` bin — `rust/bin/lsd/src/main.rs`'s `mcp` interception now only catches
-  the bare `rest.len() == 1` serve form and lets `mcp install ...` fall through. Both are dispatched
-  via the plain `mcpServers` JSON shape, which happens to already be identical across every MCP
-  host config this package's real consumers register with (Claude Code's `.mcp.json`, Kiro's
-  `.kiro/settings/mcp.json`) — a schema with *extra* fields (like infra's `.agent/mcp.json`) still
-  works because the merge only ever touches `command`/`args`.
-
-  **Two real bugs found dogfooding this against infra's actual `.agent/mcp.json`, both fixed
-  same-day:** (1) infra's file uses `"servers"` as its top-level key, not the standard
-  `"mcpServers"` every plain MCP host config shares — assumed too soon that shape was universal.
-  Fixed with a `--key <name>` flag (default `mcpServers`) rather than hardcoding infra's own
-  schema into this generic binary. (2) `serde_json::Value`'s object type is a `BTreeMap` unless
-  the crate's `preserve_order` feature is on, so the first real run **silently alphabetized every
-  key in the entire file**, turning a one-entry command/args change into a huge unreviewable diff
-  of a hand-maintained file — caught only by inspecting the actual diff before committing it, not
-  by any test (none of the original tests asserted on raw key order, only on parsed field values).
-  Fixed by enabling `preserve_order` workspace-wide in `rust/Cargo.toml` (validated safe: all 246
-  pre-existing tests still passed after the switch, since none depend on `serde_json::Value`'s
-  default alphabetical order) and adding a dedicated regression test
-  (`mcp_install_preserves_the_original_key_order_of_a_human_maintained_file`) that writes a file
-  with deliberately non-alphabetical key order and asserts it survives a merge unchanged. One
-  known, accepted residual: `serde_json::to_string_pretty` still can't preserve an original
-  compact-array style (`"args": ["x"]` on one line) — a merged file's untouched entries get their
-  arrays expanded to multi-line, a cosmetic diff with no effect on keys, values, or order.
+`lsd mcp install <config-file>...` and `lsd skill install --dest <path>` exist so a consumer doesn't
+hand-author a Node wrapper plus hand-edit its MCP client config. `mcp install` resolves the running
+binary's own path (`current_exe()`) and merges `{command, args}` into any file matching the standard
+`{mcpServers: {name: {…}}}` shape; `skill install` writes a generic, project-agnostic Markdown doc
+(`rust/crates/ls-cli/skill/local-services-mcp.md`, embedded via `include_str!`) describing the MCP
+tool contract, deliberately carrying no per-consumer catalog or service-list content.
 
 ## Maintaining this file
 
@@ -563,3 +266,7 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
+
+Specifically: do not record test counts, "clippy-clean", "N/N clean repeated runs", or a
+chronological log of what was ported when — all of it goes stale and none of it is actionable.
+Record the *rule* a bug taught, not the story of finding it.
