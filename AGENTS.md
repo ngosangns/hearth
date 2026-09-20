@@ -227,7 +227,27 @@ Status:
   the `lsd` bin exists in Phase 5); its constituent pieces (log rotation, lock-watch, lifecycle
   memoization) are independently tested — 8 new tests. **Phase 3 is now essentially complete**:
   151 tests total in the workspace, clippy-clean, stable across repeated runs.
-- **Not started**: Phase 4 (`ls-cli`), Phase 5 (`lsd` bin), Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
+- **Phase 4 (`ls-cli`): done.** New crate `rust/crates/ls-cli`, porting `src/cli/localctl.ts` in
+  full: lock-file discovery (`discover`/`ensure`/`require_client`, reusing `ls-core`'s own
+  ownership-proof verification so a Rust CLI and a Rust daemon agree on what a valid lock looks
+  like), the `doctor`/`cleanup`/`manager ensure|status|stop|reload`/`status`/`start|stop|restart`/
+  `operation get|watch`/`logs` commands, and the same exit-code scheme (usage=2, unavailable=3,
+  protocol=4, failed=5, timeout=6, unauthorized=7). One simplification worth knowing about:
+  `operation_id`'s URL-encoding step is skipped, because the validating regex
+  (`^[A-Za-z0-9._~-]{1,128}$`) only accepts RFC 3986 "unreserved" characters, which by definition
+  never need percent-encoding — the TS `encodeURIComponent` call there is a no-op in practice, not
+  a behavior this port is missing.
+
+  Tested against **real bootstrapped `LocalServicesManager`s** (not mocks) end-to-end through
+  `main()`'s actual argv dispatch: `status --json`, `start api --wait --json` (verifies the real
+  process reaches `ready`), `manager ensure --json`, `doctor`, an unknown command, and `status`
+  against no running manager at all (→ exit 3). One test also drives `ensure()`'s "spawn if
+  absent" path by wiring `spawn_daemon` to a real `ls_core::daemon::run_daemon` call — the same
+  lock-file discovery this CLI does independently finds the daemon it just spawned, which is the
+  actual contract that matters (a real consumer's `spawn_daemon` closure looks exactly like this).
+  164 tests total in the workspace (151 `ls-core` + 13 `ls-cli`), clippy-clean, stable across
+  repeated runs.
+- **Not started**: Phase 5 (`lsd` bin), Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
 ## Maintaining this file
 

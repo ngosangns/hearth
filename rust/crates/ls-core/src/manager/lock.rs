@@ -89,6 +89,17 @@ pub fn verify_lock_ownership_proof(key: Option<&str>, metadata: &ManagerMetadata
     constant_time_eq(&proof.token_digest, &expected_digest) && constant_time_eq(&proof.signature, &expected_signature)
 }
 
+/// Port of `isStaleLockMarker` — used by `localctl`'s `cleanup` command to confirm a quarantined
+/// `manager.lock.stale-*` directory is one this same ownership key actually produced (matching the
+/// proof it was quarantined with) before deleting it, rather than deleting an unrelated lookalike.
+pub fn is_stale_lock_marker(marker: &StaleLockMarker, key: &str, metadata: &ManagerMetadata, token: &str, expected_proof: &LockOwnershipProof) -> bool {
+    marker.version == 1
+        && matches!(marker.action, StaleLockAction::StaleLock)
+        && &marker.original == metadata
+        && &marker.proof == expected_proof
+        && verify_lock_ownership_proof(Some(key), metadata, token, expected_proof)
+}
+
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
