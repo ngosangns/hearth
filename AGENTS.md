@@ -247,7 +247,28 @@ Status:
   actual contract that matters (a real consumer's `spawn_daemon` closure looks exactly like this).
   164 tests total in the workspace (151 `ls-core` + 13 `ls-cli`), clippy-clean, stable across
   repeated runs.
-- **Not started**: Phase 5 (`lsd` bin), Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
+- **Phase 5 (`lsd` bin): done.** New binary crate `rust/bin/lsd`, porting `src/bin/lsd.ts`: `lsd
+  daemon --root <path>` (loads the catalog, resolves the base environment, calls
+  `ls_core::daemon::run_daemon` directly — this invocation *is* the daemon process body once
+  spawned detached) and every other subcommand delegating to `ls_cli::main` after loading the
+  catalog, with the exact same `--root`-extraction contract in both places so the two never
+  disagree on which project root an invocation means. `spawn_daemon` re-invokes
+  `std::env::current_exe()` as `lsd daemon --root <root>` with its own process group and discarded
+  stdio — Rust has no `Bun.spawn(...).unref()` equivalent to reach for; the same effect (the parent
+  can exit without waiting for or killing the child) falls out for free from just not calling
+  `.wait()` on the spawned `Child` and letting the handle drop. `tui` is deliberately not wired yet
+  (Phase 6 doesn't exist as a crate to depend on) — `ls_cli::main`'s own `tui` command already
+  surfaces a clear "not available" message rather than silently doing nothing.
+
+  Proven two ways: a real end-to-end subprocess test (`rust/bin/lsd/tests/end_to_end.rs`, the
+  closest equivalent to `test/bin/lsd.test.ts`) drives the actual compiled binary through
+  `manager ensure --json` → `start --wait --json` → `status --json` → `logs` → `manager stop
+  --json` → a fresh `manager ensure` proving the old instance is really gone — and a dedicated
+  test that ad-hoc signs the real (not hello-world) compiled binary and confirms it still runs,
+  reconfirming Phase 0's signing spike against the actual multi-thousand-line artifact a real
+  consumer would ship, not just a trivial stand-in. 169 tests total in the workspace, clippy-clean,
+  stable across repeated runs.
+- **Not started**: Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
 ## Maintaining this file
 

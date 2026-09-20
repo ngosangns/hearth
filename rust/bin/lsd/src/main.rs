@@ -1,0 +1,125 @@
+//! Port of `src/bin/lsd.ts` — the generic declarative-config binary every consumer (a desktop app's
+//! sidecar, a `local-services.yaml`-only project) shells out to. Phase 5 of the Rust-rewrite plan.
+//! `lsd daemon --root <path>` is the daemon entrypoint this binary spawns detached; every other
+//! subcommand delegates to `ls_cli::main`.
+use std::path::{Path, PathBuf};
+
+/// Mirrors `ls_cli::main`'s own `--root` extraction exactly (a leading `--root <path>`, nothing
+/// more lenient) so this binary and `ls_cli::main` always agree on which project root a given
+/// invocation means.
+fn extract_root(argv: &[String]) -> (PathBuf, Vec<String>) {
+    if argv.first().map(String::as_str) == Some("--root") {
+        let root = argv.get(1).cloned().unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
+        (PathBuf::from(root), argv.get(2..).unwrap_or(&[]).to_vec())
+    } else {
+        (std::env::current_dir().unwrap(), argv.to_vec())
+    }
+}
+
+fn report_config_error(root: &Path, errors: &[String]) {
+    eprintln!("lsd: could not load a service catalog for {}", root.display());
+    for error in errors {
+        eprintln!("  - {error}");
+    }
+}
+
+async fn run_daemon_subcommand(argv: &[String]) -> i32 {
+    let (root, rest) = extract_root(argv);
+    if !rest.is_empty() {
+        eprintln!("usage: lsd daemon --root <path>");
+        return 2;
+    }
+    let loaded = match ls_core::config_file::load_catalog(&root) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            report_config_error(&root, &error.errors);
+            return 1;
+        }
+    };
+    let runtime_directory = ls_core::paths::resolve_runtime_directory(&root, loaded.catalog.runtime_directory.as_deref());
+    let base_environment = ls_core::env::resolve_base_environment(ls_core::env::BaseEnvironmentOptions { root: Some(root.clone()), ..Default::default() });
+    let supervisor = ls_core::supervisor::default_supervisor_options(root.clone(), Some(runtime_directory.clone()), Some(base_environment));
+    ls_core::daemon::run_daemon(
+        ls_core::manager::LocalServicesManagerOptions {
+            runtime_directory: Some(runtime_directory),
+            root: Some(root),
+            catalog: loaded.catalog,
+            event_capacity: None,
+            log_tail_bytes: None,
+            log_max_bytes: None,
+            log_rotation_count: None,
+            supervisor: Some(supervisor),
+        },
+        false,
+    )
+    .await;
+    0
+}
+
+/// Re-invokes this same binary as `lsd daemon --root <root>`, detached (own process group, stdio
+/// discarded) — mirrors `Bun.spawn([...], {detached:true}).unref()`. Rust has no `.unref()`
+/// equivalent because that's a Node/Bun event-loop concept; the actual effect it achieves (the
+/// parent can exit without waiting for or killing the child) falls out for free here since we
+/// simply never call `.wait()` on the spawned child and let its `Child` handle drop.
+fn spawn_daemon(root: &Path) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("lsd"));
+    let root_arg = root.to_string_lossy().to_string();
+    let mut command = std::process::Command::new(exe);
+    command.args(["daemon", "--root", &root_arg]).current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
+}
+
+async fn run_cli(argv: &[String]) -> i32 {
+    let (root, _) = extract_root(argv);
+    let loaded = match ls_core::config_file::load_catalog(&root) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            report_config_error(&root, &error.errors);
+            return 1;
+        }
+    };
+    // `tui` is intentionally not wired yet — Phase 6 (`ls-tui`) doesn't exist as a crate this
+    // binary can depend on. `ls_cli::main`'s own `tui` command surfaces a clear "not available"
+    // message rather than silently doing nothing.
+    let options = ls_cli::LocalctlOptions { catalog: loaded.catalog, spawn_daemon: Box::new(spawn_daemon), doctor_checks: None };
+    let mut out = |s: &str| println!("{s}");
+    let mut err = |s: &str| eprintln!("{s}");
+    let mut io = ls_cli::Io { out: &mut out, err: &mut err };
+    // The *full*, un-stripped argv is passed through — `ls_cli::main` does its own `--root`
+    // extraction identically, exactly mirroring how the TS `runCli` passes its original argv to
+    // `main()` rather than the root-stripped remainder computed just above for `load_catalog`.
+    ls_cli::main(&options, argv, &mut io).await
+}
+
+#[tokio::main]
+async fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let code = if argv.first().map(String::as_str) == Some("daemon") { run_daemon_subcommand(&argv[1..]).await } else { run_cli(&argv).await };
+    std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_root_recognizes_a_leading_root_flag() {
+        let argv: Vec<String> = ["--root", "/tmp/project", "status"].iter().map(|s| s.to_string()).collect();
+        let (root, rest) = extract_root(&argv);
+        assert_eq!(root, PathBuf::from("/tmp/project"));
+        assert_eq!(rest, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn extract_root_defaults_to_cwd_without_the_flag() {
+        let argv: Vec<String> = ["status"].iter().map(|s| s.to_string()).collect();
+        let (root, rest) = extract_root(&argv);
+        assert_eq!(root, std::env::current_dir().unwrap());
+        assert_eq!(rest, vec!["status".to_string()]);
+    }
+}

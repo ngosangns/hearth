@@ -700,6 +700,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lsd"
+version = "0.1.0"
+dependencies = [
+ "ls-cli",
+ "ls-core",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
