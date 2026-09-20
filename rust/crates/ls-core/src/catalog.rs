@@ -94,6 +94,12 @@ pub struct PreparationCommand {
     pub command: CommandSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Services that share a `serialization_key` run their preparation command one at a time —
+    /// same idea, same mechanism (`KeyedLock`), as `ServiceBuildProfile::serialization_key`. Set
+    /// this when preparation touches shared, non-concurrency-safe state (e.g. a check-then-generate
+    /// shared cert/config file with no locking of its own).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serialization_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

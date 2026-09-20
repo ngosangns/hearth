@@ -42,7 +42,15 @@ export type ServiceKind = "application" | "infrastructure";
  * adapter `{ kind: "command" }` readiness already uses), independently of the opaque `preparation`
  * marker list above — a service may use either, both, or neither. `cwd` is relative to the manager's
  * root; omitted defaults to the root itself. */
-export type PreparationCommand = { readonly command: CommandSpec; readonly cwd?: string };
+export type PreparationCommand = {
+  readonly command: CommandSpec;
+  readonly cwd?: string;
+  /** Services that share a `serializationKey` run their preparation command one at a time — same
+   * idea, same mechanism, as `ServiceBuildProfile.serializationKey`. Set this when preparation
+   * touches shared, non-concurrency-safe state (e.g. a check-then-generate shared cert/config file
+   * with no locking of its own). */
+  readonly serializationKey?: string;
+};
 
 export type VerifiedServiceRunProfile = {
   readonly command: ServiceCommand;

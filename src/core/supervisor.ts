@@ -101,6 +101,7 @@ export class ProcessSupervisor {
   private readonly queues = new Map<ServiceId, Promise<void>>();
   private readonly buildAborts = new Map<ServiceId, AbortController>();
   private readonly buildSerials = new Map<string, Promise<void>>();
+  private readonly preparationSerials = new Map<string, Promise<void>>();
   private readonly outputTails = new Map<ServiceId, () => void>();
   private composeStartTail = Promise.resolve();
   private readonly optionsClock: SupervisorClock;
@@ -257,7 +258,9 @@ export class ProcessSupervisor {
     try {
       if (profile.preparation?.length) await this.options.preparation?.prepare(serviceId, profile.preparation);
       if (profile.preparationCommand) {
-        const ok = await this.options.probes.command?.(profile.preparationCommand.command, profile.preparationCommand.cwd);
+        const { command, cwd, serializationKey } = profile.preparationCommand;
+        const run = () => this.options.probes.command?.(command, cwd) ?? Promise.resolve(undefined);
+        const ok = serializationKey ? await this.serializedPreparationCommand(serializationKey, run) : await run();
         if (ok !== true) throw new Error("preparation command failed");
       }
     } catch {
@@ -534,6 +537,22 @@ export class ProcessSupervisor {
         }
       });
     }).finally(release);
+  }
+  /** Preparation analogue of `serializedBuild`, minus the cancellation plumbing (unlike a build,
+   * nothing today cancels an in-flight preparation command). */
+  private async serializedPreparationCommand(key: string, run: () => Promise<boolean | undefined>): Promise<boolean | undefined> {
+    const previous = (this.preparationSerials.get(key) ?? Promise.resolve()).catch(() => undefined);
+    let release!: () => void;
+    const turn = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.preparationSerials.set(key, previous.then(() => turn));
+    try {
+      await previous;
+      return await run();
+    } finally {
+      release();
+    }
   }
   private abortBuild(serviceId: ServiceId): void {
     this.buildAborts.get(serviceId)?.abort(new Error("Build cancelled"));

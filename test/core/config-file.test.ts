@@ -167,6 +167,17 @@ services:
     if (result.ok) expect(result.catalog.services[0]!.profiles.run).toMatchObject({ preparationCommand: { command: { argv: ["task", "sync:prepare"] }, cwd: "infra" } });
   });
 
+  test("maps a preparationCommand's serializationKey", async () => {
+    const root = await scratchRoot();
+    await writeFile(
+      join(root, "local-services.yaml"),
+      `version: 1\nservices:\n  sync:\n    run: { argv: [task, sync] }\n    readiness: { kind: process }\n    preparationCommand: { command: { argv: [task, "sync:prepare"] }, serializationKey: shared }\n`,
+    );
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.catalog.services[0]!.profiles.run).toMatchObject({ preparationCommand: { serializationKey: "shared" } });
+  });
+
   test("rejects a malformed preparationCommand", async () => {
     const root = await scratchRoot();
     await writeFile(join(root, "local-services.yaml"), `version: 1\nservices:\n  sync:\n    run: { argv: [task, sync] }\n    readiness: { kind: process }\n    preparationCommand: "not-an-object"\n`);

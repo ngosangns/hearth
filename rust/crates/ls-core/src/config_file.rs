@@ -331,7 +331,15 @@ fn read_preparation_command(value: &Value, path: &str, errors: &mut Vec<String>)
             None
         }
     };
-    Some(crate::catalog::PreparationCommand { command: command?.spec, cwd })
+    let serialization_key = match obj.get("serializationKey") {
+        None => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            errors.push(format!("{path}.serializationKey must be a string"));
+            None
+        }
+    };
+    Some(crate::catalog::PreparationCommand { command: command?.spec, cwd, serialization_key })
 }
 
 fn read_ports(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<Vec<ServicePort>> {

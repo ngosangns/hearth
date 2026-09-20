@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::{
-    is_container_command, ReadinessSpec, ServiceCatalog, ServiceCommand, ServiceDefinition, ServiceId,
+    is_container_command, CommandSpec, ReadinessSpec, ServiceCatalog, ServiceCommand, ServiceDefinition, ServiceId,
     ServiceOwnership, ServiceRunProfile,
 };
 use crate::state::{
@@ -161,6 +161,7 @@ pub struct ProcessSupervisor {
     queues: KeyedLock<ServiceId>,
     build_aborts: Mutex<HashMap<ServiceId, CancellationToken>>,
     build_serials: KeyedLock<String>,
+    preparation_serials: KeyedLock<String>,
     output_tails: Mutex<HashMap<ServiceId, Box<dyn FnOnce() + Send>>>,
     compose_start_tail: tokio::sync::Mutex<()>,
 }
@@ -175,6 +176,7 @@ impl ProcessSupervisor {
             queues: KeyedLock::new(),
             build_aborts: Mutex::new(HashMap::new()),
             build_serials: KeyedLock::new(),
+            preparation_serials: KeyedLock::new(),
             output_tails: Mutex::new(HashMap::new()),
             compose_start_tail: tokio::sync::Mutex::new(()),
         })
@@ -556,9 +558,18 @@ impl ProcessSupervisor {
         // neither. Reuses `ProbeAdapter::command`, the same adapter `ReadinessSpec::Command`
         // readiness already uses, so a bespoke `PreparationAdapter` is no longer the only way to
         // express "run this before starting" in a catalog that has no closures (`.config.ts`/YAML).
+        // `serialization_key` reuses the exact same `KeyedLock` primitive as build serialization —
+        // services sharing a key never run their preparation command concurrently, for the same
+        // reason a shared Gradle daemon can't take concurrent builds: some preparation work (a
+        // check-then-generate shared cert/config file with no locking of its own) isn't
+        // concurrency-safe either.
         if !preparation_failed {
             if let Some(prep_command) = &profile.preparation_command {
-                if self.options.probes.command(&prep_command.command, prep_command.cwd.as_deref()).await != Some(true) {
+                let ok = match &prep_command.serialization_key {
+                    Some(key) => self.serialized_preparation_command(key, &prep_command.command, prep_command.cwd.as_deref()).await,
+                    None => self.options.probes.command(&prep_command.command, prep_command.cwd.as_deref()).await,
+                };
+                if ok != Some(true) {
                     preparation_failed = true;
                 }
             }
@@ -1149,6 +1160,17 @@ impl ProcessSupervisor {
             .await
     }
 
+    /// Runs a declarative preparation command through `probes.command()`, serialized against every
+    /// other in-flight preparation command sharing the same `key` — the preparation analogue of
+    /// `serialized_build`, minus the cancellation plumbing (unlike a build, nothing today cancels an
+    /// in-flight preparation command).
+    async fn serialized_preparation_command(&self, key: &str, command: &CommandSpec, cwd: Option<&str>) -> Option<bool> {
+        let probes = self.options.probes.clone();
+        let command = command.clone();
+        let cwd = cwd.map(str::to_string);
+        self.preparation_serials.run(&key.to_string(), || async move { probes.command(&command, cwd.as_deref()).await }).await
+    }
+
     fn abort_build(&self, service_id: &ServiceId) {
         if let Some(token) = self.build_aborts.lock().unwrap().get(service_id) {
             token.cancel();
@@ -1552,28 +1574,53 @@ mod tests {
         // (`CommandCapableProbeAdapter`) is used for tests that need a real command-probe result.
     }
 
+    #[derive(Default)]
     struct CommandCapableProbeAdapter {
-        inner: Arc<FakeProbeAdapter>,
+        inner: Option<Arc<FakeProbeAdapter>>,
         result: std::sync::Mutex<Option<bool>>,
+        // Only used by the preparation-command serialization test below — a real delay (instead of
+        // an instant return) is what makes two concurrent calls sharing a `serializationKey`
+        // observably overlap if the engine's serialization ever regressed.
+        delay_ms: u64,
+        timeline: std::sync::Mutex<Vec<std::time::Instant>>,
     }
     #[async_trait]
     impl ProbeAdapter for CommandCapableProbeAdapter {
         async fn tcp(&self, port: u16) -> bool {
-            self.inner.tcp(port).await
+            match &self.inner {
+                Some(inner) => inner.tcp(port).await,
+                None => false,
+            }
         }
         async fn http(&self, url: &str) -> bool {
-            self.inner.http(url).await
+            match &self.inner {
+                Some(inner) => inner.http(url).await,
+                None => false,
+            }
         }
         async fn container(&self, name: &str) -> bool {
-            self.inner.container(name).await
+            match &self.inner {
+                Some(inner) => inner.container(name).await,
+                None => false,
+            }
         }
         async fn tailnet(&self) -> bool {
-            self.inner.tailnet().await
+            match &self.inner {
+                Some(inner) => inner.tailnet().await,
+                None => false,
+            }
         }
         async fn port_in_use(&self, port: u16) -> Option<bool> {
-            self.inner.port_in_use(port).await
+            match &self.inner {
+                Some(inner) => inner.port_in_use(port).await,
+                None => None,
+            }
         }
         async fn command(&self, _command: &CommandSpec, _cwd: Option<&str>) -> Option<bool> {
+            self.timeline.lock().unwrap().push(std::time::Instant::now());
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
             *self.result.lock().unwrap()
         }
     }
@@ -2003,7 +2050,7 @@ mod tests {
         )));
         let process = FakeProcessAdapter::new();
         let inner_probes = FakeProbeAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { inner: inner_probes, result: std::sync::Mutex::new(Some(true)) });
+        let probes = Arc::new(CommandCapableProbeAdapter { inner: Some(inner_probes), result: std::sync::Mutex::new(Some(true)), ..Default::default() });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
@@ -2027,7 +2074,7 @@ mod tests {
     fn preparation_catalog() -> ServiceCatalog {
         let service = with_preparation_command(
             argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
-            crate::catalog::PreparationCommand { command: CommandSpec::Argv { argv: vec!["prepare".to_string()] }, cwd: Some("infra".to_string()) },
+            crate::catalog::PreparationCommand { command: CommandSpec::Argv { argv: vec!["prepare".to_string()] }, cwd: Some("infra".to_string()), serialization_key: None },
         );
         one_service_catalog(service)
     }
@@ -2038,7 +2085,7 @@ mod tests {
         let process = FakeProcessAdapter::new();
         let inner_probes = FakeProbeAdapter::new();
         inner_probes.set_tcp_ready(8080, true);
-        let probes = Arc::new(CommandCapableProbeAdapter { inner: inner_probes, result: std::sync::Mutex::new(Some(true)) });
+        let probes = Arc::new(CommandCapableProbeAdapter { inner: Some(inner_probes), result: std::sync::Mutex::new(Some(true)), ..Default::default() });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
@@ -2054,7 +2101,7 @@ mod tests {
         let host = FakeHost::new(preparation_catalog());
         let process = FakeProcessAdapter::new();
         let inner_probes = FakeProbeAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { inner: inner_probes, result: std::sync::Mutex::new(Some(false)) });
+        let probes = Arc::new(CommandCapableProbeAdapter { inner: Some(inner_probes), result: std::sync::Mutex::new(Some(false)), ..Default::default() });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
@@ -2076,6 +2123,49 @@ mod tests {
         let h = build_harness_with_timeout(preparation_catalog(), 20);
         let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
         assert_eq!(err.0, "Preparation failed for api");
+    }
+
+    #[tokio::test]
+    async fn preparation_command_serialization_by_key_runs_one_at_a_time() {
+        // Mirrors `build_serialization_by_key_runs_one_at_a_time` — the same real risk (a
+        // check-then-generate shared cert/config file with no locking of its own, e.g. `viclass`'s
+        // `ensure_local_certificates`) motivated adding `serializationKey` to `preparationCommand` at
+        // all, so this proves the `KeyedLock` wiring actually prevents the overlap it exists for.
+        fn service_with_prep(id: &str, key: &str) -> ServiceDefinition {
+            with_preparation_command(
+                argv_verified(id, ReadinessSpec::Process),
+                crate::catalog::PreparationCommand { command: CommandSpec::Argv { argv: vec!["prepare".to_string()] }, cwd: None, serialization_key: Some(key.to_string()) },
+            )
+        }
+        let catalog = ServiceCatalog {
+            services: vec![service_with_prep("a", "shared"), service_with_prep("b", "shared")],
+            groups: HashMap::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: None,
+        };
+        let host = FakeHost::new(catalog);
+        let process = FakeProcessAdapter::new();
+        let probes = Arc::new(CommandCapableProbeAdapter { result: std::sync::Mutex::new(Some(true)), delay_ms: 5, ..Default::default() });
+        let run_build = FakeRunBuild::new();
+        let clock = FakeClock::new();
+        let supervisor = ProcessSupervisor::new(
+            host.clone(),
+            SupervisorOptions { process, run_build, probes: probes.clone(), preparation: Some(Arc::new(NoPreparation)), clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+        );
+        let sup_a = supervisor.clone();
+        let sup_b = supervisor.clone();
+        let id_a = "a".to_string();
+        let id_b = "b".to_string();
+        let (ra, rb) = tokio::join!(sup_a.start(&id_a, None), sup_b.start(&id_b, None));
+        ra.unwrap();
+        rb.unwrap();
+
+        let timeline = probes.timeline.lock().unwrap().clone();
+        assert_eq!(timeline.len(), 2);
+        let gap = timeline[1].duration_since(timeline[0]);
+        assert!(gap >= std::time::Duration::from_millis(4), "preparation commands sharing a serializationKey must not overlap, gap was {gap:?}");
     }
 
     #[tokio::test]

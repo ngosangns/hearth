@@ -640,6 +640,39 @@ describe("declarative preparation command", () => {
     const fixture = setup({ probes: { tcp: async () => true, http: async () => false, container: async () => false, tailnet: async () => false, portInUse: async () => false } }, preparationCatalog);
     await expect(fixture.supervisor.start("metadata")).rejects.toThrow("Preparation failed for metadata");
   });
+
+  test("serializes concurrent preparation commands sharing a serializationKey", async () => {
+    // Mirrors the build-serialization test's real motivation (a shared, non-concurrency-safe
+    // resource — e.g. viclass's check-then-generate local certificates) — proves the
+    // serializationKey wiring actually prevents two services' preparation commands from
+    // overlapping, not just that it type-checks.
+    const serviceWithPrep = (id: string, port: number) => ({
+      id,
+      profiles: { run: { commandStatus: "verified" as const, command: shellCommand(`serve ${id}`), readiness: { kind: "tcp" as const, port }, preparationCommand: { command: { argv: ["prepare"] }, serializationKey: "shared" } } },
+    });
+    const twoServices: ServiceCatalog = { ...catalog, services: [serviceWithPrep("a", 1166), serviceWithPrep("b", 1167)] };
+    const timeline: number[] = [];
+    const fixture = setup(
+      {
+        probes: {
+          tcp: async () => true,
+          http: async () => false,
+          container: async () => false,
+          tailnet: async () => false,
+          portInUse: async () => false,
+          command: async () => {
+            timeline.push(Date.now());
+            await Bun.sleep(15);
+            return true;
+          },
+        },
+      },
+      twoServices,
+    );
+    await Promise.all([fixture.supervisor.start("a"), fixture.supervisor.start("b")]);
+    expect(timeline).toHaveLength(2);
+    expect(timeline[1]! - timeline[0]!).toBeGreaterThanOrEqual(10);
+  });
 });
 
 describe("default supervisor options — command readiness probe", () => {

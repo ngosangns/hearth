@@ -445,26 +445,50 @@ Status:
   run against it was clean; the `daemon.ts` diff read is what caught this).
 
   **Resolved**: `ServiceRunProfile` gained `preparationCommand?: { command: CommandSpec; cwd?:
-  string }` (`src/core/catalog.ts` / `catalog.rs`'s `PreparationCommand`) — a declarative,
-  JSON-serializable stand-in for a bespoke `PreparationAdapter`, mirroring exactly why `{ kind:
-  "command" }` readiness exists. The engine (`src/core/supervisor.ts` / `ls-core`'s `engine.rs`) runs
-  it via `ProbeAdapter.command`/`probes.command()` — the *same* adapter method `{ kind: "command" }`
-  readiness already uses — independently of the opaque `preparation` marker list, so a service may
-  declare either, both, or neither. Declarative YAML/`.config.ts` catalogs can now express a prepare
-  step with no closure at all. Critically, **`default_supervisor_options`/`defaultSupervisorOptions`
-  needed no changes** — both already wire a real `DefaultProbeAdapter`/`command` adapter (for
-  readiness), so `lsd daemon`'s stock setup picks up a catalog's `preparationCommand` automatically.
-  The remaining step to actually unblock `viclass` is entirely catalog-side: migrate its 3
+  string; serializationKey?: string }` (`src/core/catalog.ts` / `catalog.rs`'s `PreparationCommand`)
+  — a declarative, JSON-serializable stand-in for a bespoke `PreparationAdapter`, mirroring exactly
+  why `{ kind: "command" }` readiness exists. The engine (`src/core/supervisor.ts` / `ls-core`'s
+  `engine.rs`) runs it via `ProbeAdapter.command`/`probes.command()` — the *same* adapter method
+  `{ kind: "command" }` readiness already uses — independently of the opaque `preparation` marker
+  list, so a service may declare either, both, or neither. Declarative YAML/`.config.ts` catalogs can
+  now express a prepare step with no closure at all. Critically,
+  **`default_supervisor_options`/`defaultSupervisorOptions` needed no changes** — both already wire a
+  real `DefaultProbeAdapter`/`command` adapter (for readiness), so `lsd daemon`'s stock setup picks up
+  a catalog's `preparationCommand` automatically.
+
+  **Re-reading `viclass`'s actual `prepare_service()` dispatch before migrating anything surfaced two
+  things the first pass underestimated.** First, it isn't 3 services — **27 of `viclass`'s ~30
+  services** carry a non-empty `preparation` marker, and *every one* dispatches through the exact same
+  shell call (`bash scripts/local-services.sh prepare <serviceId>`, keyed entirely by its own
+  case-statement on `$1`; the marker array's *contents* were never inspected by the adapter, only its
+  non-emptiness) — so mapping to `preparationCommand` is mechanical for all 27, not a 3-service
+  special case. Second, and more importantly: `viclass`'s current `serializedPreparation` wrapper
+  serializes *every* prepare call **globally, across all services**, because some of the underlying
+  work is a check-then-generate race with no locking of its own — `ensure_local_certificates` in
+  particular (`[[ -f cert ]] && return`, else regenerate) would corrupt a shared cert file if two
+  first-time-prepared services (e.g. `filestore` + `math` + `portal`, all sharing those certs) ran
+  concurrently, e.g. during `start all`. The original `preparationCommand` design (independent
+  per-service, no cross-service coordination) would have silently dropped that protection.
+  `PreparationCommand` gained `serializationKey`, reusing the exact same `KeyedLock` primitive
+  `ServiceBuildProfile.serializationKey` already uses for a shared-Gradle-daemon build queue —
+  services sharing a key run their preparation command one at a time. `viclass`'s eventual migration
+  should give every prep-dependent service the same key (reproducing the old global-queue behavior
+  exactly), not per-service keys.
+
+  The remaining step to actually unblock `viclass` is entirely catalog-side: migrate its ~27
   prep-dependent services from the opaque marker list to `preparationCommand: { command: { shell:
-  "scripts/local-services.sh prepare <id>" } }` (or equivalent) in `viclass`'s own `catalog.ts` — not
-  yet done, since that's an edit to `viclass`'s real catalog and worth a real end-to-end check against
-  its actual running services before landing, same as `infra`'s cutover was. Proven on both sides:
-  TS (`test/core/supervisor.test.ts`'s "declarative preparation command" describe block,
-  `test/core/config-file.test.ts`'s two new mapping tests) and Rust (3 fakes-based `engine.rs` tests
-  covering success/failure/no-adapter-configured, a `config_file.rs` YAML-mapping test pair, and a
-  real end-to-end test spawning an actual shell preparation command — writes a marker file — through
-  a real `ProcessSupervisor` before a real `nc`-backed service starts). 236 tests total in the Rust
-  workspace, 181 in the TS suite, both clippy/typecheck-clean.
+  "scripts/local-services.sh prepare <id>" }, serializationKey: "<one shared key>" }` in `viclass`'s
+  own `catalog.ts` — not yet done, since that's an edit to `viclass`'s real catalog and worth a real
+  end-to-end check against its actual running services before landing, same as `infra`'s cutover was.
+  Proven on both sides: TS (`test/core/supervisor.test.ts`'s "declarative preparation command"
+  describe block, including a serialization-by-key test; `test/core/config-file.test.ts`'s three new
+  mapping tests) and Rust (4 fakes-based `engine.rs` tests covering success/failure/
+  no-adapter-configured/serialization-by-key, a `config_file.rs` YAML-mapping test pair, and a real
+  end-to-end test spawning an actual shell preparation command — writes a marker file — through a real
+  `ProcessSupervisor` before a real `nc`-backed service starts). 237 tests total in the Rust workspace,
+  183 in the TS suite (one, unrelated real-process test flaked once under load across several repeated
+  runs — the same pre-existing category of flakiness as the Rust workspace's own real-process tests,
+  not a regression from this change), both clippy/typecheck-clean.
 
   Neither `infra`'s nor `viclass`'s own commits/pushes are this repo's to make — `infra`'s package.json
   edit sits uncommitted in that repo pending its owner's confirmation to push.

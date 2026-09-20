@@ -164,8 +164,9 @@ function readPreparationCommand(value: unknown, path: string, errors: string[]):
   }
   const command = readCommandSpec(value.command, `${path}.command`, errors);
   if (value.cwd !== undefined && typeof value.cwd !== "string") errors.push(`${path}.cwd must be a string`);
+  if (value.serializationKey !== undefined && typeof value.serializationKey !== "string") errors.push(`${path}.serializationKey must be a string`);
   if (!command) return undefined;
-  return { command: command.spec, cwd: value.cwd as string | undefined };
+  return { command: command.spec, cwd: value.cwd as string | undefined, serializationKey: value.serializationKey as string | undefined };
 }
 
 function readPorts(value: unknown, path: string, errors: string[]): ServicePort[] | undefined {

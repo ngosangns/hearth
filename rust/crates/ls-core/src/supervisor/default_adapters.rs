@@ -920,7 +920,7 @@ mod tests {
                     readiness: ReadinessSpec::Tcp { port },
                     readiness_timeout_ms: Some(5_000),
                     preparation: None,
-                    preparation_command: Some(PreparationCommand { command: Spec::Shell { shell: format!("touch '{}'", marker.display()), exec: None }, cwd: None }),
+                    preparation_command: Some(PreparationCommand { command: Spec::Shell { shell: format!("touch '{}'", marker.display()), exec: None }, cwd: None, serialization_key: None }),
                 },
                 build: None,
             },
