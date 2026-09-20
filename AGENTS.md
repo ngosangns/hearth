@@ -41,7 +41,10 @@ separately from the package's own `ci.yml`.
   separate `rust-test` job in the same workflow runs `cargo test --workspace` and `cargo clippy
   --workspace --all-targets -- -D warnings` from `rust/` (unconditionally, not path-filtered, same
   as the TS `test` job) — added once Phase 7 closed out the Rust rewrite below, since until then
-  every one of its ~220 tests had only ever been run manually, never gated in CI.
+  every one of its ~220 tests had only ever been run manually, never gated in CI. Since the
+  Docker/tailnet real-adapter tests noted under Phase 2 below, `rust-test` also needs a working
+  `docker` (daemon running) and `tailscale` on the runner, on top of the `bun` it already needed for
+  the `.config.ts` escape hatch tests.
 - Semver doubles as the protocol-compatibility signal: `PROTOCOL_VERSION` (src/core/state.ts) is the
   one place a daemon and its TUI/CLI/MCP clients read it from — a bump there must be a major release.
 
@@ -191,9 +194,31 @@ Status:
   mid-flight, exact persisted-identity reclaim without respawn, PID-reused-but-port-held
   externally-owned retention, Docker Compose concurrent-start serialization exercised against a
   real `docker compose` project, abort-in-flight-build-before-restart, stop-a-preparing-service-
-  cleanly). Docker/tailnet code paths compile and are exercised by unit-level parsing logic, but
-  have **not** been integration-tested against a real `docker compose`/`tailscale serve` setup in
-  this pass — flagging so a future pass doesn't assume they're as battle-tested as the POSIX path.
+  cleanly).
+
+  **Docker/tailnet real integration coverage: resolved in a later pass** (`default_adapters.rs`,
+  after Phase 7 closed out the rest of the rewrite). Two new tests:
+  `real_process_supervisor_starts_and_stops_a_real_docker_compose_service` drives a real
+  `docker compose` project (a throwaway `alpine` service, unique-per-run project name) through a
+  real `ProcessSupervisor`/`DefaultProcessAdapter` — start, verify `ActualServiceState::Ready` with
+  a real `ProcessIdentity::Docker` and `docker inspect` agreeing it's running, stop, verify
+  `docker inspect` agrees it's really gone — always tearing the compose project down (even on a
+  failed assertion) so a broken test run never leaves a live container behind.
+  `tailnet_serving_agrees_with_the_real_tailscale_serve_status` calls the real
+  `tailnet_serving`/`DefaultProbeAdapter::tailnet` against whatever `tailscale serve` state already
+  exists on the test machine — deliberately **read-only**, never calling `tailscale serve` to add or
+  remove anything, since that would mutate a real (and on a dev machine, possibly shared/personal)
+  Tailscale configuration outside the test's control. Instead it independently re-derives the same
+  "does `Web` have any entries" check from a fresh `tailscale serve status --json` and asserts the
+  production function agrees, so the assertion is grounded in live system state rather than a
+  hardcoded `true`/`false` that would silently stop meaning anything if the machine's Tailscale
+  setup ever changes. **New, real requirement**: both tests need a working `docker` (daemon running)
+  and `tailscale` on the machine running `cargo test` — confirmed present on this session's own
+  machine (the same kind of environment as the `{self-hosted, macmini}` CI runner) before writing
+  them; every other real-tool-dependent test in this crate (`nc`, `ps`, `sh`) makes the same
+  assumption, so this isn't a new category of fragility, just a new pair of tools in that category.
+  228 tests total in the workspace, clippy-clean, 5/5 clean repeated runs, no leftover containers
+  after any run.
 - **Phase 3 (`LocalServicesManager`/daemon): substantially done.** Built bottom-up, each piece
   tested in isolation before wiring into HTTP: `manager/event_store.rs` (the SSE ring buffer,
   deliberately kept simple — see below), `manager/operations.rs` (per-target operation
@@ -385,13 +410,12 @@ Status:
   `ls-mcp` preserves. Adding an `lsd mcp` subcommand would be new scope beyond what was ported.
 
   **This closes out the Rust-rewrite plan's Phase 0–7 checklist.** Everything below "Sharp edges" in
-  the Rust rewrite section is now settled to the extent this repo's own scope requires; the one
-  standing, deliberate gap is the untested Docker/tailnet integration paths (Phase 2) — already
-  called out above, still open, still explicitly flagged (the `.config.ts` escape hatch, Phase 1's
-  other open item, was resolved after this phase — see its own entry above). Real cutover of any of
-  the three downstream consumers (`apps/macos`, `viclass`, `infra`) onto this Rust implementation is
-  separate follow-up work, not part of this repo's own scope (see the Phase 2/4-scope sharp-edge note
-  above).
+  the Rust rewrite section is now settled to the extent this repo's own scope requires — both open
+  items from earlier phases (the `.config.ts` escape hatch, Phase 1; the untested Docker/tailnet
+  integration paths, Phase 2) were resolved in passes after this one; see their own entries above.
+  Real cutover of any of the three downstream consumers (`apps/macos`, `viclass`, `infra`) onto this
+  Rust implementation is separate follow-up work, not part of this repo's own scope (see the
+  Phase 2/4-scope sharp-edge note above).
 
 ## Maintaining this file
 

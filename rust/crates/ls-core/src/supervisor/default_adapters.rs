@@ -695,4 +695,162 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&runtime_dir);
     }
+
+    /// Real end-to-end test of the `is_container_command` path in `DefaultProcessAdapter::spawn`
+    /// (and `stop_container`): a real `docker compose` project, driven entirely through a real
+    /// `ProcessSupervisor`. This is the Docker half of the "not yet integration-tested against a
+    /// real `docker compose`/`tailscale serve` setup" gap flagged when Phase 2 first landed — the
+    /// container-identity *logic* (fingerprint matching, adoption, reap-on-mismatch) was already
+    /// covered by fakes; what those fakes could never prove is that the real `docker inspect`/
+    /// `docker compose up|down` shell-outs in this file actually parse and drive a real daemon.
+    /// Needs a real `docker` (with a running daemon) on the test machine — every other test in this
+    /// crate that shells out to a real tool (`nc`, `ps`, `sh`) makes the same assumption, so this
+    /// follows the same convention rather than adding a first skip-if-missing guard.
+    #[tokio::test]
+    async fn real_process_supervisor_starts_and_stops_a_real_docker_compose_service() {
+        use crate::catalog::{
+            CommandSpec as Spec, ReadinessSpec, ServiceCatalog, ServiceCommand as Cmd, ServiceDefinition, ServiceKind,
+            ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
+        };
+        use crate::state::{ActualServiceState, DesiredServiceState, ServiceLifecycleState, ServiceReadiness};
+        use crate::supervisor::Host;
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+
+        struct TestHost {
+            catalog: Arc<ServiceCatalog>,
+            states: StdMutex<Map<String, ServiceLifecycleState>>,
+        }
+        #[async_trait]
+        impl Host for TestHost {
+            fn instance_id(&self) -> String {
+                "real-docker-adapter-test".to_string()
+            }
+            fn catalog(&self) -> Arc<ServiceCatalog> {
+                self.catalog.clone()
+            }
+            fn service_states(&self) -> Vec<ServiceLifecycleState> {
+                let states = self.states.lock().unwrap();
+                self.catalog
+                    .services
+                    .iter()
+                    .map(|s| {
+                        states.get(&s.id).cloned().unwrap_or(ServiceLifecycleState {
+                            service_id: s.id.clone(),
+                            desired_state: DesiredServiceState::Stopped,
+                            actual_state: ActualServiceState::Stopped,
+                            readiness: ServiceReadiness::Unknown,
+                            generation: 0,
+                            identity: None,
+                            readiness_kind: None,
+                            readiness_detail: None,
+                            created_at: "2024-01-01T00:00:00.000Z".to_string(),
+                            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+                            exited_at: None,
+                            exit_code: None,
+                            error: None,
+                            current_operation_id: None,
+                        })
+                    })
+                    .collect()
+            }
+            async fn set_service_state(&self, next: ServiceLifecycleState) {
+                self.states.lock().unwrap().insert(next.service_id.clone(), next);
+            }
+            async fn append_log(&self, _service_id: &str, _data: &str) {}
+            fn publish(&self, _event_type: &str, _data: serde_json::Value) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(&compose_path, "services:\n  app:\n    image: alpine:latest\n    command: [\"sleep\", \"3600\"]\n").unwrap();
+        // Unique per test run so concurrent/repeated runs never collide on a project name, and
+        // lowercase-hex-only so it's always a valid Compose project name.
+        let project = format!("ls-core-test-{}", uuid::Uuid::new_v4().simple());
+        let container_name = format!("{project}-app-1");
+        let compose_path_str = compose_path.to_string_lossy().to_string();
+
+        let service = ServiceDefinition {
+            id: "docker-app".to_string(),
+            label: None,
+            kind: Some(ServiceKind::Application),
+            ownership: None,
+            dependencies: None,
+            profiles: ServiceProfiles {
+                run: ServiceRunProfile::Verified {
+                    command: Cmd {
+                        command: Spec::Shell { shell: format!("docker compose -p {project} -f '{compose_path_str}' up -d"), exec: None },
+                        cwd: ".".to_string(),
+                        environment: None,
+                        container_name: Some(container_name.clone()),
+                        docker_stop_command: Some(Spec::Shell { shell: format!("docker compose -p {project} -f '{compose_path_str}' down --timeout 1"), exec: None }),
+                    },
+                    readiness: ReadinessSpec::Container,
+                    readiness_timeout_ms: Some(30_000),
+                    preparation: None,
+                },
+                build: None,
+            },
+            ports: None,
+        };
+        let catalog = ServiceCatalog {
+            services: vec![service],
+            groups: Map::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: None,
+        };
+        let host = Arc::new(TestHost { catalog: Arc::new(catalog), states: StdMutex::new(Map::new()) });
+
+        let runtime_dir = std::env::temp_dir().join(format!("ls-core-real-docker-adapter-test-{}", uuid::Uuid::new_v4()));
+        let options = default_supervisor_options(dir.path().to_path_buf(), Some(runtime_dir.clone()), None);
+        let supervisor = ProcessSupervisor::new(host.clone(), options);
+
+        let start_result = supervisor.start(&"docker-app".to_string(), None).await;
+        // Always clean up the compose project, whether start succeeded or not, so a failed
+        // assertion never leaves a real container running on the test machine.
+        let cleanup = || {
+            let _ = std::process::Command::new("docker").args(["compose", "-p", &project, "-f", &compose_path_str, "down", "--timeout", "1"]).output();
+        };
+        if let Err(error) = &start_result {
+            cleanup();
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            panic!("real docker-backed service should start and become ready: {error:?}");
+        }
+
+        let state = host.service_states().into_iter().find(|s| s.service_id == "docker-app").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Ready);
+        match &state.identity {
+            Some(ProcessIdentity::Docker(id)) => assert_eq!(id.container_name, container_name),
+            other => panic!("expected a docker identity, got {other:?}"),
+        }
+        assert!(container_running(&container_name).await, "the real container should be running per `docker inspect`");
+
+        let stop_result = supervisor.stop(&"docker-app".to_string(), None).await;
+        cleanup();
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        stop_result.expect("stop should succeed");
+        assert!(!container_running(&container_name).await, "the real container must be stopped/removed after stop()");
+    }
+
+    /// Real (read-only) test of `tailnet_serving`/`DefaultProbeAdapter::tailnet` against whatever
+    /// `tailscale serve` state actually exists on the test machine — the Tailnet half of the gap
+    /// noted above `real_process_supervisor_starts_and_stops_a_real_docker_compose_service`.
+    /// Deliberately does not call `tailscale serve` to add or remove anything (that would mutate a
+    /// real, possibly shared Tailscale configuration outside this test's control) — instead it
+    /// re-derives the same "Web" non-empty check independently and asserts the production function
+    /// agrees with it, so the assertion is grounded in live system state rather than a hardcoded
+    /// `true`/`false` that would silently stop meaning anything if the machine's Tailscale
+    /// configuration ever changes.
+    #[tokio::test]
+    async fn tailnet_serving_agrees_with_the_real_tailscale_serve_status() {
+        let output = match std::process::Command::new("tailscale").args(["serve", "status", "--json"]).output() {
+            Ok(output) => output,
+            Err(error) => panic!("`tailscale` must be installed and on PATH to run this test: {error}"),
+        };
+        let expected = output.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&output.stdout).ok().and_then(|v| v.get("Web").and_then(|w| w.as_object()).map(|o| !o.is_empty())).unwrap_or(false);
+        assert_eq!(tailnet_serving().await, expected);
+    }
 }
