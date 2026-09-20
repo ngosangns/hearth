@@ -149,3 +149,44 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
     let _ = client.cancel().await;
     let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
 }
+
+/// Real end-to-end test of `lsd mcp install`: the whole point of resolving `std::env::current_exe()`
+/// inside `ls_cli`'s `mcp_install_command` is that it names *this actual compiled binary*, not some
+/// dev-time cargo artifact path or a symlink — the only way to prove that is to run the real
+/// binary and check what it wrote about itself.
+#[test]
+fn mcp_install_writes_the_real_compiled_binarys_own_path() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), free_port());
+    let config_path = dir.path().join(".mcp.json");
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("installed mcp server \"local-services\""), "{stdout}");
+
+    let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let entry = &written["mcpServers"]["local-services"];
+    assert_eq!(entry["command"], serde_json::json!(lsd_bin()));
+    let expected_root = std::fs::canonicalize(dir.path()).unwrap().to_string_lossy().to_string();
+    assert_eq!(entry["args"], serde_json::json!(["--root", expected_root, "mcp"]));
+
+    // Merging again (as a re-install would) must not disturb an unrelated sibling entry.
+    let mut existing: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    existing["mcpServers"]["other"] = serde_json::json!({ "command": "node", "args": ["other.mjs"] });
+    std::fs::write(&config_path, existing.to_string()).unwrap();
+    let (code, _, stderr) = run_lsd(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["other"]["command"], serde_json::json!("node"));
+}
+
+#[test]
+fn skill_install_writes_the_real_binarys_generic_skill_doc() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), free_port());
+    let dest = ".agent/skills/local-dev/SKILL.md";
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["skill", "install", "--dest", dest]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("installed skill doc"), "{stdout}");
+    let written = std::fs::read_to_string(dir.path().join(dest)).unwrap();
+    assert!(written.contains("local_services_manage"), "{written}");
+}

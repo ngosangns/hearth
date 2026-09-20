@@ -136,11 +136,13 @@ async fn run_cli(argv: &[String]) -> i32 {
     // reasonable while every consumer is a Bun/TS project that can just write one; a generic,
     // non-Bun `lsd` consumer has no equivalent on-ramp without this, so it earns a real subcommand
     // here rather than asking every future caller to hand-roll the same wrapper again.
-    if rest.first().map(String::as_str) == Some("mcp") {
-        if rest.len() > 1 {
-            eprintln!("usage: lsd mcp");
-            return 2;
-        }
+    //
+    // Only the *bare* `mcp` (serve-over-stdio) form is intercepted here — it alone needs `ls-mcp`/
+    // `rmcp`, which `ls-cli` can't depend on any more than it can depend on `ls-tui` (same
+    // circular-dependency reasoning as `tui` above). `mcp install ...` needs neither and is plain
+    // file-manipulation logic, so it's implemented in `ls_cli::main` itself (alongside `skill
+    // install`) and falls through to it below.
+    if rest.first().map(String::as_str) == Some("mcp") && rest.len() == 1 {
         return run_mcp_subcommand(root, loaded.catalog).await;
     }
     let options = ls_cli::LocalctlOptions { catalog: loaded.catalog, spawn_daemon: Box::new(spawn_daemon), doctor_checks: None };

@@ -87,6 +87,8 @@ pub enum FlagName {
     Wait,
     Follow,
     Tail,
+    Name,
+    Dest,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -96,6 +98,8 @@ pub struct Flags {
     pub wait: bool,
     pub follow: bool,
     pub tail: Option<u64>,
+    pub name: Option<String>,
+    pub dest: Option<String>,
 }
 
 pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> LocalctlResult<Flags> {
@@ -115,6 +119,8 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
             "wait" => (FlagName::Wait, "wait"),
             "follow" => (FlagName::Follow, "follow"),
             "tail" => (FlagName::Tail, "tail"),
+            "name" => (FlagName::Name, "name"),
+            "dest" => (FlagName::Dest, "dest"),
             _ => return usage_err(format!("unknown flag: {argument}")),
         };
         if !allowed.contains(&flag) {
@@ -133,6 +139,20 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
                 match value {
                     Some(v) if v >= 1 => result.tail = Some(v as u64),
                     _ => return usage_err("--tail must be a positive integer"),
+                }
+            }
+            FlagName::Name => {
+                index += 1;
+                match arguments.get(index).filter(|v| !v.is_empty()) {
+                    Some(value) => result.name = Some(value.clone()),
+                    None => return usage_err("--name requires a value"),
+                }
+            }
+            FlagName::Dest => {
+                index += 1;
+                match arguments.get(index).filter(|v| !v.is_empty()) {
+                    Some(value) => result.dest = Some(value.clone()),
+                    None => return usage_err("--dest requires a value"),
                 }
             }
         }
@@ -545,6 +565,8 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
             ensure(&root, options).await?;
             usage_err("tui is not available: this build did not wire a `tui` runtime handler (see the /tui subpath)")
         }
+        "mcp" => mcp_command(&root, rest, io).await,
+        "skill" => skill_command(&root, rest, io).await,
         other => usage_err(format!("unknown command: {other}")),
     }
 }
@@ -679,6 +701,117 @@ fn operation_status_str(status: OperationStatus) -> &'static str {
         OperationStatus::Succeeded => "succeeded",
         OperationStatus::Failed => "failed",
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// mcp install / skill install
+//
+// Every real consumer of this package (infra, viclass) used to hand-author its own ~20-line
+// Node/Bun wrapper spawning `lsd mcp`, plus hand-edit its MCP host's JSON config to point at that
+// wrapper — duplicated per repo for no reason once `lsd` itself is a single binary any MCP host
+// can spawn directly. `mcp install` replaces both: it resolves the *running* `lsd` binary's own
+// absolute path (no wrapper script needed) and merges a `{command, args}` entry directly into
+// whatever JSON file the caller points it at.
+// ---------------------------------------------------------------------------------------------
+
+async fn mcp_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
+    let Some(subcommand) = rest.first() else {
+        return usage_err("usage: local-services mcp install [--name <name>] [--json] <config-file>...");
+    };
+    match subcommand.as_str() {
+        "install" => mcp_install_command(root, &rest[1..], io).await,
+        other => usage_err(format!("unknown mcp subcommand: {other}")),
+    }
+}
+
+/// Merges `mcpServers.<name>` into each given JSON file, setting only `command`/`args` and
+/// preserving every other field already on that entry (e.g. infra's `.agent/mcp.json` schema
+/// carries `skill`/`summary`/`env`/`mutateGate`/`notes` alongside `command`/`args` — this must
+/// never clobber those) and every other entry in the file. Creates the file (as `{}`) if it
+/// doesn't exist yet, so a first-time install needs no pre-existing scaffold.
+async fn mcp_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
+    let flags = parse_command_flags(rest, &[FlagName::Name, FlagName::Json])?;
+    if flags.positionals.is_empty() {
+        return usage_err("usage: local-services mcp install [--name <name>] [--json] <config-file>...");
+    }
+    let name = flags.name.clone().unwrap_or_else(|| "local-services".to_string());
+    let exe = std::env::current_exe()
+        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not resolve the running lsd binary's own path: {e}") })?;
+    let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let command = exe.to_string_lossy().to_string();
+    let args = vec!["--root".to_string(), resolved_root.to_string_lossy().to_string(), "mcp".to_string()];
+    for config_file in &flags.positionals {
+        install_mcp_entry(Path::new(config_file), &name, &command, &args)?;
+    }
+    if flags.json {
+        (io.out)(&print_value(&json!({ "server": name, "command": command, "args": args, "files": flags.positionals }), true));
+    } else {
+        for config_file in &flags.positionals {
+            (io.out)(&format!("installed mcp server \"{name}\" into {config_file}"));
+        }
+    }
+    Ok(0)
+}
+
+fn install_mcp_entry(path: &Path, name: &str, command: &str, args: &[String]) -> LocalctlResult<()> {
+    let io_err = |context: String| move |e: std::io::Error| LocalctlError { exit_code: EXIT_FAILED, message: format!("{context}: {e}") };
+    let mut document: Value = if path.exists() {
+        let text = std::fs::read_to_string(path).map_err(io_err(format!("could not read {}", path.display())))?;
+        serde_json::from_str(&text)
+            .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not parse {} as JSON: {e}", path.display()) })?
+    } else {
+        json!({})
+    };
+    let not_an_object = |what: &str| LocalctlError { exit_code: EXIT_FAILED, message: format!("{}'s {what} is not a JSON object", path.display()) };
+    let root_object = document.as_object_mut().ok_or_else(|| not_an_object("top level"))?;
+    let servers = root_object.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers_object = servers.as_object_mut().ok_or_else(|| not_an_object("\"mcpServers\""))?;
+    let entry = servers_object.entry(name.to_string()).or_insert_with(|| json!({}));
+    let entry_object = entry.as_object_mut().ok_or_else(|| not_an_object(&format!("\"mcpServers.{name}\"")))?;
+    entry_object.insert("command".to_string(), json!(command));
+    entry_object.insert("args".to_string(), json!(args));
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(io_err(format!("could not create {}", parent.display())))?;
+    }
+    let serialized = serde_json::to_string_pretty(&document).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
+    std::fs::write(path, serialized + "\n").map_err(io_err(format!("could not write {}", path.display())))?;
+    Ok(())
+}
+
+/// A generic, project-agnostic doc describing the MCP tool contract and mutate-gate policy any
+/// `@gnasdev/local-services`-backed project shares — deliberately doesn't mention a project's own
+/// service list, ports, or Taskfile targets, since those vary per consumer and belong in that
+/// project's own supplementary docs.
+const SKILL_MARKDOWN: &str = include_str!("../skill/local-services-mcp.md");
+
+async fn skill_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
+    let Some(subcommand) = rest.first() else {
+        return usage_err("usage: local-services skill install --dest <path>");
+    };
+    match subcommand.as_str() {
+        "install" => skill_install_command(root, &rest[1..], io).await,
+        other => usage_err(format!("unknown skill subcommand: {other}")),
+    }
+}
+
+async fn skill_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
+    let flags = parse_command_flags(rest, &[FlagName::Dest])?;
+    if !flags.positionals.is_empty() {
+        return usage_err("skill install takes no positional arguments");
+    }
+    let Some(dest) = flags.dest.clone() else {
+        return usage_err("usage: local-services skill install --dest <path>");
+    };
+    let dest_path = Path::new(&dest);
+    let resolved = if dest_path.is_absolute() { dest_path.to_path_buf() } else { root.join(dest_path) };
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not create {}: {e}", parent.display()) })?;
+    }
+    std::fs::write(&resolved, SKILL_MARKDOWN)
+        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not write {}: {e}", resolved.display()) })?;
+    (io.out)(&format!("installed skill doc at {}", resolved.display()));
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -934,5 +1067,127 @@ mod tests {
         let code = main(&options, &args(&["--root", "/tmp", "status"]), &mut io).await;
         assert_eq!(code, EXIT_UNAVAILABLE);
         assert!(err.lock().unwrap()[0].contains("unavailable"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // mcp install / skill install
+    // -----------------------------------------------------------------------------------------
+
+    async fn run_cli(dir: &Path, extra_args: &[&str]) -> (i32, Vec<String>, Vec<String>) {
+        let catalog = test_catalog(dir, vec![]);
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let out2 = out.clone();
+        let err2 = err.clone();
+        let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
+        let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut full_args: Vec<&str> = vec!["--root", dir.to_str().unwrap()];
+        full_args.extend_from_slice(extra_args);
+        let code = main(&options, &args(&full_args), &mut io).await;
+        let out = out.lock().unwrap().clone();
+        let err = err.lock().unwrap().clone();
+        (code, out, err)
+    }
+
+    #[tokio::test]
+    async fn mcp_install_creates_a_new_config_file_with_the_resolved_lsd_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("mcp.json");
+        let (code, out, _err) = run_cli(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]).await;
+        assert_eq!(code, 0);
+        assert!(out[0].contains("installed mcp server \"local-services\""));
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let entry = &written["mcpServers"]["local-services"];
+        let expected_exe = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        assert_eq!(entry["command"], json!(expected_exe));
+        let expected_root = std::fs::canonicalize(dir.path()).unwrap().to_string_lossy().to_string();
+        assert_eq!(entry["args"], json!(["--root", expected_root, "mcp"]));
+    }
+
+    #[tokio::test]
+    async fn mcp_install_preserves_other_fields_and_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("mcp.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "mcpServers": {
+                    "other-server": { "command": "node", "args": ["other.mjs"] },
+                    "local-services": {
+                        "command": "node",
+                        "args": ["old-wrapper.mjs"],
+                        "skill": "local-dev",
+                        "env": {},
+                        "notes": ["some historical note"],
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (code, _out, _err) = run_cli(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]).await;
+        assert_eq!(code, 0);
+
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["other-server"]["command"], json!("node"));
+        assert_eq!(written["mcpServers"]["other-server"]["args"], json!(["other.mjs"]));
+        let entry = &written["mcpServers"]["local-services"];
+        assert_eq!(entry["skill"], json!("local-dev"));
+        assert_eq!(entry["notes"], json!(["some historical note"]));
+        assert_ne!(entry["args"], json!(["old-wrapper.mjs"]));
+    }
+
+    #[tokio::test]
+    async fn mcp_install_supports_a_custom_name_and_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("nested/b.json");
+        let (code, out, _err) =
+            run_cli(dir.path(), &["mcp", "install", "--name", "viclass-local-services", a.to_str().unwrap(), b.to_str().unwrap()]).await;
+        assert_eq!(code, 0);
+        assert_eq!(out.len(), 2);
+        for path in [&a, &b] {
+            let written: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(written["mcpServers"]["viclass-local-services"]["command"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_install_requires_at_least_one_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, _out, err) = run_cli(dir.path(), &["mcp", "install"]).await;
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err[0].contains("usage: local-services mcp install"));
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_an_unknown_subcommand() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, _out, err) = run_cli(dir.path(), &["mcp", "bogus"]).await;
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err[0].contains("unknown mcp subcommand"));
+    }
+
+    #[tokio::test]
+    async fn skill_install_writes_the_generic_doc_at_a_relative_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, out, _err) = run_cli(dir.path(), &["skill", "install", "--dest", ".agent/skills/local-dev/SKILL.md"]).await;
+        assert_eq!(code, 0);
+        assert!(out[0].contains("installed skill doc"));
+        let written = std::fs::read_to_string(dir.path().join(".agent/skills/local-dev/SKILL.md")).unwrap();
+        assert_eq!(written, SKILL_MARKDOWN);
+        assert!(written.contains("local_services_manage"));
+    }
+
+    #[tokio::test]
+    async fn skill_install_requires_a_dest_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, _out, err) = run_cli(dir.path(), &["skill", "install"]).await;
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err[0].contains("usage: local-services skill install"));
     }
 }

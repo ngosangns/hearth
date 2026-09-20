@@ -515,6 +515,30 @@ Status:
   `/opt/homebrew/bin/lsd` directly to sidestep the shadowing; worth knowing before assuming a bare
   `lsd` in any consumer's package.json script means what it looks like it means.
 
+  **`lsd mcp install` / `lsd skill install`: added once both real consumers needed the same
+  hand-rolled wrapper a third time.** Each consumer used to hand-author its own ~20-line Node
+  wrapper spawning `lsd mcp` (to dodge the `node_modules/.bin` shadowing above and the MCP host's
+  possibly-minimal `PATH`) plus hand-edit its own MCP client config JSON — `mcp install <config-
+  file>...` (`ls-cli`'s `mcp_command`/`mcp_install_command`) replaces both: it resolves
+  `std::env::current_exe()` (the *running* `lsd` binary's own real path) and merges a
+  `{command, args: [--root, <canonical root>, mcp]}` entry into any file matching the standard
+  `{mcpServers: {name: {command, args, ...}}}` shape, touching only those two fields and
+  preserving every other field already on that entry (needed because infra's own MCP registry
+  schema — `.agent/mcp.json`, `task agent:sync`-generated into `.mcp.json`/`.grok/config.toml` —
+  carries `skill`/`summary`/`env`/`mutateGate`/`notes` alongside `command`/`args`) and every other
+  server entry in the file untouched. `skill install --dest <path>` writes a generic, project-
+  agnostic Markdown doc (`rust/crates/ls-cli/skill/local-services-mcp.md`, embedded via
+  `include_str!`) describing the 5 MCP tools' contract and mutate-gate policy — deliberately no
+  catalog/service-list content, since that varies per consumer and stays in that consumer's own
+  supplementary docs. Both subcommands are pure file manipulation (no `ls-mcp`/`ls-tui` runtime
+  needed), so unlike bare `mcp`/`tui` they live in `ls_cli::main` itself rather than being
+  intercepted in the `lsd` bin — `rust/bin/lsd/src/main.rs`'s `mcp` interception now only catches
+  the bare `rest.len() == 1` serve form and lets `mcp install ...` fall through. Both are dispatched
+  via the plain `mcpServers` JSON shape, which happens to already be identical across every MCP
+  host config this package's real consumers register with (Claude Code's `.mcp.json`, Kiro's
+  `.kiro/settings/mcp.json`) — a schema with *extra* fields (like infra's `.agent/mcp.json`) still
+  works because the merge only ever touches `command`/`args`.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
