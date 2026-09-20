@@ -314,7 +314,69 @@ Status:
   mid-request (Rust's single-owner `TuiApp` makes true concurrent mutation awkward without
   message-passing the whole action back in, not worth it for an already-`busy`-gated, typically
   sub-second HTTP round trip); and the `crossterm`-vs-raw-bytes input deviation noted above.
-- **Not started**: Phase 7 (`ls-mcp`).
+- **Phase 7 (`ls-mcp`): done — the last phase of the rewrite.** New crate `rust/crates/ls-mcp`,
+  porting `src/mcp/mcp-server.ts` on top of `rmcp` 3.4.0 (the official Rust MCP SDK): `client.rs`
+  (the `LocalServicesMcpClient` trait — `async-trait`-boxed, matching this codebase's existing
+  object-safe-trait pattern, e.g. `ls-core`'s `Host` — plus `ManagerApiClient`, built on `ls-cli`'s
+  own `require_client`/`request`/`runnable_targets` rather than a third HTTP re-implementation) and
+  `server.rs` (`LocalServicesMcpServer`, argument validation, secret-key/Bearer-token redaction).
+  `rmcp` was evaluated shallowly in an earlier pass and deep-dived only now, per the original plan.
+
+  **Hand-implements `ServerHandler`** (`get_info`/`list_tools`/`call_tool`) rather than using
+  `rmcp`'s declarative `#[tool]`/`#[tool_router]` macros — those generate a tool's name and JSON
+  schema at compile time, but this server's tool names carry a runtime-configurable prefix and the
+  `status`/`logs`/`manage` schemas embed an `enum` of the caller's actual `knownServiceIds`, known
+  only at construction time. Every other `ServerHandler` method (resources, prompts, subscriptions,
+  tasks, discover) is left at its provided default, mirroring how the TS `Server` only ever
+  registers `ListToolsRequestSchema`/`CallToolRequestSchema` handlers.
+
+  **`rmcp` 3.4.0 implements the 2026-07-28 MCP spec revision** (server discovery, tasks,
+  multi-round-trip requests, response caching — none of which this server or the TS source use),
+  so `ServerHandler`'s method list is much larger than the TS SDK's; only the three methods above
+  needed overriding; `CallToolRequestParams`/`CallToolResponse`/`ListToolsResult`/`ServerConfig`
+  (`= InitializeResult`) are all `#[non_exhaustive]`, so built through their constructor/builder
+  methods (`Tool::new`, `ListToolsResult::with_all_items`, `ServerConfig::new(...)
+  .with_server_info(...)`, `CallToolResult::success`/`::error`) rather than struct-literal syntax.
+
+  **One small upstream fix in `ls-core`** was needed to make this crate's `Arc<dyn
+  LocalServicesMcpClient + Send + Sync>` compile at all: `ls_core::doctor`'s
+  `DoctorCheckPredicate`/`DoctorCheckDetailFormatter` closures (unused by any real caller today)
+  were `Box<dyn Fn(...)>` with no `Send + Sync` bound, which transitively made all of
+  `LocalctlOptions` — and therefore `ManagerApiClient`, which owns one — not `Sync`. Widened to
+  `Box<dyn Fn(...) + Send + Sync>`; free, since nothing constructs one of these closures yet.
+
+  Tested two ways: 7 in-crate tests (a 1:1 port of `mcp-server.test.ts`'s scenarios — confirm-gating
+  by default and when disabled, unknown-service/extra-argument rejection, prefix-qualified tool
+  names and ordering) driving a real in-process client/server pair connected over a
+  `tokio::io::duplex` transport (this codebase's Rust equivalent of the TS SDK's
+  `InMemoryTransport.createLinkedPair()`), and a real end-to-end test
+  (`rust/crates/ls-mcp/tests/end_to_end.rs`) against a real bootstrapped `LocalServicesManager` and
+  a real `nc -lk`-backed TCP service: `status` (stopped) → `manage` start (waits on real TCP
+  readiness, returns the real pid) → `logs` → `events` (asserts a real `service.lifecycle` event
+  landed) → `trace` on a made-up operation id (asserts a tool-level error, not a protocol error) →
+  `manage` stop (asserts the real OS process is gone) — the same capstone-test category that closed
+  out every earlier phase. 222 tests total in the workspace, clippy-clean, 5/5 clean repeated runs.
+
+  **Sharp edge hit while writing the in-crate tests**: `service.serve(transport)` performs the
+  `initialize` handshake as a real round trip — each side's call blocks until it hears from the
+  other — so awaiting the server's and the client's `.serve()` calls *sequentially* deadlocks
+  forever (confirmed the hard way: a test hung indefinitely, 0% CPU, no compile activity). Fixed by
+  driving both concurrently with `tokio::join!`. Worth remembering for any future in-process
+  client/server test against any `rmcp`-based service, not just this one.
+
+  **Deliberately not wired into `lsd`**: unlike `tui` (a real `localctl.ts` CLI subcommand this
+  binary intercepts), the TS source has no `mcp` subcommand anywhere in `localctl.ts`/`lsd.ts` —
+  `/mcp` is a subpath a consumer embeds directly into its own MCP host (e.g. a few lines wiring
+  `createLocalServicesMcpServer` to a stdio transport in a small wrapper script), the same shape
+  `ls-mcp` preserves. Adding an `lsd mcp` subcommand would be new scope beyond what was ported.
+
+  **This closes out the Rust-rewrite plan's Phase 0–7 checklist.** Everything below "Sharp edges" in
+  the Rust rewrite section is now settled to the extent this repo's own scope requires; the two
+  standing, deliberate gaps are the `.config.ts` escape hatch (Phase 1) and the untested Docker/
+  tailnet integration paths (Phase 2) — both already called out above, still open, still explicitly
+  flagged. Real cutover of any of the three downstream consumers (`apps/macos`, `viclass`, `infra`)
+  onto this Rust implementation is separate follow-up work, not part of this repo's own scope (see
+  the Phase 2/4-scope sharp-edge note above).
 
 ## Maintaining this file
 

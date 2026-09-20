@@ -65,8 +65,12 @@ impl DoctorAdapter for DefaultDoctorAdapter {
     }
 }
 
-pub type DoctorCheckPredicate = Box<dyn Fn(&CommandResult) -> bool>;
-pub type DoctorCheckDetailFormatter = Box<dyn Fn(&CommandResult) -> String>;
+// `Send + Sync` (not just `Fn`): `ls-mcp`'s server needs its whole `LocalctlOptions` — and
+// therefore this type, transitively — to cross an `Arc<dyn LocalServicesMcpClient + Send + Sync>`
+// boundary. No existing caller constructs one of these closures today, so widening the bound is
+// free.
+pub type DoctorCheckPredicate = Box<dyn Fn(&CommandResult) -> bool + Send + Sync>;
+pub type DoctorCheckDetailFormatter = Box<dyn Fn(&CommandResult) -> String + Send + Sync>;
 
 pub struct DoctorCommandCheck {
     pub name: String,
