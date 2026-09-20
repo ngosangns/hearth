@@ -6,6 +6,7 @@
 
 pub mod catalog;
 pub mod config_file;
+pub mod daemon;
 pub mod doctor;
 pub mod env;
 pub mod file_io;

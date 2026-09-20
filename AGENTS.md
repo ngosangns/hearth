@@ -212,9 +212,21 @@ Status:
   tracked. Given SSE frames here are small JSON, frame-count bounding already caps memory to a small
   multiple in practice, but a future pass should add the byte tracking for full parity if a real
   workload ever produces unusually large events.
-  **Not yet done**: `daemon.rs` itself (`runDaemon`, `LockOwnershipWatch`, the `DaemonLifecycle`
-  SIGINT/SIGTERM wiring) — Phase 3's daemon-*process* glue, as opposed to the `LocalServicesManager`
-  it wraps, which is what's built so far.
+  **`daemon.rs` (the daemon-*process* glue around `LocalServicesManager`) is also ported**:
+  `create_daemon_log` (rotated diagnostics file), `read_lock_instance_id` (the three-way missing/
+  unreadable/found distinction — a transient read failure must never be mistaken for losing the
+  lock), `LockOwnershipWatch` (the losing-side lock-takeover self-stop), `DaemonLifecycle`
+  (memoized shutdown-once, via a `ShutdownManager` trait so it's testable without a real manager),
+  and `run_daemon` (bootstrap + SIGINT/SIGTERM/SIGHUP wiring). One documented, deliberate gap: Bun's
+  global `unhandledRejection`/`uncaughtException` hooks have no direct Rust equivalent (a panicking
+  spawned task is caught at that task's own `JoinHandle`, not globally) — narrower than it looks
+  since fire-and-forget work in this codebase already routes errors through
+  `Host::record_background_error` rather than panicking; noted rather than papered over with a
+  global panic hook that would itself diverge from the TS design. `run_daemon` itself doesn't yet
+  have a dedicated test (needs a real long-running process context that will come naturally once
+  the `lsd` bin exists in Phase 5); its constituent pieces (log rotation, lock-watch, lifecycle
+  memoization) are independently tested — 8 new tests. **Phase 3 is now essentially complete**:
+  151 tests total in the workspace, clippy-clean, stable across repeated runs.
 - **Not started**: Phase 4 (`ls-cli`), Phase 5 (`lsd` bin), Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
 ## Maintaining this file
