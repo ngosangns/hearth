@@ -12,9 +12,12 @@ path = "src/main.rs"
 ls-core = { path = "../../crates/ls-core" }
 ls-cli = { path = "../../crates/ls-cli" }
 ls-tui = { path = "../../crates/ls-tui" }
+ls-mcp = { path = "../../crates/ls-mcp" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+rmcp = { version = "3", features = ["server", "transport-io"] }
 
 [dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rmcp = { version = "3", features = ["server", "client", "transport-io", "transport-child-process"] }

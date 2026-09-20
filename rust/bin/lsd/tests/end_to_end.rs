@@ -106,3 +106,46 @@ fn missing_config_file_reports_a_clear_error() {
     assert_eq!(code, 1);
     assert!(stderr.contains("could not load a service catalog"), "{stderr}");
 }
+
+/// Real end-to-end test of `lsd mcp`: spawns the actual compiled binary as a child process over
+/// stdio (`rmcp`'s `TokioChildProcess`, the same transport a real MCP host like an editor/agent tool
+/// uses), lists tools, and calls `status` against a real bootstrapped daemon it also spawns via
+/// `manager ensure`. This is the Rust equivalent of infra's/viclass's own hand-rolled `src/mcp.ts`
+/// wrapper — proving a non-Bun MCP host can get the exact same tool surface from this binary alone.
+#[tokio::test]
+async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::TokioChildProcess;
+    use rmcp::{ClientHandler, ServiceExt};
+
+    #[derive(Clone, Default)]
+    struct NoopClientHandler;
+    impl ClientHandler for NoopClientHandler {}
+
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    write_config(dir.path(), port);
+
+    // A running daemon isn't required for `mcp` to start serving tools — but `status` needs one to
+    // actually answer, so ensure one's up first (same contract SidecarLocator/apps/macos rely on).
+    let (code, _, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let mut command = tokio::process::Command::new(lsd_bin());
+    command.arg("--root").arg(dir.path()).arg("mcp");
+    let transport = TokioChildProcess::new(command).expect("should spawn `lsd mcp`");
+    let client = NoopClientHandler.serve(transport).await.expect("mcp client should initialize");
+
+    let tools = client.list_all_tools().await.expect("list_tools should succeed");
+    let names: Vec<String> = tools.into_iter().map(|tool| tool.name.to_string()).collect();
+    assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage"]);
+
+    let response = client.call_tool(CallToolRequestParams::new("local_services_status")).await.expect("status tool call should succeed");
+    assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+    let text = response.content[0].as_text().unwrap().text.clone();
+    let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(status["services"]["services"][0]["serviceId"], "api");
+
+    let _ = client.cancel().await;
+    let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
+}

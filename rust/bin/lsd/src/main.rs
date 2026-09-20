@@ -74,6 +74,35 @@ fn spawn_daemon(root: &Path) {
     let _ = command.spawn();
 }
 
+/// Runs an MCP server over stdio for `root`'s catalog — the Rust on-ramp for an MCP host (an
+/// editor/agent tool) that would otherwise need its own hand-rolled `createLocalServicesMcpServer`
+/// wrapper. `require_confirm` stays at its safe default (`true`); `tool_prefix` is fixed at
+/// `local_services_` to match the convention every real TS consumer already independently chose.
+async fn run_mcp_subcommand(root: PathBuf, catalog: ls_core::catalog::ServiceCatalog) -> i32 {
+    use rmcp::ServiceExt;
+    let known_service_ids = catalog.services.iter().map(|s| s.id.clone()).collect();
+    let options = ls_cli::LocalctlOptions { catalog, spawn_daemon: Box::new(spawn_daemon), doctor_checks: None };
+    let client = ls_mcp::ManagerApiClient::new(root, options);
+    let server = ls_mcp::create_local_services_mcp_server(
+        std::sync::Arc::new(client),
+        ls_mcp::CreateLocalServicesMcpServerOptions { name: "local-services".to_string(), tool_prefix: "local_services_".to_string(), known_service_ids, ..Default::default() },
+    );
+    let running = match server.serve(rmcp::transport::stdio()).await {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("lsd mcp: failed to start: {error}");
+            return 1;
+        }
+    };
+    match running.waiting().await {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("lsd mcp: {error}");
+            1
+        }
+    }
+}
+
 async fn run_cli(argv: &[String]) -> i32 {
     let (root, rest) = extract_root(argv);
     let loaded = match ls_core::config_file::load_catalog(&root) {
@@ -100,6 +129,19 @@ async fn run_cli(argv: &[String]) -> i32 {
             service_kind: None,
         })
         .await;
+    }
+    // `mcp` has no TS equivalent in `lsd.ts`/`localctl.ts` either — every existing TS consumer
+    // (infra's, viclass's own `src/mcp.ts`) hand-authors an ~20-line wrapper around
+    // `createLocalServicesMcpServer` + a stdio transport instead. That duplication is only
+    // reasonable while every consumer is a Bun/TS project that can just write one; a generic,
+    // non-Bun `lsd` consumer has no equivalent on-ramp without this, so it earns a real subcommand
+    // here rather than asking every future caller to hand-roll the same wrapper again.
+    if rest.first().map(String::as_str) == Some("mcp") {
+        if rest.len() > 1 {
+            eprintln!("usage: lsd mcp");
+            return 2;
+        }
+        return run_mcp_subcommand(root, loaded.catalog).await;
     }
     let options = ls_cli::LocalctlOptions { catalog: loaded.catalog, spawn_daemon: Box::new(spawn_daemon), doctor_checks: None };
     let mut out = |s: &str| println!("{s}");

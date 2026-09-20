@@ -403,19 +403,35 @@ Status:
   driving both concurrently with `tokio::join!`. Worth remembering for any future in-process
   client/server test against any `rmcp`-based service, not just this one.
 
-  **Deliberately not wired into `lsd`**: unlike `tui` (a real `localctl.ts` CLI subcommand this
-  binary intercepts), the TS source has no `mcp` subcommand anywhere in `localctl.ts`/`lsd.ts` —
-  `/mcp` is a subpath a consumer embeds directly into its own MCP host (e.g. a few lines wiring
-  `createLocalServicesMcpServer` to a stdio transport in a small wrapper script), the same shape
-  `ls-mcp` preserves. Adding an `lsd mcp` subcommand would be new scope beyond what was ported.
+  **`lsd mcp`: added in a later pass, once real cutover started.** Originally left unwired
+  deliberately (the TS source has no `mcp` subcommand in `localctl.ts`/`lsd.ts` either — every real
+  consumer hand-rolls a ~20-line `src/mcp.ts` wrapper around `createLocalServicesMcpServer` + a stdio
+  transport instead). Once `infra` and `viclass` both needed exactly that wrapper rewritten in Rust,
+  duplicating it a second time per consumer stopped making sense — `lsd mcp` (`rust/bin/lsd/src/
+  main.rs`) now does it once, generically: loads the root's catalog the same way every other `lsd`
+  subcommand does, fixes `tool_prefix` at `local_services_` (the convention both real consumers had
+  already independently chosen), and serves over `rmcp::transport::stdio()`. Proven by a real
+  end-to-end test (`rust/bin/lsd/tests/end_to_end.rs`) that spawns the actual compiled binary as a
+  child process over stdio (`rmcp`'s `TokioChildProcess` — the same transport a real MCP host uses),
+  lists tools, and calls `status` against a real daemon it also spawned via `manager ensure`. 229
+  tests total in the workspace, clippy-clean.
 
   **This closes out the Rust-rewrite plan's Phase 0–7 checklist.** Everything below "Sharp edges" in
   the Rust rewrite section is now settled to the extent this repo's own scope requires — both open
   items from earlier phases (the `.config.ts` escape hatch, Phase 1; the untested Docker/tailnet
   integration paths, Phase 2) were resolved in passes after this one; see their own entries above.
-  Real cutover of any of the three downstream consumers (`apps/macos`, `viclass`, `infra`) onto this
-  Rust implementation is separate follow-up work, not part of this repo's own scope (see the
-  Phase 2/4-scope sharp-edge note above).
+
+  **Real cutover has since started** (previously "separate follow-up work... not part of this repo's
+  own scope" — that changed once the rewrite reached parity and the project owner asked for it):
+  `apps/macos`'s `SidecarLocator`/`DaemonConnection` now prefer a real compiled `lsd` over `bun run
+  lsd.ts` (see `apps/macos/README.md` and `SidecarLocator.swift`'s own doc comment for the full
+  resolution order), `scripts/build-app.sh` bundles that compiled binary so a packaged app needs no
+  `bun` at all for the common path, and both real downstream consumers' own daemon/CLI/MCP entry
+  points (`infra`'s `scripts/local-services-tui`, `viclass`'s `tools/local-services-tui`) were
+  switched to call the installed `lsd` binary directly instead of their own `bun run src/{daemon,
+  localctl,mcp}.ts` wrappers — verified against each repo's real, already-running daemon (`lsd status`
+  reporting real live services) before editing anything. Those two repos' own commits/pushes are
+  theirs to make, not this repo's.
 
 ## Maintaining this file
 

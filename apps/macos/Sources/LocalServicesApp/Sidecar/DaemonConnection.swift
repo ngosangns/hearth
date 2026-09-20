@@ -44,12 +44,18 @@ enum DaemonConnection {
     }
 
     private static func runLsd(root: String, args: [String]) async throws -> String {
-        guard let bun = SidecarLocator.findBun() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.bunNotFound) }
-        guard let lsdEntry = SidecarLocator.findLsdEntry() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.lsdEntryNotFound("<unresolved>")) }
-
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: bun)
-        process.arguments = ["run", lsdEntry, "--root", root] + args
+        if let lsdBinary = SidecarLocator.findLsdBinary() {
+            // Preferred: the real compiled binary, no `bun` needed at all.
+            process.executableURL = URL(fileURLWithPath: lsdBinary)
+            process.arguments = ["--root", root] + args
+        } else {
+            // Fallback: `bun run <lsd.ts>` against the original TypeScript source.
+            guard let bun = SidecarLocator.findBun() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.bunNotFound) }
+            guard let lsdEntry = SidecarLocator.findLsdEntry() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.lsdEntryNotFound("<unresolved>")) }
+            process.executableURL = URL(fileURLWithPath: bun)
+            process.arguments = ["run", lsdEntry, "--root", root] + args
+        }
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
