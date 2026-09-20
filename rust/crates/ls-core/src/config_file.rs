@@ -450,9 +450,12 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
 
     let mut services: Vec<ServiceDefinition> = Vec::new();
     let services_raw = services_raw.unwrap();
-    let mut service_ids: Vec<&String> = services_raw.keys().collect();
-    service_ids.sort();
-    for id in service_ids {
+    // Document order, not sorted: the TS loader iterates `Object.entries` (insertion order), and
+    // this order is user-visible — it drives `/v1/catalog`, `lsd status` row order, the TUI list,
+    // and the within-level start order `dependency_levels` produces. Sorting here made the same
+    // YAML file present differently depending on which implementation read it. `serde_json`'s
+    // `preserve_order` feature (enabled workspace-wide) is what makes `keys()` document-ordered.
+    for id in services_raw.keys() {
         let value = &services_raw[id];
         let svc_path = format!("services.{id}");
         let Some(obj) = value.as_object() else {
@@ -501,7 +504,11 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
         };
 
         let cwd = resolve_service_cwd(obj.get("cwd").and_then(Value::as_str), &svc_path, &mut errors);
-        let readiness = obj.get("readiness").and_then(|r| read_readiness(r, &format!("{svc_path}.readiness"), &mut errors));
+        // Unconditional, even when the key is absent: `read_readiness` is what reports
+        // "readiness.kind is required", and an `and_then` on `get("readiness")` would swallow that
+        // — the service would then be skipped below with no error at all, silently vanishing from
+        // a catalog that otherwise loaded fine.
+        let readiness = read_readiness(obj.get("readiness").unwrap_or(&Value::Null), &format!("{svc_path}.readiness"), &mut errors);
         let ports = read_ports(obj.get("ports"), &format!("{svc_path}.ports"), &mut errors);
         let preparation_command = obj.get("preparationCommand").and_then(|v| read_preparation_command(v, &format!("{svc_path}.preparationCommand"), &mut errors));
 
@@ -911,5 +918,33 @@ services:
         );
         let err = load_catalog(dir.path()).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("is shared by")), "{:?}", err.errors);
+    }
+
+    /// A missing `readiness` used to be swallowed by an `and_then` on the absent key: no error was
+    /// recorded, the service was then skipped by the `let Some(profile_run) … else { continue }`
+    /// guard, and the catalog loaded *successfully* without it. A typo'd key silently deleted a
+    /// service from the catalog.
+    #[test]
+    fn a_service_missing_readiness_fails_the_load_instead_of_vanishing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "local-services.yaml", "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n");
+        let error = load_catalog(dir.path()).expect_err("must not load");
+        let text = format!("{error:?}");
+        assert!(text.contains("readiness"), "the error must name the missing field, got: {text}");
+    }
+
+    /// Document order, not alphabetical: the TS loader iterates insertion order, and this ordering
+    /// is user-visible in `/v1/catalog`, `lsd status` and both TUIs.
+    #[test]
+    fn services_keep_their_document_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "local-services.yaml",
+            "version: 1\nservices:\n  zebra:\n    run: { argv: [x] }\n    readiness: { kind: process }\n  alpha:\n    run: { argv: [x] }\n    readiness: { kind: process }\n  middle:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let loaded = load_catalog(dir.path()).expect("loads");
+        let ids: Vec<&str> = loaded.catalog.services.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["zebra", "alpha", "middle"], "alphabetizing here diverges from the TS loader");
     }
 }

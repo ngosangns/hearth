@@ -38,7 +38,10 @@ fi
 
 app_bundle="$app_root/.build/Local Services.app"
 rm -rf "$app_bundle"
-mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources/lsd/src" "$app_bundle/Contents/Resources/lsd/bin"
+# NOTE: deliberately does NOT pre-create Resources/lsd/src. `cp -R src <dest>` copies the directory
+# *into* <dest> when <dest> already exists, which put the fallback at lsd/src/src/bin/lsd.ts —
+# a path SidecarLocator.findLsdEntry() does not look at, silently disabling the bundled fallback.
+mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources/lsd/bin"
 
 echo "==> assembling bundle at $app_bundle"
 cp "$executable" "$app_bundle/Contents/MacOS/LocalServicesApp"

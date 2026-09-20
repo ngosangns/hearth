@@ -25,12 +25,19 @@ struct ContentView: View {
                 }
             }
         } detail: {
-            if let selection, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }) {
-                // The controller is resolved here (where `registry` — an @EnvironmentObject — is
+            if let selection, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }),
+               let controller = registry.controllers[workspace.id] {
+                // A read-only lookup: the registry creates controllers in `sync(_:)`, never here —
+                // creating one from inside `body` would publish a change during a view update. The
+                // controller is resolved here (where `registry` — an @EnvironmentObject — is
                 // actually available) and passed down, rather than WorkspaceDetailView resolving it
                 // itself in an `init`, where @EnvironmentObject cannot be read yet.
-                WorkspaceDetailView(controller: registry.controller(for: workspace), workspace: workspace)
+                WorkspaceDetailView(controller: controller, workspace: workspace)
                     .id(workspace.id) // resets per-view state (e.g. an open log sheet) on selection change
+            } else if selection != nil {
+                // Only reachable for the frame between a workspace being added and `sync(_:)`
+                // running for the changed list.
+                ContentUnavailableViewCompat(title: "Preparing…", message: "Setting up this workspace.", systemImage: "folder")
             } else {
                 ContentUnavailableViewCompat(title: "Select a workspace", message: "Choose a folder from the sidebar.", systemImage: "folder")
             }

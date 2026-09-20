@@ -455,7 +455,7 @@ pub fn router(manager: Arc<LocalServicesManager>) -> Router {
 
 async fn require_authorized_and_protocol(State(manager): State<Arc<LocalServicesManager>>, headers: HeaderMap, request: axum::extract::Request, next: Next) -> Response {
     let expected = format!("Bearer {}", manager.token);
-    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(expected.as_str()) {
+    if !headers.get("authorization").and_then(|v| v.to_str().ok()).is_some_and(|got| super::lock::constant_time_eq(got, &expected)) {
         return ManagerHttpError::new(StatusCode::UNAUTHORIZED, "unauthorized", "Bearer authentication is required").into_response();
     }
     let protocol_ok = headers.get("x-local-services-protocol").and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u32>().ok()) == Some(PROTOCOL_VERSION);
@@ -466,7 +466,8 @@ async fn require_authorized_and_protocol(State(manager): State<Arc<LocalServices
 }
 
 fn is_authorized(manager: &LocalServicesManager, headers: &HeaderMap) -> bool {
-    headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(format!("Bearer {}", manager.token).as_str())
+    let expected = format!("Bearer {}", manager.token);
+    headers.get("authorization").and_then(|v| v.to_str().ok()).is_some_and(|got| super::lock::constant_time_eq(got, &expected))
 }
 
 async fn get_healthz(State(manager): State<Arc<LocalServicesManager>>, headers: HeaderMap) -> Response {
@@ -568,16 +569,28 @@ async fn post_operation_inner(manager: Arc<LocalServicesManager>, bytes: Bytes) 
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
 
-fn run_service_operation(manager: Arc<LocalServicesManager>, _handle: super::operations::OperationHandle, service_id: ServiceId, action: ServiceOperationKind, start_services: Vec<ServiceId>) -> BoxFuture<'static, Result<(), OperationError>> {
+fn run_service_operation(manager: Arc<LocalServicesManager>, handle: super::operations::OperationHandle, service_id: ServiceId, action: ServiceOperationKind, start_services: Vec<ServiceId>) -> BoxFuture<'static, Result<(), OperationError>> {
     async move {
+        // A single-service `start` brings up that service's whole dependency closure, in dependency
+        // order, exactly like bulk-start — `start_services` is that closure (computed by
+        // `dependency_levels` at schedule time), not just `service_id`. Calling
+        // `supervisor().start(&service_id)` directly here would spawn the service with its
+        // dependencies still stopped: they would be marked `queued-start` by
+        // `queue_stopped_services_for_start`, never started, then reset to `stopped` by the clear
+        // pass below, and the service itself would fail readiness against a dependency that was
+        // never brought up. `lsd start <id>`, the TUI's start key and MCP `manage start` all land
+        // here, so that path has to match `bulk-start`'s.
         let result = match action {
-            ServiceOperationKind::Start => manager.supervisor().start(&service_id, None).await,
+            ServiceOperationKind::Start => start_selected_dag(&manager, &start_services, &handle).await.map_err(|e| crate::supervisor::types::SupervisorError(e.message)),
             ServiceOperationKind::Stop => manager.supervisor().stop(&service_id, None).await,
             ServiceOperationKind::Restart => manager.supervisor().restart(&service_id, None).await,
             ServiceOperationKind::Status => manager.supervisor().status(&service_id).await,
         };
         if action == ServiceOperationKind::Start {
-            let operation_id = String::new(); // best-effort clear; exact operation id not required for clearing by desired-state check
+            // The real operation id, never an empty string: `clear_queued_starts` skips its
+            // ownership check when the id is empty, which would let this operation reset
+            // `queued-start` services belonging to a concurrent bulk-start and cancel it.
+            let operation_id = handle.lock().unwrap().id.clone();
             clear_queued_starts(&manager, &start_services, &operation_id).await;
         }
         result.map_err(|e| OperationError { code: "operation_failed".to_string(), message: e.0 })
@@ -633,7 +646,10 @@ async fn clear_queued_starts(manager: &Arc<LocalServicesManager>, service_ids: &
         if previous.actual_state != crate::state::ActualServiceState::QueuedStart {
             continue;
         }
-        if !operation_id.is_empty() && previous.current_operation_id.as_deref() != Some(operation_id) {
+        // Always ownership-checked: only the operation that queued a service may un-queue it.
+        // There is deliberately no "clear regardless" escape hatch — one used to exist for the
+        // single-service start path and let it cancel a concurrent bulk-start's queued services.
+        if previous.current_operation_id.as_deref() != Some(operation_id) {
             continue;
         }
         let next = ServiceLifecycleState {
@@ -952,7 +968,7 @@ async fn post_shutdown_inner(manager: Arc<LocalServicesManager>, bytes: Bytes) -
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
     }
     let non_terminal = ["stopped", "queued-start", "failed", "orphaned", "externally-owned"];
-    let active = manager.service_states().into_iter().any(|s| default_daemon_owned(&manager.catalog(), &s.service_id) && !non_terminal.contains(&format!("{:?}", s.actual_state).to_lowercase().replace('_', "-").as_str()));
+    let active = manager.service_states().into_iter().any(|s| default_daemon_owned(&manager.catalog(), &s.service_id) && !non_terminal.contains(&s.actual_state.as_wire_str()));
     if active && !stop_services {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "active_services", "Manager shutdown is refused while managed services are active"));
     }
@@ -1189,6 +1205,69 @@ mod tests {
         let empty_catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let outcome = manager.reload_catalog(empty_catalog).await.unwrap();
         assert_eq!(outcome.stopped, vec!["api".to_string()]);
+        manager.close().await;
+    }
+
+    /// Regression test for a real port bug: `run_service_operation` used to call
+    /// `supervisor().start(&service_id)` for the single requested service, while the TypeScript
+    /// source runs the whole dependency closure through `startSelectedDag`. A single-service start
+    /// therefore left every dependency stopped — visibly flipping them to `queued-start` and back
+    /// to `stopped` — and the service itself failed readiness against a dependency that was never
+    /// brought up. `lsd start <id>`, the TUI's start key and MCP `manage start` all post here, so
+    /// this is the path almost every real start takes.
+    #[tokio::test]
+    async fn single_service_start_brings_up_its_dependencies() {
+        let db_port = free_port();
+        let api_port = free_port();
+        let mut api = tcp_service("api", api_port);
+        api.dependencies = Some(vec!["db".to_string()]);
+        let catalog = ServiceCatalog {
+            services: vec![tcp_service("db", db_port), api],
+            groups: HashMap::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: Some(false),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = bootstrap(LocalServicesManagerOptions {
+            runtime_directory: Some(dir.path().to_path_buf()),
+            root: Some(PathBuf::from("/tmp")),
+            catalog,
+            event_capacity: None,
+            log_tail_bytes: None,
+            log_max_bytes: None,
+            log_rotation_count: None,
+            supervisor: None,
+        })
+        .await
+        .unwrap();
+
+        let base = manager.base_url();
+        let token = manager.bearer_token().to_string();
+        let client = reqwest::Client::new();
+
+        // Start ONLY `api`. Its dependency `db` is not named anywhere in the request.
+        let accepted: Value = client
+            .post(format!("{base}/v1/operations"))
+            .bearer_auth(&token)
+            .header("x-local-services-protocol", "1")
+            .json(&json!({ "requestId": "req-dep-start", "serviceId": "api", "action": "start" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let operation_id = accepted["operation"]["id"].as_str().unwrap().to_string();
+        let settled = wait_for_operation(&client, &base, &token, &operation_id).await;
+        assert_eq!(settled["operation"]["status"], "succeeded", "{settled:?}");
+
+        let states = manager.service_states();
+        let state_of = |id: &str| states.iter().find(|s| s.service_id == id).cloned().expect("service present");
+        assert_eq!(state_of("db").actual_state, crate::state::ActualServiceState::Ready, "the dependency must be started, not left stopped");
+        assert_eq!(state_of("api").actual_state, crate::state::ActualServiceState::Ready);
+
         manager.close().await;
     }
 }

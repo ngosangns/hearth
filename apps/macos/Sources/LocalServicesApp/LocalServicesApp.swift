@@ -11,8 +11,8 @@ struct LocalServicesApp: App {
                 .environmentObject(workspaceStore)
                 .environmentObject(registry)
                 .frame(minWidth: 760, minHeight: 480)
-                .task { registry.connectTrusted(workspaceStore.workspaces) }
-                .onChange(of: workspaceStore.workspaces) { workspaces in registry.connectTrusted(workspaces) }
+                .task { registry.sync(workspaceStore.workspaces) }
+                .onChange(of: workspaceStore.workspaces) { workspaces in registry.sync(workspaces) }
         }
         .windowResizability(.contentSize)
 

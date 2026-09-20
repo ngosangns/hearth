@@ -98,13 +98,13 @@ impl ManagerEventStore {
             (oldest_sequence > 0 && after < oldest_sequence - 1) || after > latest_sequence
         });
         let reset = epoch_mismatch || out_of_range;
-        let events = if reset {
-            Vec::new()
-        } else {
-            match after_sequence {
-                None => inner.events.clone(),
-                Some(after) => inner.events.iter().filter(|e| e.sequence > after).cloned().collect(),
-            }
+        // A reset returns the WHOLE buffer, not nothing: `reset` tells the client its cursor is
+        // unusable (wrong epoch, or a sequence the ring buffer has already evicted), and the reply
+        // is the full snapshot it needs to resynchronize from. Returning an empty vec left a
+        // client with a stale cursor no way to recover — it saw `reset: true` and no events.
+        let events = match after_sequence {
+            Some(after) if !reset => inner.events.iter().filter(|e| e.sequence > after).cloned().collect(),
+            _ => inner.events.clone(),
         };
         Replay { epoch: self.epoch.clone(), reset, events, latest_sequence }
     }
@@ -150,13 +150,30 @@ mod tests {
         assert_eq!(replay.events[0].sequence, b.sequence);
     }
 
+    /// A reset hands back the whole buffer, which is the point of the flag: the client's cursor is
+    /// unusable, so it needs the full snapshot to resynchronize from. This test previously asserted
+    /// `events.is_empty()`, pinning a real bug — a client with a stale cursor got `reset: true` and
+    /// nothing to reset *to*, while the TS source (`src/core/manager.ts`'s `replay`) returns every
+    /// buffered event in the same situation.
     #[test]
-    fn replay_resets_on_epoch_mismatch() {
+    fn replay_resets_on_epoch_mismatch_and_returns_the_whole_buffer() {
         let store = ManagerEventStore::new(None, Some("epoch-a".to_string()));
         store.publish("a", data());
+        store.publish("b", data());
         let replay = store.replay(None, Some("epoch-b"));
         assert!(replay.reset);
-        assert!(replay.events.is_empty());
+        assert_eq!(replay.events.len(), 2, "a reset must return the full snapshot, not an empty list");
+    }
+
+    #[test]
+    fn replay_returns_the_whole_buffer_when_the_cursor_is_out_of_range() {
+        let store = ManagerEventStore::new(Some(2), None);
+        for _ in 0..5 {
+            store.publish("a", data());
+        }
+        let replay = store.replay(Some(1), None);
+        assert!(replay.reset);
+        assert_eq!(replay.events.len(), 2, "everything still buffered, so the client can resynchronize");
     }
 
     #[test]

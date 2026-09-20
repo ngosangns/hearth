@@ -117,8 +117,15 @@ fn is_persisted_manager_state_value(value: &Value) -> bool {
     services.iter().all(|(key, state)| is_lifecycle_state(state, key))
 }
 
-fn value_to_persisted_state(value: &Value) -> PersistedManagerState {
-    serde_json::from_value(value.clone()).expect("validated by is_persisted_manager_state_value")
+/// Deliberately fallible rather than `.expect(...)`: `is_persisted_manager_state_value` is a
+/// shape check, not a type check, and it is weaker than these types in at least two places —
+/// `readinessKind` is validated as "any string" but deserializes into a closed enum, and
+/// `exitCode` is validated as any i64 but deserializes into an `i32`. A `state.json` containing
+/// `"readinessKind": "grpc"` passed validation and then panicked here, killing the daemon at
+/// bootstrap instead of quarantining the file and starting clean — which is the entire reason this
+/// module quarantines rather than trusts.
+fn value_to_persisted_state(value: &Value) -> Option<PersistedManagerState> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 /// A state file written by either predecessor tool keys its services under `units` and names them
@@ -179,7 +186,8 @@ impl AtomicStateStore {
             let raw = self.io.read_file(&self.path).ok()??;
             let value: Value = serde_json::from_str(&raw).ok()?;
             if is_persisted_manager_state_value(&value) {
-                return Some(value_to_persisted_state(&value));
+                // `None` here falls through to the quarantine path below rather than panicking.
+                return value_to_persisted_state(&value);
             }
             if let Some(migrated) = migrate_legacy_persisted_state(&value) {
                 let _ = self.save(&migrated);

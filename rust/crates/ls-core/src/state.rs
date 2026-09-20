@@ -41,6 +41,49 @@ pub enum ActualServiceState {
     ExternallyOwned,
 }
 
+impl ActualServiceState {
+    /// The kebab-case wire encoding — identical to this enum's serde representation, and the only
+    /// form any client understands.
+    ///
+    /// Never reach for `format!("{:?}", state)` to build a client-facing string: `Debug` yields
+    /// `QueuedStart`/`ExternallyOwned`, so lowercasing it gives `queuedstart`, which matches
+    /// neither the serde encoding the same daemon emits elsewhere nor the `queued-start` every
+    /// client matches on. Both mistakes were live bugs (a shutdown guard that never saw a
+    /// non-terminal service, and `service.lifecycle` events whose `actualState` disagreed with the
+    /// manager's own events for the same transition). `wire_encoding_matches_serde` below pins the
+    /// two encodings together.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::QueuedStart => "queued-start",
+            Self::Preparing => "preparing",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::RunningUnready => "running-unready",
+            Self::Ready => "ready",
+            Self::Stopping => "stopping",
+            Self::Failed => "failed",
+            Self::Orphaned => "orphaned",
+            Self::ExternallyOwned => "externally-owned",
+        }
+    }
+
+    /// Every variant, so exhaustive tests cannot silently miss one added later.
+    pub const ALL: [Self; 11] = [
+        Self::Stopped,
+        Self::QueuedStart,
+        Self::Preparing,
+        Self::Starting,
+        Self::Running,
+        Self::RunningUnready,
+        Self::Ready,
+        Self::Stopping,
+        Self::Failed,
+        Self::Orphaned,
+        Self::ExternallyOwned,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServiceReadiness {
@@ -78,6 +121,25 @@ pub enum ReadinessKind {
     Tailnet,
     Command,
     Custom,
+}
+
+impl ReadinessKind {
+    /// The lowercase wire encoding, matching this enum's serde representation. Same rule as
+    /// `ActualServiceState::as_wire_str`: `Debug` would give `Tcp`, which leaks into
+    /// `readinessDetail` — a string persisted in `state.json` and rendered by both TUIs.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Tcp => "tcp",
+            Self::Http => "http",
+            Self::Container => "container",
+            Self::Tailnet => "tailnet",
+            Self::Command => "command",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub const ALL: [Self; 7] = [Self::Process, Self::Tcp, Self::Http, Self::Container, Self::Tailnet, Self::Command, Self::Custom];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,5 +393,33 @@ mod tests {
         assert!(json.get("managerInstanceId").is_some(), "{json:?}");
         assert!(json.get("startIdentity").is_some(), "{json:?}");
         assert!(json.get("commandFingerprint").is_some(), "{json:?}");
+    }
+
+    #[test]
+    fn wire_encoding_matches_serde_for_every_actual_state() {
+        for state in ActualServiceState::ALL {
+            let serde_form = serde_json::to_value(state).expect("serializable");
+            assert_eq!(
+                serde_form.as_str().expect("a string"),
+                state.as_wire_str(),
+                "as_wire_str drifted from the serde encoding for {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_encoding_matches_serde_for_every_readiness_kind() {
+        for kind in ReadinessKind::ALL {
+            let serde_form = serde_json::to_value(kind).expect("serializable");
+            assert_eq!(serde_form.as_str().expect("a string"), kind.as_wire_str(), "as_wire_str drifted from serde for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn debug_formatting_is_not_a_usable_wire_encoding() {
+        // Pins the reason `as_wire_str` exists: the `format!("{:?}", ..).to_lowercase()` shortcut
+        // silently produces a string no client matches, for exactly the multi-word variants.
+        assert_eq!(ActualServiceState::QueuedStart.as_wire_str(), "queued-start");
+        assert_eq!(format!("{:?}", ActualServiceState::QueuedStart).to_lowercase(), "queuedstart");
     }
 }

@@ -524,7 +524,7 @@ impl ProcessSupervisor {
                 _ => {}
             }
             token = self.cancel(service_id);
-            self.terminate(&identity, &profile.command).await;
+            self.report_terminate_failure(service_id, self.terminate(&identity, &profile.command).await);
         }
 
         self.transition(
@@ -683,7 +683,7 @@ impl ProcessSupervisor {
             }
         }
         let profile = profile_for(&self.host.catalog(), service_id)?;
-        self.terminate(state.identity.as_ref().unwrap(), &profile.command).await;
+        self.terminate(state.identity.as_ref().unwrap(), &profile.command).await?;
         if has_active {
             self.active.lock().unwrap().remove(service_id);
         }
@@ -788,7 +788,7 @@ impl ProcessSupervisor {
             }),
         };
         if !self.valid(service_id, generation, token) {
-            self.terminate(&identity, &profile.command).await;
+            self.report_terminate_failure(service_id, self.terminate(&identity, &profile.command).await);
             return Ok(());
         }
         self.active
@@ -919,7 +919,7 @@ impl ProcessSupervisor {
         }
         ReadinessOutcome::Timeout {
             message: "Readiness timed out".to_string(),
-            detail: format!("Readiness {:?} probe timed out after {}ms", readiness_kind_of(&profile.readiness), timeout),
+            detail: format!("Readiness {} probe timed out after {}ms", readiness_kind_of(&profile.readiness).as_wire_str(), timeout),
         }
     }
 
@@ -1006,19 +1006,31 @@ impl ProcessSupervisor {
         if let Some(mut active) = active_entry {
             active.stopped = true;
             if terminate && self.owns_identity(&active.identity).await {
-                self.terminate(&active.identity, &active.command).await;
+                let service_id = match &active.identity {
+                    ProcessIdentity::Posix(p) => p.service_id.clone(),
+                    ProcessIdentity::Docker(d) => d.service_id.clone(),
+                };
+                self.report_terminate_failure(&service_id, self.terminate(&active.identity, &active.command).await);
             }
         }
     }
 
-    async fn terminate(self: &Arc<Self>, identity: &ProcessIdentity, command: &ServiceCommand) {
+    /// A container stop that FAILS must propagate: `stop_locked` transitions the service to
+    /// `stopped` immediately after this returns, so swallowing the error here would record a
+    /// service as stopped while its container is still running — the exact state drift this whole
+    /// daemon exists to prevent. An adapter that has no `stop_container` at all is likewise an
+    /// error (matching the TS source's `Docker container stop is unavailable`), not a silent no-op.
+    async fn terminate(self: &Arc<Self>, identity: &ProcessIdentity, command: &ServiceCommand) -> Result<(), SupervisorError> {
         if !self.owns_identity(identity).await {
-            return;
+            return Ok(());
         }
         match identity {
             ProcessIdentity::Docker(_) => {
                 let sink: OnOutput = Arc::new(|_| {});
-                let _ = self.options.process.stop_container(command, sink).await;
+                match self.options.process.stop_container(command, sink).await {
+                    Some(result) => result?,
+                    None => return Err(SupervisorError("Docker container stop is unavailable".to_string())),
+                }
             }
             ProcessIdentity::Posix(posix) => {
                 if let Some(stop) = self.output_tails.lock().unwrap().remove(&posix.service_id) {
@@ -1032,7 +1044,7 @@ impl ProcessSupervisor {
                         break;
                     }
                     if !self.process_tree_alive(&tree).await {
-                        return;
+                        return Ok(());
                     }
                     self.options.clock.sleep(self.options.readiness_backoff_ms).await;
                 }
@@ -1040,6 +1052,17 @@ impl ProcessSupervisor {
                     self.signal_process_tree(&tree, posix.pgid, ProcessSignal::Sigkill).await;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The three cleanup call sites of `terminate` have no caller to return an error to (they run
+    /// while abandoning a superseded start, or while finalizing). They still must not drop it
+    /// silently — this codebase's rule is that fire-and-forget work reports through
+    /// `Host::record_background_error` rather than vanishing.
+    fn report_terminate_failure(&self, service_id: &ServiceId, result: Result<(), SupervisorError>) {
+        if let Err(error) = result {
+            self.host.record_background_error("supervisor.terminate", &format!("{service_id}: {}", error.0));
         }
     }
 
@@ -1328,7 +1351,8 @@ impl ProcessSupervisor {
             "service.lifecycle",
             serde_json::json!({
                 "serviceId": next.service_id,
-                "actualState": format!("{:?}", next.actual_state),
+                "actualState": next.actual_state.as_wire_str(),
+                "readiness": next.readiness,
                 "generation": next.generation,
                 "operationId": next.current_operation_id,
             }),

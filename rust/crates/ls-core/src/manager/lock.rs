@@ -40,7 +40,9 @@ fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
+/// Shared with `http.rs`'s bearer-token check — the daemon's token gates every `/v1` route and
+/// `/healthz`'s `instanceId`, so it deserves the same treatment as the ownership proof next door.
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 

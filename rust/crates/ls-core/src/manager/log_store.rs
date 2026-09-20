@@ -314,7 +314,11 @@ impl CursorLogStore {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| name.starts_with(&prefix) && !name.ends_with(".rotation.json"))
             .collect();
-        rotated.sort();
+        // Sort by the NUMERIC generation suffix, not lexicographically. These names are
+        // `<service>.log.<generation>`, so a plain string sort orders them `.1, .10, .11, .2, …` —
+        // and since the pruning below drops the *front* of this list, that deleted the newest
+        // generations and kept the oldest as soon as a service passed 9 rotations.
+        rotated.sort_by_key(|name| name.rsplit('.').next().and_then(|suffix| suffix.parse::<u64>().ok()).unwrap_or(0));
         let excess = rotated.len().saturating_sub(self.rotation_count);
         for name in &rotated[..excess] {
             let _ = self.io.remove_file(&self.directory.join(name));
