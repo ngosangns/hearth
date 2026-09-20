@@ -81,6 +81,7 @@ pub enum ReadinessKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PosixProcessIdentity {
     pub manager_instance_id: String,
     pub service_id: ServiceId,
@@ -95,6 +96,7 @@ pub struct PosixProcessIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DockerContainerIdentity {
     pub manager_instance_id: String,
     pub service_id: ServiceId,
@@ -114,6 +116,7 @@ pub enum ProcessIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceLifecycleState {
     pub service_id: ServiceId,
     pub desired_state: DesiredServiceState,
@@ -159,6 +162,7 @@ pub enum OperationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Operation {
     pub id: String,
     pub request_id: String,
@@ -187,6 +191,7 @@ pub struct ManagerEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ManagerMetadata {
     pub version: u32,
     pub protocol_version: u32,
@@ -197,6 +202,7 @@ pub struct ManagerMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ManagerInfo {
     pub protocol_version: u32,
     pub instance_id: String,
@@ -214,6 +220,7 @@ pub struct PersistedManagerState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogSlice {
     pub service_id: ServiceId,
     pub generation: u64,
@@ -225,6 +232,7 @@ pub struct LogSlice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LockOwnershipProof {
     pub version: u32,
     pub metadata: ManagerMetadata,
@@ -244,4 +252,84 @@ pub struct StaleLockMarker {
     pub action: StaleLockAction,
     pub original: ManagerMetadata,
     pub proof: LockOwnershipProof,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Wire-format regression: every type sent over HTTP (and every macOS Swift `Codable` struct
+    // decoding it) expects camelCase JSON field names, matching what `JSON.stringify` naturally
+    // produces from the TS source's camelCase object literals — Rust's derive(Serialize) defaults
+    // to the field's own (snake_case) spelling unless told otherwise. This is the single most
+    // safety-critical serialization detail in the whole rewrite: get it wrong and every downstream
+    // consumer's strict decode breaks silently until someone notices a parse failure.
+    #[test]
+    fn service_lifecycle_state_serializes_camel_case() {
+        let state = ServiceLifecycleState {
+            service_id: "api".to_string(),
+            desired_state: DesiredServiceState::Running,
+            actual_state: ActualServiceState::Ready,
+            readiness: ServiceReadiness::Ready,
+            generation: 1,
+            identity: None,
+            readiness_kind: Some(ReadinessKind::Tcp),
+            readiness_detail: None,
+            created_at: "2024-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+            exited_at: None,
+            exit_code: None,
+            error: None,
+            current_operation_id: None,
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("serviceId"), "{obj:?}");
+        assert!(obj.contains_key("desiredState"), "{obj:?}");
+        assert!(obj.contains_key("actualState"), "{obj:?}");
+        assert!(obj.contains_key("readinessKind"), "{obj:?}");
+        assert!(obj.contains_key("createdAt"), "{obj:?}");
+        assert!(obj.contains_key("updatedAt"), "{obj:?}");
+        assert!(!obj.contains_key("service_id"), "{obj:?}");
+    }
+
+    #[test]
+    fn manager_metadata_and_info_serialize_camel_case() {
+        let metadata = ManagerMetadata { version: 1, protocol_version: 1, instance_id: "x".to_string(), pid: 1, port: 8080, started_at: "2024-01-01T00:00:00.000Z".to_string() };
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json.get("protocolVersion").is_some(), "{json:?}");
+        assert!(json.get("instanceId").is_some(), "{json:?}");
+        assert!(json.get("startedAt").is_some(), "{json:?}");
+
+        let info = ManagerInfo { protocol_version: 1, instance_id: "x".to_string(), pid: 1, port: 8080, started_at: "2024-01-01T00:00:00.000Z".to_string(), metadata_version: 1, runtime_directory: "/tmp".to_string() };
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("runtimeDirectory").is_some(), "{json:?}");
+        assert!(json.get("metadataVersion").is_some(), "{json:?}");
+    }
+
+    #[test]
+    fn log_slice_serializes_camel_case() {
+        let slice = LogSlice { service_id: "api".to_string(), generation: 1, cursor: 0, next_cursor: 10, data: "hi".to_string(), reset: false, truncated: false };
+        let json = serde_json::to_value(&slice).unwrap();
+        assert!(json.get("nextCursor").is_some(), "{json:?}");
+        assert!(json.get("serviceId").is_some(), "{json:?}");
+    }
+
+    #[test]
+    fn process_identity_serializes_camel_case() {
+        let identity = ProcessIdentity::Posix(PosixProcessIdentity {
+            manager_instance_id: "instance".to_string(),
+            service_id: "api".to_string(),
+            generation: 1,
+            pid: 100,
+            pgid: 100,
+            started_at: "2024-01-01T00:00:00.000Z".to_string(),
+            start_identity: "Mon Jan  1 00:00:00 2024".to_string(),
+            command_fingerprint: "abc".to_string(),
+        });
+        let json = serde_json::to_value(&identity).unwrap();
+        assert!(json.get("managerInstanceId").is_some(), "{json:?}");
+        assert!(json.get("startIdentity").is_some(), "{json:?}");
+        assert!(json.get("commandFingerprint").is_some(), "{json:?}");
+    }
 }

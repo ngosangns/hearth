@@ -24,6 +24,7 @@ pub enum CommandSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceCommand {
     pub command: CommandSpec,
     pub cwd: String,
@@ -81,7 +82,7 @@ pub enum ServiceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "commandStatus", rename_all = "lowercase")]
+#[serde(tag = "commandStatus", rename_all = "lowercase", rename_all_fields = "camelCase")]
 pub enum ServiceRunProfile {
     Verified {
         command: ServiceCommand,
@@ -117,6 +118,7 @@ impl ServiceRunProfile {
 /// `serialization_key` run their builds one at a time — set this when the underlying build tool
 /// (e.g. a shared Gradle daemon) cannot run concurrent builds safely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceBuildProfile {
     pub command: ServiceCommand,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +128,7 @@ pub struct ServiceBuildProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServicePort {
     pub port: u16,
     pub label: String,
@@ -166,6 +169,7 @@ impl ServiceDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceCatalog {
     pub services: Vec<ServiceDefinition>,
     pub groups: HashMap<String, Vec<ServiceId>>,
@@ -561,5 +565,28 @@ mod tests {
         let c = catalog(vec![argv_service_with_deps("a", &["b"]), argv_service_with_deps("b", &["a"])], &[]);
         let err = dependency_levels(&c, &["a".to_string()]).unwrap_err();
         assert!(err.to_string().contains("Invalid service catalog"));
+    }
+
+    // Wire-format regression — see the equivalent tests in state.rs for why this matters.
+    #[test]
+    fn service_catalog_and_command_serialize_camel_case() {
+        let c = catalog(vec![argv_service("api")], &[]);
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("startFailurePolicy").is_some(), "{json:?}");
+
+        let command = ServiceCommand {
+            command: CommandSpec::Argv { argv: vec!["x".to_string()] },
+            cwd: ".".to_string(),
+            environment: None,
+            container_name: Some("proj-db".to_string()),
+            docker_stop_command: None,
+        };
+        let json = serde_json::to_value(&command).unwrap();
+        assert!(json.get("containerName").is_some(), "{json:?}");
+
+        let profile = ServiceRunProfile::Verified { command, readiness: ReadinessSpec::Process, readiness_timeout_ms: Some(1000), preparation: None };
+        let json = serde_json::to_value(&profile).unwrap();
+        assert!(json.get("readinessTimeoutMs").is_some(), "{json:?}");
+        assert_eq!(json.get("commandStatus").and_then(|v| v.as_str()), Some("verified"));
     }
 }
