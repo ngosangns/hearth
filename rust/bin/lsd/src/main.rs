@@ -103,8 +103,47 @@ async fn run_mcp_subcommand(root: PathBuf, catalog: ls_core::catalog::ServiceCat
     }
 }
 
+/// `--help`/`--version` must work from ANY directory. Every other subcommand needs a catalog, but
+/// these two don't — and answering "how do I use this?" with "there is no config file here" is a
+/// bad first experience for someone who just installed the binary.
+fn print_help() {
+    println!(
+        "lsd — local dev services daemon, CLI, TUI and MCP server
+
+usage: lsd [--root <path>] <command> [options]
+
+  status [target] [--json]              current state of one service, a group, or all
+  start|stop|restart <target> [--wait]  lifecycle actions (start brings up dependencies)
+  logs <service> [--tail N] [--follow]  read a service's log
+  operation get|watch <id> [--json]     inspect one operation
+  doctor [--json]                       environment and catalog diagnostics
+  cleanup                               remove stale runtime state
+  manager ensure|status|stop|reload     daemon lifecycle
+  daemon --root <path>                  run the daemon in the foreground (spawned internally)
+  tui                                   interactive terminal UI
+  mcp                                   serve the MCP tool surface over stdio
+  mcp install [--name N] [--key K] <config-file>...
+                                        register this binary in an MCP client config
+  skill install --dest <path>           write the generic MCP skill doc
+
+Every command except --help/--version resolves a catalog from --root (default: cwd):
+local-services.yaml, .yml, .json, or .config.ts."
+    );
+}
+
 async fn run_cli(argv: &[String]) -> i32 {
     let (root, rest) = extract_root(argv);
+    match rest.first().map(String::as_str) {
+        Some("--help") | Some("-h") | Some("help") | None => {
+            print_help();
+            return 0;
+        }
+        Some("--version") | Some("-V") => {
+            println!("lsd {}", env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        _ => {}
+    }
     let loaded = match ls_core::config_file::load_catalog(&root) {
         Ok(loaded) => loaded,
         Err(error) => {

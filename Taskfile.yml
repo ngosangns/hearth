@@ -41,7 +41,7 @@ tasks:
       - cp target/release/lsd /opt/homebrew/bin/lsd
       # Required after every copy on macOS, or the binary won't launch.
       - codesign --sign - --force /opt/homebrew/bin/lsd
-      - /opt/homebrew/bin/lsd --help >/dev/null && echo "installed $(/opt/homebrew/bin/lsd --version 2>/dev/null || echo lsd)"
+      - echo "installed $(/opt/homebrew/bin/lsd --version)"
 
   ci:
     desc: Everything CI runs (TS test + typecheck, plus the Rust test and clippy jobs)

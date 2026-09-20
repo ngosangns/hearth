@@ -190,3 +190,20 @@ fn skill_install_writes_the_real_binarys_generic_skill_doc() {
     let written = std::fs::read_to_string(dir.path().join(dest)).unwrap();
     assert!(written.contains("local_services_manage"), "{written}");
 }
+
+/// `--help` and `--version` must work from a directory with no catalog — every other subcommand
+/// resolves one, and answering "how do I use this?" with "no config file found here" is a bad first
+/// experience for someone who has just installed the binary. Regression test: these used to fail.
+#[test]
+fn help_and_version_work_outside_a_project() {
+    let empty = tempfile::tempdir().unwrap();
+    for args in [vec!["--help"], vec!["-h"], vec![]] {
+        let output = std::process::Command::new(lsd_bin()).args(&args).current_dir(empty.path()).output().unwrap();
+        assert!(output.status.success(), "lsd {args:?} failed outside a project: {}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("usage: lsd"), "lsd {args:?} printed no usage: {stdout}");
+    }
+    let version = std::process::Command::new(lsd_bin()).arg("--version").current_dir(empty.path()).output().unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("lsd "));
+}
