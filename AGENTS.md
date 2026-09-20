@@ -180,8 +180,42 @@ Status:
   cleanly). Docker/tailnet code paths compile and are exercised by unit-level parsing logic, but
   have **not** been integration-tested against a real `docker compose`/`tailscale serve` setup in
   this pass — flagging so a future pass doesn't assume they're as battle-tested as the POSIX path.
-- **Not started**: Phase 3 (`LocalServicesManager`/daemon), Phase 4 (`ls-cli`), Phase 5 (`lsd` bin),
-  Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
+- **Phase 3 (`LocalServicesManager`/daemon): substantially done.** Built bottom-up, each piece
+  tested in isolation before wiring into HTTP: `manager/event_store.rs` (the SSE ring buffer,
+  deliberately kept simple — see below), `manager/operations.rs` (per-target operation
+  serialization; hit and fixed a real `wait()`/`drain_services()` race where re-acquiring a
+  `tokio::sync::Mutex` from outside raced against `tokio::spawn` merely *scheduling* the task,
+  fixed with a per-operation `watch` channel), `manager/state_store.rs` (`state.json` load/save +
+  legacy `units`/`unitId` migration), `manager/lock.rs` (HMAC ownership proofs + the `claim_lock`
+  protocol — the "a healthcheck timeout is never death" 263-daemon-incident guard, tested against a
+  real axum server standing in for a live manager), `manager/log_store.rs` (crash-safe two-phase
+  rotation journal + UTF-8-safe cursor tailing). `manager/http.rs` then ties all of it plus a
+  `ProcessSupervisor` together behind a real `axum` server on a loopback OS-assigned port,
+  including the full route table (`/healthz`, `/v1/manager`, `/v1/catalog`,
+  `/v1/manager/reload`, `/v1/services`, `/v1/operations`, `/v1/operations/bulk-start`,
+  `/v1/operations/:id`, `/v1/events`, `/v1/events/stream` (SSE), `/v1/logs/:id`,
+  `/v1/manager/shutdown`), the `startSelectedDag` concurrent-per-node dependency scheduler (via
+  `futures::future::Shared`, not naive level-by-level batching — preserves the same
+  finer-grained parallelism the TS version gets from per-node promise memoization), and
+  bootstrap/shutdown. Proven with a real end-to-end test: a real bootstrapped manager, a real `nc
+  -lk`-backed TCP service, driven entirely over real HTTP (start → poll operation → verify ready →
+  read logs/events → stop → verify the real OS process is gone → shut the manager down) — the same
+  category of capstone test that closed out Phase 2. 143 tests total in the workspace, clippy-clean,
+  5/5 clean repeated runs. **Sharp edge hit while writing that test**: plain `nc -l <port>` (no
+  `-k`) exits after accepting one connection — and the TCP readiness probe's own `connect()` IS that
+  one connection, so the service went `ready` and then immediately `failed` (exit-watcher fired)
+  before the test's next assertion ran. Not a bug in the port; a test-double gotcha worth remembering
+  for any future test that needs a TCP service to actually stay up.
+  **Deliberately simplified, not yet fully faithful**: `/v1/events/stream`'s SSE backpressure is a
+  bounded `tokio::sync::mpsc` channel gated by frame *count* (64, matching `maxSseQueueFrames`) —
+  the TS source's additional cumulative *byte-size* ceiling (`maxSseQueueBytes`) isn't separately
+  tracked. Given SSE frames here are small JSON, frame-count bounding already caps memory to a small
+  multiple in practice, but a future pass should add the byte tracking for full parity if a real
+  workload ever produces unusually large events.
+  **Not yet done**: `daemon.rs` itself (`runDaemon`, `LockOwnershipWatch`, the `DaemonLifecycle`
+  SIGINT/SIGTERM wiring) — Phase 3's daemon-*process* glue, as opposed to the `LocalServicesManager`
+  it wraps, which is what's built so far.
+- **Not started**: Phase 4 (`ls-cli`), Phase 5 (`lsd` bin), Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
 ## Maintaining this file
 

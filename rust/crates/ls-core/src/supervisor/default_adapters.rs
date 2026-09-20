@@ -649,7 +649,7 @@ mod tests {
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd {
-                        command: Spec::Shell { shell: format!("exec nc -l {port}"), exec: Some(true) },
+                        command: Spec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) },
                         cwd: "/tmp".to_string(),
                         environment: None,
                         container_name: None,
