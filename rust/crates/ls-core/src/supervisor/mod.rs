@@ -5,11 +5,13 @@
 //! `ProcessSupervisor` struct itself (start/stop/restart/readiness-probing/adoption state machine)
 //! is built on top of them — see AGENTS.md's "Rust rewrite" section for current status.
 
+pub mod default_adapters;
 pub mod engine;
 pub mod fingerprint;
 pub mod process_tree;
 pub mod types;
 
+pub use default_adapters::default_supervisor_options;
 pub use engine::ProcessSupervisor;
 pub use fingerprint::{command_argv, normalize_command_fingerprint, normalize_observed_command_fingerprint};
 pub use process_tree::{

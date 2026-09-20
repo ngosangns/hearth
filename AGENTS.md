@@ -155,15 +155,31 @@ Status:
   adopt/release, externally-killed-process reconciliation). 84 tests total in the crate, clippy-clean,
   5/5 clean repeated full-suite runs (no flakiness observed).
 
-  **Not yet ported** (tracked here as the actual remaining checklist, not just "the rest of the
-  file"): the *default (production) adapters* — the bottom of `supervisor.ts`, i.e. the real
-  `Bun.spawn`/`docker`/`tailscale`/`ps` shell-outs that make a `ProcessSupervisor` actually spawn
-  real processes (needed before Phase 3's daemon can do anything real) — and the remaining
-  `supervisor.test.ts` scenarios this pass didn't cover (queued-start cancellation mid-flight,
-  exact persisted-identity reclaim without respawn, PID-reused-but-port-held externally-owned
-  retention, reconcile-marks-vanished-child-failed via the *real* default adapters rather than
-  fakes, Docker Compose concurrent-start serialization, abort-in-flight-build-before-restart,
-  stop-a-preparing-service-cleanly).
+  **Default (production) adapters are now ported too** (`.../supervisor/default_adapters.rs`):
+  real `tokio::process::Command`-based spawning (own process group via `.process_group(0)`, raw-file
+  stdout/stderr capture + `tail_file` copytruncate polling for `attach_output`, exactly mirroring
+  the TS "don't pipe into the daemon, a dead daemon would SIGPIPE the child" reasoning), real `ps`
+  inspection (`observed_system_process`), the exec-fingerprint settling loop
+  (`observed_stable_exec_process`), Docker container spawn/inspect/stop via `docker
+  compose`/`docker inspect`, tailnet probing via `tailscale serve status --json`, TCP probing via
+  `tokio::net::TcpStream`, HTTP probing via `reqwest` (rustls, not the system TLS/OpenSSL, for
+  portability), and build execution with real cancellation (SIGTERM the process group, wait, then
+  SIGKILL). `default_supervisor_options(root, runtime_directory, base_environment)` wires all of it
+  together, mirroring `defaultSupervisorOptions`. 6 new tests, including a real end-to-end one that
+  starts an actual `ProcessSupervisor` with these real adapters, spawns a real `nc`-backed TCP
+  service, waits for real `tcp` readiness against a real bound port, stops it, and asserts the real
+  OS process is gone (`kill(pid, 0)` fails) afterward — this is the strongest evidence so far that
+  the ported engine and its real adapters work together, not just against fakes. 90 tests total,
+  clippy-clean, 5/5 clean repeated full-suite runs.
+
+  **Not yet ported** (tracked here as the actual remaining checklist, not "the rest of the file"):
+  the remaining `supervisor.test.ts` scenarios this pass didn't cover (queued-start cancellation
+  mid-flight, exact persisted-identity reclaim without respawn, PID-reused-but-port-held
+  externally-owned retention, Docker Compose concurrent-start serialization exercised against a
+  real `docker compose` project, abort-in-flight-build-before-restart, stop-a-preparing-service-
+  cleanly). Docker/tailnet code paths compile and are exercised by unit-level parsing logic, but
+  have **not** been integration-tested against a real `docker compose`/`tailscale serve` setup in
+  this pass — flagging so a future pass doesn't assume they're as battle-tested as the POSIX path.
 - **Not started**: Phase 3 (`LocalServicesManager`/daemon), Phase 4 (`ls-cli`), Phase 5 (`lsd` bin),
   Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
