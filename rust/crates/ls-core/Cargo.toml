@@ -13,6 +13,9 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 sha2 = { workspace = true }
 regex = "1"
+async-trait = "0.1"
+tokio-util = "0.7"
+futures = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process", "fs"] }

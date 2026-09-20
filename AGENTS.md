@@ -139,9 +139,31 @@ Status:
   given its own process group via `process_group(0)` (`setpgid(0,0)`, mirroring the real adapter's
   `detached: true` spawn) — without it, the child inherits the *test harness's own* pgid, and the
   test's `killpg` calls signal the whole cargo-test process group instead of the subtree under test.
-  Not yet ported: the stateful `ProcessSupervisor` struct itself (start/stop/restart, readiness
-  probing per kind, adoption/external-ownership, build serialization, the two-pass shutdown) and the
-  rest of `supervisor.test.ts`'s ~40 scenarios.
+
+  **The stateful `ProcessSupervisor` struct itself is now ported** (`.../supervisor/engine.rs`,
+  ~1300 lines incl. tests): start/stop/restart/status/reconcile/`sync_external_services`/shutdown,
+  readiness probing per kind (process/tcp/http/container/tailnet/command, matching the "no adapter
+  configured degrades to timeout, never throws" sharp edge), retained-identity adoption with the
+  liveness re-check, build execution with timeout + external cancellation +
+  `serializationKey`-based one-at-a-time serialization, and the two-pass shutdown (active-state stop,
+  then persisted-identity reap). Driven entirely through the `ProcessAdapter`/`ProbeAdapter`/
+  `PreparationAdapter`/`RunBuild`/`Host`/`SupervisorClock` traits so it's testable without real OS
+  processes — 22 tests using fakes (a representative subset of `supervisor.test.ts`'s ~40 scenarios,
+  not an exhaustive 1:1 port: happy-path start/restart/stop, readiness timeout, TCP port-conflict
+  refusal, the shutdown two-pass reap, fingerprint-mismatch orphaning, spawn/build failure, build
+  serialization-by-key, command-readiness-with-no-adapter, container identity, external-ownership
+  adopt/release, externally-killed-process reconciliation). 84 tests total in the crate, clippy-clean,
+  5/5 clean repeated full-suite runs (no flakiness observed).
+
+  **Not yet ported** (tracked here as the actual remaining checklist, not just "the rest of the
+  file"): the *default (production) adapters* — the bottom of `supervisor.ts`, i.e. the real
+  `Bun.spawn`/`docker`/`tailscale`/`ps` shell-outs that make a `ProcessSupervisor` actually spawn
+  real processes (needed before Phase 3's daemon can do anything real) — and the remaining
+  `supervisor.test.ts` scenarios this pass didn't cover (queued-start cancellation mid-flight,
+  exact persisted-identity reclaim without respawn, PID-reused-but-port-held externally-owned
+  retention, reconcile-marks-vanished-child-failed via the *real* default adapters rather than
+  fakes, Docker Compose concurrent-start serialization, abort-in-flight-build-before-restart,
+  stop-a-preparing-service-cleanly).
 - **Not started**: Phase 3 (`LocalServicesManager`/daemon), Phase 4 (`ls-cli`), Phase 5 (`lsd` bin),
   Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
 
