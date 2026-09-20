@@ -268,7 +268,53 @@ Status:
   reconfirming Phase 0's signing spike against the actual multi-thousand-line artifact a real
   consumer would ship, not just a trivial stand-in. 169 tests total in the workspace, clippy-clean,
   stable across repeated runs.
-- **Not started**: Phase 6 (`ls-tui`), Phase 7 (`ls-mcp`).
+- **Phase 6 (`ls-tui`): done.** New crate `rust/crates/ls-tui`, porting all of `src/tui/*.ts`:
+  `state.rs` (`TuiState`/`ServiceSelection`, the connection/request/selection fence machinery),
+  `text_utils.rs` (`sanitize_terminal_text`, `visible_width`, `truncate_to_width`), `actions.rs`
+  (`keyboard_action`), `screen.rs` (`ServiceScreen`, the cached `(state, geometry) -> lines` layout
+  engine), `client.rs` (`ManagerTuiClient` — reuses `ls_cli::{discover, request, require_client,
+  wait_operation}` directly rather than re-implementing HTTP plumbing a second time), and `run.rs`
+  (`run_tui`, the terminal event-loop orchestration). Wired into `lsd tui` (`rust/bin/lsd/src/
+  main.rs`), which intercepts that subcommand itself before delegating to `ls_cli::main` — `ls-cli`
+  can't depend on `ls-tui` (that would be circular), so there's no TS-style injectable
+  `LocalctlRuntime.tui` handler; the binary that depends on both crates is the natural place to
+  wire the concrete implementation in. 45 new tests (214 total in the workspace), clippy-clean,
+  5/5 clean repeated full-suite runs.
+
+  **`crossterm`+`unicode-width` chosen over `ratatui`**, confirmed by an earlier research pass: the
+  TS TUI only uses `pi-tui` at a low level (raw mode, SGR mouse parsing, key matching), never a
+  widget-tree framework, so there was no framework-level API to match — `crossterm`'s structured
+  `KeyEvent`/`MouseEvent` types mean `actions.rs` takes one directly instead of re-deriving pi-tui's
+  raw-byte key matching (a deliberate, documented deviation, not a corner cut).
+
+  **Two primitives had no vendored source to port from.** pi-tui's `DEFAULT_TAB_WIDTH` and its
+  `truncateToWidth`/`visibleWidth` delegate to a native (compiled) addon (`@oh-my-pi/pi-natives`)
+  whose Rust source isn't published in this checkout's `node_modules` — both were reverse-engineered
+  by probing the real compiled functions directly (`bun -e 'import { truncateToWidth } from
+  "@oh-my-pi/pi-tui"; ...'`) rather than read from source. Findings: the tab width is a **fixed
+  3-space replacement per tab, not a tab-stop calculation** (confirmed by expanding tabs after
+  prefixes of several different lengths — every tab always becomes exactly 3 spaces regardless of
+  the column it starts at); `truncate_to_width`'s SGR-colour handling around a truncation cut point
+  reproduces every case probed (~a dozen inputs covering open/reset colours before, at, and after
+  the cut) but the native engine may special-case inputs outside that probing — see the extensive
+  doc comment on `truncate_to_width` in `text_utils.rs` for the exact reproduced rule. None of the
+  ported TUI tests exercise the unprobed edge cases, so this is unlikely to matter for real service
+  log output, but it is a real fidelity gap distinct from every other "documented simplification" in
+  this file, which were all judgment calls made *with* the source in hand.
+
+  **`run.rs` (the terminal event-loop orchestration) is the one piece with no automated test
+  coverage** — it owns a real terminal and a real reconnect loop, which is exactly the parity bar
+  the original migration plan set for this phase ("ported unit tests pass + a manual smoke pass,
+  rendering isn't cleanly auto-diffable"). Three deliberate deviations from the TS source, each
+  called out in `run.rs`'s own module doc comment: no incremental-diffing renderer (`pi-tui`'s
+  `TUI`/`ProcessTerminal` diff the terminal; this does a full clear + redraw every frame via plain
+  ANSI — more flicker-prone under a very fast event stream, functionally equivalent otherwise);
+  action dispatch (`start`/`stop`/`restart`/`start all`) runs to completion inline in the same loop
+  that reads input, instead of the TS source's fire-and-forget that lets input keep being processed
+  mid-request (Rust's single-owner `TuiApp` makes true concurrent mutation awkward without
+  message-passing the whole action back in, not worth it for an already-`busy`-gated, typically
+  sub-second HTTP round trip); and the `crossterm`-vs-raw-bytes input deviation noted above.
+- **Not started**: Phase 7 (`ls-mcp`).
 
 ## Maintaining this file
 

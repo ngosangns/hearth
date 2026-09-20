@@ -75,7 +75,7 @@ fn spawn_daemon(root: &Path) {
 }
 
 async fn run_cli(argv: &[String]) -> i32 {
-    let (root, _) = extract_root(argv);
+    let (root, rest) = extract_root(argv);
     let loaded = match ls_core::config_file::load_catalog(&root) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -83,9 +83,24 @@ async fn run_cli(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    // `tui` is intentionally not wired yet — Phase 6 (`ls-tui`) doesn't exist as a crate this
-    // binary can depend on. `ls_cli::main`'s own `tui` command surfaces a clear "not available"
-    // message rather than silently doing nothing.
+    // `tui` has no equivalent of the TS source's injectable `LocalctlRuntime.tui` handler — `ls-cli`
+    // can't depend on `ls-tui` (that would be circular, since `ls-tui` itself depends on `ls-cli`
+    // for its HTTP client), so this binary intercepts the subcommand itself before it ever reaches
+    // `ls_cli::main` (whose own `tui` case exists only for a build that never wires one in at all).
+    if rest.first().map(String::as_str) == Some("tui") {
+        if rest.len() > 1 {
+            eprintln!("usage: lsd tui");
+            return 2;
+        }
+        return ls_tui::run_tui(ls_tui::RunTuiOptions {
+            root: root.clone(),
+            catalog: loaded.catalog,
+            spawn_daemon: Box::new(spawn_daemon),
+            refresh_interval: std::time::Duration::from_secs(10),
+            service_kind: None,
+        })
+        .await;
+    }
     let options = ls_cli::LocalctlOptions { catalog: loaded.catalog, spawn_daemon: Box::new(spawn_daemon), doctor_checks: None };
     let mut out = |s: &str| println!("{s}");
     let mut err = |s: &str| eprintln!("{s}");
