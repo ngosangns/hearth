@@ -4,9 +4,11 @@
 //! itself wiring them together — see AGENTS.md for current status.
 
 pub mod event_store;
+pub mod lock;
 pub mod operations;
 pub mod state_store;
 
 pub use event_store::{ManagerEventStore, Replay, DEFAULT_EVENT_CAPACITY};
+pub use lock::{claim_lock, ClaimLockError, LockHandle, OwnedLockArtifacts};
 pub use operations::{OperationExecute, OperationHandle, OperationInput, OperationRejected, OperationScheduler, RequestIdConflict};
 pub use state_store::AtomicStateStore;
