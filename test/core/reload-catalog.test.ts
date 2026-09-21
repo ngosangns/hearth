@@ -150,13 +150,13 @@ describe("POST /v1/manager/reload", () => {
     }
   });
 
-  test("rejects an invalid catalog (dependency cycle) and keeps the previous catalog live", async () => {
+  test("rejects an invalid catalog (duplicate service id) and keeps the previous catalog live", async () => {
     const runtime = await tempRuntime();
     const catalog: ServiceCatalog = { startFailurePolicy: "stop-on-first-failure-keep-started", groups: {}, services: [service("a", 9001)] };
     const manager = await LocalServicesManager.bootstrap({ runtimeDirectory: runtime, catalog, supervisor: foreverSupervisor() });
     try {
-      const cyclicCatalog: ServiceCatalog = { startFailurePolicy: "stop-on-first-failure-keep-started", groups: {}, services: [service("a", 9001, { dependencies: ["b"] }), service("b", 9002, { dependencies: ["a"] })] };
-      const response = await fetch(`${manager.baseUrl}/v1/manager/reload`, { method: "POST", headers: headers(manager), body: JSON.stringify({ requestId: "r1", catalog: cyclicCatalog }) });
+      const duplicateCatalog: ServiceCatalog = { startFailurePolicy: "stop-on-first-failure-keep-started", groups: {}, services: [service("a", 9001), service("a", 9002)] };
+      const response = await fetch(`${manager.baseUrl}/v1/manager/reload`, { method: "POST", headers: headers(manager), body: JSON.stringify({ requestId: "r1", catalog: duplicateCatalog }) });
       expect(response.status).toBe(422);
       expect(((await response.json()) as { error: { code: string } }).error.code).toBe("invalid_catalog");
       const catalogResponse = await fetch(`${manager.baseUrl}/v1/catalog`, { headers: headers(manager) });

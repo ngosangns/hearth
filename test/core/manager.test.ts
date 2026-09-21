@@ -13,15 +13,15 @@ const graphCatalog = (): ServiceCatalog => ({
   startFailurePolicy: "stop-on-first-failure-keep-started",
   services: [
     { id: "nginx", profiles: { run: { command: { command: { argv: ["nginx"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 80 } } } },
-    { id: "mongo", dependencies: ["nginx"], profiles: { run: { command: { command: { argv: ["mongo"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 27017 } } } },
-    { id: "redis", dependencies: ["nginx"], profiles: { run: { command: { command: { argv: ["redis"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 6379 } } } },
-    { id: "kafka", dependencies: ["nginx"], profiles: { run: { command: { command: { argv: ["kafka"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 9092 } } } },
-    { id: "nats", dependencies: ["nginx"], profiles: { run: { command: { command: { argv: ["nats"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 4222 } } } },
-    { id: "metadata", dependencies: ["nginx", "mongo", "redis", "kafka", "nats"], profiles: { run: { command: { command: { argv: ["metadata"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 1166 } } } },
-    { id: "configurations", dependencies: ["nginx", "mongo", "redis", "kafka", "nats"], profiles: { run: { command: { command: { argv: ["configurations"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 1144 } } } },
-    { id: "ccs", dependencies: ["nginx", "mongo", "redis", "kafka", "nats"], profiles: { run: { command: { command: { argv: ["ccs"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 8000 } } } },
-    { id: "syncer", dependencies: ["nginx", "mongo", "redis", "kafka", "nats", "ccs"], profiles: { run: { command: { command: { argv: ["syncer"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 6060 } } } },
-    { id: "portal", dependencies: ["nginx", "mongo", "redis", "kafka", "nats", "metadata", "configurations"], profiles: { run: { command: { command: { argv: ["portal"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 19000 } } } },
+    { id: "mongo", profiles: { run: { command: { command: { argv: ["mongo"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 27017 } } } },
+    { id: "redis", profiles: { run: { command: { command: { argv: ["redis"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 6379 } } } },
+    { id: "kafka", profiles: { run: { command: { command: { argv: ["kafka"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 9092 } } } },
+    { id: "nats", profiles: { run: { command: { command: { argv: ["nats"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 4222 } } } },
+    { id: "metadata", profiles: { run: { command: { command: { argv: ["metadata"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 1166 } } } },
+    { id: "configurations", profiles: { run: { command: { command: { argv: ["configurations"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 1144 } } } },
+    { id: "ccs", profiles: { run: { command: { command: { argv: ["ccs"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 8000 } } } },
+    { id: "syncer", profiles: { run: { command: { command: { argv: ["syncer"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 6060 } } } },
+    { id: "portal", profiles: { run: { command: { command: { argv: ["portal"] }, cwd: "." }, commandStatus: "verified", readiness: { kind: "tcp", port: 19000 } } } },
   ],
   groups: { core: ["portal", "syncer"] },
 });
@@ -114,36 +114,29 @@ describe("local services manager", () => {
     }
   });
 
-  test("bulk start gates infrastructure on nginx, applications on infrastructure, and syncer on CCS", async () => {
+  test("bulk start brings up every requested target independently, with no start ordering between them", async () => {
     const runtime = await tempRuntime("local-services-graph-");
     const started: string[] = [];
     const manager = await LocalServicesManager.bootstrap({ runtimeDirectory: runtime, catalog: graphCatalog(), supervisor: graphSupervisor(started) });
     try {
-      const response = await bulkStartOperation(manager, ["portal", "syncer"]);
+      const targets = ["nginx", "mongo", "redis", "kafka", "nats", "metadata", "configurations", "ccs", "portal", "syncer"];
+      const response = await bulkStartOperation(manager, targets);
       expect(response.status).toBe(202);
       const operation = await waitForOperation(manager, ((await response.json()) as { operation: Operation }).operation);
       expect(operation.status).toBe("succeeded");
-      expect(started).toEqual(expect.arrayContaining(["nginx", "mongo", "redis", "kafka", "nats", "metadata", "configurations", "ccs", "portal", "syncer"]));
-      const trace = operation.trace.map((entry) => entry.message);
-      const ready = (serviceId: string): number => trace.indexOf(`Ready: ${serviceId}`);
-      const starting = (serviceId: string): number => trace.indexOf(`Starting: ${serviceId}`);
-      expect(ready("nginx")).toBeLessThan(starting("mongo"));
-      for (const infrastructure of ["mongo", "redis", "kafka", "nats"]) {
-        expect(ready(infrastructure)).toBeLessThan(starting("metadata"));
-        expect(ready(infrastructure)).toBeLessThan(starting("portal"));
-      }
-      expect(ready("ccs")).toBeLessThan(starting("syncer"));
+      expect(started).toEqual(expect.arrayContaining(targets));
+      expect(manager.serviceStates().filter((service) => targets.includes(service.serviceId)).every((service) => service.actualState === "ready")).toBe(true);
     } finally {
       await manager.shutdown("stop-services");
       await rm(runtime, { recursive: true, force: true });
     }
   });
 
-  test("starts portal without waiting for a slow ccs sibling and holds syncer until CCS readiness is ready", async () => {
-    const runtime = await tempRuntime("local-services-dag-ready-");
+  test("starts independent bulk targets concurrently, not waiting on each other's readiness", async () => {
+    const runtime = await tempRuntime("local-services-independent-concurrency-");
     const started: string[] = [];
-    const ccsReadinessProbe = Promise.withResolvers<void>();
-    const releaseCcsReadiness = Promise.withResolvers<void>();
+    const syncerReadinessProbe = Promise.withResolvers<void>();
+    const releaseSyncerReadiness = Promise.withResolvers<void>();
     const portalStarted = Promise.withResolvers<void>();
     const manager = await LocalServicesManager.bootstrap({
       runtimeDirectory: runtime,
@@ -155,9 +148,9 @@ describe("local services manager", () => {
           if (serviceId === "portal") portalStarted.resolve();
         },
         async (port) => {
-          if (port !== 8000) return true;
-          ccsReadinessProbe.resolve();
-          await releaseCcsReadiness.promise;
+          if (port !== 6060) return true;
+          syncerReadinessProbe.resolve();
+          await releaseSyncerReadiness.promise;
           return true;
         },
       ),
@@ -166,60 +159,17 @@ describe("local services manager", () => {
       const response = await bulkStartOperation(manager, ["portal", "syncer"]);
       expect(response.status).toBe(202);
       const accepted = ((await response.json()) as { operation: Operation }).operation;
-      await ccsReadinessProbe.promise;
+      await syncerReadinessProbe.promise;
       await portalStarted.promise;
-      expect(started).toContain("ccs");
       expect(started).toContain("portal");
-      expect(started).not.toContain("syncer");
-      const ccs = manager.serviceStates().find((service) => service.serviceId === "ccs");
-      expect(ccs).toMatchObject({ actualState: "running-unready", readiness: "not-ready" });
-      releaseCcsReadiness.resolve();
+      expect(started).toContain("syncer");
+      const syncer = manager.serviceStates().find((service) => service.serviceId === "syncer");
+      expect(syncer).toMatchObject({ actualState: "running-unready", readiness: "not-ready" });
+      releaseSyncerReadiness.resolve();
       const operation = await waitForOperation(manager, accepted);
       expect(operation.status).toBe("succeeded");
-      expect(started.indexOf("syncer")).toBeGreaterThan(started.indexOf("ccs"));
     } finally {
-      releaseCcsReadiness.resolve();
-      await manager.shutdown("stop-services");
-      await rm(runtime, { recursive: true, force: true });
-    }
-  });
-
-  test("does not start a queued bulk-service after a concurrent stop cancels it", async () => {
-    const runtime = await tempRuntime("local-services-queued-stop-");
-    const started: string[] = [];
-    const ccsReadinessProbe = Promise.withResolvers<void>();
-    const releaseCcsReadiness = Promise.withResolvers<void>();
-    const manager = await LocalServicesManager.bootstrap({
-      runtimeDirectory: runtime,
-      catalog: graphCatalog(),
-      supervisor: graphSupervisor(started, new Set(), undefined, async (port) => {
-        if (port !== 8000) return true;
-        ccsReadinessProbe.resolve();
-        await releaseCcsReadiness.promise;
-        return true;
-      }),
-    });
-    try {
-      const response = await bulkStartOperation(manager, ["syncer"]);
-      const start = ((await response.json()) as { operation: Operation }).operation;
-      await ccsReadinessProbe.promise;
-
-      const stopResponse = await fetch(`${manager.baseUrl}/v1/operations`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${manager.bearerToken}`, "x-local-services-protocol": String(managerProtocolVersion), "content-type": "application/json" },
-        body: JSON.stringify({ requestId: crypto.randomUUID(), serviceId: "syncer", action: "stop" }),
-      });
-      expect(stopResponse.status).toBe(202);
-      await waitForOperation(manager, ((await stopResponse.json()) as { operation: Operation }).operation);
-      expect(manager.serviceStates().find((service) => service.serviceId === "syncer")).toMatchObject({ actualState: "stopped", desiredState: "stopped" });
-
-      releaseCcsReadiness.resolve();
-      const operation = await waitForOperation(manager, start);
-      expect(operation.status).toBe("succeeded");
-      expect(started).not.toContain("syncer");
-      expect(operation.trace.map((entry) => entry.message)).toContain("Skipped: syncer (start cancelled)");
-    } finally {
-      releaseCcsReadiness.resolve();
+      releaseSyncerReadiness.resolve();
       await manager.shutdown("stop-services");
       await rm(runtime, { recursive: true, force: true });
     }
@@ -254,19 +204,18 @@ describe("local services manager", () => {
     }
   });
 
-  test("blocks syncer and traces the CCS failure when CCS cannot start", async () => {
-    const runtime = await tempRuntime("local-services-ccs-failure-");
+  test("traces the failure when a single-service start fails", async () => {
+    const runtime = await tempRuntime("local-services-single-failure-");
     const started: string[] = [];
     const manager = await LocalServicesManager.bootstrap({ runtimeDirectory: runtime, catalog: graphCatalog(), supervisor: graphSupervisor(started, new Set(["ccs"])) });
     try {
-      const accepted = await startOperation(manager, "syncer");
+      const accepted = await startOperation(manager, "ccs");
       const operation = await waitForOperation(manager, accepted);
 
       expect(operation.status).toBe("failed");
-      expect(started).toEqual(expect.arrayContaining(["mongo", "kafka", "ccs"]));
-      expect(started).not.toContain("syncer");
-      expect(operation.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Failed: ccs (ccs failed)", "Blocked: syncer (dependencies not ready: ccs)"]));
-      expect(manager.serviceStates().find((service) => service.serviceId === "syncer")).toMatchObject({ actualState: "stopped", desiredState: "stopped" });
+      expect(started).toEqual(["ccs"]);
+      expect(operation.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Failed: ccs (ccs failed)"]));
+      expect(manager.serviceStates().find((service) => service.serviceId === "ccs")).toMatchObject({ actualState: "failed", desiredState: "running" });
     } finally {
       await manager.shutdown("stop-services");
       await rm(runtime, { recursive: true, force: true });
@@ -411,19 +360,19 @@ describe("local services manager", () => {
     expect(queuedExecuteCalled).toBe(false);
   });
 
-  test("blocks only descendants when a dependency fails while independent branches succeed", async () => {
-    const runtime = await tempRuntime("local-services-graph-failure-");
+  test("starts independent bulk targets even when one of them fails", async () => {
+    const runtime = await tempRuntime("local-services-bulk-failure-");
     const started: string[] = [];
     const manager = await LocalServicesManager.bootstrap({ runtimeDirectory: runtime, catalog: graphCatalog(), supervisor: graphSupervisor(started, new Set(["metadata"])) });
     try {
-      const response = await bulkStartOperation(manager, ["portal", "syncer"]);
+      const response = await bulkStartOperation(manager, ["metadata", "syncer"]);
       const accepted = ((await response.json()) as { operation: Operation }).operation;
       const operation = await waitForOperation(manager, accepted);
       expect(operation.status).toBe("failed");
-      expect(started).toEqual(expect.arrayContaining(["mongo", "kafka", "ccs", "syncer", "metadata", "configurations"]));
-      expect(started).not.toContain("portal");
-      expect(operation.trace.map((entry) => entry.message)).toContain("Blocked: portal (dependencies not ready: metadata)");
-      expect(manager.serviceStates().find((service) => service.serviceId === "portal")).toMatchObject({ actualState: "stopped", desiredState: "stopped" });
+      expect(started).toEqual(expect.arrayContaining(["metadata", "syncer"]));
+      expect(operation.trace.map((entry) => entry.message)).toContain("Failed: metadata (metadata failed)");
+      expect(manager.serviceStates().find((service) => service.serviceId === "syncer")).toMatchObject({ actualState: "ready", desiredState: "running" });
+      expect(manager.serviceStates().find((service) => service.serviceId === "metadata")).toMatchObject({ actualState: "failed", desiredState: "running" });
     } finally {
       await manager.shutdown("stop-services");
       await rm(runtime, { recursive: true, force: true });

@@ -90,8 +90,8 @@ final class WorkspaceController: ObservableObject {
     }
 
     /// A config edit never tears down the live connection on failure (a bad edit — invalid YAML, a
-    /// dependency cycle — is exactly when a developer most wants the app to keep showing them the
-    /// last-known-good state, with the error surfaced, not a blank/disconnected screen).
+    /// duplicate service id — is exactly when a developer most wants the app to keep showing them
+    /// the last-known-good state, with the error surfaced, not a blank/disconnected screen).
     private func handleConfigChanged(root: String) async {
         do {
             try await DaemonConnection.reload(root: root)
@@ -166,8 +166,9 @@ final class WorkspaceController: ObservableObject {
         }
     }
 
-    /// Every catalog service, dependency order handled server-side (`/v1/operations/bulk-start`) —
-    /// same "stop on first failure" policy `lsd start <group> --wait` uses.
+    /// Every catalog service, started independently and concurrently via
+    /// `/v1/operations/bulk-start` — same "stop on first failure" policy
+    /// `lsd start <group> --wait` uses.
     func startAll() async {
         guard let client, let catalog, !catalog.services.isEmpty else { return }
         let targets = catalog.services.map(\.id)

@@ -700,7 +700,6 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd {
@@ -832,7 +831,6 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd {
@@ -970,7 +968,6 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd { command: Spec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },

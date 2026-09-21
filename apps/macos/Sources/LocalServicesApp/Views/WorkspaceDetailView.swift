@@ -219,9 +219,9 @@ private struct ServiceRow: View {
                 Button("Restart") { onAction(.restart) }
                 Button("Stop") { onAction(.stop) }
             }
-        // A service parked behind a dependency that never came up stays `queued-start` until
-        // something clears it, and `Stop All` deliberately skips that state — so without this the
-        // row offered no way out of it at all.
+        // A service queued behind another operation on the same target stays `queued-start`
+        // until something clears it, and `Stop All` deliberately skips that state — so without
+        // this the row offered no way out of it at all.
         case "queued":
             Button("Cancel") { onAction(.stop) }
         // Externally-owned (an adopted docker/tailnet unit): the daemon observes it rather than

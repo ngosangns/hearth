@@ -119,7 +119,7 @@ fn print_help() {
 usage: lsd [--root <path>] <command> [options]
 
   status [target] [--json]              current state of one service, a group, or all
-  start|stop|restart <target> [--wait]  lifecycle actions (start brings up dependencies)
+  start|stop|restart <target> [--wait]  lifecycle actions
   logs <service> [--tail N] [--follow]  read a service's log
   urls [target] [--json]                where each service can be reached (live URLs)
   operation get|watch <id> [--json]     inspect one operation

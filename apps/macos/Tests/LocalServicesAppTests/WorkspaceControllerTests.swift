@@ -128,7 +128,7 @@ final class WorkspaceControllerTests: XCTestCase {
         let api = FakeManagerAPI()
         api.catalogHandler = {
             ServiceCatalogSummary(
-                services: [CatalogService(id: "db", label: nil, kind: nil, ownership: nil, dependencies: nil), CatalogService(id: "api", label: nil, kind: nil, ownership: nil, dependencies: nil)],
+                services: [CatalogService(id: "db", label: nil, kind: nil, ownership: nil), CatalogService(id: "api", label: nil, kind: nil, ownership: nil)],
                 groups: [:]
             )
         }

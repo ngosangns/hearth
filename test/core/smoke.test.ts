@@ -50,18 +50,6 @@ describe("LocalServicesManager smoke test", () => {
     expect(after).toBeUndefined();
   }, 15_000);
 
-  test("rejects a catalog with a dependency cycle", async () => {
-    const bad: ServiceCatalog = {
-      startFailurePolicy: "stop-on-first-failure-keep-started",
-      groups: {},
-      services: [
-        { id: "a", dependencies: ["b"], profiles: { run: { commandStatus: "verified", command: { command: { argv: ["true"] }, cwd: "." }, readiness: { kind: "process" } } } },
-        { id: "b", dependencies: ["a"], profiles: { run: { commandStatus: "verified", command: { command: { argv: ["true"] }, cwd: "." }, readiness: { kind: "process" } } } },
-      ],
-    };
-    await expect(LocalServicesManager.bootstrap({ root, catalog: bad })).rejects.toThrow(/cycle/);
-  });
-
   test("HTTP API round-trips a start operation", async () => {
     const manager = await LocalServicesManager.bootstrap({ root, catalog: catalog() });
     try {

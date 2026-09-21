@@ -69,7 +69,6 @@ struct CatalogService: Codable, Equatable, Identifiable {
     let label: String?
     let kind: String?
     let ownership: String?
-    let dependencies: [String]?
 
     var displayName: String { label ?? id }
 }

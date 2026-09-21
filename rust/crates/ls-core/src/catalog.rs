@@ -1,7 +1,7 @@
 //! Public config/catalog API — port of `src/core/catalog.ts`. A consumer authors one
 //! `ServiceCatalog` value describing its own services and passes it to every other entry point;
 //! nothing in this crate imports a catalog directly.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -263,20 +263,12 @@ pub struct ServiceDefinition {
     /// its own state machine when detected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ownership: Option<ServiceOwnership>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dependencies: Option<Vec<ServiceId>>,
     pub profiles: ServiceProfiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<ServicePort>>,
     /// Where this service can be reached — see `ServiceUrl`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<ServiceUrl>>,
-}
-
-impl ServiceDefinition {
-    pub fn dependencies(&self) -> &[ServiceId] {
-        self.dependencies.as_deref().unwrap_or(&[])
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,54 +321,6 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
         }
     }
 
-    for service in &catalog.services {
-        for dependency in service.dependencies() {
-            if !services.contains_key(dependency) {
-                errors.push(format!("{} depends on unknown service {}", service.id, dependency));
-            }
-        }
-    }
-
-    let mut visiting: HashSet<&ServiceId> = HashSet::new();
-    let mut visited: HashSet<&ServiceId> = HashSet::new();
-
-    fn visit<'a>(
-        service_id: &'a ServiceId,
-        path: &mut Vec<&'a ServiceId>,
-        services: &HashMap<&'a ServiceId, &'a ServiceDefinition>,
-        visiting: &mut HashSet<&'a ServiceId>,
-        visited: &mut HashSet<&'a ServiceId>,
-        errors: &mut Vec<String>,
-    ) {
-        if visiting.contains(service_id) {
-            let start = path.iter().position(|id| *id == service_id).unwrap_or(0);
-            let mut cycle: Vec<&str> = path[start..].iter().map(|s| s.as_str()).collect();
-            cycle.push(service_id.as_str());
-            errors.push(format!("dependency cycle: {}", cycle.join(" -> ")));
-            return;
-        }
-        if visited.contains(service_id) {
-            return;
-        }
-        visiting.insert(service_id);
-        if let Some(service) = services.get(service_id) {
-            for dependency in service.dependencies() {
-                if services.contains_key(dependency) {
-                    path.push(service_id);
-                    visit(dependency, path, services, visiting, visited, errors);
-                    path.pop();
-                }
-            }
-        }
-        visiting.remove(service_id);
-        visited.insert(service_id);
-    }
-
-    for service in &catalog.services {
-        let mut path = Vec::new();
-        visit(&service.id, &mut path, &services, &mut visiting, &mut visited, &mut errors);
-    }
-
     let mut verified_ports: HashMap<u16, &ServiceId> = HashMap::new();
     for service in &catalog.services {
         let profile = &service.profiles.run;
@@ -425,77 +369,6 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
     CatalogValidation { errors, warnings }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("Invalid service catalog: {0}")]
-pub struct InvalidCatalogError(String);
-
-pub fn dependency_levels(
-    catalog: &ServiceCatalog,
-    targets: &[ServiceId],
-) -> Result<Vec<Vec<ServiceId>>, InvalidCatalogError> {
-    let validation = validate_catalog(catalog);
-    if !validation.errors.is_empty() {
-        return Err(InvalidCatalogError(validation.errors.join("; ")));
-    }
-    let services: HashMap<&ServiceId, &ServiceDefinition> =
-        catalog.services.iter().map(|s| (&s.id, s)).collect();
-
-    let mut selected: HashSet<ServiceId> = HashSet::new();
-    fn include(
-        service_id: &ServiceId,
-        services: &HashMap<&ServiceId, &ServiceDefinition>,
-        selected: &mut HashSet<ServiceId>,
-    ) {
-        if selected.contains(service_id) {
-            return;
-        }
-        selected.insert(service_id.clone());
-        if let Some(service) = services.get(service_id) {
-            for dependency in service.dependencies() {
-                include(dependency, services, selected);
-            }
-        }
-    }
-    for target in targets {
-        include(target, &services, &mut selected);
-    }
-
-    let mut remaining: HashMap<ServiceId, usize> = HashMap::new();
-    for service_id in &selected {
-        let count = services
-            .get(service_id)
-            .map(|s| s.dependencies().iter().filter(|d| selected.contains(*d)).count())
-            .unwrap_or(0);
-        remaining.insert(service_id.clone(), count);
-    }
-
-    let mut levels: Vec<Vec<ServiceId>> = Vec::new();
-    while !remaining.is_empty() {
-        let ready: Vec<ServiceId> = catalog
-            .services
-            .iter()
-            .map(|s| s.id.clone())
-            .filter(|id| remaining.get(id) == Some(&0))
-            .collect();
-        if ready.is_empty() {
-            return Err(InvalidCatalogError("dependency cycle".to_string()));
-        }
-        levels.push(ready.clone());
-        for id in &ready {
-            remaining.remove(id);
-        }
-        let remaining_ids: Vec<ServiceId> = remaining.keys().cloned().collect();
-        for id in remaining_ids {
-            let count = services
-                .get(&id)
-                .map(|s| s.dependencies().iter().filter(|d| remaining.contains_key(*d)).count())
-                .unwrap_or(0);
-            remaining.insert(id, count);
-        }
-    }
-    Ok(levels)
-}
-
 pub fn is_container_command(command: &ServiceCommand) -> bool {
     command.container_name.is_some()
 }
@@ -511,7 +384,6 @@ mod tests {
             label: None,
             kind: None,
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
@@ -533,20 +405,12 @@ mod tests {
         }
     }
 
-    fn argv_service_with_deps(id: &str, dependencies: &[&str]) -> ServiceDefinition {
-        ServiceDefinition {
-            dependencies: Some(dependencies.iter().map(|d| d.to_string()).collect()),
-            ..argv_service(id)
-        }
-    }
-
     fn tcp_service(id: &str, port: u16) -> ServiceDefinition {
         ServiceDefinition {
             id: id.to_string(),
             label: None,
             kind: None,
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
@@ -583,11 +447,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_well_formed_catalog_with_dependencies_and_groups() {
-        let c = catalog(
-            vec![argv_service("nginx"), argv_service_with_deps("api", &["nginx"])],
-            &[("all", &["nginx", "api"])],
-        );
+    fn accepts_a_well_formed_catalog_with_services_and_groups() {
+        let c = catalog(vec![argv_service("nginx"), argv_service("api")], &[("all", &["nginx", "api"])]);
         assert_eq!(validate_catalog(&c), CatalogValidation { errors: vec![], warnings: vec![] });
     }
 
@@ -606,18 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_dependency_on_an_unknown_service() {
-        let c = catalog(vec![argv_service_with_deps("api", &["ghost"])], &[]);
-        assert!(validate_catalog(&c).errors.contains(&"api depends on unknown service ghost".to_string()));
-    }
-
-    #[test]
-    fn detects_a_dependency_cycle_and_reports_the_cycle_path() {
-        let c = catalog(vec![argv_service_with_deps("a", &["b"]), argv_service_with_deps("b", &["a"])], &[]);
-        assert_eq!(validate_catalog(&c).errors, vec!["dependency cycle: a -> b -> a".to_string()]);
-    }
-
-    #[test]
     fn rejects_two_services_sharing_the_same_tcp_readiness_port() {
         let c = catalog(vec![tcp_service("a", 8080), tcp_service("b", 8080)], &[]);
         assert!(validate_catalog(&c).errors.contains(&"port 8080 is shared by a and b".to_string()));
@@ -631,7 +480,6 @@ mod tests {
                 label: None,
                 kind: None,
                 ownership: None,
-                dependencies: None,
                 profiles: ServiceProfiles {
                     run: ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
                     build: None,
@@ -664,42 +512,6 @@ mod tests {
         });
         let c = catalog(vec![service], &[]);
         assert!(validate_catalog(&c).errors.contains(&"api:build has an invalid timeout".to_string()));
-    }
-
-    #[test]
-    fn orders_a_diamond_dependency_graph_into_levels_by_depth() {
-        let c = catalog(
-            vec![
-                argv_service("nginx"),
-                argv_service_with_deps("mongo", &["nginx"]),
-                argv_service_with_deps("redis", &["nginx"]),
-                argv_service_with_deps("api", &["mongo", "redis"]),
-            ],
-            &[],
-        );
-        let levels = dependency_levels(&c, &["api".to_string()]).unwrap();
-        assert_eq!(
-            levels,
-            vec![vec!["nginx".to_string()], vec!["mongo".to_string(), "redis".to_string()], vec!["api".to_string()]]
-        );
-    }
-
-    #[test]
-    fn includes_only_the_transitive_dependencies_of_the_requested_targets() {
-        let c = catalog(
-            vec![argv_service("nginx"), argv_service_with_deps("api", &["nginx"]), argv_service("unrelated")],
-            &[],
-        );
-        let levels = dependency_levels(&c, &["api".to_string()]).unwrap();
-        let flat: Vec<String> = levels.into_iter().flatten().collect();
-        assert_eq!(flat, vec!["nginx".to_string(), "api".to_string()]);
-    }
-
-    #[test]
-    fn throws_when_the_catalog_itself_is_invalid() {
-        let c = catalog(vec![argv_service_with_deps("a", &["b"]), argv_service_with_deps("b", &["a"])], &[]);
-        let err = dependency_levels(&c, &["a".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("Invalid service catalog"));
     }
 
     // Wire-format regression — see the equivalent tests in state.rs for why this matters.

@@ -135,7 +135,6 @@ export type ServiceDefinition = {
    * machine when detected — generalizes infra's `syncExternalUnits` carve-out for docker/tailnet units
    * that can also be brought up outside the daemon (e.g. `task local:up`). */
   readonly ownership?: ServiceOwnership;
-  readonly dependencies?: readonly ServiceId[];
   readonly profiles: { readonly run: ServiceRunProfile; readonly build?: ServiceBuildProfile };
   /** Additional ports this service exposes beyond its readiness port (generalizes infra's `tailnetPorts`). */
   readonly ports?: readonly ServicePort[];
@@ -171,28 +170,6 @@ export function validateCatalog(catalog: ServiceCatalog): CatalogValidation {
       if (!services.has(member)) errors.push(`group ${groupName} references unknown service ${member}`);
     }
   }
-  for (const service of catalog.services) {
-    for (const dependency of service.dependencies ?? []) {
-      if (!services.has(dependency)) errors.push(`${service.id} depends on unknown service ${dependency}`);
-    }
-  }
-  const visiting = new Set<ServiceId>();
-  const visited = new Set<ServiceId>();
-  const visit = (serviceId: ServiceId, path: ServiceId[]): void => {
-    if (visiting.has(serviceId)) {
-      const start = path.indexOf(serviceId);
-      errors.push(`dependency cycle: ${[...path.slice(start), serviceId].join(" -> ")}`);
-      return;
-    }
-    if (visited.has(serviceId)) return;
-    visiting.add(serviceId);
-    const service = services.get(serviceId);
-    for (const dependency of service?.dependencies ?? []) if (services.has(dependency)) visit(dependency, [...path, serviceId]);
-    visiting.delete(serviceId);
-    visited.add(serviceId);
-  };
-  for (const service of catalog.services) visit(service.id, []);
-
   const verifiedPorts = new Map<number, ServiceId>();
   for (const service of catalog.services) {
     const profile = service.profiles.run;
@@ -223,33 +200,6 @@ export function validateCatalog(catalog: ServiceCatalog): CatalogValidation {
     }
   }
   return { errors, warnings };
-}
-
-export function dependencyLevels(catalog: ServiceCatalog, targets: readonly ServiceId[]): ServiceId[][] {
-  const validation = validateCatalog(catalog);
-  if (validation.errors.length) throw new Error(`Invalid service catalog: ${validation.errors.join("; ")}`);
-  const services = new Map(catalog.services.map((service) => [service.id, service]));
-  const selected = new Set<ServiceId>();
-  const include = (serviceId: ServiceId): void => {
-    if (selected.has(serviceId)) return;
-    selected.add(serviceId);
-    for (const dependency of services.get(serviceId)!.dependencies ?? []) include(dependency);
-  };
-  for (const target of targets) include(target);
-  const remaining = new Map<ServiceId, number>();
-  for (const serviceId of selected) remaining.set(serviceId, (services.get(serviceId)!.dependencies ?? []).filter((dependency) => selected.has(dependency)).length);
-  const levels: ServiceId[][] = [];
-  while (remaining.size) {
-    const ready = catalog.services.map((service) => service.id).filter((serviceId) => remaining.get(serviceId) === 0);
-    if (!ready.length) throw new Error("Invalid service catalog: dependency cycle");
-    levels.push(ready);
-    for (const serviceId of ready) remaining.delete(serviceId);
-    for (const serviceId of remaining.keys()) {
-      const dependencies = services.get(serviceId)!.dependencies ?? [];
-      remaining.set(serviceId, dependencies.filter((dependency) => remaining.has(dependency)).length);
-    }
-  }
-  return levels;
 }
 
 export function isContainerCommand(command: ServiceCommand): boolean {

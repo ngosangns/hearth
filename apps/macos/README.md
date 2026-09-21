@@ -85,8 +85,8 @@ design; `build-app.sh` just copies the committed `.icns` into the bundle.
   `local-services.yaml`/`.yml`/`.json`/`.config.ts` triggers `lsd manager reload` automatically,
   debounced.
 - "Start All" / "Stop All" — in the main window's toolbar and in each menu bar dropdown row. Start
-  goes through `/v1/operations/bulk-start` (dependency-ordered, stops on first failure, same as
-  `lsd start <group> --wait`); the daemon has no bulk-stop endpoint, so Stop All
+  goes through `/v1/operations/bulk-start` (every target started independently and concurrently,
+  stops on first failure, same as `lsd start <group> --wait`); the daemon has no bulk-stop endpoint, so Stop All
   is a client-side concurrent loop over individual stops, the same way the TUI's `s` key works.
 
 ## Known limitations / next steps

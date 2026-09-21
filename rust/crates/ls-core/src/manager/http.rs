@@ -15,13 +15,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::future::{BoxFuture, FutureExt, Shared};
+use futures::future::{BoxFuture, FutureExt};
 use serde_json::{json, Map, Value};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::catalog::{dependency_levels, validate_catalog, ServiceCatalog, ServiceId, ServiceOwnership};
+use crate::catalog::{validate_catalog, ServiceCatalog, ServiceId, ServiceOwnership};
 use crate::file_io::{create_file_io, FileIo};
 use crate::platform::{is_supported_local_services_platform, unsupported_platform_message};
 use crate::state::{
@@ -560,11 +560,7 @@ async fn post_operation_inner(manager: Arc<LocalServicesManager>, bytes: Bytes) 
         Some("status") => ServiceOperationKind::Status,
         _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_action", "action must be start, stop, restart, or status")),
     };
-    let start_services: Vec<ServiceId> = if action == ServiceOperationKind::Start {
-        dependency_levels(&catalog, std::slice::from_ref(&service_id)).map_err(|e| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e.to_string()))?.into_iter().flatten().collect()
-    } else {
-        Vec::new()
-    };
+    let start_services: Vec<ServiceId> = if action == ServiceOperationKind::Start { vec![service_id.clone()] } else { Vec::new() };
 
     let input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::Service, service_id: Some(service_id.clone()), target_service_ids: None, action: Some(action) };
     if let Some(existing) = manager.operations.resolve_request(&input).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))? {
@@ -598,15 +594,9 @@ async fn post_operation_inner(manager: Arc<LocalServicesManager>, bytes: Bytes) 
 
 fn run_service_operation(manager: Arc<LocalServicesManager>, handle: super::operations::OperationHandle, service_id: ServiceId, action: ServiceOperationKind, start_services: Vec<ServiceId>) -> BoxFuture<'static, Result<(), OperationError>> {
     async move {
-        // A single-service `start` brings up that service's whole dependency closure, in dependency
-        // order, exactly like bulk-start — `start_services` is that closure (computed by
-        // `dependency_levels` at schedule time), not just `service_id`. Calling
-        // `supervisor().start(&service_id)` directly here would spawn the service with its
-        // dependencies still stopped: they would be marked `queued-start` by
-        // `queue_stopped_services_for_start`, never started, then reset to `stopped` by the clear
-        // pass below, and the service itself would fail readiness against a dependency that was
-        // never brought up. `lsd start <id>`, the TUI's start key and MCP `manage start` all land
-        // here, so that path has to match `bulk-start`'s.
+        // `start_services` is `[service_id]` for a `start` action — routed through the same
+        // `start_selected_dag` as bulk-start so `lsd start <id>`, the TUI's start key and MCP
+        // `manage start` all land on one code path.
         let result = match action {
             ServiceOperationKind::Start => start_selected_dag(&manager, &start_services, &handle).await.map_err(|e| crate::supervisor::types::SupervisorError(e.message)),
             ServiceOperationKind::Stop => manager.supervisor().stop(&service_id, None).await,
@@ -642,9 +632,9 @@ async fn queue_stopped_services_for_start(manager: &Arc<LocalServicesManager>, s
             // the node is already ready.
             //
             // Skipping this left a service that is genuinely ready but carries a stale
-            // `desired_state: stopped` in a state it could never leave: the DAG skipped it, every
-            // dependent was reported `Blocked`, and the operation still reported success — so
-            // nothing surfaced the problem. Reached easily in practice, because `manager stop`
+            // `desired_state: stopped` in a state it could never leave: `start_selected_dag`
+            // skipped it and the operation still reported success — so nothing surfaced the
+            // problem. Reached easily in practice, because `manager stop`
             // sets `desired_state: stopped` for everything and an adopted docker/tailnet unit then
             // comes back as `ready` on the next daemon start with that stale intent attached.
             if previous.desired_state != crate::state::DesiredServiceState::Running {
@@ -751,7 +741,7 @@ async fn post_bulk_start_inner(manager: Arc<LocalServicesManager>, bytes: Bytes)
     if targets.iter().any(|t| catalog.services.iter().find(|s| &s.id == t).map(|s| !s.profiles.run.is_verified()).unwrap_or(true)) {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "unsupported_service", "The requested catalog service is not executable"));
     }
-    let selected: Vec<ServiceId> = dependency_levels(&catalog, &targets).map_err(|e| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e.to_string()))?.into_iter().flatten().collect();
+    let selected: Vec<ServiceId> = targets.clone();
 
     let input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::BulkStart, service_id: None, target_service_ids: Some(targets.clone()), action: None };
     if let Some(existing) = manager.operations.resolve_request(&input).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))? {
@@ -782,92 +772,66 @@ async fn post_bulk_start_inner(manager: Arc<LocalServicesManager>, bytes: Bytes)
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
 
-/// Port of `startSelectedDag`: brings up every selected service respecting dependency order, each
-/// node's own future awaiting only its direct (also-selected) dependencies — so independent branches
-/// of the graph proceed concurrently rather than waiting for an entire dependency "level" to finish.
+/// Port of `startSelectedDag`: starts every selected service concurrently and independently — no
+/// service waits on another.
 async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[ServiceId], operation: &super::operations::OperationHandle) -> Result<(), OperationError> {
-    /// Three distinct non-ready outcomes, not one `ready: bool`. Only `Failed` makes the operation
-    /// fail: a node `Blocked` behind a dependency that didn't come up, or `Skipped` because its
-    /// start was cancelled mid-flight, is a normal result the TS source reports as success.
-    /// Collapsing all three into "not ready" made a cancelled start report the whole bulk start as
-    /// failed.
+    /// Two distinct non-ready outcomes, not one `ready: bool`. Only `Failed` makes the operation
+    /// fail: `Skipped` because a start was cancelled mid-flight is a normal result the TS source
+    /// reports as success. Collapsing both into "not ready" made a cancelled start report the
+    /// whole bulk start as failed.
     #[derive(Clone, PartialEq)]
     enum StartOutcome {
         Ready,
-        Blocked,
         Skipped,
         Failed(String),
     }
 
-    #[derive(Clone)]
     struct StartResult {
         service_id: ServiceId,
         outcome: StartOutcome,
     }
 
-    impl StartResult {
-        fn is_ready(&self) -> bool {
-            self.outcome == StartOutcome::Ready
+    async fn start(manager: Arc<LocalServicesManager>, operation: super::operations::OperationHandle, service_id_owned: ServiceId) -> StartResult {
+        let desired_running = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| s.desired_state == crate::state::DesiredServiceState::Running).unwrap_or(false);
+        if !desired_running {
+            manager.operations.trace(&operation, &format!("Skipped: {service_id_owned} (start cancelled)"));
+            return StartResult { service_id: service_id_owned, outcome: StartOutcome::Skipped };
         }
-    }
-    let selected_set: std::collections::HashSet<ServiceId> = selected.iter().cloned().collect();
-    let catalog = manager.catalog();
-    let mut tasks: HashMap<ServiceId, Shared<BoxFuture<'static, StartResult>>> = HashMap::new();
-    for service_id in selected {
-        let dependencies: Vec<ServiceId> = catalog.services.iter().find(|s| &s.id == service_id).and_then(|s| s.dependencies.clone()).unwrap_or_default().into_iter().filter(|d| selected_set.contains(d)).collect();
-        let dependency_futures: Vec<Shared<BoxFuture<'static, StartResult>>> = dependencies.iter().map(|d| tasks[d].clone()).collect();
-        let manager = manager.clone();
-        let operation = operation.clone();
-        let service_id_owned = service_id.clone();
-        let fut: BoxFuture<'static, StartResult> = async move {
-            let dependency_results = futures::future::join_all(dependency_futures).await;
-            let unavailable: Vec<ServiceId> = dependency_results.iter().filter(|r| !r.is_ready()).map(|r| r.service_id.clone()).collect();
-            if !unavailable.is_empty() {
-                manager.operations.trace(&operation, &format!("Blocked: {service_id_owned} (dependencies not ready: {})", unavailable.join(", ")));
-                return StartResult { service_id: service_id_owned, outcome: StartOutcome::Blocked };
-            }
-            let desired_running = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| s.desired_state == crate::state::DesiredServiceState::Running).unwrap_or(false);
-            if !desired_running {
-                manager.operations.trace(&operation, &format!("Skipped: {service_id_owned} (start cancelled)"));
-                return StartResult { service_id: service_id_owned, outcome: StartOutcome::Skipped };
-            }
-            let already_ready = manager
-                .state
-                .lock()
-                .unwrap()
-                .services
-                .get(&service_id_owned)
-                .map(|s| s.actual_state == crate::state::ActualServiceState::Ready && s.readiness == crate::state::ServiceReadiness::Ready)
-                .unwrap_or(false);
-            if already_ready {
-                manager.operations.trace(&operation, &format!("Ready: {service_id_owned} (already ready)"));
-                return StartResult { service_id: service_id_owned, outcome: StartOutcome::Ready };
-            }
-            manager.operations.trace(&operation, &format!("Starting: {service_id_owned}"));
-            let operation_id = operation.lock().unwrap().id.clone();
-            match manager.supervisor().start(&service_id_owned, Some(operation_id)).await {
-                Ok(()) => {
-                    let settled = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| {
-                        s.actual_state == crate::state::ActualServiceState::Ready || (s.actual_state == crate::state::ActualServiceState::RunningUnready && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
-                    }).unwrap_or(false);
-                    if settled {
-                        manager.operations.trace(&operation, &format!("Ready: {service_id_owned}"));
-                        StartResult { service_id: service_id_owned, outcome: StartOutcome::Ready }
-                    } else {
-                        manager.operations.trace(&operation, &format!("Failed: {service_id_owned} (did not become ready)"));
-                        StartResult { service_id: service_id_owned, outcome: StartOutcome::Failed("did not become ready".to_string()) }
-                    }
-                }
-                Err(error) => {
-                    manager.operations.trace(&operation, &format!("Failed: {service_id_owned} ({})", error.0));
-                    StartResult { service_id: service_id_owned, outcome: StartOutcome::Failed(error.0) }
+        let already_ready = manager
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .get(&service_id_owned)
+            .map(|s| s.actual_state == crate::state::ActualServiceState::Ready && s.readiness == crate::state::ServiceReadiness::Ready)
+            .unwrap_or(false);
+        if already_ready {
+            manager.operations.trace(&operation, &format!("Ready: {service_id_owned} (already ready)"));
+            return StartResult { service_id: service_id_owned, outcome: StartOutcome::Ready };
+        }
+        manager.operations.trace(&operation, &format!("Starting: {service_id_owned}"));
+        let operation_id = operation.lock().unwrap().id.clone();
+        match manager.supervisor().start(&service_id_owned, Some(operation_id)).await {
+            Ok(()) => {
+                let settled = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| {
+                    s.actual_state == crate::state::ActualServiceState::Ready || (s.actual_state == crate::state::ActualServiceState::RunningUnready && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
+                }).unwrap_or(false);
+                if settled {
+                    manager.operations.trace(&operation, &format!("Ready: {service_id_owned}"));
+                    StartResult { service_id: service_id_owned, outcome: StartOutcome::Ready }
+                } else {
+                    manager.operations.trace(&operation, &format!("Failed: {service_id_owned} (did not become ready)"));
+                    StartResult { service_id: service_id_owned, outcome: StartOutcome::Failed("did not become ready".to_string()) }
                 }
             }
+            Err(error) => {
+                manager.operations.trace(&operation, &format!("Failed: {service_id_owned} ({})", error.0));
+                StartResult { service_id: service_id_owned, outcome: StartOutcome::Failed(error.0) }
+            }
         }
-        .boxed();
-        tasks.insert(service_id.clone(), fut.shared());
     }
-    let results = futures::future::join_all(selected.iter().map(|id| tasks[id].clone())).await;
+
+    let results = futures::future::join_all(selected.iter().map(|service_id| start(manager.clone(), operation.clone(), service_id.clone()))).await;
     let failures: Vec<&StartResult> = results.iter().filter(|r| matches!(r.outcome, StartOutcome::Failed(_))).collect();
     if !failures.is_empty() {
         let summary = failures.iter().map(|r| r.service_id.clone()).collect::<Vec<_>>().join(", ");
@@ -877,7 +841,7 @@ async fn start_selected_dag(manager: &Arc<LocalServicesManager>, selected: &[Ser
             StartOutcome::Failed(message) if !message.is_empty() => format!(" ({message})"),
             _ => String::new(),
         };
-        return Err(OperationError { code: "operation_failed".to_string(), message: format!("Dependency startup failed: {summary}{cause}") });
+        return Err(OperationError { code: "operation_failed".to_string(), message: format!("Service startup failed: {summary}{cause}") });
     }
     Ok(())
 }
@@ -1102,7 +1066,6 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
@@ -1306,87 +1269,21 @@ mod tests {
         manager.close().await;
     }
 
-    /// Regression test for a real port bug: `run_service_operation` used to call
-    /// `supervisor().start(&service_id)` for the single requested service, while the TypeScript
-    /// source runs the whole dependency closure through `startSelectedDag`. A single-service start
-    /// therefore left every dependency stopped — visibly flipping them to `queued-start` and back
-    /// to `stopped` — and the service itself failed readiness against a dependency that was never
-    /// brought up. `lsd start <id>`, the TUI's start key and MCP `manage start` all post here, so
-    /// this is the path almost every real start takes.
-    #[tokio::test]
-    async fn single_service_start_brings_up_its_dependencies() {
-        let db_port = free_port();
-        let api_port = free_port();
-        let mut api = tcp_service("api", api_port);
-        api.dependencies = Some(vec!["db".to_string()]);
-        let catalog = ServiceCatalog {
-            services: vec![tcp_service("db", db_port), api],
-            groups: HashMap::new(),
-            compose_file: None,
-            runtime_directory: None,
-            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
-            private_file_guard: Some(false),
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let manager = bootstrap(LocalServicesManagerOptions {
-            runtime_directory: Some(dir.path().to_path_buf()),
-            root: Some(PathBuf::from("/tmp")),
-            catalog,
-            event_capacity: None,
-            log_tail_bytes: None,
-            log_max_bytes: None,
-            log_rotation_count: None,
-            supervisor: None,
-        })
-        .await
-        .unwrap();
-
-        let base = manager.base_url();
-        let token = manager.bearer_token().to_string();
-        let client = reqwest::Client::new();
-
-        // Start ONLY `api`. Its dependency `db` is not named anywhere in the request.
-        let accepted: Value = client
-            .post(format!("{base}/v1/operations"))
-            .bearer_auth(&token)
-            .header("x-local-services-protocol", "1")
-            .json(&json!({ "requestId": "req-dep-start", "serviceId": "api", "action": "start" }))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let operation_id = accepted["operation"]["id"].as_str().unwrap().to_string();
-        let settled = wait_for_operation(&client, &base, &token, &operation_id).await;
-        assert_eq!(settled["operation"]["status"], "succeeded", "{settled:?}");
-
-        let states = manager.service_states();
-        let state_of = |id: &str| states.iter().find(|s| s.service_id == id).cloned().expect("service present");
-        assert_eq!(state_of("db").actual_state, crate::state::ActualServiceState::Ready, "the dependency must be started, not left stopped");
-        assert_eq!(state_of("api").actual_state, crate::state::ActualServiceState::Ready);
-
-        manager.close().await;
-    }
-
     /// Regression for a deadlock reachable from an ordinary restart: a service that is genuinely
-    /// ready but carries a stale `desired_state: stopped` could never be started, and permanently
-    /// blocked every dependent — while the operation still reported success.
+    /// ready but carries a stale `desired_state: stopped` could never be started again — the
+    /// operation still reported success, but the service stayed skipped forever.
     ///
     /// How it is reached: `manager stop` sets `desired_state: stopped` for everything, then the
     /// next daemon adopts an externally-owned docker/tailnet unit back as `ready` with that stale
     /// intent still attached. `start_selected_dag` checks `desired_state` before it checks whether
-    /// the node is already ready, so it reported `Skipped: <dep> (start cancelled)` and cascaded
-    /// `Blocked` to everything downstream. `queue_stopped_services_for_start` could not fix the
-    /// intent either, because it only ever touched services whose actual state was `stopped`.
+    /// the node is already ready, so it reported `Skipped: db (start cancelled)`.
+    /// `queue_stopped_services_for_start` could not fix the intent either, because it only ever
+    /// touched services whose actual state was `stopped`.
     #[tokio::test]
-    async fn a_ready_dependency_with_a_stale_desired_state_does_not_block_its_dependents() {
+    async fn a_ready_service_with_a_stale_desired_state_is_not_skipped() {
         let db_port = free_port();
-        let api_port = free_port();
-        let mut api = tcp_service("api", api_port);
-        api.dependencies = Some(vec!["db".to_string()]);
         let catalog = ServiceCatalog {
-            services: vec![tcp_service("db", db_port), api],
+            services: vec![tcp_service("db", db_port)],
             groups: HashMap::new(),
             compose_file: None,
             runtime_directory: None,
@@ -1425,7 +1322,7 @@ mod tests {
             .post(format!("{base}/v1/operations"))
             .bearer_auth(&token)
             .header("x-local-services-protocol", "1")
-            .json(&json!({ "requestId": "req-stale-intent", "serviceId": "api", "action": "start" }))
+            .json(&json!({ "requestId": "req-stale-intent", "serviceId": "db", "action": "start" }))
             .send()
             .await
             .unwrap()
@@ -1438,11 +1335,10 @@ mod tests {
 
         let states = manager.service_states();
         let state_of = |id: &str| states.iter().find(|s| s.service_id == id).cloned().expect("service present");
-        assert_eq!(state_of("db").actual_state, crate::state::ActualServiceState::Ready);
         assert_eq!(
-            state_of("api").actual_state,
+            state_of("db").actual_state,
             crate::state::ActualServiceState::Ready,
-            "a ready dependency with a stale desired_state must not block its dependent"
+            "a ready service with a stale desired_state must not be skipped"
         );
 
         manager.close().await;

@@ -45,7 +45,7 @@ hatch.
 
 | Subpath | What it is |
 |---|---|
-| `@gnasdev/local-services/core` | `LocalServicesManager` (the daemon engine), catalog types + `validateCatalog`/`dependencyLevels`, `runDoctor`, `runDaemon`/`DaemonLifecycle`, `loadCatalog`/`findConfigFile` (declarative config), `resolveBaseEnvironment` (login-shell/`.env` resolution) |
+| `@gnasdev/local-services/core` | `LocalServicesManager` (the daemon engine), catalog types + `validateCatalog`, `runDoctor`, `runDaemon`/`DaemonLifecycle`, `loadCatalog`/`findConfigFile` (declarative config), `resolveBaseEnvironment` (login-shell/`.env` resolution) |
 | `@gnasdev/local-services/cli` | `main()` — the `localctl`-style command surface (`status`, `urls`, `logs`, `start`/`stop`/`restart`, `operation`, `doctor`, `cleanup`, `manager`, `tui`) |
 | `@gnasdev/local-services/tui` | `runTui()` — a [`pi-tui`](https://www.npmjs.com/package/@oh-my-pi/pi-tui)-based terminal app, just another HTTP+SSE client of the daemon |
 | `@gnasdev/local-services/mcp` | `createLocalServicesMcpServer()` — a 5-tool MCP server (status/logs/trace/events/manage) for AI agents |
@@ -80,7 +80,6 @@ export const catalog: ServiceCatalog = {
     },
     {
       id: "api",
-      dependencies: ["redis"],
       profiles: {
         run: {
           commandStatus: "verified",
@@ -121,7 +120,7 @@ process.exitCode = await main(options);
 
 ```bash
 bun run cli.ts status        # one-shot status of every service
-bun run cli.ts start api     # start api (and its redis dependency)
+bun run cli.ts start api     # start api
 bun run cli.ts doctor        # environment checks
 ```
 
@@ -162,7 +161,6 @@ services:
     run: { argv: [docker, compose, up, -d, redis] }
     readiness: { kind: container }
   api:
-    dependsOn: [redis]
     cwd: apps/api
     build: { argv: [go, build, ./...], timeoutMs: 120000, serializationKey: go }
     run: { shell: "air -c .air.toml", exec: true }
@@ -189,7 +187,7 @@ that file and behaves exactly like a project-authored `cli.ts`/`daemon.ts` pair:
 ```bash
 lsd status              # one-shot status of every service
 lsd urls                # where every service can be reached
-lsd start api --wait    # start api (and its redis dependency)
+lsd start api --wait    # start api
 lsd manager ensure --json   # spawn the daemon if needed; print {instanceId, port, token, protocolVersion, runtimeDirectory, root}
 lsd daemon --root .     # the daemon entrypoint lsd spawns itself, detached — not usually invoked by hand
 ```

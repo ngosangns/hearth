@@ -72,8 +72,9 @@ final class ManagerClient: ManagerAPI {
         return try await post("/v1/operations", body: body, as: OperationResponse.self).operation
     }
 
-    /// `POST /v1/operations/bulk-start` — brings up `targets` in dependency order, stopping on the
-    /// first failure (same policy the CLI's `start <group> --wait` uses). There's no bulk-stop
+    /// `POST /v1/operations/bulk-start` — brings up every one of `targets` independently and
+    /// concurrently, stopping on the first failure (same policy the CLI's `start <group> --wait`
+    /// uses). There's no bulk-stop
     /// endpoint on the daemon (see AGENTS.md); stopping several services is a client-side loop of
     /// individual `perform(.stop, ...)` calls instead — see `WorkspaceController.stopAll`.
     /// `GET /v1/operations/:id` — the daemon accepts an operation with `202` and runs it

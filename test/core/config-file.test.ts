@@ -53,7 +53,6 @@ services:
     run: { argv: [docker, compose, up, -d, redis] }
     readiness: { kind: container }
   api:
-    dependsOn: [redis]
     cwd: apps/api
     env:
       PORT: "8080"
@@ -73,7 +72,6 @@ services:
     expect(redis.kind).toBe("infrastructure");
     expect(redis.profiles.run.commandStatus).toBe("verified");
     const api = result.catalog.services.find((s) => s.id === "api")!;
-    expect(api.dependencies).toEqual(["redis"]);
     expect(api.profiles.build).toEqual({ command: { command: { argv: ["go", "build", "./..."] }, cwd: "apps/api" }, timeoutMs: 120000, serializationKey: "go" });
     expect(api.ports).toEqual([{ port: 6060, label: "pprof", requiresRunning: undefined }]);
     expect(api.profiles.run.commandStatus).toBe("verified");
@@ -134,15 +132,15 @@ services:
     if (!result.ok) expect(result.errors).toContain('services.api.readiness.kind must be one of process, tcp, http, container, tailnet, command, got "magic"');
   });
 
-  test("propagates cross-service validation errors (dependency cycle) from validateCatalog", async () => {
+  test("propagates cross-service validation errors (group referencing an unknown service) from validateCatalog", async () => {
     const root = await scratchRoot();
     await writeFile(
       join(root, "local-services.yaml"),
-      `version: 1\nservices:\n  a:\n    dependsOn: [b]\n    run: { argv: [a] }\n    readiness: { kind: process }\n  b:\n    dependsOn: [a]\n    run: { argv: [b] }\n    readiness: { kind: process }\n`,
+      `version: 1\ngroups:\n  all: [ghost]\nservices:\n  a:\n    run: { argv: [a] }\n    readiness: { kind: process }\n`,
     );
     const result = await loadCatalog(root);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.errors.some((e) => e.includes("dependency cycle"))).toBe(true);
+    if (!result.ok) expect(result.errors.some((e) => e.includes("references unknown service"))).toBe(true);
   });
 
   test("maps command readiness with an explicit cwd", async () => {
@@ -251,7 +249,7 @@ describe("unknown keys", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.errors).toEqual([
-      'services.api has unknown key "command" (known: label, kind, ownership, dependsOn, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)',
+      'services.api has unknown key "command" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)',
     ]);
   });
 });

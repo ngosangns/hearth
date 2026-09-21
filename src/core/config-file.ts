@@ -248,7 +248,7 @@ function resolveServiceCwd(root: string, cwd: string | undefined, path: string, 
 // A key outside these sets is a typo (e.g. `command:` for `run:`), which would otherwise be silently
 // dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
 const topLevelKeys = ["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
-const serviceKeys = ["label", "kind", "ownership", "dependsOn", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls"];
+const serviceKeys = ["label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls"];
 function checkKnownKeys(value: Record<string, unknown>, known: readonly string[], path: string, errors: string[]): void {
   for (const key of Object.keys(value)) {
     if (!known.includes(key) && !key.startsWith("x-")) errors.push(`${path} has unknown key "${key}" (known: ${known.join(", ")})`);
@@ -283,7 +283,6 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
     checkKnownKeys(value, serviceKeys, svcPath, errors);
     if (value.kind !== undefined && !serviceKinds.includes(value.kind as ServiceKind)) errors.push(`${svcPath}.kind must be one of ${serviceKinds.join(", ")}`);
     if (value.ownership !== undefined && !ownerships.includes(value.ownership as ServiceOwnership)) errors.push(`${svcPath}.ownership must be one of ${ownerships.join(", ")}`);
-    if (value.dependsOn !== undefined && !isStringArray(value.dependsOn)) errors.push(`${svcPath}.dependsOn must be a string array`);
     if (value.env !== undefined && !isStringRecord(value.env)) errors.push(`${svcPath}.env must be a map of string to string`);
     if (value.container !== undefined && typeof value.container !== "string") errors.push(`${svcPath}.container must be a string`);
 
@@ -328,7 +327,6 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
       label: typeof value.label === "string" ? value.label : undefined,
       kind: value.kind as ServiceKind | undefined,
       ownership: value.ownership as ServiceOwnership | undefined,
-      dependencies: value.dependsOn as ServiceId[] | undefined,
       profiles: { run: profileRun, build: profileBuild },
       ports: ports?.length ? ports : undefined,
       urls: urls?.length ? urls : undefined,

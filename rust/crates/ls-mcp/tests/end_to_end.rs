@@ -31,7 +31,6 @@ fn tcp_service(id: &str, port: u16) -> ServiceDefinition {
         label: None,
         kind: Some(ServiceKind::Application),
         ownership: None,
-        dependencies: None,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified { command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None }, readiness: ReadinessSpec::Tcp { port }, readiness_timeout_ms: Some(5_000), preparation: None, preparation_command: None },
             build: None,

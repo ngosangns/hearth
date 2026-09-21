@@ -17,8 +17,8 @@ pub mod state;
 pub mod supervisor;
 
 pub use catalog::{
-    dependency_levels, is_container_command, validate_catalog, CatalogValidation, CommandSpec,
-    ReadinessProbeContext, ReadinessSpec, ServiceBuildProfile, ServiceCatalog, ServiceCommand,
-    ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership, ServicePort, ServiceProfiles,
-    ServiceRunProfile, StartFailurePolicy,
+    is_container_command, validate_catalog, CatalogValidation, CommandSpec, ReadinessProbeContext,
+    ReadinessSpec, ServiceBuildProfile, ServiceCatalog, ServiceCommand, ServiceDefinition,
+    ServiceId, ServiceKind, ServiceOwnership, ServicePort, ServiceProfiles, ServiceRunProfile,
+    StartFailurePolicy,
 };

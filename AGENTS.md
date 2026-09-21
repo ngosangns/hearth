@@ -172,7 +172,7 @@ Applies to both implementations unless noted.
   adoption carve-out. `test/core/external-ownership.test.ts` is the only coverage of
   `syncExternalServices()`.
 - Service order from a config file is **document order**, not sorted — it's user-visible in
-  `/v1/catalog`, `lsd status`, both TUIs, and within-level start order.
+  `/v1/catalog`, `lsd status`, and both TUIs.
 - A missing/invalid `readiness` must fail the load, not skip the service. Skipping let a typo
   silently delete a service from an otherwise-fine catalog.
 

@@ -1798,7 +1798,6 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {

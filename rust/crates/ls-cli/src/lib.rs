@@ -1021,7 +1021,6 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
-            dependencies: None,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },

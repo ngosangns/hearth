@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { open, readdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-import { dependencyLevels, resolveServiceUrls, validateCatalog, type ServiceCatalog, type ServiceId } from "./catalog";
+import { resolveServiceUrls, validateCatalog, type ServiceCatalog, type ServiceId } from "./catalog";
 import { lookupPlaceholder } from "./service-urls";
 import { createFileIo, isRecord, removeDirectory, type FileIo } from "./file-io";
 import { resolveRuntimeDirectory } from "./paths";
@@ -956,7 +956,7 @@ export class LocalServicesManager {
     if (body.action !== "start" && body.action !== "stop" && body.action !== "restart" && body.action !== "status") throw new ManagerHttpError(400, "invalid_action", "action must be start, stop, restart, or status");
     const serviceId = body.serviceId;
     const action = body.action as ServiceOperationKind;
-    const startServices = action === "start" ? dependencyLevels(this.catalog, [serviceId]).flat() : [];
+    const startServices = action === "start" ? [serviceId] : [];
     const input = { requestId: body.requestId, kind: "service" as const, serviceId, action };
     const existing = this.operations.resolveRequest(input);
     if (existing) return this.json({ operation: existing }, 202);
@@ -989,7 +989,7 @@ export class LocalServicesManager {
     const targets = body.targets as ServiceId[];
     const services = new Map(this.catalog.services.map((service) => [service.id, service]));
     if (targets.some((target) => services.get(target)?.profiles.run.commandStatus !== "verified")) throw new ManagerHttpError(409, "unsupported_service", "The requested catalog service is not executable");
-    const selected = dependencyLevels(this.catalog, targets).flat();
+    const selected = targets;
     const input = { requestId: body.requestId, kind: "bulk-start" as const, targetServiceIds: targets };
     const existing = this.operations.resolveRequest(input);
     if (existing) return this.json({ operation: existing }, 202);
@@ -1009,49 +1009,41 @@ export class LocalServicesManager {
   }
 
   private async startSelectedDag(selected: readonly ServiceId[], operation: Operation): Promise<void> {
-    type StartResult = { serviceId: ServiceId; status: "ready" | "failed" | "blocked"; error?: unknown };
-    const selectedSet = new Set(selected);
-    const services = new Map(this.catalog.services.map((service) => [service.id, service]));
-    const tasks = new Map<ServiceId, Promise<StartResult>>();
-    for (const serviceId of selected) {
-      const dependencies = (services.get(serviceId)?.dependencies ?? []).filter((dependency) => selectedSet.has(dependency));
-      const task = (async (): Promise<StartResult> => {
-        const dependencyResults = await Promise.all(dependencies.map((dependency) => tasks.get(dependency)!));
-        const unavailable = dependencyResults.filter((result) => result.status !== "ready").map((result) => result.serviceId);
-        if (unavailable.length) {
-          this.operations.trace(operation, `Blocked: ${serviceId} (dependencies not ready: ${unavailable.join(", ")})`);
-          return { serviceId, status: "blocked" };
-        }
-        const state = this.serviceStates().find((current) => current.serviceId === serviceId);
-        if (state?.desiredState !== "running") {
-          this.operations.trace(operation, `Skipped: ${serviceId} (start cancelled)`);
-          return { serviceId, status: "blocked" };
-        }
-        if (state.actualState === "ready" && state.readiness === "ready") {
-          this.operations.trace(operation, `Ready: ${serviceId} (already ready)`);
-          return { serviceId, status: "ready" };
-        }
-        this.operations.trace(operation, `Starting: ${serviceId}`);
-        try {
-          await this.supervisor.start(serviceId, operation.id);
-          const after = this.serviceStates().find((current) => current.serviceId === serviceId);
-          const settled = after?.actualState === "ready" || (after?.actualState === "running-unready" && after.readinessKind === "process");
-          if (!settled) throw new Error(`${serviceId} did not become ready`);
-          this.operations.trace(operation, `Ready: ${serviceId}`);
-          return { serviceId, status: "ready" };
-        } catch (error) {
-          this.operations.trace(operation, `Failed: ${serviceId}${error instanceof Error && error.message ? ` (${error.message})` : ""}`);
-          return { serviceId, status: "failed", error };
-        }
-      })();
-      tasks.set(serviceId, task);
-    }
-    const results = await Promise.all(selected.map((serviceId) => tasks.get(serviceId)!));
+    type StartResult = { serviceId: ServiceId; status: "ready" | "skipped" | "failed"; error?: unknown };
+    const start = async (serviceId: ServiceId): Promise<StartResult> => {
+      // Yield once before the first state read: the caller marks these services queued-start via
+      // `queueStoppedServicesForStart` on a separate promise chain kicked off right after this
+      // operation was scheduled, and that write must land before this task's first read of
+      // `desiredState` or every service is (wrongly) seen as still "stopped" and skipped.
+      await Promise.resolve();
+      const state = this.serviceStates().find((current) => current.serviceId === serviceId);
+      if (state?.desiredState !== "running") {
+        this.operations.trace(operation, `Skipped: ${serviceId} (start cancelled)`);
+        return { serviceId, status: "skipped" };
+      }
+      if (state.actualState === "ready" && state.readiness === "ready") {
+        this.operations.trace(operation, `Ready: ${serviceId} (already ready)`);
+        return { serviceId, status: "ready" };
+      }
+      this.operations.trace(operation, `Starting: ${serviceId}`);
+      try {
+        await this.supervisor.start(serviceId, operation.id);
+        const after = this.serviceStates().find((current) => current.serviceId === serviceId);
+        const settled = after?.actualState === "ready" || (after?.actualState === "running-unready" && after.readinessKind === "process");
+        if (!settled) throw new Error(`${serviceId} did not become ready`);
+        this.operations.trace(operation, `Ready: ${serviceId}`);
+        return { serviceId, status: "ready" };
+      } catch (error) {
+        this.operations.trace(operation, `Failed: ${serviceId}${error instanceof Error && error.message ? ` (${error.message})` : ""}`);
+        return { serviceId, status: "failed", error };
+      }
+    };
+    const results = await Promise.all(selected.map((serviceId) => start(serviceId)));
     const failures = results.filter((result) => result.status === "failed");
     if (failures.length) {
       const summary = failures.map((result) => result.serviceId).join(", ");
       const cause = failures[0]!.error;
-      throw new Error(`Dependency startup failed: ${summary}${cause instanceof Error && cause.message ? ` (${cause.message})` : ""}`);
+      throw new Error(`Service startup failed: ${summary}${cause instanceof Error && cause.message ? ` (${cause.message})` : ""}`);
     }
   }
 

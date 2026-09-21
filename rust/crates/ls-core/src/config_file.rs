@@ -506,7 +506,7 @@ fn resolve_service_cwd(cwd: Option<&str>, path: &str, errors: &mut Vec<String>) 
 /// dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
 const TOP_LEVEL_KEYS: &[&str] = &["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
 const SERVICE_KEYS: &[&str] = &[
-    "label", "kind", "ownership", "dependsOn", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls",
+    "label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls",
 ];
 
 fn check_known_keys(value: &serde_json::Map<String, Value>, known: &[&str], path: &str, errors: &mut Vec<String>) {
@@ -575,10 +575,10 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
     let mut services: Vec<ServiceDefinition> = Vec::new();
     let services_raw = services_raw.unwrap();
     // Document order, not sorted: the TS loader iterates `Object.entries` (insertion order), and
-    // this order is user-visible — it drives `/v1/catalog`, `lsd status` row order, the TUI list,
-    // and the within-level start order `dependency_levels` produces. Sorting here made the same
-    // YAML file present differently depending on which implementation read it. `serde_json`'s
-    // `preserve_order` feature (enabled workspace-wide) is what makes `keys()` document-ordered.
+    // this order is user-visible — it drives `/v1/catalog`, `lsd status` row order, and the TUI
+    // list. Sorting here made the same YAML file present differently depending on which
+    // implementation read it. `serde_json`'s `preserve_order` feature (enabled workspace-wide) is
+    // what makes `keys()` document-ordered.
     for id in services_raw.keys() {
         let value = &services_raw[id];
         let svc_path = format!("services.{id}");
@@ -603,14 +603,6 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             Some(Value::String(s)) if s == "external" => Some(ServiceOwnership::External),
             Some(_) => {
                 errors.push(format!("{svc_path}.ownership must be one of {}", OWNERSHIPS.join(", ")));
-                None
-            }
-        };
-        let dependencies: Option<Vec<String>> = match obj.get("dependsOn") {
-            None => None,
-            Some(v) if is_string_array(v) => Some(string_array(v)),
-            Some(_) => {
-                errors.push(format!("{svc_path}.dependsOn must be a string array"));
                 None
             }
         };
@@ -712,7 +704,6 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             label: obj.get("label").and_then(Value::as_str).map(str::to_string),
             kind,
             ownership,
-            dependencies,
             profiles: ServiceProfiles { run: profile_run, build: profile_build },
             ports: ports.filter(|p| !p.is_empty()),
             urls: urls.filter(|u| !u.is_empty()),
@@ -1047,7 +1038,7 @@ services:
         assert_eq!(
             err.errors,
             vec![
-                "services.api has unknown key \"command\" (known: label, kind, ownership, dependsOn, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)"
+                "services.api has unknown key \"command\" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)"
                     .to_string()
             ]
         );
