@@ -1,6 +1,6 @@
 {
   "name": "@gnasdev/local-services",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Local dev services manager (daemon, TUI, CLI, MCP) for Bun projects",
   "license": "UNLICENSED",
   "private": false,
