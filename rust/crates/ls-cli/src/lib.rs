@@ -671,10 +671,33 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
             let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "mode": "stop-services" });
             let result = request(&client, "/v1/manager/shutdown", reqwest::Method::POST, Some(&body), Some(client.metadata.protocol_version)).await.or_else(unavailable_err)?;
             let operation = result.get("operation").cloned().unwrap_or(Value::Null);
+            wait_for_daemon_exit(client.metadata.pid, MANAGER_STOP_TIMEOUT, ls_core::platform::is_pid_alive).await?;
             (io.out)(&print_value(&operation, flags.json));
             Ok(0)
         }
     }
+}
+
+/// How long `manager stop` waits for the daemon to finish stopping every service and exit.
+const MANAGER_STOP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The shutdown request returns as soon as the daemon starts closing, but it keeps its lock (and
+/// keeps answering discovery) until every service is stopped. Returning then let an immediate
+/// `ensure` reconnect to the closing daemon and get `manager_closing` for every request — so `stop`
+/// means "the daemon process is gone". An in-process daemon (tests, embedders) shares our pid and can
+/// never be seen to exit, so it is not waited on.
+async fn wait_for_daemon_exit(pid: i64, timeout: Duration, alive: impl Fn(i64) -> bool) -> LocalctlResult<()> {
+    if pid == i64::from(std::process::id()) {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    while alive(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return fail_err(EXIT_FAILED, format!("local services manager (pid {pid}) did not exit within {}s", timeout.as_secs()));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(())
 }
 
 /// `urls [target] [--json]`: every registered URL of the selected services, placeholders resolved
@@ -1123,6 +1146,21 @@ mod tests {
         assert!(client.metadata.port > 0);
         // Clean up: ask the real daemon we just spawned to stop.
         let _ = request(&client, "/v1/manager/shutdown", reqwest::Method::POST, Some(&json!({"requestId": uuid::Uuid::new_v4().to_string(), "mode": "stop-services"})), Some(client.metadata.protocol_version)).await;
+    }
+
+    #[tokio::test]
+    async fn manager_stop_waits_for_the_daemon_process_to_exit_and_fails_if_it_never_does() {
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let waited = wait_for_daemon_exit(999_999, Duration::from_secs(5), |_| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2).await;
+        assert!(waited.is_ok());
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let stuck = wait_for_daemon_exit(999_999, Duration::from_millis(300), |_| true).await;
+        let err = stuck.expect_err("a daemon that never exits must fail the stop");
+        assert!(format!("{err:?}").contains("did not exit within"), "{err:?}");
+
+        // Our own pid is an in-process daemon: never waited on, even though it is alive.
+        assert!(wait_for_daemon_exit(i64::from(std::process::id()), Duration::from_millis(1), |_| true).await.is_ok());
     }
 
     #[tokio::test]

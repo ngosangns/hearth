@@ -13,6 +13,7 @@ import {
   type OwnedLockArtifacts,
 } from "../core/manager";
 import { resolveRuntimeDirectory } from "../core/paths";
+import { isPidAlive } from "../core/platform";
 import { staleLockMarkerName, type ManagerMetadata, type Operation, type ServiceLifecycleState } from "../core/state";
 import type { DoctorChecks, DoctorReport } from "../core/doctor";
 import { runDoctor } from "../core/doctor";
@@ -50,7 +51,11 @@ export type LocalctlRuntime = {
   error?(data: string): void;
   doctor?(root: string): Promise<DoctorReport>;
   tui?(root: string): Promise<number>;
+  processAlive?(pid: number): boolean;
 };
+
+/** How long `manager stop` waits for the daemon to finish stopping every service and exit. */
+export const managerStopTimeoutMs = 300_000;
 
 export class LocalctlError extends Error {
   constructor(
@@ -401,6 +406,19 @@ export async function main(options: LocalctlOptions, argv = process.argv.slice(2
       const operation = ((await request(client, "/v1/manager/shutdown", { method: "POST", body: JSON.stringify({ requestId: randomUUID(), mode: "stop-services" }), headers: { "content-type": "application/json" } }, runtime, client.metadata.protocolVersion)) as {
         operation: Operation;
       }).operation;
+      // The shutdown request returns as soon as the daemon starts closing, but it keeps its lock
+      // (and keeps answering discovery) until every service is stopped. Returning then let an
+      // immediate `ensure` reconnect to the closing daemon and get `manager_closing` for every
+      // request — so `stop` means "the daemon process is gone".
+      const alive = runtimeValue(runtime.processAlive, isPidAlive);
+      const sleep = runtimeValue(runtime.sleep, Bun.sleep);
+      const now = runtimeValue(runtime.now, Date.now);
+      const deadline = now() + managerStopTimeoutMs;
+      // An in-process daemon (tests, embedders) shares our pid and can never be seen to exit.
+      while (client.metadata.pid !== process.pid && alive(client.metadata.pid)) {
+        if (now() >= deadline) fail(localctlExit.failed, `local services manager (pid ${client.metadata.pid}) did not exit within ${managerStopTimeoutMs / 1000}s`);
+        await sleep(200);
+      }
       print(operation, flags.json, runtime);
       return 0;
     }

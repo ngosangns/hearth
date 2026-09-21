@@ -57,9 +57,42 @@ describe("localctl", () => {
         requests.push({ path, protocol: new Headers(init?.headers).get("x-local-services-protocol") ?? undefined });
         return { operation: operation("stop") };
       },
+      processAlive: () => false,
     };
     expect(await main(options, ["manager", "stop", "--json"], runtime)).toBe(0);
     expect(requests).toEqual([{ path: "/v1/manager/shutdown", protocol: "1" }]);
+  });
+
+  // The daemon keeps its lock until every service is stopped, so returning straight after the
+  // shutdown request let an immediate `ensure` reconnect to the closing daemon.
+  test("manager stop waits for the daemon process to exit, and fails if it never does", async () => {
+    let checks = 0;
+    const waiting: LocalctlRuntime = {
+      discover: async () => live(),
+      request: async () => ({ operation: operation("stop") }),
+      processAlive: (pid) => {
+        expect(pid).toBe(42);
+        return ++checks < 3;
+      },
+      sleep: async () => {},
+      output: () => {},
+    };
+    expect(await main(options, ["manager", "stop"], waiting)).toBe(0);
+    expect(checks).toBe(3);
+
+    let clock = 0;
+    const errors: string[] = [];
+    const stuck: LocalctlRuntime = {
+      ...waiting,
+      processAlive: () => true,
+      now: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      error: (message) => errors.push(message),
+    };
+    expect(await main(options, ["manager", "stop"], stuck)).toBe(localctlExit.failed);
+    expect(errors.join("\n")).toContain("did not exit within 300s");
   });
 
   test("manager reload POSTs the current in-process catalog and prints the result", async () => {
@@ -83,6 +116,7 @@ describe("localctl", () => {
       discover: async () => live(),
       request: async () => ({ operation: operation("stop") }),
       output: (line) => output.push(line),
+      processAlive: () => false,
     };
     expect(await main(options, ["manager", "stop"], runtime)).toBe(0);
     expect(output).toEqual([JSON.stringify(operation("stop"), null, 2)]);

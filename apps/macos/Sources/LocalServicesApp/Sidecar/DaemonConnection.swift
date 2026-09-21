@@ -33,9 +33,10 @@ enum DaemonConnection {
         return connection
     }
 
-    /// Stops the daemon for `root` (and every service it manages) — `lsd manager stop`.
+    /// Stops the daemon for `root` (and every service it manages) — `lsd manager stop`, which only
+    /// returns once the daemon process has exited (up to its own 300s limit), so this outlasts it.
     static func stopManager(root: String) async throws {
-        _ = try await runLsd(root: root, args: ["manager", "stop", "--json"])
+        _ = try await runLsd(root: root, args: ["manager", "stop", "--json"], timeout: .seconds(330))
     }
 
     /// Re-reads `root`'s config file and pushes it to the running daemon — `lsd manager reload`
