@@ -51,6 +51,21 @@ jobs:
           exit 1
       - run: cargo --version && rustc --version
       - run: cargo test --workspace
+      # The runner's toolchain is managed by rustup, whose stable toolchain does not include clippy
+      # unless the component is added. Dev machines here use Homebrew's rust, which bundles it —
+      # which is why a clippy-clean local run never predicted CI. Idempotent: a no-op once present.
+      - name: Ensure clippy is available
+        run: |
+          set -euo pipefail
+          if cargo clippy --version >/dev/null 2>&1; then
+            echo "clippy already available: $(cargo clippy --version)"
+            exit 0
+          fi
+          if ! command -v rustup >/dev/null 2>&1; then
+            echo "clippy is missing and rustup is not available to install it" >&2
+            exit 1
+          fi
+          rustup component add clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   publish:
