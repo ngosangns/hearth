@@ -1,4 +1,5 @@
 export * from "./catalog";
+export { lookupPlaceholder, parseTailnetHost, tailnetHost } from "./service-urls";
 export * from "./state";
 export * from "./paths";
 export * from "./platform";

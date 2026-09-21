@@ -2,7 +2,8 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { open, readdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-import { dependencyLevels, validateCatalog, type ServiceCatalog, type ServiceId } from "./catalog";
+import { dependencyLevels, resolveServiceUrls, validateCatalog, type ServiceCatalog, type ServiceId } from "./catalog";
+import { lookupPlaceholder } from "./service-urls";
 import { createFileIo, isRecord, removeDirectory, type FileIo } from "./file-io";
 import { resolveRuntimeDirectory } from "./paths";
 import { isPidAlive, requireSupportedLocalServicesPlatform, type LocalServicesPlatform } from "./platform";
@@ -918,6 +919,7 @@ export class LocalServicesManager {
       this.requireProtocol(request);
       if (url.pathname === "/v1/manager" && request.method === "GET") return this.json(this.info);
       if (url.pathname === "/v1/catalog" && request.method === "GET") return this.json({ catalog: this.catalog });
+      if (url.pathname === "/v1/urls" && request.method === "GET") return this.json(resolveServiceUrls(this.catalog, lookupPlaceholder));
       if (url.pathname === "/v1/manager/reload" && request.method === "POST") return await this.reloadRequest(request);
       if (url.pathname === "/v1/services" && request.method === "GET") return this.json({ services: this.serviceStates() });
       if (url.pathname === "/v1/operations" && request.method === "POST") return await this.createServiceOperation(request);

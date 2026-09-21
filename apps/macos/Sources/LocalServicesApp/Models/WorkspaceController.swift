@@ -18,6 +18,10 @@ final class WorkspaceController: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var services: [ServiceLifecycleState] = []
     @Published private(set) var catalog: ServiceCatalogSummary?
+    /// Every registered service URL, placeholders resolved by the daemon. Fetched on connect and
+    /// after each catalog reload — URLs only change when the catalog does (or the tailnet host does,
+    /// which the daemon re-resolves on each request).
+    @Published private(set) var urls: [ResolvedServiceUrl] = []
     @Published private(set) var actionsInFlight: Set<String> = []
     @Published var lastActionError: String?
 
@@ -58,6 +62,7 @@ final class WorkspaceController: ObservableObject {
             let client = try await connector(workspace.path)
             self.client = client
             catalog = try? await client.catalog() // best-effort — service status doesn't depend on it
+            await refreshUrls()
             services = try await client.services()
             phase = .connected
             startPolling()
@@ -91,9 +96,22 @@ final class WorkspaceController: ObservableObject {
         do {
             try await DaemonConnection.reload(root: root)
             await refresh()
+            await refreshUrls()
         } catch {
             lastActionError = "Config reload failed: \(error.localizedDescription)"
         }
+    }
+
+    /// Best-effort: a daemon from before `/v1/urls` existed leaves the list empty rather than
+    /// failing the connection.
+    func refreshUrls() async {
+        guard let client else { return }
+        if let fresh = try? await client.urls() { urls = fresh }
+    }
+
+    /// The registered URLs for one service, in catalog order.
+    func urls(for serviceId: String) -> [ResolvedServiceUrl] {
+        urls.filter { $0.serviceId == serviceId }
     }
 
     private func startPolling() {

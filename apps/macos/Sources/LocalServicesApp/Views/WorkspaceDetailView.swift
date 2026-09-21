@@ -112,6 +112,7 @@ private struct ServiceListView: View {
                         service: service,
                         label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
                         busy: controller.actionsInFlight.contains(service.serviceId),
+                        urls: controller.urls(for: service.serviceId),
                         onAction: { action in Task { await controller.perform(action, serviceId: service.serviceId) } }
                     )
                     .tag(service.serviceId)
@@ -152,7 +153,11 @@ private struct ServiceRow: View {
     let service: ServiceLifecycleState
     let label: String
     let busy: Bool
+    let urls: [ResolvedServiceUrl]
     let onAction: (ManagerAction) -> Void
+
+    /// Same rule as `lsd urls` and both TUIs: in-flight states count as running.
+    private var isRunning: Bool { ["ready", "starting"].contains(service.displayState) }
 
     var body: some View {
         HStack {
@@ -168,6 +173,9 @@ private struct ServiceRow: View {
                         Text(detail).font(.caption).foregroundStyle(.red).lineLimit(1)
                     }
                 }
+                if !urls.isEmpty {
+                    links
+                }
             }
             Spacer()
             if busy {
@@ -178,6 +186,27 @@ private struct ServiceRow: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle()) // the whole row is clickable/selectable, not just the text
+    }
+
+    /// One link per registered URL. A URL that needs the service running is dimmed while it is not,
+    /// so a dead link is recognisable before anyone clicks it — still clickable, since the catalog
+    /// can't know for certain (another process may be serving it).
+    private var links: some View {
+        HStack(spacing: 8) {
+            ForEach(urls, id: \.self) { entry in
+                if let destination = URL(string: entry.url) {
+                    let stale = entry.requiresRunning && !isRunning
+                    Link(destination: destination) {
+                        Label(entry.displayName, systemImage: "arrow.up.right.square")
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1)
+                    }
+                    .font(.caption)
+                    .opacity(stale ? 0.45 : 1)
+                    .help(stale ? "\(entry.url) — \(label) is not running" : entry.url)
+                }
+            }
+        }
     }
 
     @ViewBuilder

@@ -1816,6 +1816,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         }
     }
 

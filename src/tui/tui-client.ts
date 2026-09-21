@@ -1,3 +1,4 @@
+import type { ResolvedServiceUrl } from "../core/catalog";
 import { randomUUID } from "node:crypto";
 
 import { request, requireClient, type Client, type LocalctlOptions, type LocalctlRuntime } from "../cli/localctl";
@@ -39,6 +40,12 @@ export class ManagerTuiClient {
     const response = await request(client, "/v1/services", {}, this.runtime);
     if (!isServices(response)) throw new Error("manager returned malformed service state");
     return response.services;
+  }
+
+  /** Every resolved service URL (`GET /v1/urls`). */
+  async urls(): Promise<ResolvedServiceUrl[]> {
+    const response = (await request(await this.client(), "/v1/urls", {}, this.runtime)) as { urls?: ResolvedServiceUrl[] };
+    return Array.isArray(response.urls) ? response.urls : [];
   }
 
   async log(serviceId: string, cursor?: number, generation?: number): Promise<{ data: string; nextCursor: number; generation: number; reset: boolean }> {

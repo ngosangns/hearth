@@ -161,6 +161,89 @@ pub struct ServicePort {
     pub requires_running: Option<bool>,
 }
 
+/// A URL where a service can be reached, surfaced by every client (CLI `urls`, TUI, MCP `status`,
+/// the macOS app). `url` may contain placeholders from `SERVICE_URL_PLACEHOLDERS`, resolved by the
+/// daemon at request time — `{tailnetHost}` becomes this machine's Tailscale DNS name, so a catalog
+/// shared across machines never hardcodes one machine's hostname. `requires_running: Some(false)`
+/// marks a URL that works even while this service is stopped. Mirrors `ServiceUrl` in the TS source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires_running: Option<bool>,
+}
+
+/// Placeholders a `ServiceUrl::url` may contain. Anything else in braces is a validation error, so a
+/// typo'd placeholder fails the catalog load instead of rendering a dead link.
+pub const SERVICE_URL_PLACEHOLDERS: [&str; 1] = ["tailnetHost"];
+
+/// Names of every `{placeholder}` in a URL template, in order of appearance.
+pub fn service_url_placeholders(url: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = url;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        match after.find(['{', '}']) {
+            Some(close) if after.as_bytes()[close] == b'}' => {
+                names.push(&after[..close]);
+                rest = &after[close + 1..];
+            }
+            Some(close) => rest = &after[close..],
+            None => break,
+        }
+    }
+    names
+}
+
+/// A service URL with its placeholders substituted, as served by `GET /v1/urls`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedServiceUrl {
+    pub service_id: ServiceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub url: String,
+    /// `false` only when the catalog said the URL works while the service is stopped.
+    pub requires_running: bool,
+}
+
+/// A URL that could not be resolved because a placeholder had no value on this machine (e.g.
+/// `{tailnetHost}` with Tailscale not running). Reported rather than dropped silently, so a client
+/// can explain why a link it expected is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnresolvedServiceUrl {
+    pub service_id: ServiceId,
+    pub url: String,
+    pub placeholder: String,
+}
+
+/// Substitutes every placeholder in every service URL, in catalog order. `lookup` answers one
+/// placeholder name; it is injected so this stays testable without a real Tailscale.
+pub fn resolve_service_urls(catalog: &ServiceCatalog, lookup: impl Fn(&str) -> Option<String>) -> (Vec<ResolvedServiceUrl>, Vec<UnresolvedServiceUrl>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for service in &catalog.services {
+        'entries: for entry in service.urls.iter().flatten() {
+            let mut url = entry.url.clone();
+            for name in service_url_placeholders(&entry.url) {
+                match lookup(name) {
+                    Some(value) => url = url.replace(&format!("{{{name}}}"), &value),
+                    None => {
+                        unresolved.push(UnresolvedServiceUrl { service_id: service.id.clone(), url: entry.url.clone(), placeholder: name.to_string() });
+                        continue 'entries;
+                    }
+                }
+            }
+            resolved.push(ResolvedServiceUrl { service_id: service.id.clone(), label: entry.label.clone(), url, requires_running: entry.requires_running != Some(false) });
+        }
+    }
+    (resolved, unresolved)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceProfiles {
     pub run: ServiceRunProfile,
@@ -185,6 +268,9 @@ pub struct ServiceDefinition {
     pub profiles: ServiceProfiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<ServicePort>>,
+    /// Where this service can be reached — see `ServiceUrl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<ServiceUrl>>,
 }
 
 impl ServiceDefinition {
@@ -307,6 +393,25 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
                 }
             }
         }
+        for (index, entry) in service.urls.iter().flatten().enumerate() {
+            let place = format!("{}:urls[{index}]", service.id);
+            let well_formed = (entry.url.starts_with("http://") || entry.url.starts_with("https://"))
+                && entry.url.len() > entry.url.find("://").map_or(0, |i| i + 3)
+                && !entry.url.chars().any(char::is_whitespace);
+            if !well_formed {
+                errors.push(format!("{place} must be an http:// or https:// URL"));
+                continue;
+            }
+            for name in service_url_placeholders(&entry.url) {
+                if !SERVICE_URL_PLACEHOLDERS.contains(&name) {
+                    let known = SERVICE_URL_PLACEHOLDERS.iter().map(|k| format!("{{{k}}}")).collect::<Vec<_>>().join(", ");
+                    errors.push(format!("{place} has unknown placeholder {{{name}}} (known: {known})"));
+                }
+            }
+            if entry.label.as_deref().is_some_and(|label| label.trim().is_empty()) {
+                errors.push(format!("{place}.label must be a non-empty string"));
+            }
+        }
         if let ReadinessSpec::Tcp { port } = profile.readiness() {
             if let Some(existing) = verified_ports.get(port) {
                 if *existing != &service.id {
@@ -424,6 +529,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         }
     }
 
@@ -458,6 +564,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         }
     }
 
@@ -530,6 +637,7 @@ mod tests {
                     build: None,
                 },
                 ports: None,
+                urls: None,
             }],
             &[],
         );
@@ -615,5 +723,34 @@ mod tests {
         let json = serde_json::to_value(&profile).unwrap();
         assert!(json.get("readinessTimeoutMs").is_some(), "{json:?}");
         assert_eq!(json.get("commandStatus").and_then(|v| v.as_str()), Some("verified"));
+    }
+
+    #[test]
+    fn resolves_placeholders_and_reports_the_ones_it_cannot() {
+        let mut api = tcp_service("api", 18080);
+        api.urls = Some(vec![
+            ServiceUrl { url: "http://127.0.0.1:8080".into(), label: None, requires_running: None },
+            ServiceUrl { url: "https://{tailnetHost}:8443".into(), label: Some("admin".into()), requires_running: Some(false) },
+        ]);
+        let catalog = catalog(vec![api], &[]);
+
+        let (urls, unresolved) = resolve_service_urls(&catalog, |name| (name == "tailnetHost").then(|| "box.tail.ts.net".to_string()));
+        assert!(unresolved.is_empty());
+        assert_eq!(urls[0].url, "http://127.0.0.1:8080");
+        assert!(urls[0].requires_running, "requiresRunning defaults to true");
+        assert_eq!(urls[1].url, "https://box.tail.ts.net:8443");
+        assert_eq!(urls[1].label.as_deref(), Some("admin"));
+        assert!(!urls[1].requires_running);
+
+        // No Tailscale on this machine: the templated URL is reported, not silently dropped.
+        let (urls, unresolved) = resolve_service_urls(&catalog, |_| None);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(unresolved, vec![UnresolvedServiceUrl { service_id: "api".into(), url: "https://{tailnetHost}:8443".into(), placeholder: "tailnetHost".into() }]);
+    }
+
+    #[test]
+    fn extracts_placeholder_names_in_order() {
+        assert_eq!(service_url_placeholders("https://{tailnetHost}:{port}/x"), vec!["tailnetHost", "port"]);
+        assert!(service_url_placeholders("http://127.0.0.1:1").is_empty());
     }
 }

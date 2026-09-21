@@ -77,6 +77,55 @@ export type ServiceBuildProfile = { readonly command: ServiceCommand; readonly t
 
 export type ServicePort = { readonly port: number; readonly label: string; readonly requiresRunning?: boolean };
 
+/** A URL where a service can be reached, surfaced by every client (CLI `urls`, TUI, MCP `status`,
+ * the macOS app) so nobody has to remember which port or nginx path a service lives behind.
+ *
+ * `url` may contain placeholders from `SERVICE_URL_PLACEHOLDERS`, resolved by the daemon at request
+ * time — `{tailnetHost}` becomes this machine's Tailscale DNS name, so a catalog shared across
+ * machines never hardcodes one machine's hostname. `requiresRunning: false` marks a URL that works
+ * even while this service is stopped (e.g. a storefront another service also serves); clients may
+ * dim the others when the service is not running. */
+export type ServiceUrl = { readonly url: string; readonly label?: string; readonly requiresRunning?: boolean };
+
+/** Placeholders a `ServiceUrl.url` may contain. Anything else in braces is a validation error, so a
+ * typo'd placeholder fails the catalog load instead of rendering a dead link. */
+export const SERVICE_URL_PLACEHOLDERS = ["tailnetHost"] as const;
+export type ServiceUrlPlaceholder = (typeof SERVICE_URL_PLACEHOLDERS)[number];
+
+/** Names of every `{placeholder}` in a URL template, in order of appearance. */
+export function serviceUrlPlaceholders(url: string): string[] {
+  return [...url.matchAll(/\{([^{}]*)\}/g)].map((match) => match[1] ?? "");
+}
+
+/** A service URL with its placeholders substituted, as served by `GET /v1/urls`. `requiresRunning`
+ * is `false` only when the catalog said the URL works while the service is stopped. */
+export type ResolvedServiceUrl = { readonly serviceId: ServiceId; readonly label?: string; readonly url: string; readonly requiresRunning: boolean };
+/** A URL that could not be resolved because a placeholder had no value on this machine (e.g.
+ * `{tailnetHost}` with Tailscale not running) — reported rather than dropped silently. */
+export type UnresolvedServiceUrl = { readonly serviceId: ServiceId; readonly url: string; readonly placeholder: string };
+
+/** Substitutes every placeholder in every service URL, in catalog order. `lookup` answers one
+ * placeholder name; it is injected so this stays testable without a real Tailscale. */
+export function resolveServiceUrls(catalog: ServiceCatalog, lookup: (placeholder: string) => string | undefined): { urls: ResolvedServiceUrl[]; unresolved: UnresolvedServiceUrl[] } {
+  const urls: ResolvedServiceUrl[] = [];
+  const unresolved: UnresolvedServiceUrl[] = [];
+  for (const service of catalog.services) {
+    entries: for (const entry of service.urls ?? []) {
+      let url = entry.url;
+      for (const name of serviceUrlPlaceholders(entry.url)) {
+        const value = lookup(name);
+        if (value === undefined) {
+          unresolved.push({ serviceId: service.id, url: entry.url, placeholder: name });
+          continue entries;
+        }
+        url = url.replaceAll(`{${name}}`, value);
+      }
+      urls.push({ serviceId: service.id, ...(entry.label !== undefined ? { label: entry.label } : {}), url, requiresRunning: entry.requiresRunning !== false });
+    }
+  }
+  return { urls, unresolved };
+}
+
 export type ServiceDefinition = {
   readonly id: ServiceId;
   readonly label?: string;
@@ -90,6 +139,8 @@ export type ServiceDefinition = {
   readonly profiles: { readonly run: ServiceRunProfile; readonly build?: ServiceBuildProfile };
   /** Additional ports this service exposes beyond its readiness port (generalizes infra's `tailnetPorts`). */
   readonly ports?: readonly ServicePort[];
+  /** Where this service can be reached — see `ServiceUrl`. */
+  readonly urls?: readonly ServiceUrl[];
 };
 
 export type ServiceCatalog = {
@@ -153,6 +204,17 @@ export function validateCatalog(catalog: ServiceCatalog): CatalogValidation {
     }
     if (service.profiles.build?.timeoutMs !== undefined && (!Number.isInteger(service.profiles.build.timeoutMs) || service.profiles.build.timeoutMs <= 0)) {
       errors.push(`${service.id}:build has an invalid timeout`);
+    }
+    for (const [index, entry] of (service.urls ?? []).entries()) {
+      const where = `${service.id}:urls[${index}]`;
+      if (typeof entry.url !== "string" || !/^https?:\/\/\S+$/.test(entry.url)) {
+        errors.push(`${where} must be an http:// or https:// URL`);
+        continue;
+      }
+      for (const name of serviceUrlPlaceholders(entry.url)) {
+        if (!(SERVICE_URL_PLACEHOLDERS as readonly string[]).includes(name)) errors.push(`${where} has unknown placeholder {${name}} (known: ${SERVICE_URL_PLACEHOLDERS.map((known) => `{${known}}`).join(", ")})`);
+      }
+      if (entry.label !== undefined && (typeof entry.label !== "string" || !entry.label.trim())) errors.push(`${where}.label must be a non-empty string`);
     }
     if (profile.readiness.kind === "tcp") {
       const existing = verifiedPorts.get(profile.readiness.port);

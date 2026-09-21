@@ -15,7 +15,7 @@
 
 import { isAbsolute, join, relative } from "node:path";
 
-import type { CommandSpec, PreparationCommand, ReadinessSpec, ServiceCatalog, ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership, ServicePort } from "./catalog";
+import type { CommandSpec, PreparationCommand, ReadinessSpec, ServiceCatalog, ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership, ServicePort, ServiceUrl } from "./catalog";
 import { validateCatalog } from "./catalog";
 import { isRecord } from "./file-io";
 import { loadEnvFile } from "./env";
@@ -191,6 +191,39 @@ function readPorts(value: unknown, path: string, errors: string[]): ServicePort[
   return ports;
 }
 
+/** `urls` accepts a bare string or `{ url, label?, requiresRunning? }` per entry. Only the shape is
+ * checked here; the URL format and its placeholders are checked by `validateCatalog`, which runs for
+ * every catalog source, not just config files. */
+function readUrls(value: unknown, path: string, errors: string[]): ServiceUrl[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    errors.push(`${path} must be an array`);
+    return undefined;
+  }
+  const urls: ServiceUrl[] = [];
+  value.forEach((entry, index) => {
+    const entryPath = `${path}[${index}]`;
+    if (typeof entry === "string") {
+      urls.push({ url: entry });
+      return;
+    }
+    if (!isRecord(entry) || typeof entry.url !== "string") {
+      errors.push(`${entryPath} must be a URL string or { url: string, label?: string, requiresRunning?: boolean }`);
+      return;
+    }
+    if (entry.label !== undefined && typeof entry.label !== "string") {
+      errors.push(`${entryPath}.label must be a string`);
+      return;
+    }
+    if (entry.requiresRunning !== undefined && typeof entry.requiresRunning !== "boolean") {
+      errors.push(`${entryPath}.requiresRunning must be a boolean`);
+      return;
+    }
+    urls.push({ url: entry.url, label: entry.label as string | undefined, requiresRunning: entry.requiresRunning as boolean | undefined });
+  });
+  return urls;
+}
+
 /** `cwd` is authored relative to the project root and must stay inside it — a service definition is
  * as trusted as arbitrary code (it names a command to run), but a `cwd` that walks out of the
  * project via `..` or an absolute path has no legitimate use here and is easy to author by mistake
@@ -245,6 +278,7 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
     const cwd = resolveServiceCwd(root, value.cwd as string | undefined, svcPath, errors);
     const readiness = readReadiness(value.readiness, `${svcPath}.readiness`, errors);
     const ports = readPorts(value.ports, `${svcPath}.ports`, errors);
+    const urls = readUrls(value.urls, `${svcPath}.urls`, errors);
 
     const preparationCommand = value.preparationCommand === undefined ? undefined : readPreparationCommand(value.preparationCommand, `${svcPath}.preparationCommand`, errors);
 
@@ -285,6 +319,7 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
       dependencies: value.dependsOn as ServiceId[] | undefined,
       profiles: { run: profileRun, build: profileBuild },
       ports: ports?.length ? ports : undefined,
+      urls: urls?.length ? urls : undefined,
     });
   }
   if (errors.length) return { ok: false, errors };

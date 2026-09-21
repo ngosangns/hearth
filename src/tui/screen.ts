@@ -11,12 +11,19 @@ type ScreenState = {
   logService: string;
   log: string;
   notice: string;
+  /** The focused service's URLs, one per line (`label  url`). A single string rather than an array
+   * so `update`'s `===` change detection keeps working. */
+  urls: string;
 };
+
+/** At most this many URL rows are shown, so a service with many URLs cannot push its own log off
+ * the screen. */
+const maxUrlRows = 4;
 
 const headerHeight = 3;
 
 export class ServiceScreen implements Component {
-  #state: ScreenState = { services: [], selectedName: "", logService: "", log: "Loading…", notice: "" };
+  #state: ScreenState = { services: [], selectedName: "", logService: "", log: "Loading…", notice: "", urls: "" };
   #serviceOffset = 0;
   #revision = 0;
   #cacheKey = "";
@@ -61,7 +68,8 @@ export class ServiceScreen implements Component {
 
     const bodyHeight = Math.max(0, rows - headerHeight);
     const serviceHeight = this.#serviceHeight(rows);
-    const logHeight = Math.max(0, bodyHeight - serviceHeight - (serviceHeight > 0 ? 2 : 1));
+    const urlRows = this.#state.urls ? this.#state.urls.split("\n").slice(0, maxUrlRows) : [];
+    const logHeight = Math.max(0, bodyHeight - serviceHeight - urlRows.length - (serviceHeight > 0 ? 2 : 1));
     const start = this.#clampServiceOffset(serviceHeight);
     const services = this.#state.services.slice(start, start + serviceHeight);
     const hasServiceScrollbar = this.#state.services.length > serviceHeight;
@@ -82,6 +90,7 @@ export class ServiceScreen implements Component {
         lines.push(`${fit(content, serviceWidth)}${hasServiceScrollbar ? scrollbarCell(index, start, serviceHeight, this.#state.services.length) : ""}`);
       }
     }
+    for (const url of urlRows) if (lines.length < rows) lines.push(fit(`URL ${url}`, width));
     if (lines.length < rows) {
       lines.push(fit(`LOG — ${this.#state.logService}`, width));
       lines.push(...logs.map((log) => fit(log, width)));

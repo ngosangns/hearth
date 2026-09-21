@@ -219,3 +219,24 @@ describe("loadCatalog (.config.ts escape hatch)", () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe("service urls", () => {
+  test("maps urls in both the string and object forms", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), 'version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    urls:\n      - http://127.0.0.1:8080\n      - { url: "https://{tailnetHost}:8443", label: admin, requiresRunning: false }\n');
+    const result = await loadCatalog(root);
+    if (!result.ok) throw new Error(result.errors.join("; "));
+    expect(result.catalog.services[0]?.urls).toEqual([{ url: "http://127.0.0.1:8080" }, { url: "https://{tailnetHost}:8443", label: "admin", requiresRunning: false }]);
+  });
+
+  // A typo'd placeholder must fail the load rather than render a dead link — with exactly the
+  // messages the Rust loader produces for the same input.
+  test("rejects an unknown placeholder and a non-http url", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), 'version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    urls: ["https://{tailnethost}:1", "ftp://x"]\n');
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors).toEqual(["api:urls[0] has unknown placeholder {tailnethost} (known: {tailnetHost})", "api:urls[1] must be an http:// or https:// URL"]);
+  });
+});

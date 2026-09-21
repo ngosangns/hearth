@@ -718,6 +718,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         };
         let catalog = ServiceCatalog {
             services: vec![service],
@@ -849,6 +850,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         };
         let catalog = ServiceCatalog {
             services: vec![service],
@@ -980,6 +982,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         };
         let catalog = ServiceCatalog { services: vec![service], groups: Map::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: None };
         let host = Arc::new(TestHost { catalog: Arc::new(catalog), states: StdMutex::new(Map::new()) });

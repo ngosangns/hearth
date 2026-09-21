@@ -23,6 +23,7 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     var performHandler: (@Sendable (ManagerAction, String) async throws -> ManagerOperation)?
     var bulkStartHandler: (@Sendable ([String]) async throws -> ManagerOperation)?
     var operationHandler: (@Sendable (String) async throws -> ManagerOperation)?
+    var urlsHandler: (@Sendable () async throws -> [ResolvedServiceUrl])?
 
     var performed: [(action: ManagerAction, serviceId: String)] {
         lock.sync { _performed }
@@ -69,6 +70,11 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     func bulkStart(targets: [String]) async throws -> ManagerOperation {
         guard let bulkStartHandler else { throw Unimplemented(what: "bulkStart") }
         return try await bulkStartHandler(targets)
+    }
+
+    func urls() async throws -> [ResolvedServiceUrl] {
+        guard let urlsHandler else { throw Unimplemented(what: "urls") }
+        return try await urlsHandler()
     }
 
     func operation(id: String) async throws -> ManagerOperation {

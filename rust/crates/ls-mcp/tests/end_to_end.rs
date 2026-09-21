@@ -37,6 +37,7 @@ fn tcp_service(id: &str, port: u16) -> ServiceDefinition {
             build: None,
         },
         ports: None,
+        urls: Some(vec![ls_core::catalog::ServiceUrl { url: "http://127.0.0.1:18090/".into(), label: Some("app".into()), requires_running: None }]),
     }
 }
 
@@ -66,6 +67,9 @@ async fn full_tool_lifecycle_over_a_real_bootstrapped_manager() {
     let status_text = status.content[0].as_text().unwrap().text.clone();
     let status_json: Value = serde_json::from_str(&status_text).unwrap();
     assert_eq!(status_json["services"]["services"][0]["actualState"], "stopped");
+    // `urls` rides along on `status`, so an agent can tell a user where a service lives.
+    assert_eq!(status_json["urls"]["urls"][0]["url"], "http://127.0.0.1:18090/");
+    assert_eq!(status_json["urls"]["urls"][0]["label"], "app");
 
     // manage start — waits for the real nc-backed process to answer real TCP readiness, then
     // returns the post-start status inline (mirroring `ManagerApiClient.manage`'s own status()

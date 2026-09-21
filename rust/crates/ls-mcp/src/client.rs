@@ -92,7 +92,13 @@ impl LocalServicesMcpClient for ManagerApiClient {
     async fn status(&self, arguments: StatusArguments) -> Result<Value, String> {
         let client = require_client(&self.root, &self.options).await.map_err(|e| e.message)?;
         let (manager, services) = tokio::try_join!(cli_request(&client, "/v1/manager", reqwest::Method::GET, None, None), cli_request(&client, "/v1/services", reqwest::Method::GET, None, None))?;
-        Ok(json!({ "manager": manager, "services": filter_service_states(services, arguments.service.as_deref()) }))
+        let mut result = json!({ "manager": manager, "services": filter_service_states(services, arguments.service.as_deref()) });
+        // Additive, and best-effort: a daemon from before `/v1/urls` existed still answers
+        // `status`, just without `urls`, rather than failing the whole call.
+        if let Ok(urls) = cli_request(&client, "/v1/urls", reqwest::Method::GET, None, None).await {
+            result["urls"] = filter_service_urls(urls, arguments.service.as_deref());
+        }
+        Ok(result)
     }
 
     async fn logs(&self, arguments: LogsArguments) -> Result<Value, String> {
@@ -130,6 +136,17 @@ impl LocalServicesMcpClient for ManagerApiClient {
         }
         self.status(StatusArguments { service: Some(arguments.service) }).await
     }
+}
+
+/// `/v1/urls`' body narrowed to one service's entries when `status` was asked about one service.
+fn filter_service_urls(mut value: Value, service: Option<&str>) -> Value {
+    let Some(service) = service else { return value };
+    for key in ["urls", "unresolved"] {
+        if let Some(entries) = value.get_mut(key).and_then(Value::as_array_mut) {
+            entries.retain(|entry| entry.get("serviceId").and_then(Value::as_str) == Some(service));
+        }
+    }
+    value
 }
 
 fn filter_service_states(value: Value, service: Option<&str>) -> Value {

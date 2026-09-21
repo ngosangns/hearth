@@ -446,6 +446,7 @@ pub fn router(manager: Arc<LocalServicesManager>) -> Router {
     let authorized_routes = Router::new()
         .route("/v1/manager", get(get_manager_info))
         .route("/v1/catalog", get(get_catalog))
+        .route("/v1/urls", get(get_urls))
         .route("/v1/manager/reload", post(post_reload))
         .route("/v1/services", get(get_services))
         .route("/v1/operations", post(post_operation))
@@ -499,6 +500,17 @@ async fn get_manager_info(State(manager): State<Arc<LocalServicesManager>>) -> R
 
 async fn get_catalog(State(manager): State<Arc<LocalServicesManager>>) -> Response {
     json_response(json!({ "catalog": manager.catalog().as_ref() }), StatusCode::OK)
+}
+
+/// Every service URL in the current catalog with its placeholders resolved. Resolution may spawn
+/// `tailscale` (cached), so it runs on the blocking pool rather than on a runtime worker.
+async fn get_urls(State(manager): State<Arc<LocalServicesManager>>) -> Response {
+    let catalog = manager.catalog();
+    let resolved = tokio::task::spawn_blocking(move || crate::catalog::resolve_service_urls(&catalog, super::service_urls::lookup_placeholder)).await;
+    match resolved {
+        Ok((urls, unresolved)) => json_response(json!({ "urls": urls, "unresolved": unresolved }), StatusCode::OK),
+        Err(error) => ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error.to_string()).into_response(),
+    }
 }
 
 async fn get_services(State(manager): State<Arc<LocalServicesManager>>) -> Response {
@@ -1102,6 +1114,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         }
     }
 
@@ -1432,6 +1445,33 @@ mod tests {
             "a ready dependency with a stale desired_state must not block its dependent"
         );
 
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn serves_resolved_service_urls_over_http() {
+        let mut api = tcp_service("api", free_port());
+        api.urls = Some(vec![crate::catalog::ServiceUrl { url: "http://127.0.0.1:18080/app".into(), label: Some("app".into()), requires_running: Some(false) }]);
+        let catalog = ServiceCatalog { services: vec![api], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = bootstrap(LocalServicesManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }).await.unwrap();
+
+        let body: Value = reqwest::Client::new()
+            .get(format!("{}/v1/urls", manager.base_url()))
+            .bearer_auth(manager.bearer_token())
+            .header("x-local-services-protocol", "1")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["urls"], json!([{ "serviceId": "api", "label": "app", "url": "http://127.0.0.1:18080/app", "requiresRunning": false }]));
+        assert_eq!(body["unresolved"], json!([]));
+
+        // Behind auth like every other /v1 route.
+        let status = reqwest::Client::new().get(format!("{}/v1/urls", manager.base_url())).send().await.unwrap().status();
+        assert_eq!(status, 401);
         manager.close().await;
     }
 }

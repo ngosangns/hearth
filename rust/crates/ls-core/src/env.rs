@@ -95,6 +95,34 @@ fn run_login_shell_env(shell: &str, timeout: Duration) -> HashMap<String, String
     attempt.unwrap_or_default()
 }
 
+/// Directories where the tools this daemon itself invokes (`docker`, `tailscale`, `bun`, `ps`) are
+/// installed on a typical macOS dev machine, beyond launchd's bare default.
+pub const KNOWN_TOOL_DIRECTORIES: [&str; 3] = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"];
+
+/// `path` with every directory in `KNOWN_TOOL_DIRECTORIES` (plus `~/.bun/bin` and `~/.cargo/bin`)
+/// appended if it is not already present.
+///
+/// `lsd` is routinely spawned by the macOS app, and a Dock/Finder-launched GUI process inherits
+/// launchd's bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) — which the daemon it spawns then
+/// inherits too. Every tool the daemon calls by name (`docker compose` for container services,
+/// `tailscale serve status` for tailnet readiness, `tailscale status` for `{tailnetHost}` URLs)
+/// would then fail to spawn, even though all of them work from a terminal. Appending rather than
+/// prepending keeps any explicit ordering in the inherited `PATH` authoritative.
+///
+/// This covers the daemon's *own* subprocesses only. The environment of the services it runs is
+/// resolved separately, from the login shell, by `resolve_base_environment`.
+pub fn with_known_tool_directories(path: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let mut entries: Vec<std::path::PathBuf> = path.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+    let home_dirs = home.map(std::path::PathBuf::from).into_iter().flat_map(|h| [h.join(".bun/bin"), h.join(".cargo/bin")]);
+    for dir in KNOWN_TOOL_DIRECTORIES.iter().map(std::path::PathBuf::from).chain(home_dirs) {
+        if !entries.contains(&dir) {
+            entries.push(dir);
+        }
+    }
+    std::env::join_paths(entries).unwrap_or_else(|_| path.map(std::ffi::OsStr::to_owned).unwrap_or_default())
+}
+
+
 /// Cached per shell path — spawning an interactive login shell is expensive (can run a user's full
 /// `.zshrc`), and a daemon only needs this resolved once at startup.
 pub fn resolve_login_shell_env(shell: Option<&str>, timeout: Option<Duration>) -> HashMap<String, String> {

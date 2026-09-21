@@ -70,7 +70,7 @@ pub async fn run_tui(options: RunTuiOptions) -> i32 {
     let client = ManagerTuiClient::new(root, &localctl_options);
     let (columns, rows) = crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24));
 
-    let mut app = TuiApp { state: TuiState::new(service_kind_lookup), screen: ServiceScreen::new(Viewport { columns, rows }), all_targets, busy: false, disposed: false, columns, rows };
+    let mut app = TuiApp { state: TuiState::new(service_kind_lookup), screen: ServiceScreen::new(Viewport { columns, rows }), all_targets, busy: false, disposed: false, columns, rows, urls: Vec::new() };
 
     let _ = crossterm::terminal::enable_raw_mode();
     let mut stdout = std::io::stdout();
@@ -98,6 +98,8 @@ struct TuiApp {
     disposed: bool,
     columns: usize,
     rows: usize,
+    /// Every service's resolved URLs, refreshed alongside each snapshot.
+    urls: Vec<ls_core::catalog::ResolvedServiceUrl>,
 }
 
 impl TuiApp {
@@ -250,6 +252,10 @@ impl TuiApp {
                 if !self.state.apply_snapshot(fence, &services) {
                     return;
                 }
+                // Best-effort: a daemon from before `/v1/urls` existed simply has no URL rows.
+                if let Ok(urls) = client.urls().await {
+                    self.urls = urls;
+                }
                 self.state.notice.clear();
                 self.draw();
                 let fence = self.state.begin_request();
@@ -378,6 +384,18 @@ impl TuiApp {
         self.state.begin_connection();
     }
 
+    /// The focused service's URLs as screen rows, flagging the ones that need the service running
+    /// while it is not — the same rule as `lsd urls`.
+    fn focused_urls(&self) -> Vec<String> {
+        let selected = &self.state.selection.selected_name;
+        let running = self.state.selection.services.iter().find(|s| &s.name == selected).is_some_and(|s| matches!(s.state.as_str(), "ready" | "running" | "degraded" | "starting" | "preparing"));
+        self.urls
+            .iter()
+            .filter(|u| &u.service_id == selected)
+            .map(|u| format!("{}  {}{}", u.label.as_deref().unwrap_or("-"), u.url, if u.requires_running && !running { "  (not running)" } else { "" }))
+            .collect()
+    }
+
     fn draw(&mut self) {
         self.screen.update(ScreenUpdate {
             services: Some(self.state.selection.services.clone()),
@@ -385,6 +403,7 @@ impl TuiApp {
             log_service: Some(self.state.selection.selected_name.clone()),
             log: Some(format!("{}\n{}", self.state.detail(), self.state.log)),
             notice: Some(self.state.notice.clone()),
+            urls: Some(self.focused_urls()),
         });
         let lines = self.screen.render(self.columns, Some(self.rows)).to_vec();
         let mut stdout = std::io::stdout();

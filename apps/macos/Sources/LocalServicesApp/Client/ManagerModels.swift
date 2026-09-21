@@ -79,6 +79,27 @@ struct ServiceCatalogSummary: Codable, Equatable {
     let groups: [String: [String]]
 }
 
+/// One registered service URL with its placeholders already resolved by the daemon
+/// (`GET /v1/urls`). `requiresRunning` is `false` only when the catalog said the URL works while the
+/// service is stopped.
+struct ResolvedServiceUrl: Codable, Equatable, Hashable {
+    let serviceId: String
+    let label: String?
+    let url: String
+    let requiresRunning: Bool
+
+    /// What a link shows: the catalog's label, else the URL's host and port.
+    var displayName: String {
+        if let label, !label.isEmpty { return label }
+        guard let components = URLComponents(string: url), let host = components.host else { return url }
+        return components.port.map { "\(host):\($0)" } ?? host
+    }
+}
+
+struct UrlsResponse: Codable {
+    let urls: [ResolvedServiceUrl]
+}
+
 struct CatalogResponse: Codable {
     let catalog: ServiceCatalogSummary
 }

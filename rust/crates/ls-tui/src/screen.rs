@@ -16,6 +16,8 @@ struct ScreenState {
     log_service: String,
     log: String,
     notice: String,
+    /// The focused service's URLs, pre-formatted one per line (`label  url`).
+    urls: Vec<String>,
 }
 
 /// A `Partial<ScreenState>` patch — only fields set to `Some` are compared/applied by `update`.
@@ -26,7 +28,12 @@ pub struct ScreenUpdate {
     pub log_service: Option<String>,
     pub log: Option<String>,
     pub notice: Option<String>,
+    pub urls: Option<Vec<String>>,
 }
+
+/// At most this many URL rows are shown, so a service with many URLs cannot push its own log off
+/// the screen.
+const MAX_URL_ROWS: usize = 4;
 
 const HEADER_HEIGHT: usize = 3;
 const HEADER_LINE_1: &str = "Local services";
@@ -52,7 +59,8 @@ impl ServiceScreen {
             && patch.selected_name.as_ref().is_none_or(|v| v == &self.state.selected_name)
             && patch.log_service.as_ref().is_none_or(|v| v == &self.state.log_service)
             && patch.log.as_ref().is_none_or(|v| v == &self.state.log)
-            && patch.notice.as_ref().is_none_or(|v| v == &self.state.notice);
+            && patch.notice.as_ref().is_none_or(|v| v == &self.state.notice)
+            && patch.urls.as_ref().is_none_or(|v| v == &self.state.urls);
         if unchanged {
             return;
         }
@@ -70,6 +78,9 @@ impl ServiceScreen {
         }
         if let Some(v) = patch.notice {
             self.state.notice = v;
+        }
+        if let Some(v) = patch.urls {
+            self.state.urls = v;
         }
         if selection_changed {
             let height = self.service_height(self.terminal.rows);
@@ -127,7 +138,8 @@ impl ServiceScreen {
 
         let body_height = rows.saturating_sub(HEADER_HEIGHT);
         let service_height = self.service_height(rows);
-        let log_height = body_height.saturating_sub(service_height + if service_height > 0 { 2 } else { 1 });
+        let url_rows = self.state.urls.len().min(MAX_URL_ROWS);
+        let log_height = body_height.saturating_sub(service_height + url_rows + if service_height > 0 { 2 } else { 1 });
         let start = self.clamp_service_offset(service_height);
         let services: Vec<&Service> = self.state.services.iter().skip(start).take(service_height).collect();
         let has_service_scrollbar = self.state.services.len() > service_height;
@@ -148,6 +160,11 @@ impl ServiceScreen {
                 };
                 let scrollbar = if has_service_scrollbar { scrollbar_cell(index, start, service_height, self.state.services.len()) } else { "" };
                 lines.push(format!("{}{}", fit(&content, service_width), scrollbar));
+            }
+        }
+        for url in self.state.urls.iter().take(url_rows) {
+            if lines.len() < rows {
+                lines.push(fit(&format!("URL {url}"), width));
             }
         }
         if lines.len() < rows {
@@ -538,5 +555,22 @@ mod tests {
         assert_eq!(screen.handle_wheel(9, 1, None), None);
         assert_eq!(screen.render(80, None).to_vec(), first);
         assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("svc-0")));
+    }
+
+    #[test]
+    fn shows_the_focused_service_urls_above_its_log() {
+        let mut screen = ServiceScreen::new(terminal());
+        screen.update(ScreenUpdate {
+            services: Some(vec![service("metadata", "ready")]),
+            selected_name: Some("metadata".to_string()),
+            log_service: Some("metadata".to_string()),
+            log: Some("hello".to_string()),
+            urls: Some(vec!["app  http://127.0.0.1:1166/".to_string()]),
+            ..Default::default()
+        });
+        let lines: Vec<String> = screen.render(80, Some(12)).iter().map(|l| strip_ansi(l)).collect();
+        let url = lines.iter().position(|l| l.contains("URL app  http://127.0.0.1:1166/")).expect("url row rendered");
+        let log = lines.iter().position(|l| l.starts_with("LOG")).expect("log header rendered");
+        assert!(url < log, "urls sit between the services and the log: {lines:?}");
     }
 }

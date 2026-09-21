@@ -186,8 +186,12 @@ Applies to both implementations unless noted.
   at all), but **never assume it is on `PATH`**: `lsd` is routinely spawned by the macOS app, and a
   Dock/Finder-launched GUI process gets launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`. `find_bun`
   searches an override, `PATH`, bun's and Homebrew's install dirs, then the login shell's `PATH`.
-  Test anything the app spawns under `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin` — launching the
-  app with `open` from a terminal does not reproduce what the user gets.
+  The daemon that GUI-spawned `lsd` starts inherits the same bare `PATH`, so `lsd` appends Homebrew
+  and `~/.bun`/`~/.cargo` bin dirs to its own `PATH` before its runtime starts
+  (`with_known_tool_directories`) — otherwise `docker compose`, `tailscale serve status` and
+  `tailscale status` (the `{tailnetHost}` URL placeholder) all fail to spawn. Test anything the app
+  spawns under `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin` — launching the app with `open` from a
+  terminal does not reproduce what the user gets.
 - `load_typescript_catalog` must canonicalize the path before handing it to `bun -e`: `import()`
   from an eval'd script has no importer file to resolve a relative specifier against, and falls
   into node_modules-style resolution instead.

@@ -46,7 +46,7 @@ hatch.
 | Subpath | What it is |
 |---|---|
 | `@gnasdev/local-services/core` | `LocalServicesManager` (the daemon engine), catalog types + `validateCatalog`/`dependencyLevels`, `runDoctor`, `runDaemon`/`DaemonLifecycle`, `loadCatalog`/`findConfigFile` (declarative config), `resolveBaseEnvironment` (login-shell/`.env` resolution) |
-| `@gnasdev/local-services/cli` | `main()` — the `localctl`-style command surface (`status`, `logs`, `start`/`stop`/`restart`, `operation`, `doctor`, `cleanup`, `manager`, `tui`) |
+| `@gnasdev/local-services/cli` | `main()` — the `localctl`-style command surface (`status`, `urls`, `logs`, `start`/`stop`/`restart`, `operation`, `doctor`, `cleanup`, `manager`, `tui`) |
 | `@gnasdev/local-services/tui` | `runTui()` — a [`pi-tui`](https://www.npmjs.com/package/@oh-my-pi/pi-tui)-based terminal app, just another HTTP+SSE client of the daemon |
 | `@gnasdev/local-services/mcp` | `createLocalServicesMcpServer()` — a 5-tool MCP server (status/logs/trace/events/manage) for AI agents |
 | `@gnasdev/local-services/node-bridge` | A ~20-line Node-only adapter so a Node/oclif task runner can shell out to this Bun-only tool without depending on Bun itself |
@@ -168,7 +168,19 @@ services:
     run: { shell: "air -c .air.toml", exec: true }
     readiness: { kind: tcp, port: 8080 }
     ports: [{ port: 6060, label: pprof }]
+    urls:
+      - http://127.0.0.1:8080
+      - { url: "https://{tailnetHost}:8443", label: admin, requiresRunning: false }
 ```
+
+**Live URLs.** `urls` registers where a service can be reached — each entry a bare URL or `{ url,
+label?, requiresRunning? }`. Every client surfaces them: `lsd urls [target]`, the TUI (for the focused
+service), the MCP `status` tool, and the macOS app (as clickable links). `{tailnetHost}` is resolved by
+the daemon to this machine's Tailscale DNS name, so a catalog shared across machines never hardcodes
+one machine's hostname; set `LOCAL_SERVICES_TAILNET_HOST` to override it. An unknown placeholder
+fails the catalog load. `requiresRunning: false` marks a URL that works while the service is stopped;
+the others are flagged `(not running)` when it is not up. The daemon serves the resolved list at
+`GET /v1/urls`.
 
 and drive it with this package's own `lsd` binary (installed as this package's `bin`; `bunx
 @gnasdev/local-services lsd status`, or `lsd` directly once installed) — it loads the catalog from
@@ -176,6 +188,7 @@ that file and behaves exactly like a project-authored `cli.ts`/`daemon.ts` pair:
 
 ```bash
 lsd status              # one-shot status of every service
+lsd urls                # where every service can be reached
 lsd start api --wait    # start api (and its redis dependency)
 lsd manager ensure --json   # spawn the daemon if needed; print {instanceId, port, token, protocolVersion, runtimeDirectory, root}
 lsd daemon --root .     # the daemon entrypoint lsd spawns itself, detached — not usually invoked by hand

@@ -42,6 +42,10 @@ final class ManagerClient: ManagerAPI {
         try await get("/v1/services", as: ServicesResponse.self).services
     }
 
+    func urls() async throws -> [ResolvedServiceUrl] {
+        try await get("/v1/urls", as: UrlsResponse.self).urls
+    }
+
     func catalog() async throws -> ServiceCatalogSummary {
         try await get("/v1/catalog", as: CatalogResponse.self).catalog
     }

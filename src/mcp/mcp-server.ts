@@ -169,6 +169,12 @@ export function createLocalServicesMcpServer(client: LocalServicesMcpClient, opt
   return server;
 }
 
+/** `/v1/urls`' body narrowed to one service's entries when `status` was asked about one service. */
+function filterServiceUrls(value: unknown, service?: string): unknown {
+  if (service === undefined || !isObject(value)) return value;
+  const keep = (entries: unknown) => (Array.isArray(entries) ? entries.filter((entry) => isObject(entry) && entry.serviceId === service) : entries);
+  return { ...value, urls: keep(value.urls), unresolved: keep(value.unresolved) };
+}
 function filterServiceStates(value: unknown, service?: string): unknown {
   if (service === undefined) return value;
   if (Array.isArray(value)) return value.filter((entry) => isObject(entry) && entry.serviceId === service);
@@ -195,7 +201,10 @@ export class ManagerApiClient implements LocalServicesMcpClient {
   async status(arguments_: StatusArguments): Promise<unknown> {
     const client = await requireClient(this.root, this.options);
     const [manager, services] = await Promise.all([request(client, "/v1/manager"), request(client, "/v1/services")]);
-    return { manager, services: filterServiceStates(services, arguments_.service) };
+    // Additive, and best-effort: a daemon from before `/v1/urls` existed still answers `status`,
+    // just without `urls`, rather than failing the whole call.
+    const urls = await request(client, "/v1/urls").then((body) => filterServiceUrls(body, arguments_.service), () => undefined);
+    return { manager, services: filterServiceStates(services, arguments_.service), ...(urls !== undefined ? { urls } : {}) };
   }
   logs(arguments_: LogsArguments): Promise<unknown> {
     return this.call(`/v1/logs/${encodeURIComponent(arguments_.service)}${queryString({ cursor: arguments_.cursor, generation: arguments_.generation, limit: arguments_.limit })}`);

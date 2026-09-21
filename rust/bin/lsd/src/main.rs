@@ -121,6 +121,7 @@ usage: lsd [--root <path>] <command> [options]
   status [target] [--json]              current state of one service, a group, or all
   start|stop|restart <target> [--wait]  lifecycle actions (start brings up dependencies)
   logs <service> [--tail N] [--follow]  read a service's log
+  urls [target] [--json]                where each service can be reached (live URLs)
   operation get|watch <id> [--json]     inspect one operation
   doctor [--json]                       environment and catalog diagnostics
   cleanup                               remove stale runtime state
@@ -200,10 +201,23 @@ async fn run_cli(argv: &[String]) -> i32 {
     ls_cli::main(&options, argv, &mut io).await
 }
 
-#[tokio::main]
-async fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let code = if argv.first().map(String::as_str) == Some("daemon") { run_daemon_subcommand(&argv[1..]).await } else { run_cli(&argv).await };
+fn main() {
+    // Before the runtime exists, so no other thread can be reading the environment concurrently.
+    // Needed because a GUI-spawned `lsd` (and the daemon it spawns) inherits launchd's bare PATH,
+    // under which `docker`, `tailscale` and `bun` cannot be found — see
+    // `ls_core::env::with_known_tool_directories`.
+    let path = ls_core::env::with_known_tool_directories(std::env::var_os("PATH").as_deref(), std::env::var_os("HOME").as_deref());
+    std::env::set_var("PATH", path);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    let code = runtime.block_on(async {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if argv.first().map(String::as_str) == Some("daemon") {
+            run_daemon_subcommand(&argv[1..]).await
+        } else {
+            run_cli(&argv).await
+        }
+    });
     std::process::exit(code);
 }
 

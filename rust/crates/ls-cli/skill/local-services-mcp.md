@@ -19,7 +19,7 @@ install customized `--name`, or the server's own `tool_prefix` differs):
 
 | Tool | Does | Mutate gate |
 | --- | --- | --- |
-| `local_services_status` | Current state of one service or all of them | free |
+| `local_services_status` | Current state of one service or all of them, plus where each can be reached (`urls`) | free |
 | `local_services_logs` | Tail (or follow) one service's log | free |
 | `local_services_trace` | Look up one operation by id | free |
 | `local_services_events` | Recent manager/service lifecycle events | free |
@@ -36,6 +36,7 @@ talk to the same daemon over the same loopback HTTP+SSE API, so state seen throu
 seen through all:
 
 - `lsd status [service]` / `lsd logs <service> [--tail N] [-f]`
+- `lsd urls [service]` — the live URLs a service is reachable at (use these rather than guessing ports)
 - `lsd start|stop|restart <service|group> [--wait]`
 - `lsd doctor` / `lsd manager ensure|status|stop|reload`
 - `lsd tui`

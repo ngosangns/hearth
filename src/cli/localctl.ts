@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-import { validateCatalog, type ServiceCatalog, type ServiceId } from "../core/catalog";
+import { validateCatalog, type ResolvedServiceUrl, type ServiceCatalog, type ServiceId, type UnresolvedServiceUrl } from "../core/catalog";
 import { createFileIo, type FileIo } from "../core/file-io";
 import {
   isStaleLockMarker,
@@ -414,6 +414,27 @@ export async function main(options: LocalctlOptions, argv = process.argv.slice(2
       });
       if (flags.json) print({ services: result }, true, runtime);
       else result.forEach((row) => output(runtime, `${row.state} ${row.serviceId}${row.pid ? ` pid ${row.pid}` : ""}`));
+      return 0;
+    }
+    if (command === "urls") {
+      // Every registered URL of the selected services, placeholders resolved by the daemon. A URL
+      // that only works while its service runs is marked "(not running)" when it is not up; URLs
+      // whose placeholder has no value on this machine go to stderr with the reason.
+      const flags = parseCommandFlags(rest, ["json"]);
+      if (flags.positionals.length > 1) usage("usage: local-services urls [target] [--json]");
+      const selected = new Set(targets(options.catalog, flags.positionals[0]));
+      const client = await requireClient(root, options, runtime);
+      const body = (await request(client, "/v1/urls", {}, runtime)) as { urls: ResolvedServiceUrl[]; unresolved: UnresolvedServiceUrl[] };
+      const rows = await serviceRows(client, runtime);
+      const running = (serviceId: string): boolean => ["ready", "running"].includes(textState(rows.find((row) => row.serviceId === serviceId)));
+      const urls = body.urls.filter((entry) => selected.has(entry.serviceId)).map((entry) => ({ ...entry, running: running(entry.serviceId) }));
+      const unresolved = body.unresolved.filter((entry) => selected.has(entry.serviceId));
+      if (flags.json) {
+        print({ urls, unresolved }, true, runtime);
+        return 0;
+      }
+      for (const entry of urls) output(runtime, `${entry.serviceId}  ${entry.label ?? "-"}  ${entry.url}${entry.requiresRunning && !entry.running ? "  (not running)" : ""}`);
+      for (const entry of unresolved) error(runtime, `unresolved ${entry.serviceId} ${entry.url}: no value for {${entry.placeholder}} on this machine`);
       return 0;
     }
     if (command === "start" || command === "stop" || command === "restart") {

@@ -245,3 +245,22 @@ describe("daemon-unreachable exit code", () => {
     expect(errors.join("\n")).toContain("manager unavailable");
   });
 });
+
+describe("urls", () => {
+  // Same output as the Rust CLI: a URL that needs its service running is flagged while the
+  // service is stopped, and a URL that works regardless is not.
+  test("lists urls and flags the ones whose service is down", async () => {
+    const output: string[] = [];
+    const runtime: LocalctlRuntime = {
+      discover: async () => live(),
+      request: async (_client, path) => {
+        if (path === "/v1/urls") return { urls: [{ serviceId: "metadata", label: "app", url: "http://127.0.0.1:18080/", requiresRunning: true }, { serviceId: "metadata", url: "http://127.0.0.1:18081/", requiresRunning: false }], unresolved: [] };
+        if (path === "/v1/services") return { services: [{ serviceId: "metadata", actualState: "stopped" }] };
+        return {};
+      },
+      output: (line) => output.push(line),
+    };
+    expect(await main(options, ["urls"], runtime)).toBe(0);
+    expect(output).toEqual(["metadata  app  http://127.0.0.1:18080/  (not running)", "metadata  -  http://127.0.0.1:18081/"]);
+  });
+});

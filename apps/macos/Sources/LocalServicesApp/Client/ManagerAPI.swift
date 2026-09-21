@@ -14,6 +14,8 @@ protocol ManagerAPI: Sendable {
     @discardableResult func perform(_ action: ManagerAction, serviceId: String) async throws -> ManagerOperation
     @discardableResult func bulkStart(targets: [String]) async throws -> ManagerOperation
     func operation(id: String) async throws -> ManagerOperation
+    /// Every registered service URL, placeholders resolved (`GET /v1/urls`).
+    func urls() async throws -> [ResolvedServiceUrl]
 }
 
 extension ManagerAPI {

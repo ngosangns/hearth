@@ -1,7 +1,7 @@
 import { ProcessTerminal, routeSgrMouseInput, TUI, type TerminalFrameProvider } from "@oh-my-pi/pi-tui";
 
 import { ensure, type LocalctlOptions } from "../cli/localctl";
-import type { ServiceCatalog } from "../core/catalog";
+import type { ResolvedServiceUrl, ServiceCatalog } from "../core/catalog";
 import { ServiceScreen } from "./screen";
 import { TuiState, type ServiceKindLookup, type TuiFence } from "./state";
 import { keyboardAction } from "./tui-actions";
@@ -44,6 +44,19 @@ export async function runTui(options: RunTuiOptions): Promise<number> {
   const streamAbort = new AbortController();
   let busy = false;
   let disposed = false;
+  let urls: ResolvedServiceUrl[] = [];
+
+  /** The focused service's URLs as screen rows, flagging the ones that need the service running
+   * while it is not — the same rule as `lsd urls`. */
+  const focusedUrls = (): string => {
+    const selected = state.selection.selectedName;
+    const current = state.selection.services.find((service) => service.name === selected);
+    const running = ["ready", "running", "degraded", "starting", "preparing"].includes(current?.state ?? "");
+    return urls
+      .filter((entry) => entry.serviceId === selected)
+      .map((entry) => `${entry.label ?? "-"}  ${entry.url}${entry.requiresRunning && !running ? "  (not running)" : ""}`)
+      .join("\n");
+  };
 
   return new Promise<number>((resolveExit) => {
     function render(): void {
@@ -53,6 +66,7 @@ export async function runTui(options: RunTuiOptions): Promise<number> {
         logService: state.selection.selectedName,
         log: `${state.detail()}\n${state.log}`,
         notice: state.notice,
+        urls: focusedUrls(),
       });
       tui.requestRender();
     }
@@ -144,6 +158,8 @@ export async function runTui(options: RunTuiOptions): Promise<number> {
       try {
         const services = await client.snapshot();
         if (!state.applySnapshot(fence, services)) return;
+        // Best-effort: a daemon from before `/v1/urls` existed simply has no URL rows.
+        urls = await client.urls().catch(() => urls);
         state.notice = "";
         render();
         await refreshSelected(state.beginRequest());

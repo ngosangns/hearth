@@ -212,6 +212,7 @@ mod tests {
                     build: None,
                 },
                 ports: None,
+                urls: None,
             }],
             groups: HashMap::new(),
             compose_file: None,

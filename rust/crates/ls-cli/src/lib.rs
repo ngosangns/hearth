@@ -565,6 +565,7 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
             }
             Ok(0)
         }
+        "urls" => urls_command(&root, options, rest, io).await,
         "start" | "stop" | "restart" => start_stop_restart_command(&root, options, command, rest, io).await,
         "operation" => {
             let flags = parse_command_flags(rest, &[FlagName::Json])?;
@@ -674,6 +675,61 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
             Ok(0)
         }
     }
+}
+
+/// `urls [target] [--json]`: every registered URL of the selected services, placeholders resolved
+/// by the daemon. A URL that only works while its service runs is marked `(not running)` when the
+/// service is not up, so a dead link is recognisable before anyone clicks it; URLs whose
+/// placeholder has no value on this machine go to stderr with the reason rather than vanishing.
+async fn urls_command(root: &Path, options: &LocalctlOptions, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
+    let flags = parse_command_flags(rest, &[FlagName::Json])?;
+    if flags.positionals.len() > 1 {
+        return usage_err("usage: local-services urls [target] [--json]");
+    }
+    let selected = targets(&options.catalog, flags.positionals.first().map(String::as_str))?;
+    let client = require_client(root, options).await?;
+    let body = request(&client, "/v1/urls", reqwest::Method::GET, None, None).await.or_else(unavailable_err)?;
+    let rows = service_rows(&client).await?;
+    let is_running = |service_id: &str| matches!(text_state(rows.iter().find(|r| r.service_id == service_id)), "ready" | "running");
+    let in_selection = |entry: &&Value| entry["serviceId"].as_str().is_some_and(|id| selected.iter().any(|s| s == id));
+
+    let urls: Vec<Value> = body["urls"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter(in_selection)
+        .map(|entry| {
+            let mut entry = entry.clone();
+            entry["running"] = json!(is_running(entry["serviceId"].as_str().unwrap_or_default()));
+            entry
+        })
+        .collect();
+    let unresolved: Vec<Value> = body["unresolved"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter(in_selection).cloned().collect();
+
+    if flags.json {
+        (io.out)(&print_value(&json!({ "urls": urls, "unresolved": unresolved }), true));
+        return Ok(0);
+    }
+    for entry in &urls {
+        let stale = entry["requiresRunning"].as_bool() != Some(false) && entry["running"] == json!(false);
+        (io.out)(&format!(
+            "{}  {}  {}{}",
+            entry["serviceId"].as_str().unwrap_or_default(),
+            entry["label"].as_str().unwrap_or("-"),
+            entry["url"].as_str().unwrap_or_default(),
+            if stale { "  (not running)" } else { "" }
+        ));
+    }
+    for entry in &unresolved {
+        (io.err)(&format!(
+            "unresolved {} {}: no value for {{{}}} on this machine",
+            entry["serviceId"].as_str().unwrap_or_default(),
+            entry["url"].as_str().unwrap_or_default(),
+            entry["placeholder"].as_str().unwrap_or_default()
+        ));
+    }
+    Ok(0)
 }
 
 async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, command: &str, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
@@ -954,6 +1010,7 @@ mod tests {
                 build: None,
             },
             ports: None,
+            urls: None,
         }
     }
 
@@ -1328,5 +1385,46 @@ mod tests {
             assert_eq!(text_state(Some(&state(actual))), printed, "{actual:?}");
         }
         assert_eq!(text_state(None), "stopped");
+    }
+
+    /// A URL that needs its service running is flagged while the service is stopped, so a dead link
+    /// is recognisable before anyone clicks it; a URL that works regardless is not.
+    #[tokio::test]
+    async fn urls_command_lists_urls_and_flags_the_ones_whose_service_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut api = tcp_service("api", free_port());
+        api.urls = Some(vec![
+            ls_core::catalog::ServiceUrl { url: "http://127.0.0.1:18080/".into(), label: Some("app".into()), requires_running: None },
+            ls_core::catalog::ServiceUrl { url: "http://127.0.0.1:18081/".into(), label: None, requires_running: Some(false) },
+        ]);
+        let catalog = test_catalog(dir.path(), vec![api]);
+        let manager = bootstrap_manager(catalog.clone()).await;
+
+        let run = |extra: &'static [&'static str]| {
+            let catalog = catalog.clone();
+            async move {
+                let out = Arc::new(Mutex::new(Vec::new()));
+                let out2 = out.clone();
+                let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
+                let mut err_fn = move |_: &str| {};
+                let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+                let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+                let mut argv = vec!["--root", "/tmp", "urls"];
+                argv.extend_from_slice(extra);
+                let code = main(&options, &args(&argv), &mut io).await;
+                let lines = out.lock().unwrap().clone();
+                (code, lines)
+            }
+        };
+
+        let (code, lines) = run(&[]).await;
+        assert_eq!(code, 0, "{lines:?}");
+        assert_eq!(lines, vec!["api  app  http://127.0.0.1:18080/  (not running)".to_string(), "api  -  http://127.0.0.1:18081/".to_string()]);
+
+        let (_, lines) = run(&["api", "--json"]).await;
+        let printed: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(printed["urls"][0]["running"], json!(false));
+        assert_eq!(printed["urls"].as_array().unwrap().len(), 2);
+        manager.close().await;
     }
 }

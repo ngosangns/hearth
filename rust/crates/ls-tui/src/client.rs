@@ -79,6 +79,13 @@ impl<'a> ManagerTuiClient<'a> {
         serde_json::from_value(body["services"].clone()).map_err(malformed_error)
     }
 
+    /// Every resolved service URL (`GET /v1/urls`).
+    pub async fn urls(&self) -> Result<Vec<ls_core::catalog::ResolvedServiceUrl>, LocalctlError> {
+        let client = self.client().await?;
+        let body = cli_request(&client, "/v1/urls", reqwest::Method::GET, None, None).await.map_err(unavailable_error)?;
+        serde_json::from_value(body["urls"].clone()).map_err(malformed_error)
+    }
+
     pub async fn log(&self, service_id: &str, cursor: Option<u64>, generation: Option<u64>) -> Result<LogSlice, LocalctlError> {
         let client = self.client().await?;
         let mut query = format!("limit={LOG_TAIL_BYTES}");

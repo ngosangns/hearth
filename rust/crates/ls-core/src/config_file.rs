@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::catalog::{
     validate_catalog, CommandSpec, ReadinessSpec, ServiceCatalog, ServiceDefinition, ServiceKind,
-    ServiceOwnership, ServicePort, ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
+    ServiceOwnership, ServicePort, ServiceProfiles, ServiceRunProfile, ServiceUrl, StartFailurePolicy,
 };
 use crate::env::load_env_file;
 
@@ -401,6 +401,48 @@ fn read_preparation_command(value: &Value, path: &str, errors: &mut Vec<String>)
     Some(crate::catalog::PreparationCommand { command: command?.spec, cwd, serialization_key })
 }
 
+/// `urls` accepts a bare string or `{ url, label?, requiresRunning? }` per entry. Only the shape is
+/// checked here; the URL format and its placeholders are checked by `validate_catalog`, which runs
+/// for every catalog source, not just config files. Mirrors `readUrls` in the TS source.
+fn read_urls(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<Vec<ServiceUrl>> {
+    let Some(value) = value else { return Some(Vec::new()) };
+    let Some(array) = value.as_array() else {
+        errors.push(format!("{path} must be an array"));
+        return None;
+    };
+    let mut urls = Vec::new();
+    for (index, entry) in array.iter().enumerate() {
+        let entry_path = format!("{path}[{index}]");
+        if let Some(url) = entry.as_str() {
+            urls.push(ServiceUrl { url: url.to_string(), label: None, requires_running: None });
+            continue;
+        }
+        let Some(url) = entry.as_object().and_then(|o| o.get("url")).and_then(Value::as_str) else {
+            errors.push(format!("{entry_path} must be a URL string or {{ url: string, label?: string, requiresRunning?: boolean }}"));
+            continue;
+        };
+        let obj = entry.as_object().expect("checked above");
+        let label = match obj.get("label") {
+            None => None,
+            Some(Value::String(label)) => Some(label.clone()),
+            Some(_) => {
+                errors.push(format!("{entry_path}.label must be a string"));
+                continue;
+            }
+        };
+        let requires_running = match obj.get("requiresRunning") {
+            None => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(_) => {
+                errors.push(format!("{entry_path}.requiresRunning must be a boolean"));
+                continue;
+            }
+        };
+        urls.push(ServiceUrl { url: url.to_string(), label, requires_running });
+    }
+    Some(urls)
+}
+
 fn read_ports(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<Vec<ServicePort>> {
     let Some(value) = value else { return Some(Vec::new()) };
     let Some(array) = value.as_array() else {
@@ -576,6 +618,7 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
         // a catalog that otherwise loaded fine.
         let readiness = read_readiness(obj.get("readiness").unwrap_or(&Value::Null), &format!("{svc_path}.readiness"), &mut errors);
         let ports = read_ports(obj.get("ports"), &format!("{svc_path}.ports"), &mut errors);
+        let urls = read_urls(obj.get("urls"), &format!("{svc_path}.urls"), &mut errors);
         let preparation_command = obj.get("preparationCommand").and_then(|v| read_preparation_command(v, &format!("{svc_path}.preparationCommand"), &mut errors));
 
         let mut profile_run: Option<ServiceRunProfile> = None;
@@ -655,6 +698,7 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             dependencies,
             profiles: ServiceProfiles { run: profile_run, build: profile_build },
             ports: ports.filter(|p| !p.is_empty()),
+            urls: urls.filter(|u| !u.is_empty()),
         });
     }
     if !errors.is_empty() {
@@ -1086,5 +1130,31 @@ services:
     fn reports_none_when_bun_is_nowhere() {
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(locate_bun(None, Some(BARE_GUI_PATH.into()), None, os(empty.path()), &[], || None), None);
+    }
+
+    #[test]
+    fn maps_service_urls_in_both_the_string_and_object_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "local-services.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    urls:\n      - http://127.0.0.1:8080\n      - { url: \"https://{tailnetHost}:8443\", label: admin, requiresRunning: false }\n",
+        );
+        let urls = load_catalog(dir.path()).expect("loads").catalog.services[0].urls.clone().expect("urls");
+        assert_eq!(urls[0], ServiceUrl { url: "http://127.0.0.1:8080".into(), label: None, requires_running: None });
+        assert_eq!(urls[1], ServiceUrl { url: "https://{tailnetHost}:8443".into(), label: Some("admin".into()), requires_running: Some(false) });
+    }
+
+    /// A typo'd placeholder must fail the load rather than render a dead link, with the same
+    /// message the TS loader produces for the same input.
+    #[test]
+    fn rejects_an_unknown_placeholder_and_a_non_http_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "local-services.yaml", "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    urls: [\"https://{tailnethost}:1\", \"ftp://x\"]\n");
+        let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+        assert_eq!(
+            errors,
+            vec!["api:urls[0] has unknown placeholder {tailnethost} (known: {tailnetHost})".to_string(), "api:urls[1] must be an http:// or https:// URL".to_string()]
+        );
     }
 }
