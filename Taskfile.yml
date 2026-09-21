@@ -34,14 +34,18 @@ tasks:
       - cargo clippy --workspace --all-targets -- -D warnings
 
   rust:install:
-    desc: Build the lsd binary in release mode and install it to /opt/homebrew/bin (ad-hoc signed)
+    desc: Build the lsd binary in release mode and install it into Local Services.app (ad-hoc signed)
     dir: rust
+    vars:
+      LSD_BIN: "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd"
     cmds:
       - cargo build --release -p lsd
-      - cp target/release/lsd /opt/homebrew/bin/lsd
+      - mkdir -p "/Applications/Local Services.app/Contents/Resources/lsd/bin"
+      - cp target/release/lsd "{{.LSD_BIN}}"
       # Required after every copy on macOS, or the binary won't launch.
-      - codesign --sign - --force /opt/homebrew/bin/lsd
-      - echo "installed $(/opt/homebrew/bin/lsd --version)"
+      - codesign --sign - --force "{{.LSD_BIN}}"
+      - rm -f /opt/homebrew/bin/lsd
+      - echo "installed $("{{.LSD_BIN}}" --version) at {{.LSD_BIN}}"
 
   ci:
     desc: Everything CI runs (TS test + typecheck, plus the Rust test and clippy jobs)

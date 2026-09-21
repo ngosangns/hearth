@@ -66,7 +66,7 @@ enum DaemonConnection {
 
         // Both pipes are drained CONCURRENTLY with the process running, not from inside
         // `terminationHandler`. A child that writes more than the ~64KB pipe buffer (a Bun stack
-        // trace from a broken .config.ts, a verbose validation error) blocks forever on `write` if
+        // trace from a broken catalog, a verbose validation error) blocks forever on `write` if
         // nothing is reading — so it never exits, `terminationHandler` never fires, and the
         // continuation is never resumed. The UI's only symptom would be "Starting daemon…" forever.
         let collector = OutputCollector()

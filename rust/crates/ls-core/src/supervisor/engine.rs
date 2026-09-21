@@ -563,7 +563,7 @@ impl ProcessSupervisor {
         // Independent of the opaque marker list above — a service may declare either, both, or
         // neither. Reuses `ProbeAdapter::command`, the same adapter `ReadinessSpec::Command`
         // readiness already uses, so a bespoke `PreparationAdapter` is no longer the only way to
-        // express "run this before starting" in a catalog that has no closures (`.config.ts`/YAML).
+        // express "run this before starting" in a catalog that has no closures (YAML).
         // `serialization_key` reuses the exact same `KeyedLock` primitive as build serialization —
         // services sharing a key never run their preparation command concurrently, for the same
         // reason a shared Gradle daemon can't take concurrent builds: some preparation work (a

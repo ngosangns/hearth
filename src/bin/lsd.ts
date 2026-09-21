@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // Generic host binary for a project whose catalog is authored declaratively (see
-// `../core/config-file.ts`): a `local-services.yaml`/`.yml`/`.json`/`.config.ts` in the project root
+// `../core/config-file.ts`): a `local-services.yaml`/`.yml`/`.json` in the project root
 // is all a consumer needs to write. Every other package.json-listed entry point (`/core`, `/cli`,
 // `/tui`, `/mcp`) still takes a caller-supplied catalog as a parameter and is unaffected; this binary
 // is just one more caller, generic instead of project-specific — see the README's "every consumer

@@ -4,10 +4,8 @@
 // catalog-shape-agnostic on purpose, so this module only *produces* a `ServiceCatalog`, it never
 // changes what one is.
 //
-// A `local-services.config.ts` escape hatch is also supported for anything this declarative shape
-// can't express (a `custom` readiness probe closure, computed service lists, etc.) — it must export
-// a ready-made `ServiceCatalog` as `catalog` or as its default export, bypassing the mapper below
-// entirely.
+// TypeScript catalogs (`local-services.config.ts`) are not accepted. Anything a catalog needs to
+// express has to fit this declarative shape (including `readinessTimeoutMs` and `preparationCommand`).
 //
 // Kept deliberately separate from `./env` (login-shell / `.env` resolution for the *daemon process
 // itself*): `env`/`envFile` here are catalog-authored, per-service values baked into each spawned
@@ -20,7 +18,7 @@ import { validateCatalog } from "./catalog";
 import { isRecord } from "./file-io";
 import { loadEnvFile } from "./env";
 
-export const configFileNames = ["local-services.yaml", "local-services.yml", "local-services.json", "local-services.config.ts"] as const;
+export const configFileNames = ["local-services.yaml", "local-services.yml", "local-services.json"] as const;
 export type ConfigFileName = (typeof configFileNames)[number];
 
 export type ConfigFileLoadResult = { ok: true; catalog: ServiceCatalog; path: string } | { ok: false; path?: string; errors: string[] };
@@ -36,12 +34,18 @@ export async function findConfigFile(root: string): Promise<string | undefined> 
 
 export async function loadCatalog(root: string): Promise<ConfigFileLoadResult> {
   const path = await findConfigFile(root);
-  if (!path) return { ok: false, errors: [`no config file found in ${root} (looked for ${configFileNames.join(", ")})`] };
+  if (!path) {
+    const leftoverTs = join(root, "local-services.config.ts");
+    const hint = (await Bun.file(leftoverTs).exists()) ? "; local-services.config.ts is no longer accepted — author a local-services.yaml instead" : "";
+    return { ok: false, errors: [`no config file found in ${root} (looked for ${configFileNames.join(", ")})${hint}`] };
+  }
   return loadCatalogFromFile(path, root);
 }
 
 export async function loadCatalogFromFile(path: string, root: string = dirnameOf(path)): Promise<ConfigFileLoadResult> {
-  if (path.endsWith(".config.ts")) return loadTypeScriptCatalog(path);
+  if (path.endsWith(".ts")) {
+    return { ok: false, path, errors: [`${path} is a TypeScript catalog; only local-services.yaml, .yml, or .json are accepted`] };
+  }
   let raw: unknown;
   try {
     raw = Bun.YAML.parse(await Bun.file(path).text()); // JSON is valid YAML, so this handles .json too.
@@ -60,20 +64,6 @@ function dirnameOf(path: string): string {
   return index === -1 ? "." : path.slice(0, index);
 }
 
-async function loadTypeScriptCatalog(path: string): Promise<ConfigFileLoadResult> {
-  let module_: Record<string, unknown>;
-  try {
-    module_ = (await import(path)) as Record<string, unknown>;
-  } catch (cause) {
-    return { ok: false, path, errors: [`failed to import ${path}: ${cause instanceof Error ? cause.message : String(cause)}`] };
-  }
-  const catalog = (module_.catalog ?? module_.default) as ServiceCatalog | undefined;
-  if (!catalog || !isRecord(catalog) || !Array.isArray((catalog as ServiceCatalog).services)) return { ok: false, path, errors: [`${path} must export a ServiceCatalog as \`catalog\` or a default export`] };
-  const validation = validateCatalog(catalog);
-  if (validation.errors.length) return { ok: false, path, errors: validation.errors };
-  return { ok: true, catalog, path };
-}
-
 // -------------------------------------------------------------------------------------------
 // Declarative shape -> ServiceCatalog
 // -------------------------------------------------------------------------------------------
@@ -84,6 +74,15 @@ const ownerships: readonly ServiceOwnership[] = ["daemon", "external"];
 
 const isStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every((entry) => typeof entry === "string");
 const isStringRecord = (value: unknown): value is Record<string, string> => isRecord(value) && Object.values(value).every((entry) => typeof entry === "string");
+
+function readPositiveInteger(value: unknown, path: string, errors: string[]): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || (value as number) <= 0) {
+    errors.push(`${path} must be a positive integer`);
+    return undefined;
+  }
+  return value as number;
+}
 
 /** A raw config-file command (`{argv}` or `{shell}`, same shape as `CommandSpec`) at `path`, or
  * `undefined` with an error pushed to `errors` if present-but-malformed. Absent is valid — callers
@@ -248,7 +247,7 @@ function resolveServiceCwd(root: string, cwd: string | undefined, path: string, 
 // A key outside these sets is a typo (e.g. `command:` for `run:`), which would otherwise be silently
 // dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
 const topLevelKeys = ["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
-const serviceKeys = ["label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls"];
+const serviceKeys = ["label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "readinessTimeoutMs", "preparationCommand", "ports", "urls"];
 function checkKnownKeys(value: Record<string, unknown>, known: readonly string[], path: string, errors: string[]): void {
   for (const key of Object.keys(value)) {
     if (!known.includes(key) && !key.startsWith("x-")) errors.push(`${path} has unknown key "${key}" (known: ${known.join(", ")})`);
@@ -290,12 +289,13 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
     const readiness = readReadiness(value.readiness, `${svcPath}.readiness`, errors);
     const ports = readPorts(value.ports, `${svcPath}.ports`, errors);
     const urls = readUrls(value.urls, `${svcPath}.urls`, errors);
+    const readinessTimeoutMs = readPositiveInteger(value.readinessTimeoutMs, `${svcPath}.readinessTimeoutMs`, errors);
 
     const preparationCommand = value.preparationCommand === undefined ? undefined : readPreparationCommand(value.preparationCommand, `${svcPath}.preparationCommand`, errors);
 
     let profileRun: ServiceDefinition["profiles"]["run"] | undefined;
     if (value.run === undefined) {
-      if (readiness) profileRun = { commandStatus: "unresolved", readiness, preparationCommand };
+      if (readiness) profileRun = { commandStatus: "unresolved", readiness, readinessTimeoutMs, preparationCommand };
     } else {
       const run = readCommandSpec(value.run, `${svcPath}.run`, errors);
       const stop = value.stop === undefined ? undefined : readCommandSpec(value.stop, `${svcPath}.stop`, errors);
@@ -304,6 +304,7 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
         profileRun = {
           commandStatus: "verified",
           readiness,
+          readinessTimeoutMs,
           preparationCommand,
           command: { command: run.spec, cwd, environment: Object.keys(environment).length ? environment : undefined, containerName: value.container as string | undefined, dockerStopCommand: stop?.spec },
         };

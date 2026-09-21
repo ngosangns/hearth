@@ -10,7 +10,7 @@ This repo ships **two implementations of the same product**, both live:
 | | TypeScript (`src/`) | Rust (`rust/`) |
 | --- | --- | --- |
 | What it is | The published npm package, `@gnasdev/local-services` | A full rewrite, compiled to the `lsd` binary |
-| Consumers | `viclass` | `apps/macos`, `infra` |
+| Consumers | npm package (`@gnasdev/local-services`) | `apps/macos`, `infra`, `viclass` |
 | Surfaces | `/core` `/cli` `/tui` `/mcp` `/node-bridge` subpath exports + an `lsd` bin shim | `ls-core` `ls-cli` `ls-tui` `ls-mcp` crates + `rust/bin/lsd` |
 | Status | Maintained; still the published artifact | Feature-complete, at parity, and what new consumers should use |
 
@@ -30,9 +30,10 @@ consumer example. **No default `ServiceCatalog` ships anywhere**; every entry po
 caller-supplied catalog.
 
 A project can skip authoring its own `catalog.ts`/`daemon.ts`/`cli.ts` entirely: `local-services.yaml`
-(or `.yml`/`.json`, or a `.config.ts` escape hatch) is mapped onto `ServiceCatalog` by
-`src/core/config-file.ts` / `config_file.rs`, and the `lsd` bin wraps that loader around
-`main()`/`runDaemon`. This is also the on-ramp for a non-Bun/non-TS client: `lsd manager ensure --json`
+(or `.yml`/`.json`) is mapped onto `ServiceCatalog` by `src/core/config-file.ts` / `config_file.rs`,
+and the `lsd` bin wraps that loader around `main()`/`runDaemon`. TypeScript catalogs are not accepted.
+
+This is also the on-ramp for a non-Bun/non-TS client: `lsd manager ensure --json`
 prints everything (`token`, `port`, `runtimeDirectory`, …) a generic HTTP+SSE client needs, without it
 reimplementing lock-file discovery. `env.ts`/`env.rs` resolves the daemon's own base environment
 (login shell + `.env`) for exactly that case — a daemon launched from a GUI has none of the `PATH`
@@ -57,16 +58,17 @@ revisiting that decision. `bun test` / `bun run typecheck` (strict + `noUnchecke
 **Rust.** From `rust/`: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D
 warnings`. Also `task rust:test` / `task rust:clippy`.
 
-*The Rust suite needs real tools on the machine*: `bun` (for the `.config.ts` escape-hatch tests),
-`docker` with its daemon running and `tailscale` (for the real-adapter tests), plus `nc`, `ps`, `sh`.
+*The Rust suite needs real tools on the machine*: `docker` with its daemon running and `tailscale`
+(for the real-adapter tests), plus `nc`, `ps`, `sh`.
 Same assumption every real-tool test in the crate already makes, not a new category of fragility.
 
 **Installing/refreshing the `lsd` binary** after a Rust change — `task rust:install`, or by hand from
 `rust/`:
 ```
-cargo build --release -p lsd && cp target/release/lsd /opt/homebrew/bin/lsd && codesign --sign - --force /opt/homebrew/bin/lsd
+cargo build --release -p lsd && mkdir -p "/Applications/Local Services.app/Contents/Resources/lsd/bin" && cp target/release/lsd "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd" && codesign --sign - --force "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd"
 ```
-The ad-hoc re-sign is required after every copy on macOS.
+The ad-hoc re-sign is required after every copy on macOS. Do not install into Homebrew — that name
+collides with the `lsd` (lsdeluxe) formula. Consumer scripts must use the app-bundled path.
 
 **macOS app.** `task macos:build` / `macos:test` / `macos:package` / `macos:install`.
 
@@ -180,21 +182,17 @@ Applies to both implementations unless noted.
 
 - `bun run` prepends `node_modules/.bin` to PATH, and this package ships
   `bin: {lsd: "./src/bin/lsd.ts"}` — so a bare `lsd` in a consumer's package.json script resolves to
-  the **TS shim** (which has no `mcp` subcommand), not the installed Rust binary. Reference
-  `/opt/homebrew/bin/lsd` by absolute path in consumer scripts.
-- `.config.ts` requires `bun` to be installed (narrowly — a YAML/JSON-catalog consumer needs no Bun
-  at all), but **never assume it is on `PATH`**: `lsd` is routinely spawned by the macOS app, and a
-  Dock/Finder-launched GUI process gets launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`. `find_bun`
-  searches an override, `PATH`, bun's and Homebrew's install dirs, then the login shell's `PATH`.
-  The daemon that GUI-spawned `lsd` starts inherits the same bare `PATH`, so `lsd` appends Homebrew
-  and `~/.bun`/`~/.cargo` bin dirs to its own `PATH` before its runtime starts
+  the **TS shim** (which has no `mcp` subcommand), not the compiled Rust binary. Reference
+  `/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd` by absolute path in consumer
+  scripts.
+- **Never assume tools are on `PATH`**: `lsd` is routinely spawned by the macOS app, and a
+  Dock/Finder-launched GUI process gets launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon
+  that GUI-spawned `lsd` starts inherits the same bare `PATH`, so `lsd` appends Homebrew and
+  `~/.bun`/`~/.cargo` bin dirs to its own `PATH` before its runtime starts
   (`with_known_tool_directories`) — otherwise `docker compose`, `tailscale serve status` and
   `tailscale status` (the `{tailnetHost}` URL placeholder) all fail to spawn. Test anything the app
   spawns under `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin` — launching the app with `open` from a
   terminal does not reproduce what the user gets.
-- `load_typescript_catalog` must canonicalize the path before handing it to `bun -e`: `import()`
-  from an eval'd script has no importer file to resolve a relative specifier against, and falls
-  into node_modules-style resolution instead.
 - `serde_json`'s `preserve_order` feature is on workspace-wide and is load-bearing: without it
   `Value`'s object type is a `BTreeMap`, and `lsd mcp install` silently alphabetizes every key in any
   hand-maintained config file it touches.
@@ -242,15 +240,13 @@ Applies to both implementations unless noted.
 
 Deliberate, and each a real behavioural difference worth knowing before debugging a mismatch.
 
-- **No `Custom` readiness variant.** A closure can't cross the JSON boundary `.config.ts` loading
+- **No `Custom` readiness variant.** A closure can't cross the JSON/YAML boundary catalog loading
   needs, so a catalog using `custom` fails deserialization with a clear error rather than silently
-  dropping the probe. Both real consumers' catalogs are pure data today.
+  dropping the probe. Both real consumers' catalogs are YAML.
 - **SSE backpressure is frame-count only** (64 frames). The TS source additionally enforces a
   cumulative byte ceiling (`maxSseQueueBytes`). Frames here are small JSON, so count-bounding caps
   memory in practice, but full parity needs the byte tracking.
-- **`.config.ts` is evaluated by shelling out to a real `bun -e` subprocess** rather than in-process.
-  Error text mirrors the TS source's own two messages, since the script constructs them itself before
-  Rust ever sees stderr.
+
 - **`crossterm` + `unicode-width` instead of `pi-tui`.** The TS TUI only uses `pi-tui` at a low level
   (raw mode, SGR mouse parsing, key matching), never as a widget framework, so there was no
   framework-level API to match. `actions.rs` takes a structured `KeyEvent` directly instead of
@@ -280,8 +276,8 @@ Deliberate, and each a real behavioural difference worth knowing before debuggin
 | Consumer | Uses | Remaining work |
 | --- | --- | --- |
 | `apps/macos` | Compiled `lsd`, bundled into the app | — |
-| `infra` | Compiled `lsd` at an absolute path, for both CLI and MCP | — |
-| `viclass` | TypeScript | Migrate its ~27 prep-dependent services from the opaque `preparation` marker list to `preparationCommand`, all sharing one `serializationKey` (see Sharp edges). Every one dispatches through the same `bash scripts/local-services.sh prepare <id>` call keyed on its own case statement — the marker array's *contents* were never read — so the mapping is mechanical. |
+| `infra` | Compiled `lsd` at the app-bundled path; `local-services.yaml` | — |
+| `viclass` | Compiled `lsd` at the app-bundled path; `local-services.yaml` | — |
 
 Neither `infra`'s nor `viclass`'s commits are this repo's to make.
 

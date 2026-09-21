@@ -1,21 +1,6 @@
 //! Declarative catalog authoring — port of `src/core/config-file.ts`. A `local-services.yaml` (or
 //! `.yml`/`.json`) file sitting in a project's root is mapped onto the same `ServiceCatalog` every
-//! other entry point takes.
-//!
-//! **The `.config.ts` escape hatch** (a TypeScript module exporting a ready-made `ServiceCatalog` as
-//! `catalog` or as its default export, for anything the declarative shape can't express) has no
-//! direct Rust equivalent — this crate cannot evaluate TypeScript. Both real downstream consumers
-//! (`viclass`, `infra`) currently author exactly this kind of file at their project root, so simply
-//! refusing it would block a real cutover for either one. Resolved here by shelling out to `bun`
-//! (already a dependency of any project that would author a `.config.ts` file in the first place) to
-//! `import()` the module and print the exported catalog as JSON, which is then deserialized directly
-//! into `ServiceCatalog` — bypassing the declarative mapper below entirely, exactly like
-//! `loadTypeScriptCatalog` in the TS source does. **This does not, and cannot, support a `custom`
-//! readiness probe** (a `(ctx) => Promise<...>` closure) — `ReadinessSpec` has no `Custom` variant in
-//! this crate (see its own doc comment: `{ kind: "command" }` is the JSON-serializable stand-in), and
-//! a closure cannot cross a JSON boundary regardless. A `.config.ts` catalog that uses `custom`
-//! readiness fails deserialization with a clear error rather than silently dropping the probe; both
-//! real consumers' catalogs are pure data today, so this does not block their eventual cutover.
+//! other entry point takes. TypeScript catalogs (`local-services.config.ts`) are not accepted.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -27,12 +12,7 @@ use crate::catalog::{
 };
 use crate::env::load_env_file;
 
-pub const CONFIG_FILE_NAMES: [&str; 4] = [
-    "local-services.yaml",
-    "local-services.yml",
-    "local-services.json",
-    "local-services.config.ts",
-];
+pub const CONFIG_FILE_NAMES: [&str; 3] = ["local-services.yaml", "local-services.yml", "local-services.json"];
 
 #[derive(Debug, Clone)]
 pub struct LoadedCatalog {
@@ -53,25 +33,29 @@ pub fn find_config_file(root: &Path) -> Option<PathBuf> {
 }
 
 pub fn load_catalog(root: &Path) -> Result<LoadedCatalog, ConfigFileLoadError> {
-    let path = find_config_file(root).ok_or_else(|| ConfigFileLoadError {
-        path: None,
-        errors: vec![format!(
+    let path = find_config_file(root).ok_or_else(|| {
+        let mut message = format!(
             "no config file found in {} (looked for {})",
             root.display(),
             CONFIG_FILE_NAMES.join(", ")
-        )],
+        );
+        if root.join("local-services.config.ts").exists() {
+            message.push_str("; local-services.config.ts is no longer accepted — author a local-services.yaml instead");
+        }
+        ConfigFileLoadError { path: None, errors: vec![message] }
     })?;
     load_catalog_from_file(&path, root)
 }
 
 pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog, ConfigFileLoadError> {
     if path.extension().and_then(|e| e.to_str()) == Some("ts") {
-        let catalog = load_typescript_catalog(path)?;
-        let validation = validate_catalog(&catalog);
-        if !validation.errors.is_empty() {
-            return Err(ConfigFileLoadError { path: Some(path.to_path_buf()), errors: validation.errors });
-        }
-        return Ok(LoadedCatalog { catalog, path: path.to_path_buf() });
+        return Err(ConfigFileLoadError {
+            path: Some(path.to_path_buf()),
+            errors: vec![format!(
+                "{} is a TypeScript catalog; only local-services.yaml, .yml, or .json are accepted",
+                path.display()
+            )],
+        });
     }
 
     let text = std::fs::read_to_string(path).map_err(|e| ConfigFileLoadError {
@@ -108,118 +92,6 @@ pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog,
         return Err(ConfigFileLoadError { path: Some(path.to_path_buf()), errors: validation.errors });
     }
     Ok(LoadedCatalog { catalog, path: path.to_path_buf() })
-}
-
-const KNOWN_BUN_DIRECTORIES: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
-
-/// Locates `bun` without assuming it is on this process's `PATH`.
-///
-/// `lsd` is routinely spawned by a GUI — the macOS app launched from the Dock or Finder — and a
-/// GUI process inherits launchd's bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which contains
-/// none of the places bun is actually installed. A bare `Command::new("bun")` therefore failed for
-/// every `.config.ts` catalog (both real consumers use one) the moment the app was opened normally,
-/// while working fine from a terminal — so it only ever showed up for the user, never in testing.
-fn find_bun() -> Option<PathBuf> {
-    let var = |key: &str| std::env::var_os(key);
-    locate_bun(var("LOCAL_SERVICES_BUN_PATH"), var("PATH"), var("BUN_INSTALL"), var("HOME"), &KNOWN_BUN_DIRECTORIES, || {
-        crate::env::resolve_login_shell_env(None, None).get("PATH").map(std::ffi::OsString::from)
-    })
-}
-
-/// The search behind `find_bun`, with every input injected so it can be tested without depending
-/// on this machine's real environment. The login shell is consulted last and lazily: it costs a
-/// shell spawn, and the fixed locations already cover Homebrew and bun's own installer.
-fn locate_bun(
-    override_path: Option<std::ffi::OsString>,
-    path_var: Option<std::ffi::OsString>,
-    bun_install: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-    known_directories: &[&str],
-    login_shell_path: impl FnOnce() -> Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    if let Some(candidate) = override_path.map(PathBuf::from).filter(|p| is_executable_file(p)) {
-        return Some(candidate);
-    }
-    let in_path_list = |list: &std::ffi::OsString| std::env::split_paths(list).map(|dir| dir.join("bun")).find(|p| is_executable_file(p));
-    if let Some(found) = path_var.as_ref().and_then(in_path_list) {
-        return Some(found);
-    }
-    let fixed = bun_install
-        .map(|dir| PathBuf::from(dir).join("bin/bun"))
-        .into_iter()
-        .chain(home.map(|dir| PathBuf::from(dir).join(".bun/bin/bun")))
-        .chain(known_directories.iter().map(|dir| Path::new(dir).join("bun")));
-    for candidate in fixed {
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    login_shell_path().as_ref().and_then(in_path_list)
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-/// Evaluates a `.config.ts` module through a real `bun` subprocess and returns its exported
-/// `catalog` (or default export) as a `ServiceCatalog` — the Rust equivalent of the TS source's
-/// `loadTypeScriptCatalog`, which does this in-process via `await import(path)`. The script mirrors
-/// that function's own two failure messages (`failed to import ...` / `... must export a
-/// ServiceCatalog as \`catalog\` or a default export`) so error text stays the same across both
-/// implementations.
-fn load_typescript_catalog(path: &Path) -> Result<ServiceCatalog, ConfigFileLoadError> {
-    // `import()` of a *relative* specifier from a `bun -e` eval script doesn't resolve the way a
-    // shell would resolve a relative path against the process's cwd — bun has no natural "importer"
-    // file for an eval'd script to resolve a relative specifier against, and ends up trying
-    // node_modules-style resolution instead (reproduced with `--root ../..`: it tried to resolve the
-    // config path from *inside* this very crate's own installed npm package). Canonicalizing first
-    // sidesteps the whole ambiguity — `path` is already known to exist (the caller found it on disk),
-    // so this can't fail for a reason a caller could act on.
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let path_display = path.display().to_string();
-    // A JSON string literal is also a valid JS string literal (JSON's escaping is a subset of JS's),
-    // so this embeds the path directly into the script rather than threading it through argv, where
-    // bun's own argv-splitting rules for `-e ... -- ...` would need to be gotten exactly right.
-    let path_literal = serde_json::to_string(&path_display).unwrap();
-    let script = format!(
-        r#"try {{
-  const mod = await import({path_literal});
-  const catalog = mod.catalog ?? mod.default;
-  if (!catalog || typeof catalog !== "object" || !Array.isArray(catalog.services)) {{
-    console.error({path_literal} + " must export a ServiceCatalog as `catalog` or a default export");
-    process.exit(1);
-  }}
-  process.stdout.write(JSON.stringify(catalog));
-}} catch (cause) {{
-  console.error("failed to import " + {path_literal} + ": " + (cause instanceof Error ? cause.message : String(cause)));
-  process.exit(1);
-}}
-"#
-    );
-
-    let bun = find_bun().ok_or_else(|| ConfigFileLoadError {
-        path: Some(path.to_path_buf()),
-        errors: vec![format!(
-            "could not find `bun` to evaluate {path_display} (looked in $LOCAL_SERVICES_BUN_PATH, PATH, $BUN_INSTALL/bin, ~/.bun/bin, {}, and the login shell's PATH)",
-            KNOWN_BUN_DIRECTORIES.join(", ")
-        )],
-    })?;
-    let output = std::process::Command::new(&bun).arg("-e").arg(&script).output().map_err(|error| ConfigFileLoadError {
-        path: Some(path.to_path_buf()),
-        errors: vec![format!("failed to run {} to evaluate {path_display}: {error}", bun.display())],
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let message = if stderr.is_empty() { format!("bun exited with {} while evaluating {path_display}", output.status) } else { stderr };
-        return Err(ConfigFileLoadError { path: Some(path.to_path_buf()), errors: vec![message] });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str::<ServiceCatalog>(stdout.trim()).map_err(|error| ConfigFileLoadError {
-        path: Some(path.to_path_buf()),
-        errors: vec![format!("{path_display}: exported catalog does not match the expected ServiceCatalog shape: {error}")],
-    })
 }
 
 // -------------------------------------------------------------------------------------------
@@ -506,8 +378,21 @@ fn resolve_service_cwd(cwd: Option<&str>, path: &str, errors: &mut Vec<String>) 
 /// dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
 const TOP_LEVEL_KEYS: &[&str] = &["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
 const SERVICE_KEYS: &[&str] = &[
-    "label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls",
+    "label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "readinessTimeoutMs", "preparationCommand", "ports", "urls",
 ];
+
+fn read_positive_u64(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<u64> {
+    match value {
+        None => None,
+        Some(v) => match v.as_i64() {
+            Some(n) if n > 0 => Some(n as u64),
+            _ => {
+                errors.push(format!("{path} must be a positive integer"));
+                None
+            }
+        },
+    }
+}
 
 fn check_known_keys(value: &serde_json::Map<String, Value>, known: &[&str], path: &str, errors: &mut Vec<String>) {
     for key in value.keys() {
@@ -628,13 +513,14 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
         let readiness = read_readiness(obj.get("readiness").unwrap_or(&Value::Null), &format!("{svc_path}.readiness"), &mut errors);
         let ports = read_ports(obj.get("ports"), &format!("{svc_path}.ports"), &mut errors);
         let urls = read_urls(obj.get("urls"), &format!("{svc_path}.urls"), &mut errors);
+        let readiness_timeout_ms = read_positive_u64(obj.get("readinessTimeoutMs"), &format!("{svc_path}.readinessTimeoutMs"), &mut errors);
         let preparation_command = obj.get("preparationCommand").and_then(|v| read_preparation_command(v, &format!("{svc_path}.preparationCommand"), &mut errors));
 
         let mut profile_run: Option<ServiceRunProfile> = None;
         match obj.get("run") {
             None => {
                 if let Some(readiness) = readiness.clone() {
-                    profile_run = Some(ServiceRunProfile::Unresolved { readiness, readiness_timeout_ms: None, preparation: None, preparation_command: preparation_command.clone() });
+                    profile_run = Some(ServiceRunProfile::Unresolved { readiness, readiness_timeout_ms, preparation: None, preparation_command: preparation_command.clone() });
                 }
             }
             Some(run_value) => {
@@ -653,7 +539,7 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
                             docker_stop_command: stop.map(|s| s.spec),
                         },
                         readiness,
-                        readiness_timeout_ms: None,
+                        readiness_timeout_ms,
                         preparation: None,
                         preparation_command,
                     });
@@ -876,109 +762,35 @@ services:
         assert!(err.errors.iter().any(|e| e.contains("failed to parse")), "{:?}", err.errors);
     }
 
-    // These tests shell out to a real `bun` (same as `load_typescript_catalog` itself), matching
-    // this repo's own `bun test` requirement on every machine that runs the Rust suite — `bun` is
-    // already on PATH in CI (see `rust-test` in `.github/workflows/ci.yml`) and in dev.
-
     #[test]
-    fn config_ts_loads_a_named_catalog_export() {
+    fn leftover_config_ts_is_rejected_with_a_hint() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            &dir,
-            "local-services.config.ts",
-            r#"export const catalog = {
-  services: [{ id: "api", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["sleep", "30"] }, cwd: "." }, readiness: { kind: "process" } } } }],
-  groups: {},
-  startFailurePolicy: "stop-on-first-failure-keep-started",
-};
-"#,
-        );
-        let loaded = load_catalog_from_file(&path, dir.path()).expect("should load");
-        assert_eq!(loaded.catalog.services.len(), 1);
-        assert_eq!(loaded.catalog.services[0].id, "api");
+        write(&dir, "local-services.config.ts", "export const catalog = {};\n");
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("no longer accepted")), "{:?}", err.errors);
     }
 
     #[test]
-    fn config_ts_loads_a_default_catalog_export() {
+    fn a_typescript_path_is_rejected_directly() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            &dir,
-            "local-services.config.ts",
-            r#"export default {
-  services: [{ id: "web", profiles: { run: { commandStatus: "verified", command: { command: { shell: "exec sleep 30" }, cwd: "." }, readiness: { kind: "process" } } } }],
-  groups: {},
-  startFailurePolicy: "stop-on-first-failure-keep-started",
-};
-"#,
-        );
-        let loaded = load_catalog_from_file(&path, dir.path()).expect("should load");
-        assert_eq!(loaded.catalog.services[0].id, "web");
-    }
-
-    #[test]
-    fn config_ts_reports_a_clear_error_when_the_export_is_not_a_service_catalog() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(&dir, "local-services.config.ts", "export const catalog = {}");
+        let path = write(&dir, "local-services.config.ts", "export const catalog = {};\n");
         let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
-        assert!(err.errors.iter().any(|e| e.contains("must export a ServiceCatalog")), "{:?}", err.errors);
+        assert!(err.errors.iter().any(|e| e.contains("TypeScript catalog")), "{:?}", err.errors);
     }
 
     #[test]
-    fn config_ts_reports_a_clear_error_when_the_module_throws() {
+    fn maps_readiness_timeout_ms_onto_the_run_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(&dir, "local-services.config.ts", "throw new Error('boom');\nexport const catalog = {};\n");
-        let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
-        assert!(err.errors.iter().any(|e| e.contains("failed to import") && e.contains("boom")), "{:?}", err.errors);
-    }
-
-    #[test]
-    fn config_ts_reports_a_clear_error_for_a_custom_readiness_probe_since_a_closure_cannot_cross_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            &dir,
-            "local-services.config.ts",
-            r#"export const catalog = {
-  services: [{ id: "api", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["sleep", "30"] }, cwd: "." }, readiness: { kind: "custom", name: "probe", probe: async () => "ready" } } } }],
-  groups: {},
-  startFailurePolicy: "stop-on-first-failure-keep-started",
-};
-"#,
-        );
-        let err = load_catalog_from_file(&path, dir.path()).unwrap_err();
-        assert!(err.errors.iter().any(|e| e.contains("does not match the expected ServiceCatalog shape")), "{:?}", err.errors);
-    }
-
-    #[test]
-    fn config_ts_resolves_a_relative_path_before_handing_it_to_bun() {
-        // Regression test for a real bug found dogfooding this against a real project (a package
-        // whose scripts invoke `lsd --root ../..`, matching this repo's own `apps/macos`-style
-        // layout two directories below the actual project root): `bun -e`'s `import()` of a
-        // *relative* specifier doesn't resolve against the process's cwd the way a shell resolves a
-        // relative path — it attempts node_modules-style resolution instead, so a relative `--root`
-        // failed to import a real `.config.ts` even though the identical file loaded fine given an
-        // absolute path. `load_typescript_catalog` now canonicalizes before handing bun the path;
-        // this reproduces the original failure mode by mutating the process's own cwd for the
-        // duration of the test (restored via `original_cwd`, since `import()` needs a *relative*
-        // specifier — an absolute one never triggered the bug in the first place).
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("scripts/local-services-tui");
-        std::fs::create_dir_all(&sub).unwrap();
         write(
             &dir,
-            "local-services.config.ts",
-            r#"export const catalog = {
-  services: [{ id: "api", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["sleep", "30"] }, cwd: "." }, readiness: { kind: "process" } } } }],
-  groups: {},
-  startFailurePolicy: "stop-on-first-failure-keep-started",
-};
-"#,
+            "local-services.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: tcp, port: 8080 }\n    readinessTimeoutMs: 30000\n",
         );
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&sub).unwrap();
-        let result = load_catalog_from_file(Path::new("../../local-services.config.ts"), Path::new("../.."));
-        std::env::set_current_dir(&original_cwd).unwrap();
-        let loaded = result.expect("should load a .config.ts referenced by a relative path");
-        assert_eq!(loaded.catalog.services[0].id, "api");
+        let loaded = load_catalog(dir.path()).expect("should load");
+        match &loaded.catalog.services[0].profiles.run {
+            ServiceRunProfile::Verified { readiness_timeout_ms, .. } => assert_eq!(*readiness_timeout_ms, Some(30_000)),
+            _ => panic!("expected verified"),
+        }
     }
 
     #[test]
@@ -1038,7 +850,7 @@ services:
         assert_eq!(
             err.errors,
             vec![
-                "services.api has unknown key \"command\" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)"
+                "services.api has unknown key \"command\" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, readinessTimeoutMs, preparationCommand, ports, urls)"
                     .to_string()
             ]
         );
@@ -1096,66 +908,6 @@ services:
         );
         let error = load_catalog(dir.path()).expect_err("must not load");
         assert!(format!("{error:?}").contains("65535"), "{error:?}");
-    }
-
-    fn fake_bun(dir: &Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(dir).unwrap();
-        let bun = dir.join("bun");
-        std::fs::write(&bun, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
-        bun
-    }
-
-    fn os(value: &Path) -> Option<std::ffi::OsString> {
-        Some(value.as_os_str().to_owned())
-    }
-
-    const BARE_GUI_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-
-    /// Regression: the macOS app launched from the Dock hands `lsd` launchd's bare PATH, and a bare
-    /// `Command::new("bun")` then failed for every `.config.ts` catalog — both real consumers'.
-    #[test]
-    fn finds_bun_outside_a_bare_gui_path_via_bun_s_own_install_location() {
-        let home = tempfile::tempdir().unwrap();
-        let expected = fake_bun(&home.path().join(".bun/bin"));
-        let found = locate_bun(None, Some(BARE_GUI_PATH.into()), None, os(home.path()), &[], || panic!("login shell should not be needed"));
-        assert_eq!(found, Some(expected));
-    }
-
-    #[test]
-    fn finds_a_homebrew_style_install_from_the_known_directories() {
-        let brew = tempfile::tempdir().unwrap();
-        let expected = fake_bun(brew.path());
-        let known = [brew.path().to_str().unwrap()];
-        let found = locate_bun(None, Some(BARE_GUI_PATH.into()), None, None, &known, || panic!("login shell should not be needed"));
-        assert_eq!(found, Some(expected));
-    }
-
-    #[test]
-    fn falls_back_to_the_login_shell_s_path_last() {
-        let custom = tempfile::tempdir().unwrap();
-        let expected = fake_bun(custom.path());
-        let found = locate_bun(None, Some(BARE_GUI_PATH.into()), None, None, &[], || os(custom.path()));
-        assert_eq!(found, Some(expected));
-    }
-
-    #[test]
-    fn prefers_the_override_then_path_over_fixed_locations() {
-        let override_dir = tempfile::tempdir().unwrap();
-        let on_path = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let override_bun = fake_bun(override_dir.path());
-        let path_bun = fake_bun(on_path.path());
-        fake_bun(&home.path().join(".bun/bin"));
-        assert_eq!(locate_bun(os(&override_bun), os(on_path.path()), None, os(home.path()), &[], || None), Some(override_bun));
-        assert_eq!(locate_bun(None, os(on_path.path()), None, os(home.path()), &[], || None), Some(path_bun));
-    }
-
-    #[test]
-    fn reports_none_when_bun_is_nowhere() {
-        let empty = tempfile::tempdir().unwrap();
-        assert_eq!(locate_bun(None, Some(BARE_GUI_PATH.into()), None, os(empty.path()), &[], || None), None);
     }
 
     #[test]

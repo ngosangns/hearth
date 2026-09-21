@@ -71,7 +71,7 @@ private struct TrustPromptView: View {
         VStack(spacing: 16) {
             Image(systemName: "shield.lefthalf.filled").font(.system(size: 40)).foregroundStyle(.secondary)
             Text("Trust this folder?").font(.title2).bold()
-            Text("\(workspace.path)\n\nThis folder's local-services.yaml (or local-services.config.ts) names commands the daemon will run on your behalf. Only trust folders you wrote or downloaded from somewhere you trust.")
+            Text("\(workspace.path)\n\nThis folder's local-services.yaml names commands the daemon will run on your behalf. Only trust folders you wrote or downloaded from somewhere you trust.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

@@ -2,8 +2,8 @@ import Dispatch
 import Foundation
 
 /// Watches a workspace's root directory for writes and calls `onChange` (debounced) — used to trigger
-/// `lsd manager reload` when `local-services.yaml`/`.yml`/`.json`/`.config.ts` is edited, without this
-/// app needing to know which of those four filenames is actually in play (that's `config-file.ts`'s
+/// `lsd manager reload` when `local-services.yaml`/`.yml`/`.json` is edited, without this
+/// app needing to know which of those filenames is actually in play (that's `config-file.ts`'s
 /// job, re-run fresh on every `lsd` invocation).
 ///
 /// A lightweight `DispatchSource` on the directory's own file descriptor, not the FSEvents API proper

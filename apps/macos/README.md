@@ -1,7 +1,7 @@
 # Local Services (macOS app)
 
 A native SwiftUI front door for `@gnasdev/local-services`, alongside the CLI/TUI/MCP clients in
-`../../src`: add a folder that has a `local-services.yaml` (or `.config.ts`), and manage its
+`../../src`: add a folder that has a `local-services.yaml`, and manage its
 daemon-owned services from a menu-bar-friendly window instead of a terminal.
 
 Architecture is unchanged from the rest of the package — see the root [README](../../README.md):
@@ -33,8 +33,7 @@ heuristic that killed a compiled Bun executable doesn't apply to a compiled Rust
   `rust/target/{release,debug}/lsd` next to this checkout, so a plain `cargo build -p lsd` from
   `rust/` covers dev too.
 - [Bun](https://bun.sh) installed (`/opt/homebrew/bin/bun`, `/usr/local/bin/bun`, or `~/.bun/bin/bun`)
-  — only needed as a fallback (no `lsd` binary found anywhere) or if a workspace's catalog uses the
-  `.config.ts` escape hatch (the Rust `lsd` shells out to `bun` for that one case regardless).
+  — only needed as a fallback when no compiled `lsd` binary is found anywhere.
 ```bash
 cd apps/macos
 swift build     # or: swift run — a raw dev binary, resolves lsd from this checkout (see below)
@@ -82,7 +81,7 @@ design; `build-app.sh` just copies the committed `.icns` into the bundle.
   with a dropdown listing each one's status and a way to bring the main window forward.
 - FSEvents-ish config watch (`ConfigFileWatcher`, a `DispatchSource` on the workspace root — see its
   doc comment for why directory-level rather than the exact filename): editing
-  `local-services.yaml`/`.yml`/`.json`/`.config.ts` triggers `lsd manager reload` automatically,
+  `local-services.yaml`/`.yml`/`.json` triggers `lsd manager reload` automatically,
   debounced.
 - "Start All" / "Stop All" — in the main window's toolbar and in each menu bar dropdown row. Start
   goes through `/v1/operations/bulk-start` (every target started independently and concurrently,

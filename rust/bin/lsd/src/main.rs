@@ -134,7 +134,7 @@ usage: lsd [--root <path>] <command> [options]
   skill install --dest <path>           write the generic MCP skill doc
 
 Every command except --help/--version resolves a catalog from --root (default: cwd):
-local-services.yaml, .yml, .json, or .config.ts."
+local-services.yaml, .yml, or .json."
     );
 }
 

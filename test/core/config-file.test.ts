@@ -16,10 +16,10 @@ async function scratchRoot(): Promise<string> {
 }
 
 describe("findConfigFile", () => {
-  test("prefers yaml, then yml, then json, then the .ts escape hatch", async () => {
+  test("prefers yaml, then yml, then json, and ignores a leftover .config.ts", async () => {
     const root = await scratchRoot();
     await writeFile(join(root, "local-services.config.ts"), "export const catalog = {};");
-    expect(await findConfigFile(root)).toBe(join(root, "local-services.config.ts"));
+    expect(await findConfigFile(root)).toBeUndefined();
     await writeFile(join(root, "local-services.json"), "{}");
     expect(await findConfigFile(root)).toBe(join(root, "local-services.json"));
     await writeFile(join(root, "local-services.yml"), "version: 1");
@@ -198,23 +198,40 @@ services:
   });
 });
 
-describe("loadCatalog (.config.ts escape hatch)", () => {
-  test("imports a hand-authored ServiceCatalog", async () => {
+describe("loadCatalog (no TypeScript catalogs)", () => {
+  test("hints that a leftover .config.ts is no longer accepted", async () => {
     const root = await scratchRoot();
-    await writeFile(
-      join(root, "local-services.config.ts"),
-      `export const catalog = { startFailurePolicy: "stop-on-first-failure-keep-started", groups: {}, services: [{ id: "x", profiles: { run: { commandStatus: "verified", command: { command: { argv: ["x"] }, cwd: "." }, readiness: { kind: "process" } } } }] };\n`,
-    );
-    const result = await loadCatalog(root);
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.catalog.services.map((s) => s.id)).toEqual(["x"]);
-  });
-
-  test("rejects a .config.ts that doesn't export a catalog", async () => {
-    const root = await scratchRoot();
-    await writeFile(join(root, "local-services.config.ts"), "export const somethingElse = 1;\n");
+    await writeFile(join(root, "local-services.config.ts"), "export const catalog = {};\n");
     const result = await loadCatalog(root);
     expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors.some((e) => e.includes("no longer accepted"))).toBe(true);
+  });
+
+  test("rejects loading a .ts path directly", async () => {
+    const root = await scratchRoot();
+    const path = join(root, "local-services.config.ts");
+    await writeFile(path, "export const catalog = {};\n");
+    const result = await loadCatalogFromFile(path, root);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors.some((e) => e.includes("TypeScript catalog"))).toBe(true);
+  });
+});
+
+describe("readinessTimeoutMs", () => {
+  test("maps onto the run profile", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), `version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: tcp, port: 8080 }\n    readinessTimeoutMs: 30000\n`);
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.catalog.services[0]!.profiles.run.readinessTimeoutMs).toBe(30_000);
+  });
+
+  test("rejects a non-positive timeout", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), `version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    readinessTimeoutMs: 0\n`);
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors.some((e) => e.includes("readinessTimeoutMs"))).toBe(true);
   });
 });
 
@@ -249,7 +266,7 @@ describe("unknown keys", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.errors).toEqual([
-      'services.api has unknown key "command" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)',
+      'services.api has unknown key "command" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, readinessTimeoutMs, preparationCommand, ports, urls)',
     ]);
   });
 });

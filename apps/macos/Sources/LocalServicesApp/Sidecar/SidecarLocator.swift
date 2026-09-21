@@ -51,10 +51,10 @@ enum SidecarLocator {
         "\(NSHomeDirectory())/.bun/bin/bun",
     ]
 
-    /// Same rationale as `knownBunPaths` — a GUI-launched app's bare `PATH` won't have wherever
-    /// `cargo install`/a package manager put a compiled `lsd`.
+    /// Installed `lsd` lives inside Local Services.app (`task rust:install` / `macos:install`).
+    /// A GUI-launched app's bare `PATH` will not include that bundle, so look there by absolute path.
     private static let knownLsdBinaryPaths = [
-        "/opt/homebrew/bin/lsd",
+        "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd",
         "/usr/local/bin/lsd",
         "\(NSHomeDirectory())/.cargo/bin/lsd",
     ]

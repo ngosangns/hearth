@@ -892,7 +892,7 @@ mod tests {
     }
 
     /// Real end-to-end test of the declarative `preparation_command` (the JSON-serializable
-    /// stand-in for a bespoke `PreparationAdapter` added to unblock a `.config.ts`/YAML-only
+    /// stand-in for a bespoke `PreparationAdapter` added to unblock a YAML-only
     /// consumer whose real services depend on a prepare step — see AGENTS.md's Rust-rewrite status
     /// for the `viclass` cutover this was built to unblock). Proves the whole real chain: catalog
     /// declares a command, the engine calls the real `DefaultProbeAdapter::command` (the same

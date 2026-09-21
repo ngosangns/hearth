@@ -26,8 +26,8 @@ This repo ships the product twice, and both are live:
 - **TypeScript (`src/`)** — what this README documents, and what the npm package publishes.
 - **Rust (`rust/`)** — a full rewrite at feature parity, compiled to a standalone `lsd` binary. It
   speaks the same HTTP+SSE protocol and reads/writes the same state, so it is a drop-in replacement
-  for a consumer that would rather install one binary than depend on Bun. `apps/macos` and `infra`
-  use it; `viclass` is still on the TypeScript build.
+  for a consumer that would rather install one binary than depend on Bun. `apps/macos`, `infra`,
+  and `viclass` all drive it from a `local-services.yaml`.
 
 The Rust binary additionally has `lsd mcp` (serve MCP over stdio), `lsd mcp install` and
 `lsd skill install`, which the TypeScript CLI does not. See [AGENTS.md](AGENTS.md) for how the two
@@ -38,8 +38,7 @@ relate, how to build and install the binary, and which differences are deliberat
 Bun-only, v1. This package uses `Bun.serve`, `Bun.spawn` (detached, argv-only, process-group
 signaling) and `bun:test` directly — there is no Node runtime fallback. Node projects can still
 shell out to it via `@gnasdev/local-services/node-bridge` (see below), or spawn the compiled Rust
-`lsd` binary, which needs no Bun at all unless the project's catalog uses the `.config.ts` escape
-hatch.
+`lsd` binary, which needs no Bun at all.
 
 ## Subpath exports
 
@@ -143,10 +142,9 @@ await server.connect(new StdioServerTransport());
 
 ## Declarative config: `local-services.yaml` and the `lsd` binary
 
-The "one file per consumer" pattern above is still the full-power option, but a project that doesn't
-need a `custom` readiness probe closure or computed service lists can skip writing `catalog.ts` /
-`daemon.ts` / `cli.ts` entirely. Drop a `local-services.yaml` (`.yml`/`.json` also work; JSON is valid
-YAML) in the project root:
+The "one file per consumer" pattern above is still the full-power option, but a project can skip
+writing `catalog.ts` / `daemon.ts` / `cli.ts` entirely. Drop a `local-services.yaml` (`.yml`/`.json`
+also work; JSON is valid YAML) in the project root. TypeScript catalogs are not accepted:
 
 ```yaml
 version: 1
@@ -165,6 +163,7 @@ services:
     build: { argv: [go, build, ./...], timeoutMs: 120000, serializationKey: go }
     run: { shell: "air -c .air.toml", exec: true }
     readiness: { kind: tcp, port: 8080 }
+    readinessTimeoutMs: 30000
     ports: [{ port: 6060, label: pprof }]
     urls:
       - http://127.0.0.1:8080
@@ -195,10 +194,6 @@ lsd daemon --root .     # the daemon entrypoint lsd spawns itself, detached — 
 `manager ensure --json` is the connection contract for a non-Bun client (a desktop app's sidecar
 process, say): it ensures a daemon is running for `--root` and prints everything needed to talk to it
 directly over HTTP+SSE, without that client re-implementing this package's lock-file discovery.
-
-For anything the declarative shape can't express, drop to `local-services.config.ts` instead (same
-filename slot, checked last) — it must `export const catalog` (or a default export) as a hand-authored
-`ServiceCatalog`, same as the `catalog.ts` in the example above.
 
 Two related, independently-usable pieces from `/core`:
 
@@ -300,7 +295,7 @@ bun test
 bun run typecheck
 ```
 
-The Rust workspace is separate, and needs `bun`, a running `docker`, and `tailscale` on the machine
+The Rust workspace is separate, and needs a running `docker` and `tailscale` on the machine
 for its real-adapter tests:
 
 ```bash
@@ -310,11 +305,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 `task --list` shows both, plus `task rust:install` (build the `lsd` binary in release mode, install
-it to `/opt/homebrew/bin`, ad-hoc sign it) and the `macos:*` targets.
+it to `/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd`, ad-hoc sign it) and the
+`macos:*` targets.
 
 > **Careful with a bare `lsd` in a package.json script.** `bun run` prepends `node_modules/.bin` to
 > PATH and this package ships its own `lsd` bin, so a bare `lsd` resolves to the TypeScript shim —
-> not the installed Rust binary, which has a different command surface. Use an absolute path.
+> not the compiled Rust binary, which has a different command surface. Point at the app-bundled
+> binary: `/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd`.
 
 ## CI / publishing
 
