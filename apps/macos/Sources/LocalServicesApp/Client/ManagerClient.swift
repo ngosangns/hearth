@@ -1,8 +1,5 @@
-// Thin HTTP client for one daemon's loopback API (src/core/manager.ts's `handleRequest`). One
-// instance per workspace; the connection (host/port/token/protocolVersion) comes from
-// `DaemonConnection`/`lsd manager ensure --json`, not from anything this client discovers itself —
-// mirrors how the CLI/TUI/MCP clients in the package itself never touch lock-file discovery directly
-// either, they go through `localctl.ts`'s `ensure`.
+// Thin HTTP client for one daemon's loopback API. One instance per workspace; the connection
+// (host/port/token/protocolVersion) comes from `DaemonConnection`/`lsd manager ensure --json`.
 //
 // Polling, not SSE, for v1: `GET /v1/services` on a timer (see `WorkspaceController`). The daemon's
 // `/v1/events/stream` (SSE) is the lower-latency path the TUI/CLI use, and is a documented fast
@@ -54,7 +51,7 @@ final class ManagerClient: ManagerAPI {
         try await get("/v1/manager", as: ManagerInfo.self)
     }
 
-    /// `cursor`/`generation` mirror what `src/core/manager.ts`'s `/v1/logs/:serviceId` expects — pass
+    /// `cursor`/`generation` mirror what `GET /v1/logs/:serviceId` expects — pass
     /// back the previous slice's `nextCursor`/`generation` to continue tailing; omit both for the
     /// initial fetch. A `reset: true` slice (the log rotated or the caller's `generation` was stale)
     /// means the caller should replace its buffer, not append.

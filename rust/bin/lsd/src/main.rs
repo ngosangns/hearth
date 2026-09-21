@@ -1,4 +1,4 @@
-//! Port of `src/bin/lsd.ts` — the generic declarative-config binary every consumer (a desktop app's
+//! The generic declarative-config binary every consumer (a desktop app's
 //! sidecar, a `local-services.yaml`-only project) shells out to. Phase 5 of the Rust-rewrite plan.
 //! `lsd daemon --root <path>` is the daemon entrypoint this binary spawns detached; every other
 //! subcommand delegates to `ls_cli::main`.

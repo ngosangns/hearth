@@ -1,7 +1,7 @@
 // Decode-fidelity tests: every fixture below is byte-for-byte real output, captured from a live
-// daemon (`bun run src/bin/lsd.ts ... manager ensure/start`, then `curl`ing each endpoint directly)
+// daemon (`lsd ... manager ensure/start`, then `curl`ing each endpoint directly)
 // rather than hand-written to match what the Swift models expect. This is the one place that would
-// catch these Codable structs silently drifting from what `src/core/manager.ts` actually sends.
+// catch these Codable structs silently drifting from what the daemon actually sends.
 
 import XCTest
 @testable import LocalServicesApp

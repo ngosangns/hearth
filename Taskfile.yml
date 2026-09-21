@@ -3,6 +3,7 @@ version: "3"
 vars:
   MACOS_DIR: apps/macos
   APP_NAME: Local Services.app
+  LSD_BIN: "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd"
 
 tasks:
   dev:
@@ -11,18 +12,8 @@ tasks:
     cmds:
       - ./scripts/dev.sh
 
-  test:
-    desc: Run the package's Bun test suite (src/, test/)
-    cmds:
-      - bun test
-
-  typecheck:
-    desc: Type-check the package (tsc --noEmit)
-    cmds:
-      - bun run typecheck
-
   rust:test:
-    desc: Run the Rust workspace test suite (needs bun, docker running, tailscale, nc, ps)
+    desc: Run the Rust workspace test suite (needs docker running, tailscale, nc, ps, sh)
     dir: rust
     cmds:
       - cargo test --workspace
@@ -36,8 +27,6 @@ tasks:
   rust:install:
     desc: Build the lsd binary in release mode and install it into Local Services.app (ad-hoc signed)
     dir: rust
-    vars:
-      LSD_BIN: "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd"
     cmds:
       - cargo build --release -p lsd
       - mkdir -p "/Applications/Local Services.app/Contents/Resources/lsd/bin"
@@ -48,10 +37,8 @@ tasks:
       - echo "installed $("{{.LSD_BIN}}" --version) at {{.LSD_BIN}}"
 
   ci:
-    desc: Everything CI runs (TS test + typecheck, plus the Rust test and clippy jobs)
+    desc: Everything CI runs (Rust test + clippy)
     cmds:
-      - task: test
-      - task: typecheck
       - task: rust:test
       - task: rust:clippy
 

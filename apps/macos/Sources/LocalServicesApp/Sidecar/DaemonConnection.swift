@@ -1,8 +1,7 @@
-// Spawns `bun run <lsd.ts> --root <workspace> manager ensure --json` — a one-shot subprocess call,
-// not a long-lived one (the daemon it starts is itself detached, per `runDaemon`'s
-// `Bun.spawn(..., detached: true)`; this app never holds a handle to the daemon process, only to the
-// short-lived `lsd manager ensure` call that finds-or-starts it and hands back a connection). Mirrors
-// exactly what `lsd manager ensure` does for a terminal user — see src/cli/localctl.ts's `ensure`.
+// Spawns `lsd --root <workspace> manager ensure --json` — a one-shot subprocess call, not a
+// long-lived one (the daemon it starts is itself detached; this app never holds a handle to the
+// daemon process, only to the short-lived `lsd manager ensure` call that finds-or-starts it and
+// hands back a connection).
 
 import Foundation
 
@@ -40,25 +39,19 @@ enum DaemonConnection {
     }
 
     /// Re-reads `root`'s config file and pushes it to the running daemon — `lsd manager reload`
-    /// (src/cli/localctl.ts's `manager reload`, which loads fresh from disk on every `lsd`
-    /// invocation). Used by `ConfigFileWatcher` to react to a `local-services.yaml` edit.
+    /// (loads fresh from disk on every `lsd` invocation). Used by `ConfigFileWatcher` to react to
+    /// a `local-services.yaml` edit.
     static func reload(root: String) async throws {
         _ = try await runLsd(root: root, args: ["manager", "reload", "--json"])
     }
 
     private static func runLsd(root: String, args: [String], timeout: Duration = .seconds(60)) async throws -> String {
         let process = Process()
-        if let lsdBinary = SidecarLocator.findLsdBinary() {
-            // Preferred: the real compiled binary, no `bun` needed at all.
-            process.executableURL = URL(fileURLWithPath: lsdBinary)
-            process.arguments = ["--root", root] + args
-        } else {
-            // Fallback: `bun run <lsd.ts>` against the original TypeScript source.
-            guard let bun = SidecarLocator.findBun() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.bunNotFound) }
-            guard let lsdEntry = SidecarLocator.findLsdEntry() else { throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.lsdEntryNotFound("<unresolved>")) }
-            process.executableURL = URL(fileURLWithPath: bun)
-            process.arguments = ["run", lsdEntry, "--root", root] + args
+        guard let lsdBinary = SidecarLocator.findLsdBinary() else {
+            throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.lsdBinaryNotFound)
         }
+        process.executableURL = URL(fileURLWithPath: lsdBinary)
+        process.arguments = ["--root", root] + args
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout

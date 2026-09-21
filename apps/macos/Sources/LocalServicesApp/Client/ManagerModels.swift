@@ -1,5 +1,5 @@
-// Swift mirrors of the wire shapes `@gnasdev/local-services/core` (src/core/state.ts, src/core/
-// catalog.ts, src/core/manager.ts) sends over HTTP+SSE. Kept intentionally permissive (lots of
+// Swift mirrors of the wire shapes `ls-core` (rust/crates/ls-core/src/state.rs,
+// rust/crates/ls-core/src/manager/) sends over HTTP+SSE. Kept intentionally permissive (lots of
 // optional fields, no strict enums for `identity`'s POSIX/Docker union) rather than a byte-for-byte
 // port of the TS types — this client only needs enough to render status and drive start/stop/restart,
 // and a permissive decode degrades gracefully instead of breaking the whole app on a field this

@@ -24,8 +24,8 @@ if [ ! -x "$executable" ]; then
   exit 1
 fi
 
-# Rust `lsd` release binary — bundled so a packaged app needs no `bun` install at all
-# (SidecarLocator.findLsdBinary() checks this bundled copy before any fallback). Built with the
+# Rust `lsd` release binary — bundled so a packaged app needs no extra install.
+# SidecarLocator.findLsdBinary() checks this bundled copy first. Built with the
 # workspace's own Cargo, independent of `configuration` above (Swift's debug/release, not Cargo's).
 rust_dir="$repo_root/rust"
 echo "==> cargo build --release -p lsd"
@@ -38,9 +38,6 @@ fi
 
 app_bundle="$app_root/.build/Local Services.app"
 rm -rf "$app_bundle"
-# NOTE: deliberately does NOT pre-create Resources/lsd/src. `cp -R src <dest>` copies the directory
-# *into* <dest> when <dest> already exists, which put the fallback at lsd/src/src/bin/lsd.ts —
-# a path SidecarLocator.findLsdEntry() does not look at, silently disabling the bundled fallback.
 mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources/lsd/bin"
 
 echo "==> assembling bundle at $app_bundle"
@@ -52,11 +49,6 @@ else
   echo "warning: $app_root/AppIcon.icns not found — run scripts/generate-icon.sh first" >&2
 fi
 cp "$lsd_binary" "$app_bundle/Contents/Resources/lsd/bin/lsd"
-# Only src/ — not node_modules, not test/. Kept as a fallback for a machine where the bundled `lsd`
-# binary somehow can't run; see SidecarLocator.swift's doc comment. This app only ever runs the `lsd`
-# commands that touch core/cli (manager ensure/reload/stop, start/stop/restart, status, logs), none
-# of which need tui's or mcp's dependencies, so the fallback bundles only `src/`.
-cp -R "$repo_root/src" "$app_bundle/Contents/Resources/lsd/src"
 
 echo "==> ad-hoc codesign (local use only — see this script's header comment)"
 codesign --force --sign - "$app_bundle/Contents/Resources/lsd/bin/lsd"
@@ -64,5 +56,4 @@ codesign --force --deep --sign - "$app_bundle"
 
 echo "==> done: $app_bundle"
 echo "    First launch via Finder needs a right-click > Open (ad-hoc signed, not notarized)."
-echo "    Bundles a compiled \`lsd\` — no \`bun\` install needed on this machine for the common path;"
-echo "    bun is only needed as a fallback, or if this workspace's own catalog uses the .config.ts escape hatch."
+echo "    Bundles a compiled \`lsd\` sidecar."

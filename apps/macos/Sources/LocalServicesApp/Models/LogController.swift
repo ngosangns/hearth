@@ -1,14 +1,14 @@
 import Foundation
 
 /// One service's live log tail: polls `GET /v1/logs/:serviceId` on a timer, following the
-/// cursor/generation protocol `localctl.ts`'s own `logs()` uses (see `ManagerClient.logs`'s doc
+/// cursor/generation protocol `lsd logs` uses (see `ManagerClient.logs`'s doc
 /// comment). One instance per selected service (see `ServiceLogPanel`) — created fresh whenever the
 /// selection changes, not shared/cached.
 @MainActor
 final class LogController: ObservableObject {
     @Published private(set) var text: String = ""
     @Published var lastError: String?
-    /// Set once the daemon reports `service_not_found` (`src/core/manager.ts`'s `/v1/logs/:id`) —
+    /// Set once the daemon reports `service_not_found` (`GET /v1/logs/:id`) —
     /// the service was removed from the catalog (e.g. a config-file edit + hot-reload) while this
     /// panel was open. Polling stops for good at that point: the id will never become valid again on
     /// its own, so retrying forever would just hammer the daemon with the same 404. The view is
