@@ -337,12 +337,22 @@ async fn service_rows(client: &Client) -> LocalctlResult<Vec<ServiceLifecycleSta
     serde_json::from_value(body["services"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })
 }
 
+/// The state `lsd status` prints. In-flight states collapse into "running", but a state that
+/// means something went wrong or is out of this daemon's hands is NEVER collapsed into "stopped".
+/// It used to be: a crashed service (`failed`, still `desiredState: running`) printed as "stopped",
+/// indistinguishable from one that was simply never started, while the TUI, the macOS app and the
+/// MCP tools all reported it as failed. Four viclass services sat in that state for two days with
+/// `lsd status` calling them stopped.
 fn text_state(state: Option<&ServiceLifecycleState>) -> &'static str {
     match state.map(|s| s.actual_state) {
         Some(ActualServiceState::Ready) => "ready",
         Some(ActualServiceState::QueuedStart) => "queued-start",
         Some(ActualServiceState::Running) | Some(ActualServiceState::RunningUnready) | Some(ActualServiceState::Starting) | Some(ActualServiceState::Preparing) => "running",
-        _ => "stopped",
+        Some(ActualServiceState::Stopping) => "stopping",
+        Some(ActualServiceState::Failed) => "failed",
+        Some(ActualServiceState::Orphaned) => "orphaned",
+        Some(ActualServiceState::ExternallyOwned) => "externally-owned",
+        Some(ActualServiceState::Stopped) | None => "stopped",
     }
 }
 
@@ -1277,5 +1287,46 @@ mod tests {
         let (code, _out, err) = run_cli(dir.path(), &["skill", "install"]).await;
         assert_eq!(code, EXIT_USAGE);
         assert!(err[0].contains("usage: local-services skill install"));
+    }
+
+    /// A failed service must not print as "stopped" — that made a crash indistinguishable from a
+    /// service nobody started, while every other surface (TUI, macOS app, MCP) reported it failed.
+    #[test]
+    fn text_state_never_hides_a_failure_as_stopped() {
+        use ls_core::state::{DesiredServiceState, ServiceReadiness};
+        let state = |actual: ActualServiceState| ServiceLifecycleState {
+            service_id: "svc".to_string(),
+            desired_state: DesiredServiceState::Running,
+            actual_state: actual,
+            readiness: ServiceReadiness::Unknown,
+            generation: 1,
+            identity: None,
+            readiness_kind: None,
+            readiness_detail: None,
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+            exited_at: None,
+            exit_code: None,
+            error: None,
+            current_operation_id: None,
+        };
+        let expected = [
+            (ActualServiceState::Stopped, "stopped"),
+            (ActualServiceState::QueuedStart, "queued-start"),
+            (ActualServiceState::Preparing, "running"),
+            (ActualServiceState::Starting, "running"),
+            (ActualServiceState::Running, "running"),
+            (ActualServiceState::RunningUnready, "running"),
+            (ActualServiceState::Ready, "ready"),
+            (ActualServiceState::Stopping, "stopping"),
+            (ActualServiceState::Failed, "failed"),
+            (ActualServiceState::Orphaned, "orphaned"),
+            (ActualServiceState::ExternallyOwned, "externally-owned"),
+        ];
+        assert_eq!(expected.len(), ActualServiceState::ALL.len(), "a new state needs an explicit CLI rendering");
+        for (actual, printed) in expected {
+            assert_eq!(text_state(Some(&state(actual))), printed, "{actual:?}");
+        }
+        assert_eq!(text_state(None), "stopped");
     }
 }

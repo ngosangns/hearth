@@ -257,8 +257,31 @@ export async function waitOperation(client: Client, id: string, runtime: Localct
 const print = (value: unknown, json: boolean, runtime: LocalctlRuntime): void =>
   output(runtime, json ? JSON.stringify(value) : typeof value === "string" ? value : JSON.stringify(value, null, 2));
 const serviceRows = async (client: Client, runtime: LocalctlRuntime): Promise<ServiceLifecycleState[]> => ((await request(client, "/v1/services", {}, runtime)) as { services: ServiceLifecycleState[] }).services;
-const textState = (state: ServiceLifecycleState | undefined): string =>
-  state?.actualState === "ready" ? "ready" : state?.actualState === "queued-start" ? "queued-start" : state && ["running", "running-unready", "starting", "preparing"].includes(state.actualState) ? "running" : "stopped";
+/** The state `status` prints. In-flight states collapse into "running", but a state that means
+ * something went wrong or is out of this daemon's hands is NEVER collapsed into "stopped" — it used
+ * to be, so a crashed service (failed, still desiredState: running) printed as "stopped",
+ * indistinguishable from one never started, while the TUI, the macOS app and the MCP tools all
+ * reported it as failed. */
+const textState = (state: ServiceLifecycleState | undefined): string => {
+  switch (state?.actualState) {
+    case "ready":
+      return "ready";
+    case "queued-start":
+      return "queued-start";
+    case "running":
+    case "running-unready":
+    case "starting":
+    case "preparing":
+      return "running";
+    case "stopping":
+    case "failed":
+    case "orphaned":
+    case "externally-owned":
+      return state.actualState;
+    default:
+      return "stopped";
+  }
+};
 
 export async function cleanup(root: string, options: LocalctlOptions, runtime: LocalctlRuntime = {}): Promise<void> {
   const io = createFileIo(options.catalog.privateFileGuard !== false);

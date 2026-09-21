@@ -41,7 +41,18 @@ struct MenuBarLabel: View {
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
 
     var body: some View {
-        Label(MenuBarSummary.compute(workspaces: workspaceStore.workspaces, registry: registry).labelText, systemImage: "server.rack")
+        let summary = MenuBarSummary.compute(workspaces: workspaceStore.workspaces, registry: registry)
+        // Explicit icon + text, not `Label`: a MenuBarExtra renders a `Label` as its icon alone, so
+        // the counts were computed on every change and never shown — the status item was a bare
+        // 38pt icon, which defeated the point of a glanceable summary with the window closed. Text
+        // only appears once there is something to count, so an empty or still-connecting app keeps
+        // a compact icon instead of the placeholder "Local Services".
+        HStack(spacing: 4) {
+            Image(systemName: "server.rack")
+            if summary.total > 0 {
+                Text(summary.labelText)
+            }
+        }
     }
 }
 

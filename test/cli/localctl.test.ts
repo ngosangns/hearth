@@ -136,6 +136,26 @@ describe("localctl", () => {
     expect(output).toEqual(["queued-start metadata"]);
   });
 
+  // A failed service used to print as "stopped" — indistinguishable from one nobody started, while
+  // the TUI, the macOS app and the MCP tools all reported it failed.
+  test.each([
+    ["failed", "failed"],
+    ["orphaned", "orphaned"],
+    ["externally-owned", "externally-owned"],
+    ["stopping", "stopping"],
+    ["running-unready", "running"],
+    ["stopped", "stopped"],
+  ])("status prints %s as %s, never hiding a failure as stopped", async (actualState, printed) => {
+    const output: string[] = [];
+    const runtime: LocalctlRuntime = {
+      discover: async () => live(),
+      request: async (_client, path) => (path === "/v1/services" ? { services: [{ serviceId: "metadata", actualState }] } : {}),
+      output: (line) => output.push(line),
+    };
+    expect(await main(options, ["status", "metadata"], runtime)).toBe(0);
+    expect(output).toEqual([`${printed} metadata`]);
+  });
+
   test("continues polling a running operation beyond the former two-minute deadline", async () => {
     let now = 0;
     let polls = 0;
