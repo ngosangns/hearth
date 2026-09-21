@@ -831,7 +831,24 @@ export class LocalServicesManager {
       let changed = false;
       for (const serviceId of serviceIds) {
         const previous = this.state.services[serviceId] ?? { serviceId, desiredState: "stopped" as const, actualState: "stopped" as const, readiness: "unknown" as const, generation: 0, createdAt: timestamp, updatedAt: timestamp };
-        if (previous.actualState !== "stopped") continue;
+        if (previous.actualState !== "stopped") {
+          // Already up, or mid-flight. Its actual state must not be disturbed — but the INTENT
+          // still has to be recorded, because startSelectedDag skips any node whose desiredState
+          // is not "running" ("start cancelled") before it ever checks whether the node is
+          // already ready.
+          //
+          // Skipping this left a service that is genuinely ready but carries a stale
+          // desiredState: "stopped" in a state it could never leave: the DAG skipped it, every
+          // dependent was reported Blocked, and the operation still reported success — so nothing
+          // surfaced the problem. Reached easily in practice, because `manager stop` sets
+          // desiredState: "stopped" for everything and an adopted docker/tailnet unit then comes
+          // back as "ready" on the next daemon start with that stale intent attached.
+          if (previous.desiredState !== "running") {
+            this.state.services[serviceId] = { ...previous, desiredState: "running", updatedAt: timestamp };
+            changed = true;
+          }
+          continue;
+        }
         const next: ServiceLifecycleState = { ...previous, desiredState: "running", actualState: "queued-start", readiness: "unknown", updatedAt: timestamp, currentOperationId: operationId };
         this.state.services[serviceId] = next;
         this.events.publish("service.lifecycle", { serviceId, actualState: next.actualState, generation: next.generation, operationId });

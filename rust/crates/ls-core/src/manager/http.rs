@@ -624,6 +624,22 @@ async fn queue_stopped_services_for_start(manager: &Arc<LocalServicesManager>, s
     for service_id in service_ids {
         let previous = state.services.get(service_id).cloned().unwrap_or_else(|| default_state_or(None, service_id, &timestamp));
         if previous.actual_state != crate::state::ActualServiceState::Stopped {
+            // Already up, or mid-flight. Its actual state must not be disturbed — but the INTENT
+            // still has to be recorded, because `start_selected_dag` skips any node whose
+            // `desired_state` is not `running` ("start cancelled") before it ever checks whether
+            // the node is already ready.
+            //
+            // Skipping this left a service that is genuinely ready but carries a stale
+            // `desired_state: stopped` in a state it could never leave: the DAG skipped it, every
+            // dependent was reported `Blocked`, and the operation still reported success — so
+            // nothing surfaced the problem. Reached easily in practice, because `manager stop`
+            // sets `desired_state: stopped` for everything and an adopted docker/tailnet unit then
+            // comes back as `ready` on the next daemon start with that stale intent attached.
+            if previous.desired_state != crate::state::DesiredServiceState::Running {
+                let next = ServiceLifecycleState { desired_state: crate::state::DesiredServiceState::Running, updated_at: timestamp.clone(), ..previous };
+                state.services.insert(service_id.clone(), next);
+                changed = true;
+            }
             continue;
         }
         let next = ServiceLifecycleState {
@@ -1336,6 +1352,85 @@ mod tests {
         let state_of = |id: &str| states.iter().find(|s| s.service_id == id).cloned().expect("service present");
         assert_eq!(state_of("db").actual_state, crate::state::ActualServiceState::Ready, "the dependency must be started, not left stopped");
         assert_eq!(state_of("api").actual_state, crate::state::ActualServiceState::Ready);
+
+        manager.close().await;
+    }
+
+    /// Regression for a deadlock reachable from an ordinary restart: a service that is genuinely
+    /// ready but carries a stale `desired_state: stopped` could never be started, and permanently
+    /// blocked every dependent — while the operation still reported success.
+    ///
+    /// How it is reached: `manager stop` sets `desired_state: stopped` for everything, then the
+    /// next daemon adopts an externally-owned docker/tailnet unit back as `ready` with that stale
+    /// intent still attached. `start_selected_dag` checks `desired_state` before it checks whether
+    /// the node is already ready, so it reported `Skipped: <dep> (start cancelled)` and cascaded
+    /// `Blocked` to everything downstream. `queue_stopped_services_for_start` could not fix the
+    /// intent either, because it only ever touched services whose actual state was `stopped`.
+    #[tokio::test]
+    async fn a_ready_dependency_with_a_stale_desired_state_does_not_block_its_dependents() {
+        let db_port = free_port();
+        let api_port = free_port();
+        let mut api = tcp_service("api", api_port);
+        api.dependencies = Some(vec!["db".to_string()]);
+        let catalog = ServiceCatalog {
+            services: vec![tcp_service("db", db_port), api],
+            groups: HashMap::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: Some(false),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = bootstrap(LocalServicesManagerOptions {
+            runtime_directory: Some(dir.path().to_path_buf()),
+            root: Some(PathBuf::from("/tmp")),
+            catalog,
+            event_capacity: None,
+            log_tail_bytes: None,
+            log_max_bytes: None,
+            log_rotation_count: None,
+            supervisor: None,
+        })
+        .await
+        .unwrap();
+
+        let base = manager.base_url();
+        let token = manager.bearer_token().to_string();
+        let client = reqwest::Client::new();
+
+        // Bring `db` up, then forge exactly the state a restart leaves behind: actually ready,
+        // but with the intent still recorded as stopped.
+        manager.supervisor().start(&"db".to_string(), None).await.unwrap();
+        {
+            let mut state = manager.state.lock().unwrap();
+            let db = state.services.get_mut("db").expect("db present");
+            assert_eq!(db.actual_state, crate::state::ActualServiceState::Ready);
+            db.desired_state = crate::state::DesiredServiceState::Stopped;
+        }
+
+        let accepted: Value = client
+            .post(format!("{base}/v1/operations"))
+            .bearer_auth(&token)
+            .header("x-local-services-protocol", "1")
+            .json(&json!({ "requestId": "req-stale-intent", "serviceId": "api", "action": "start" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let operation_id = accepted["operation"]["id"].as_str().unwrap().to_string();
+        let settled = wait_for_operation(&client, &base, &token, &operation_id).await;
+        assert_eq!(settled["operation"]["status"], "succeeded", "{settled:?}");
+
+        let states = manager.service_states();
+        let state_of = |id: &str| states.iter().find(|s| s.service_id == id).cloned().expect("service present");
+        assert_eq!(state_of("db").actual_state, crate::state::ActualServiceState::Ready);
+        assert_eq!(
+            state_of("api").actual_state,
+            crate::state::ActualServiceState::Ready,
+            "a ready dependency with a stale desired_state must not block its dependent"
+        );
 
         manager.close().await;
     }
