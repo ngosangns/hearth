@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { closeSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,9 +40,15 @@ test("a process-service survives even when nothing ever reads its output", async
     // SIGPIPE almost instantly (this is the actual bug: real dev servers behave the same way once
     // the daemon that used to read their stdout pipe is gone). The file-backed redirect must not
     // have this failure mode at all.
-    await Bun.sleep(600);
+    // Wait for the writer to actually produce output rather than betting 600ms is enough for it
+    // to start under load; the survival assertion below is what this test is really about, and it
+    // only gets stronger the longer the process has been running.
+    const deadline = Date.now() + 15_000;
+    const rawPath = rawLogPath(runtimeDirectory, testServiceId);
+    const bytesWritten = (): number => statSync(rawPath, { throwIfNoEntry: false })?.size ?? 0;
+    while (bytesWritten() === 0 && Date.now() < deadline) await Bun.sleep(25);
     expect(isPidAlive(app.pid)).toBe(true);
-    const raw = readFileSync(rawLogPath(runtimeDirectory, testServiceId), "utf8");
+    const raw = readFileSync(rawPath, "utf8");
     expect(raw.length).toBeGreaterThan(0);
   } finally {
     if ("pgid" in app && app.pgid) {
@@ -65,7 +71,17 @@ test("attachOutput tails and truncates the raw capture file without disturbing t
   try {
     const collected: string[] = [];
     const stopTail = adapter.attachOutput!(testServiceId, (data) => collected.push(data));
-    await Bun.sleep(900);
+    // POLLED, not a fixed sleep. The writer needs at least 5 x `sleep 0.1` = 500ms, and a fixed
+    // 900ms wait leaves only 400ms of headroom — which a loaded machine (a full suite running
+    // alongside this one) eats, failing the test for a reason that has nothing to do with tailing.
+    // Waiting for the actual condition keeps the assertion exactly as strong and removes the bet
+    // on scheduling.
+    const deadline = Date.now() + 15_000;
+    const sawAllLines = (): boolean => {
+      const combined = collected.join("");
+      return [1, 2, 3, 4, 5].every((i) => combined.includes(`line-${i}`));
+    };
+    while (!sawAllLines() && Date.now() < deadline) await Bun.sleep(25);
     stopTail();
     const combined = collected.join("");
     for (let i = 1; i <= 5; i++) expect(combined).toContain(`line-${i}`);

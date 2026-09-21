@@ -195,6 +195,15 @@ Applies to both implementations unless noted.
   `fetchOnce()` directly over waiting on the real poll timer. Note the model is `ManagerOperation`,
   not `Operation` — the latter shadows `Foundation.Operation` and is unnameable from the test module.
 
+- **A fixed sleep waiting on another process is a flake.** Three tests bet on a wall-clock duration
+  (a detached daemon finishing shutdown, a writer producing N lines, a process starting up) and
+  failed under load for reasons unrelated to the code under test. Poll for the actual condition
+  with a generous deadline instead; the assertion stays exactly as strong.
+- Right after spawning, a child can still be mid-`execve`, and macOS `ps` reports a parenthesized
+  placeholder (`(sh)`) instead of its command line. Never treat the first readable `ps` row as a
+  just-spawned process's authoritative fingerprint — see `accepts_spawn_observation`. Reproduces
+  ~15% of the time from the TS port, effectively never from Rust (its `ps` call is slower to land),
+  so the Rust side tests the decision directly rather than the race.
 - A spawned test shell needs its own process group (`process_group(0)` / `setpgid(0,0)`, mirroring
   the real adapter's `detached: true`), or it inherits the *cargo-test harness's own* pgid and the
   test's `killpg` calls signal the whole test run.

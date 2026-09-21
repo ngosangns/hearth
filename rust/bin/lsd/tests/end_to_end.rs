@@ -86,13 +86,30 @@ fn full_lifecycle_over_the_real_compiled_binary() {
     let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "stop", "--json"]);
     assert_eq!(code, 0, "stdout: {stdout}, stderr: {stderr}");
 
-    // Give the detached daemon a moment to actually finish shutting down, then confirm a fresh
-    // `manager ensure` starts an entirely new instance (proving the old one is really gone, not
-    // just unresponsive).
-    std::thread::sleep(Duration::from_millis(500));
-    let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
-    assert_eq!(code, 0, "stderr: {stderr}");
-    let second_ensure: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    // Confirm a fresh `manager ensure` starts an entirely new instance, proving the old one is
+    // really gone rather than just unresponsive.
+    //
+    // POLLED, not a fixed sleep: shutdown is asynchronous in a detached process, and a fixed wait
+    // is a bet on how long that takes. Under load (a full `cargo test --workspace`, or another
+    // suite running alongside it) the old daemon was still alive when the single 500ms wait
+    // expired, `ensure` correctly reused it, and the instance id matched — failing the test for a
+    // reason that was never about the code under test. `ensure` is idempotent, so retrying it is
+    // safe: it returns the live daemon until that daemon exits, then starts a new one. The
+    // assertion is unchanged in strength — it still demands a genuinely different instance.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let second_ensure = loop {
+        let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let response: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        if response["instanceId"] != ensure_response["instanceId"] {
+            break response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped daemon was still serving after 20s; `manager stop` did not take effect"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_ne!(second_ensure["instanceId"], ensure_response["instanceId"], "expected a fresh daemon instance after the previous one was stopped");
 
     // Final cleanup so this test doesn't leave a daemon running.

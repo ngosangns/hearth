@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, ftruncateSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, fstatSync, ftruncateSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
 
@@ -703,13 +703,23 @@ export function tailFile(path: string, onOutput: ((data: string) => void) | unde
       // copytruncate: shrink the capture file back to empty so a long-lived service's raw output
       // never grows unbounded between polls. The writer's fd is opened O_APPEND, so its next
       // write always lands at the (now shorter) current end of file, never a stale offset.
+      //
+      // Only truncate when the file is STILL exactly the size that was just read. The child writes
+      // to it continuously and independently, so anything it appended between the read above and
+      // this call would be destroyed by an unconditional truncate — silently losing log lines on
+      // every poll of a chatty service. When it has grown, leave the bytes in place and just
+      // advance the offset; whichever later poll catches the file quiescent truncates it.
       const writeFd = openSync(path, "r+");
       try {
-        ftruncateSync(writeFd, 0);
+        if ((fstatSync(writeFd).size ?? 0) === size) {
+          ftruncateSync(writeFd, 0);
+          offset = 0;
+        } else {
+          offset = size;
+        }
       } finally {
         closeSync(writeFd);
       }
-      offset = 0;
     } catch {}
   };
   const pump = async (): Promise<void> => {
@@ -851,15 +861,40 @@ export const defaultSupervisorOptions = (root: string = process.cwd(), runtimeDi
         const record = await observedStableExecProcess(child, commandFingerprint);
         return { ...record, exited: child.exited };
       }
+      // A freshly spawned child can still be mid-`execve` when `ps` is asked about it, and macOS
+      // then reports a placeholder command line — literally `(sh)` — instead of the real one
+      // (reproducible: ~15% of spawns under load). Taking that first readable row as the
+      // authoritative fingerprint poisons the identity for the rest of the service's life: once
+      // exec completes, `ps` reports the real command, `ownsIdentity` compares unequal, and the
+      // daemon disowns and orphans the service it just started — after which the next start fails
+      // with `Port N is held by an unowned process`.
+      //
+      // The observed value (not the expected one) still has to be what gets stored: for an argv
+      // command, `ps` reports the resolved binary path where `argv[0]` may have been a bare name,
+      // and later `inspect` comparisons are made against `ps` output. So this waits for an
+      // observation that is trustworthy instead of substituting the expected fingerprint:
+      // either it already equals what we spawned, or it repeats identically across two polls —
+      // which a mid-exec placeholder never does.
       let observed: ObservedProcess | undefined;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        observed = await observedSystemProcess(child.pid);
-        if (observed) break;
-        if (attempt < 3) await Bun.sleep(25);
+      let previous: ObservedProcess | undefined;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const current = await observedSystemProcess(child.pid);
+        if (current && !isDockerObserved(current)) {
+          if (current.commandFingerprint === commandFingerprint) {
+            observed = current;
+            break;
+          }
+          if (previous && !isDockerObserved(previous) && previous.pid === current.pid && previous.pgid === current.pgid && previous.startIdentity === current.startIdentity && previous.commandFingerprint === current.commandFingerprint) {
+            observed = current;
+            break;
+          }
+        }
+        previous = current;
+        if (attempt < 7) await Bun.sleep(25);
       }
       if (!observed || isDockerObserved(observed)) {
         await stopUnverifiedChild(child);
-        throw new Error("Unable to establish POSIX process ownership identity after 4 inspections");
+        throw new Error("Unable to establish POSIX process ownership identity after 8 inspections");
       }
       return { ...observed, exited: child.exited };
     },

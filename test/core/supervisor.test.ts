@@ -154,6 +154,37 @@ describe("default supervisor options — real process spawn/build", () => {
     await app.exited;
   }, 10_000);
 
+  /// Regression: right after `Bun.spawn`, the child can still be mid-`execve`, and macOS `ps`
+  /// then reports a placeholder command line — literally `(sh)` — rather than the real one.
+  /// Accepting that first readable row as the identity's fingerprint poisoned it permanently:
+  /// once exec completed, `ps` reported the real command, `ownsIdentity` compared unequal, and the
+  /// daemon disowned and orphaned the service it had just started, after which the next start
+  /// failed with `Port N is held by an unowned process`.
+  ///
+  /// Repeated because the window is timing-dependent — a single spawn reproduced it only ~15% of
+  /// the time even under load.
+  test("never adopts a mid-exec placeholder as the command fingerprint", async () => {
+    const root = await scratchRoot();
+    const options = defaultSupervisorOptions(root);
+    const command = shellCommand("sleep 30; :");
+    const fingerprint = normalizeCommandFingerprint(command);
+
+    const spawned: Array<{ pgid: number; exited: Promise<number> }> = [];
+    try {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const app = await options.process.spawn({ command, commandFingerprint: fingerprint, serviceId: "metadata" });
+        if (!("pid" in app)) throw new Error("Expected a POSIX process");
+        spawned.push({ pgid: app.pgid, exited: app.exited });
+        expect(app.commandFingerprint).toBe(fingerprint);
+      }
+    } finally {
+      for (const child of spawned) {
+        await options.process.signalGroup(child.pgid, "SIGKILL");
+        await child.exited;
+      }
+    }
+  }, 30_000);
+
   test("terminates a real detached build process when cancelled", async () => {
     const root = await scratchRoot();
     const options = defaultSupervisorOptions(root);

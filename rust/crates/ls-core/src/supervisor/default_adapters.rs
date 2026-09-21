@@ -174,6 +174,32 @@ async fn stop_unverified_child(child: &mut tokio::process::Child) {
     }
     let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
 }
+/// Whether an observation of a just-spawned non-exec process can be trusted as its identity's
+/// command fingerprint.
+///
+/// Right after spawning, the child may still be mid-`execve`, and macOS `ps` then reports a
+/// parenthesized placeholder (`(sh)`) instead of the real command line. Storing that as the
+/// fingerprint poisons the identity permanently: once exec completes, `ps` reports the real
+/// command, `owns_identity` compares unequal, and the daemon disowns and orphans the service it
+/// just started — after which the next start fails with `Port N is held by an unowned process`.
+///
+/// The OBSERVED value (not the expected one) is what must ultimately be stored: for an argv
+/// command, `ps` reports the resolved binary path where `argv[0]` may have been a bare name, and
+/// later `inspect` comparisons are made against `ps` output. So an observation is accepted when it
+/// already equals what we spawned, or when it repeats identically across two polls — which a
+/// transient mid-exec placeholder does not.
+pub(crate) fn accepts_spawn_observation(current: &PosixProcessRecord, expected_fingerprint: &str, previous: Option<&PosixProcessRecord>) -> bool {
+    if current.command_fingerprint == expected_fingerprint {
+        return true;
+    }
+    match previous {
+        Some(previous) => {
+            previous.pid == current.pid && previous.pgid == current.pgid && previous.start_identity == current.start_identity && previous.command_fingerprint == current.command_fingerprint
+        }
+        None => false,
+    }
+}
+
 
 /// Exec fingerprint settling loop — port of `observedStableExecProcess`. A shell wrapper's own
 /// fingerprint (the `sh -c ...` line as `ps` shows it *before* exec) differs from the execed
@@ -350,13 +376,33 @@ impl ProcessAdapter for DefaultProcessAdapter {
         let record = if exec {
             observed_stable_exec_process(&mut child, &input.command_fingerprint).await?
         } else {
+            // A freshly spawned child can still be mid-`execve` when `ps` is asked about it, and
+            // macOS then reports a placeholder command line — literally `(sh)` — instead of the
+            // real one (reproducible: ~15% of spawns under load). Taking that first readable row
+            // as the authoritative fingerprint poisons the identity for the rest of the service's
+            // life: once exec completes `ps` reports the real command, `owns_identity` compares
+            // unequal, and the daemon disowns and orphans the service it just started — after
+            // which the next start fails with `Port N is held by an unowned process`.
+            //
+            // The OBSERVED value still has to be what gets stored (for an argv command `ps`
+            // reports the resolved binary path where `argv[0]` may have been a bare name, and
+            // later `inspect` comparisons are made against `ps` output), so this waits for a
+            // trustworthy observation rather than substituting the expected fingerprint: either it
+            // already equals what we spawned, or it repeats identically across two polls — which a
+            // mid-exec placeholder never does.
             let mut observed = None;
-            for attempt in 0..4 {
-                if let Some(ObservedProcess { record: ProcessRecord::Posix(r), .. }) = observed_system_process(pid).await {
-                    observed = Some(r);
-                    break;
+            let mut previous: Option<PosixProcessRecord> = None;
+            for attempt in 0..8 {
+                if let Some(ObservedProcess { record: ProcessRecord::Posix(current), .. }) = observed_system_process(pid).await {
+                    if accepts_spawn_observation(&current, &input.command_fingerprint, previous.as_ref()) {
+                        observed = Some(current);
+                        break;
+                    }
+                    previous = Some(current);
+                } else {
+                    previous = None;
                 }
-                if attempt < 3 {
+                if attempt < 7 {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
@@ -364,7 +410,7 @@ impl ProcessAdapter for DefaultProcessAdapter {
                 Some(r) => r,
                 None => {
                     stop_unverified_child(&mut child).await;
-                    return Err(SupervisorError("Unable to establish POSIX process ownership identity after 4 inspections".to_string()));
+                    return Err(SupervisorError("Unable to establish POSIX process ownership identity after 8 inspections".to_string()));
                 }
             }
         };
@@ -969,5 +1015,63 @@ mod tests {
         let expected = output.status.success()
             && serde_json::from_slice::<serde_json::Value>(&output.stdout).ok().and_then(|v| v.get("Web").and_then(|w| w.as_object()).map(|o| !o.is_empty())).unwrap_or(false);
         assert_eq!(tailnet_serving().await, expected);
+    }
+
+    fn record(pid: i64, fingerprint: &str) -> PosixProcessRecord {
+        PosixProcessRecord { pid, pgid: pid, start_identity: "Mon Jan  1 00:00:00 2026".to_string(), command_fingerprint: fingerprint.to_string() }
+    }
+
+    /// Regression, stated as the decision rather than as a race: right after spawning, the child
+    /// can still be mid-`execve`, and macOS `ps` then reports a placeholder (`(sh)`) rather than
+    /// the real command line. Accepting that first readable row as the identity's fingerprint
+    /// poisoned it permanently — once exec completed, `ps` reported the real command,
+    /// `owns_identity` compared unequal, and the daemon orphaned the service it had just started.
+    ///
+    /// Driven directly because the race itself is not reliably reproducible from Rust: spawning
+    /// `ps` through `tokio::process` is slow enough that exec has almost always completed by the
+    /// first poll. The TypeScript port, whose `ps` call is synchronous and lands sooner, hits the
+    /// window ~15% of the time and has an end-to-end test for it.
+    #[test]
+    fn a_lone_unexpected_observation_is_not_accepted_as_the_fingerprint() {
+        let placeholder = record(42, "fingerprint-of-(sh)");
+        assert!(
+            !accepts_spawn_observation(&placeholder, "expected-fingerprint", None),
+            "a first observation that does not match what we spawned must not be trusted"
+        );
+    }
+
+    #[test]
+    fn an_observation_matching_what_we_spawned_is_accepted_immediately() {
+        let observed = record(42, "expected-fingerprint");
+        assert!(accepts_spawn_observation(&observed, "expected-fingerprint", None));
+    }
+
+    /// An argv command legitimately observes differently from the logical fingerprint (`ps` reports
+    /// the resolved binary path where `argv[0]` was a bare name), so a genuinely stable mismatch
+    /// has to be accepted — otherwise those services could never start.
+    #[test]
+    fn a_stable_mismatch_is_accepted_after_repeating_identically() {
+        let first = record(42, "resolved-path-fingerprint");
+        let second = record(42, "resolved-path-fingerprint");
+        assert!(!accepts_spawn_observation(&first, "expected-fingerprint", None));
+        assert!(accepts_spawn_observation(&second, "expected-fingerprint", Some(&first)));
+    }
+
+    /// Two different readings are not stability — this is what separates a settled argv path from
+    /// a placeholder that is about to change.
+    #[test]
+    fn a_changing_observation_is_not_accepted() {
+        let first = record(42, "fingerprint-of-(sh)");
+        let second = record(42, "some-other-fingerprint");
+        assert!(!accepts_spawn_observation(&second, "expected-fingerprint", Some(&first)));
+    }
+
+    /// A reused pid must not let a stale reading vouch for a new process.
+    #[test]
+    fn a_different_process_does_not_count_as_a_repeat() {
+        let first = record(42, "same-fingerprint");
+        let mut second = record(42, "same-fingerprint");
+        second.start_identity = "Tue Jan  2 00:00:00 2026".to_string();
+        assert!(!accepts_spawn_observation(&second, "expected-fingerprint", Some(&first)));
     }
 }
