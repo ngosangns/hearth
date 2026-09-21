@@ -502,12 +502,28 @@ fn resolve_service_cwd(cwd: Option<&str>, path: &str, errors: &mut Vec<String>) 
     Some(relative_cwd.to_string())
 }
 
+/// A key outside these sets is a typo (e.g. `command:` for `run:`), which would otherwise be silently
+/// dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
+const TOP_LEVEL_KEYS: &[&str] = &["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
+const SERVICE_KEYS: &[&str] = &[
+    "label", "kind", "ownership", "dependsOn", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls",
+];
+
+fn check_known_keys(value: &serde_json::Map<String, Value>, known: &[&str], path: &str, errors: &mut Vec<String>) {
+    for key in value.keys() {
+        if !known.contains(&key.as_str()) && !key.starts_with("x-") {
+            errors.push(format!("{path} has unknown key \"{key}\" (known: {})", known.join(", ")));
+        }
+    }
+}
+
 fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCatalog, Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
     let Some(top) = raw.as_object() else {
         return Err(vec!["config file must contain a YAML/JSON object".to_string()]);
     };
 
+    check_known_keys(top, TOP_LEVEL_KEYS, "config file", &mut errors);
     if top.get("version").and_then(Value::as_i64) != Some(1) {
         errors.push(format!("version must be 1, got {}", top.get("version").cloned().unwrap_or(Value::Null)));
     }
@@ -570,6 +586,7 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             errors.push(format!("{svc_path} must be an object"));
             continue;
         };
+        check_known_keys(obj, SERVICE_KEYS, &svc_path, &mut errors);
 
         let kind: Option<ServiceKind> = match obj.get("kind") {
             None => None,
@@ -1016,6 +1033,24 @@ services:
         );
         let err = load_catalog(dir.path()).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("preparationCommand")), "{:?}", err.errors);
+    }
+
+    #[test]
+    fn rejects_a_typod_key_but_allows_x_prefixed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "local-services.yaml",
+            "version: 1\nx-common: &c { kind: process }\nservices:\n  api:\n    command: [x]\n    readiness: *c\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert_eq!(
+            err.errors,
+            vec![
+                "services.api has unknown key \"command\" (known: label, kind, ownership, dependsOn, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)"
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

@@ -240,3 +240,18 @@ describe("service urls", () => {
     expect(result.errors).toEqual(["api:urls[0] has unknown placeholder {tailnethost} (known: {tailnetHost})", "api:urls[1] must be an http:// or https:// URL"]);
   });
 });
+
+describe("unknown keys", () => {
+  // `command:` instead of `run:` used to be dropped silently, leaving a service that only failed
+  // later with an unrelated "unsupported service" — now it fails the load, same message as Rust.
+  test("rejects a typo'd key but allows x- prefixed ones", async () => {
+    const root = await scratchRoot();
+    await writeFile(join(root, "local-services.yaml"), "version: 1\nx-common: &c { kind: process }\nservices:\n  api:\n    command: [x]\n    readiness: *c\n");
+    const result = await loadCatalog(root);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors).toEqual([
+      'services.api has unknown key "command" (known: label, kind, ownership, dependsOn, env, container, cwd, run, stop, build, readiness, preparationCommand, ports, urls)',
+    ]);
+  });
+});

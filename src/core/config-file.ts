@@ -245,9 +245,20 @@ function resolveServiceCwd(root: string, cwd: string | undefined, path: string, 
   return relativeCwd;
 }
 
+// A key outside these sets is a typo (e.g. `command:` for `run:`), which would otherwise be silently
+// dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
+const topLevelKeys = ["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
+const serviceKeys = ["label", "kind", "ownership", "dependsOn", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls"];
+function checkKnownKeys(value: Record<string, unknown>, known: readonly string[], path: string, errors: string[]): void {
+  for (const key of Object.keys(value)) {
+    if (!known.includes(key) && !key.startsWith("x-")) errors.push(`${path} has unknown key "${key}" (known: ${known.join(", ")})`);
+  }
+}
+
 async function mapConfigFile(raw: unknown, root: string, path: string): Promise<{ ok: true; catalog: ServiceCatalog } | { ok: false; errors: string[] }> {
   const errors: string[] = [];
   if (!isRecord(raw)) return { ok: false, errors: [`${path} must contain a YAML/JSON object`] };
+  checkKnownKeys(raw, topLevelKeys, "config file", errors);
   if (raw.version !== 1) errors.push(`version must be 1, got ${JSON.stringify(raw.version)}`);
   if (raw.env !== undefined && !isStringRecord(raw.env)) errors.push("env must be a map of string to string");
   if (raw.envFile !== undefined && typeof raw.envFile !== "string") errors.push("envFile must be a string");
@@ -269,6 +280,7 @@ async function mapConfigFile(raw: unknown, root: string, path: string): Promise<
       errors.push(`${svcPath} must be an object`);
       continue;
     }
+    checkKnownKeys(value, serviceKeys, svcPath, errors);
     if (value.kind !== undefined && !serviceKinds.includes(value.kind as ServiceKind)) errors.push(`${svcPath}.kind must be one of ${serviceKinds.join(", ")}`);
     if (value.ownership !== undefined && !ownerships.includes(value.ownership as ServiceOwnership)) errors.push(`${svcPath}.ownership must be one of ${ownerships.join(", ")}`);
     if (value.dependsOn !== undefined && !isStringArray(value.dependsOn)) errors.push(`${svcPath}.dependsOn must be a string array`);
