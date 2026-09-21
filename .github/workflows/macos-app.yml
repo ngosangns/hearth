@@ -14,7 +14,7 @@ jobs:
       run:
         working-directory: apps/macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Not `swift test`: the registered self-hosted runner's toolchain doesn't have XCTest available
       # (`no such module 'XCTest'`) — it only has the Command Line Tools, not a full Xcode.app
       # install, unlike this repo's own dev machines. `swift build` alone never touches the test

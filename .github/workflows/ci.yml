@@ -14,7 +14,7 @@ jobs:
   test:
     runs-on: [self-hosted, macmini]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test
@@ -27,7 +27,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # A self-hosted runner executes `run:` steps from its service environment, which is not a
       # login shell — so a toolchain installed into the user's home (rustup) or under Homebrew is
       # absent from PATH here even though `cargo` works fine in a terminal on that same machine.
@@ -70,10 +70,14 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    # Gates on the Rust suite as well as the TypeScript one. `rust-test` used to be excluded
+    # because it could not run at all on the runner; now that it does, a release should not go out
+    # on a red Rust suite — the compiled `lsd` binary is what two of the three consumers actually
+    # run, even though it is not what this job publishes.
+    needs: [test, rust-test]
     runs-on: [self-hosted, macmini]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           echo "@gnasdev:registry=https://npm.pkg.github.com" >> .npmrc
           echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" >> .npmrc
