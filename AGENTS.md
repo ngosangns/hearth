@@ -83,15 +83,24 @@ app. `apps/macos`'s workflow is `.github/workflows/macos-app.yml` (repo root, pa
 **Semver doubles as the protocol-compatibility signal**: `PROTOCOL_VERSION` is the one place a daemon
 and its TUI/CLI/MCP clients read it from — a bump there must be a major release.
 
-### Two standing runner limitations (not fixable from this repo)
+### The self-hosted runner's environment
 
-- **`rust-test` is red on the registered `{self-hosted, macmini}` runner**: `cargo test` exits 127
-  because that runner's PATH for Actions steps doesn't include `cargo`. It's a different physical box
-  than any dev machine here, so the fix belongs to its own Actions service config. `publish` depends
-  only on `test`, so this has never blocked a release — but `rust-test` is not gating anything today.
-- **That runner's Swift toolchain has no XCTest** (Command Line Tools only, no full Xcode.app), so
-  `apps/macos/Tests/` passes locally but is not in CI. Don't re-add `swift test` to that workflow
-  without first fixing the runner's Xcode install.
+The registered `{self-hosted, macmini}` runner (`ngosangns-Mini`) is a different physical machine
+from any dev box here, with the same username. Two things about it that a local run cannot predict:
+
+- **It executes `run:` steps from the runner service's environment, not a login shell**, so a
+  toolchain under `~/.cargo/bin` or Homebrew is not on PATH by default. `rust-test` failed with exit
+  127 for a long time because of this. `ci.yml` now resolves cargo's directory into `$GITHUB_PATH`
+  itself — keep that in the workflow rather than relying on undocumented machine state.
+- **Its Rust is managed by rustup, whose stable toolchain does not include clippy**, while dev
+  machines here use Homebrew's rust, which bundles it. A clippy-clean local run therefore does not
+  predict CI; `ci.yml` adds the component explicitly (idempotent).
+- **Its Swift toolchain has no XCTest** (Command Line Tools only, no full Xcode.app), so
+  `apps/macos/Tests/` passes locally but is not in CI. Don't re-add `swift test` to
+  `macos-app.yml` without first fixing the runner's Xcode install.
+
+`publish` still depends only on `test`, not on `rust-test` — so the Rust suite runs on every PR but
+does not block a release. Worth revisiting now that the job actually passes.
 
 ## Sharp edges
 
