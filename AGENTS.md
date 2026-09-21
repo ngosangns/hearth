@@ -99,8 +99,7 @@ from any dev box here, with the same username. Two things about it that a local 
   `apps/macos/Tests/` passes locally but is not in CI. Don't re-add `swift test` to
   `macos-app.yml` without first fixing the runner's Xcode install.
 
-`publish` still depends only on `test`, not on `rust-test` — so the Rust suite runs on every PR but
-does not block a release. Worth revisiting now that the job actually passes.
+`publish` needs both `test` and `rust-test`, so a red Rust suite blocks a release.
 
 ## Sharp edges
 
@@ -183,10 +182,15 @@ Applies to both implementations unless noted.
   `bin: {lsd: "./src/bin/lsd.ts"}` — so a bare `lsd` in a consumer's package.json script resolves to
   the **TS shim** (which has no `mcp` subcommand), not the installed Rust binary. Reference
   `/opt/homebrew/bin/lsd` by absolute path in consumer scripts.
-- `.config.ts` requires `bun` on PATH at runtime (narrowly — a YAML/JSON-catalog consumer needs no
-  Bun at all), and `load_typescript_catalog` must canonicalize the path before handing it to
-  `bun -e`: `import()` from an eval'd script has no importer file to resolve a relative specifier
-  against, and falls into node_modules-style resolution instead.
+- `.config.ts` requires `bun` to be installed (narrowly — a YAML/JSON-catalog consumer needs no Bun
+  at all), but **never assume it is on `PATH`**: `lsd` is routinely spawned by the macOS app, and a
+  Dock/Finder-launched GUI process gets launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`. `find_bun`
+  searches an override, `PATH`, bun's and Homebrew's install dirs, then the login shell's `PATH`.
+  Test anything the app spawns under `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin` — launching the
+  app with `open` from a terminal does not reproduce what the user gets.
+- `load_typescript_catalog` must canonicalize the path before handing it to `bun -e`: `import()`
+  from an eval'd script has no importer file to resolve a relative specifier against, and falls
+  into node_modules-style resolution instead.
 - `serde_json`'s `preserve_order` feature is on workspace-wide and is load-bearing: without it
   `Value`'s object type is a `BTreeMap`, and `lsd mcp install` silently alphabetizes every key in any
   hand-maintained config file it touches.

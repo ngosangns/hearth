@@ -110,6 +110,58 @@ pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog,
     Ok(LoadedCatalog { catalog, path: path.to_path_buf() })
 }
 
+const KNOWN_BUN_DIRECTORIES: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// Locates `bun` without assuming it is on this process's `PATH`.
+///
+/// `lsd` is routinely spawned by a GUI — the macOS app launched from the Dock or Finder — and a
+/// GUI process inherits launchd's bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), which contains
+/// none of the places bun is actually installed. A bare `Command::new("bun")` therefore failed for
+/// every `.config.ts` catalog (both real consumers use one) the moment the app was opened normally,
+/// while working fine from a terminal — so it only ever showed up for the user, never in testing.
+fn find_bun() -> Option<PathBuf> {
+    let var = |key: &str| std::env::var_os(key);
+    locate_bun(var("LOCAL_SERVICES_BUN_PATH"), var("PATH"), var("BUN_INSTALL"), var("HOME"), &KNOWN_BUN_DIRECTORIES, || {
+        crate::env::resolve_login_shell_env(None, None).get("PATH").map(std::ffi::OsString::from)
+    })
+}
+
+/// The search behind `find_bun`, with every input injected so it can be tested without depending
+/// on this machine's real environment. The login shell is consulted last and lazily: it costs a
+/// shell spawn, and the fixed locations already cover Homebrew and bun's own installer.
+fn locate_bun(
+    override_path: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+    bun_install: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    known_directories: &[&str],
+    login_shell_path: impl FnOnce() -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(candidate) = override_path.map(PathBuf::from).filter(|p| is_executable_file(p)) {
+        return Some(candidate);
+    }
+    let in_path_list = |list: &std::ffi::OsString| std::env::split_paths(list).map(|dir| dir.join("bun")).find(|p| is_executable_file(p));
+    if let Some(found) = path_var.as_ref().and_then(in_path_list) {
+        return Some(found);
+    }
+    let fixed = bun_install
+        .map(|dir| PathBuf::from(dir).join("bin/bun"))
+        .into_iter()
+        .chain(home.map(|dir| PathBuf::from(dir).join(".bun/bin/bun")))
+        .chain(known_directories.iter().map(|dir| Path::new(dir).join("bun")));
+    for candidate in fixed {
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    login_shell_path().as_ref().and_then(in_path_list)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 /// Evaluates a `.config.ts` module through a real `bun` subprocess and returns its exported
 /// `catalog` (or default export) as a `ServiceCatalog` — the Rust equivalent of the TS source's
 /// `loadTypeScriptCatalog`, which does this in-process via `await import(path)`. The script mirrors
@@ -146,9 +198,16 @@ fn load_typescript_catalog(path: &Path) -> Result<ServiceCatalog, ConfigFileLoad
 "#
     );
 
-    let output = std::process::Command::new("bun").arg("-e").arg(&script).output().map_err(|error| ConfigFileLoadError {
+    let bun = find_bun().ok_or_else(|| ConfigFileLoadError {
         path: Some(path.to_path_buf()),
-        errors: vec![format!("failed to run `bun` to evaluate {path_display}: {error} (is bun installed and on PATH?)")],
+        errors: vec![format!(
+            "could not find `bun` to evaluate {path_display} (looked in $LOCAL_SERVICES_BUN_PATH, PATH, $BUN_INSTALL/bin, ~/.bun/bin, {}, and the login shell's PATH)",
+            KNOWN_BUN_DIRECTORIES.join(", ")
+        )],
+    })?;
+    let output = std::process::Command::new(&bun).arg("-e").arg(&script).output().map_err(|error| ConfigFileLoadError {
+        path: Some(path.to_path_buf()),
+        errors: vec![format!("failed to run {} to evaluate {path_display}: {error}", bun.display())],
     })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -967,5 +1026,65 @@ services:
         );
         let error = load_catalog(dir.path()).expect_err("must not load");
         assert!(format!("{error:?}").contains("65535"), "{error:?}");
+    }
+
+    fn fake_bun(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let bun = dir.join("bun");
+        std::fs::write(&bun, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bun
+    }
+
+    fn os(value: &Path) -> Option<std::ffi::OsString> {
+        Some(value.as_os_str().to_owned())
+    }
+
+    const BARE_GUI_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    /// Regression: the macOS app launched from the Dock hands `lsd` launchd's bare PATH, and a bare
+    /// `Command::new("bun")` then failed for every `.config.ts` catalog — both real consumers'.
+    #[test]
+    fn finds_bun_outside_a_bare_gui_path_via_bun_s_own_install_location() {
+        let home = tempfile::tempdir().unwrap();
+        let expected = fake_bun(&home.path().join(".bun/bin"));
+        let found = locate_bun(None, Some(BARE_GUI_PATH.into()), None, os(home.path()), &[], || panic!("login shell should not be needed"));
+        assert_eq!(found, Some(expected));
+    }
+
+    #[test]
+    fn finds_a_homebrew_style_install_from_the_known_directories() {
+        let brew = tempfile::tempdir().unwrap();
+        let expected = fake_bun(brew.path());
+        let known = [brew.path().to_str().unwrap()];
+        let found = locate_bun(None, Some(BARE_GUI_PATH.into()), None, None, &known, || panic!("login shell should not be needed"));
+        assert_eq!(found, Some(expected));
+    }
+
+    #[test]
+    fn falls_back_to_the_login_shell_s_path_last() {
+        let custom = tempfile::tempdir().unwrap();
+        let expected = fake_bun(custom.path());
+        let found = locate_bun(None, Some(BARE_GUI_PATH.into()), None, None, &[], || os(custom.path()));
+        assert_eq!(found, Some(expected));
+    }
+
+    #[test]
+    fn prefers_the_override_then_path_over_fixed_locations() {
+        let override_dir = tempfile::tempdir().unwrap();
+        let on_path = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let override_bun = fake_bun(override_dir.path());
+        let path_bun = fake_bun(on_path.path());
+        fake_bun(&home.path().join(".bun/bin"));
+        assert_eq!(locate_bun(os(&override_bun), os(on_path.path()), None, os(home.path()), &[], || None), Some(override_bun));
+        assert_eq!(locate_bun(None, os(on_path.path()), None, os(home.path()), &[], || None), Some(path_bun));
+    }
+
+    #[test]
+    fn reports_none_when_bun_is_nowhere() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(locate_bun(None, Some(BARE_GUI_PATH.into()), None, os(empty.path()), &[], || None), None);
     }
 }
