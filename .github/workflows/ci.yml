@@ -19,8 +19,8 @@ jobs:
       - run: bun run typecheck
       - run: bun test
 
-  # The in-progress Rust rewrite (`rust/`, see AGENTS.md "Rust rewrite") — a separate job so a
-  # rust/-only regression can't be missed just because the TS suite above is green, and vice versa.
+  # The Rust implementation (`rust/`) — a separate job so a rust/-only regression can't be missed
+  # just because the TS suite above is green, and vice versa.
   rust-test:
     runs-on: [self-hosted, macmini]
     defaults:
@@ -28,6 +28,28 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+      # A self-hosted runner executes `run:` steps from its service environment, which is not a
+      # login shell — so a toolchain installed into the user's home (rustup) or under Homebrew is
+      # absent from PATH here even though `cargo` works fine in a terminal on that same machine.
+      # This job failed with exit 127 for exactly that reason. Resolving it in the workflow rather
+      # than asking for the runner host to be reconfigured keeps the fix in version control.
+      #
+      # If cargo genuinely isn't installed on the runner, this fails with the list of paths tried
+      # instead of a bare 127, which is the diagnostic needed to decide what to do next.
+      - name: Put cargo on PATH
+        run: |
+          set -euo pipefail
+          for candidate in "$HOME/.cargo/bin" /opt/homebrew/bin /usr/local/bin; do
+            if [ -x "$candidate/cargo" ]; then
+              echo "using cargo at $candidate/cargo"
+              echo "$candidate" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          echo "cargo not found in: $HOME/.cargo/bin /opt/homebrew/bin /usr/local/bin" >&2
+          echo "install a Rust toolchain on this runner, or add cargo's directory to the list above" >&2
+          exit 1
+      - run: cargo --version && rustc --version
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
