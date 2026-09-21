@@ -189,6 +189,12 @@ Applies to both implementations unless noted.
 
 **Testing gotchas**
 
+- The macOS app's controllers take `any ManagerAPI`, not the concrete `ManagerClient`, so
+  `FakeManagerAPI` can drive them without a daemon; `WorkspaceController` also takes an injectable
+  connector and a flag to skip the real config-file watcher. Prefer stepping `refresh()`/
+  `fetchOnce()` directly over waiting on the real poll timer. Note the model is `ManagerOperation`,
+  not `Operation` — the latter shadows `Foundation.Operation` and is unnameable from the test module.
+
 - A spawned test shell needs its own process group (`process_group(0)` / `setpgid(0,0)`, mirroring
   the real adapter's `detached: true`), or it inherits the *cargo-test harness's own* pgid and the
   test's `killpg` calls signal the whole test run.
