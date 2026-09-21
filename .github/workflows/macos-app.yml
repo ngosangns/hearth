@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
     paths: ["apps/macos/**"]
+  # The path filter above means a change to this workflow file does not trigger it — so a manual
+  # run is the only way to verify a change here (an action bump, a new step) before it matters.
+  workflow_dispatch:
 
 jobs:
   build:
