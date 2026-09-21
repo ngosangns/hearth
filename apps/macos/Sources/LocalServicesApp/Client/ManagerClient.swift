@@ -29,7 +29,7 @@ enum ManagerClientError: Error, LocalizedError {
     }
 }
 
-final class ManagerClient: Sendable {
+final class ManagerClient: ManagerAPI {
     private let connection: ManagerConnection
     private let session: URLSession
 
@@ -54,7 +54,7 @@ final class ManagerClient: Sendable {
     /// back the previous slice's `nextCursor`/`generation` to continue tailing; omit both for the
     /// initial fetch. A `reset: true` slice (the log rotated or the caller's `generation` was stale)
     /// means the caller should replace its buffer, not append.
-    func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int = 16_384) async throws -> LogSlice {
+    func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int) async throws -> LogSlice {
         let escaped = serviceId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? serviceId
         var path = "/v1/logs/\(escaped)?limit=\(limit)"
         if let cursor { path += "&cursor=\(cursor)" }
@@ -63,7 +63,7 @@ final class ManagerClient: Sendable {
     }
 
     @discardableResult
-    func perform(_ action: ManagerAction, serviceId: String) async throws -> Operation {
+    func perform(_ action: ManagerAction, serviceId: String) async throws -> ManagerOperation {
         let body: [String: String] = ["requestId": UUID().uuidString, "serviceId": serviceId, "action": action.rawValue]
         return try await post("/v1/operations", body: body, as: OperationResponse.self).operation
     }
@@ -74,36 +74,13 @@ final class ManagerClient: Sendable {
     /// individual `perform(.stop, ...)` calls instead — see `WorkspaceController.stopAll`.
     /// `GET /v1/operations/:id` — the daemon accepts an operation with `202` and runs it
     /// asynchronously, so its outcome is only ever visible by reading it back.
-    func operation(id: String) async throws -> Operation {
+    func operation(id: String) async throws -> ManagerOperation {
         let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         return try await get("/v1/operations/\(escaped)", as: OperationResponse.self).operation
     }
 
-    /// Polls an accepted operation until it reaches a terminal status, mirroring the CLI's
-    /// `waitOperation`. Throws `ManagerClientError.operationFailed` when it settles as `failed`, so
-    /// callers surface the daemon's own reason rather than silently treating a `202` as success.
-    func waitForOperation(id: String, pollInterval: Duration = .milliseconds(250), timeout: Duration = .seconds(180)) async throws -> Operation {
-        let deadline = ContinuousClock.now.advanced(by: timeout)
-        while true {
-            try Task.checkCancellation()
-            let current = try await operation(id: id)
-            switch current.status {
-            case "succeeded":
-                return current
-            case "failed":
-                throw ManagerClientError.operationFailed(current.error?.message ?? "Operation failed")
-            default:
-                break
-            }
-            if ContinuousClock.now >= deadline {
-                throw ManagerClientError.operationFailed("Operation did not finish within \(timeout)")
-            }
-            try await Task.sleep(for: pollInterval)
-        }
-    }
-
     @discardableResult
-    func bulkStart(targets: [String]) async throws -> Operation {
+    func bulkStart(targets: [String]) async throws -> ManagerOperation {
         var req = request("/v1/operations/bulk-start")
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")

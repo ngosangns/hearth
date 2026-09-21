@@ -19,13 +19,13 @@ final class LogController: ObservableObject {
     /// Keeps the displayed buffer bounded — this is a live tail view, not a full-log archive.
     private static let maxDisplayedBytes = 262_144
 
-    private let client: ManagerClient
+    private let client: any ManagerAPI
     private let serviceId: String
     private var cursor: Int?
     private var generation: Int?
     private var pollTask: Task<Void, Never>?
 
-    init(client: ManagerClient, serviceId: String) {
+    init(client: any ManagerAPI, serviceId: String) {
         self.client = client
         self.serviceId = serviceId
     }
@@ -69,7 +69,9 @@ final class LogController: ObservableObject {
         return String(decoding: bytes[start...], as: UTF8.self)
     }
 
-    private func fetchOnce() async {
+    /// `internal` rather than `private` so a test can step one poll deterministically instead of
+    /// waiting on the real timer.
+    func fetchOnce() async {
         do {
             let slice = try await client.logs(serviceId: serviceId, cursor: cursor, generation: generation)
             text = slice.reset ? slice.data : text + slice.data

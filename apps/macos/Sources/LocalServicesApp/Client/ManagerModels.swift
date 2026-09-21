@@ -93,7 +93,7 @@ struct OperationError: Codable, Equatable {
     let message: String
 }
 
-struct Operation: Codable, Equatable, Identifiable {
+struct ManagerOperation: Codable, Equatable, Identifiable {
     let id: String
     let requestId: String
     let kind: String
@@ -107,7 +107,7 @@ struct Operation: Codable, Equatable, Identifiable {
 }
 
 struct OperationResponse: Codable {
-    let operation: Operation
+    let operation: ManagerOperation
 }
 
 struct ManagerInfo: Codable {

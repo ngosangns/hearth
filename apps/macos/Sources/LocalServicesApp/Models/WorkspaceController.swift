@@ -21,14 +21,29 @@ final class WorkspaceController: ObservableObject {
     @Published private(set) var actionsInFlight: Set<String> = []
     @Published var lastActionError: String?
 
-    private var client: ManagerClient?
+    private var client: (any ManagerAPI)?
     private var pollTask: Task<Void, Never>?
     private let pollInterval: Duration
     private var configWatcher: ConfigFileWatcher?
+    /// How `connect()` obtains a client for a project root. Injectable so the connection state
+    /// machine can be driven without a real daemon — the default is the real sidecar path.
+    private let connector: @Sendable (String) async throws -> any ManagerAPI
+    /// Whether `connect()` should start the config-file watcher. Off under test: it would install a
+    /// real dispatch source on a real directory.
+    private let watchesConfigFile: Bool
 
-    init(workspace: Workspace, pollInterval: Duration = .seconds(2)) {
+    init(
+        workspace: Workspace,
+        pollInterval: Duration = .seconds(2),
+        watchesConfigFile: Bool = true,
+        connector: (@Sendable (String) async throws -> any ManagerAPI)? = nil
+    ) {
         self.workspace = workspace
         self.pollInterval = pollInterval
+        self.watchesConfigFile = watchesConfigFile
+        self.connector = connector ?? { root in
+            ManagerClient(connection: try await DaemonConnection.ensure(root: root))
+        }
     }
 
     deinit {
@@ -40,14 +55,15 @@ final class WorkspaceController: ObservableObject {
         guard phase != .connecting else { return }
         phase = .connecting
         do {
-            let connection = try await DaemonConnection.ensure(root: workspace.path)
-            let client = ManagerClient(connection: connection)
+            let client = try await connector(workspace.path)
             self.client = client
             catalog = try? await client.catalog() // best-effort — service status doesn't depend on it
             services = try await client.services()
             phase = .connected
             startPolling()
-            startConfigWatcher()
+            if watchesConfigFile {
+                startConfigWatcher()
+            }
         } catch {
             phase = .failed(error.localizedDescription)
         }
@@ -91,7 +107,9 @@ final class WorkspaceController: ObservableObject {
         }
     }
 
-    private func refresh() async {
+    /// `internal` rather than `private` so a test can step one poll deterministically instead of
+    /// waiting on the real timer.
+    func refresh() async {
         guard let client else { return }
         do {
             services = try await client.services()
