@@ -27,6 +27,10 @@ struct LogTextView: NSViewRepresentable {
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
+        // The document view must track the clip view's width — without the mask a text view
+        // created while the pane is still zero-sized keeps a zero-width frame forever, and
+        // `widthTracksTextView` then wraps every line into invisibility (blank panel).
+        textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         textView.minSize = NSSize(width: 0, height: 0)

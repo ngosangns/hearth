@@ -41,7 +41,11 @@ final class LogTextViewHostingTests: XCTestCase {
             if findTextView(in: hosting.view)?.string == "hello log\n" { break }
         }
         log.stop()
-        XCTAssertEqual(findTextView(in: hosting.view)?.string, "hello log\n")
+        let textView = try XCTUnwrap(findTextView(in: hosting.view))
+        XCTAssertEqual(textView.string, "hello log\n")
+        // The string being set is not enough — the text view must also be laid out at a
+        // non-zero width or every line wraps into invisibility and the panel renders blank.
+        XCTAssertGreaterThan(textView.frame.width, 0, "log text view has zero width — content is laid out but invisible")
     }
 
     /// Drives the real `WorkspaceDetailView` → `ServiceListView` → `logPanel` path: connect with a
@@ -206,5 +210,38 @@ final class LogTextViewHostingTests: XCTestCase {
             }
         }
         XCTAssertTrue(rendered.contains("api log line"), "log text never reached the NSTextView; current: \(rendered.debugDescription)")
+        let textView = try XCTUnwrap(findTextView(in: hosting.view))
+        XCTAssertGreaterThan(textView.frame.width, 0, "log text view has zero width inside the split-view stack — content is laid out but invisible")
+        XCTAssertGreaterThan(textView.frame.height, 0, "log text view has zero height inside the split-view stack — content is laid out but invisible")
+    }
+
+    /// The real app can mount the panel while its split-view pane still has zero size, then grow
+    /// it. Without an autoresizing mask the document `NSTextView` keeps its zero-width frame
+    /// forever — `widthTracksTextView` then wraps every line into invisibility and the panel
+    /// renders blank even though `string` holds the log.
+    @MainActor
+    func testPanelCreatedAtZeroSizeThenResizedKeepsTextVisible() async throws {
+        let api = FakeManagerAPI()
+        api.logsHandler = { _, _ in makeLogSlice(data: "api log line\n", nextCursor: 13, generation: 1) }
+        let log = LogController(client: api, serviceId: "api")
+
+        let panel = ServiceLogPanel(serviceLabel: "api", log: log)
+        let hosting = NSHostingController(rootView: panel)
+        let window = NSWindow(contentViewController: hosting)
+        window.setContentSize(NSSize(width: 0, height: 0))
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+
+        // Grow the window after the view exists — the split-view pane opening path in the app.
+        window.setContentSize(NSSize(width: 480, height: 320))
+        await log.fetchOnce()
+        for _ in 0 ..< 50 {
+            try await Task.sleep(for: .milliseconds(20))
+            if findTextView(in: hosting.view)?.string == "api log line\n" { break }
+        }
+        log.stop()
+        let textView = try XCTUnwrap(findTextView(in: hosting.view))
+        XCTAssertTrue(textView.string.contains("api log line"), "log text never reached the NSTextView; current: \(textView.string.debugDescription)")
+        XCTAssertGreaterThan(textView.frame.width, 0, "log text view stayed zero-width after the scroll view was resized — content is laid out but invisible")
     }
 }
