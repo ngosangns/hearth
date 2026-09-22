@@ -124,34 +124,56 @@ final class WorkspaceControllerTests: XCTestCase {
         sut.stop()
     }
 
-    func testStartAllWaitsOnTheBulkOperationAndTargetsTheWholeCatalog() async {
+    func testLogControllerIsReusedForTheSameService() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = {
-            ServiceCatalogSummary(
-                services: [CatalogService(id: "db", label: nil, kind: nil, ownership: nil), CatalogService(id: "api", label: nil, kind: nil, ownership: nil)],
-                groups: [:]
-            )
-        }
-        api.servicesHandler = { [makeService("db", actualState: "stopped"), makeService("api", actualState: "stopped")] }
+        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.servicesHandler = { [makeService("api", actualState: "ready")] }
         let sut = controller(api)
         await sut.connect()
 
-        let targets = Box<[String]>([])
-        api.bulkStartHandler = { requested in
-            targets.value = requested
-            return makeOperation(id: "bulk-1", status: "queued")
-        }
-        api.operationHandler = { _ in makeOperation(id: "bulk-1", status: "succeeded") }
-
-        await sut.startAll()
-
-        XCTAssertEqual(targets.value, ["db", "api"])
-        XCTAssertEqual(api.operationReads, ["bulk-1"], "must read the bulk operation back, not assume 202 means done")
-        XCTAssertTrue(sut.actionsInFlight.isEmpty)
+        let first = sut.logController(for: "api")
+        let second = sut.logController(for: "api")
+        XCTAssertNotNil(first)
+        XCTAssertTrue(first === second, "re-focusing a service must resume the cached log tail")
         sut.stop()
     }
 
-    func testStopAllSkipsAlreadyStoppedAndQueuedServices() async {
+    func testRefreshKeepsThePublishedSnapshotWhenOnlyTimestampsChange() async {
+        let api = FakeManagerAPI()
+        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        let stamp = Box(0)
+        api.servicesHandler = {
+            stamp.value += 1
+            return [
+                ServiceLifecycleState(
+                    serviceId: "api",
+                    desiredState: "running",
+                    actualState: "ready",
+                    readiness: "ready",
+                    generation: 1,
+                    identity: nil,
+                    readinessKind: nil,
+                    readinessDetail: nil,
+                    createdAt: "2026-01-01T00:00:00.000Z",
+                    updatedAt: "2026-01-01T00:00:0\(stamp.value).000Z",
+                    exitedAt: nil,
+                    exitCode: nil,
+                    error: nil,
+                    currentOperationId: nil
+                )
+            ]
+        }
+        let sut = controller(api)
+        await sut.connect()
+        let published = sut.services[0].updatedAt
+
+        await sut.refresh()
+
+        XCTAssertEqual(sut.services[0].updatedAt, published, "timestamp-only polls must not republish the service list")
+        sut.stop()
+    }
+
+    func testStopAllSkipsAlreadyStoppedServicesAndStopsQueuedStarts() async {
         let api = FakeManagerAPI()
         api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
         api.servicesHandler = {
@@ -169,7 +191,7 @@ final class WorkspaceControllerTests: XCTestCase {
 
         await sut.stopAll()
 
-        XCTAssertEqual(api.performed.map(\.serviceId), ["ready-one"])
+        XCTAssertEqual(Set(api.performed.map(\.serviceId)), ["ready-one", "queued-one"])
         sut.stop()
     }
 }

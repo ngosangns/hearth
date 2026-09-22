@@ -39,8 +39,10 @@ struct MenuBarSummary {
 struct MenuBarLabel: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
+    @EnvironmentObject private var menuBarPulse: MenuBarPulse
 
     var body: some View {
+        let _ = menuBarPulse.tick
         let summary = MenuBarSummary.compute(workspaces: workspaceStore.workspaces, registry: registry)
         // Explicit icon + text, not `Label`: a MenuBarExtra renders a `Label` as its icon alone, so
         // the counts were computed on every change and never shown — the status item was a bare
@@ -59,43 +61,39 @@ struct MenuBarLabel: View {
 struct MenuBarContentView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
+    @EnvironmentObject private var menuBarPulse: MenuBarPulse
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if workspaceStore.workspaces.isEmpty {
-                Text("No workspaces yet").foregroundStyle(.secondary).padding()
-            } else {
-                ForEach(workspaceStore.workspaces) { workspace in
-                    workspaceRow(workspace)
-                    Divider()
+        let _ = menuBarPulse.tick
+        if workspaceStore.workspaces.isEmpty {
+            Text("No workspaces yet")
+        } else {
+            ForEach(workspaceStore.workspaces) { workspace in
+                Menu(menuTitle(for: workspace)) {
+                    Button("Open") {
+                        workspaceStore.selectedId = workspace.id
+                        openWindow(id: "main")
+                    }
+                    if let controller = registry.controllers[workspace.id], controller.phase == .connected {
+                        Button("Stop All") { Task { await controller.stopAll() } }
+                    }
                 }
             }
-            Button("Open Local Services") { openWindow(id: "main") }
-                .padding(.horizontal, 12).padding(.vertical, 8)
-            Divider()
-            Button("Quit") { NSApp.terminate(nil) }
-                .padding(.horizontal, 12).padding(.bottom, 8)
         }
-        .frame(width: 280)
+        Divider()
+        Button("Open Local Services") { openWindow(id: "main") }
+        Button("Check for Updates…") {
+            if let url = URL(string: "https://github.com/gnasdev/local-services/releases") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        Button("Quit") { NSApp.terminate(nil) }
     }
 
-    @ViewBuilder
-    private func workspaceRow(_ workspace: Workspace) -> some View {
-        let controller = registry.controllers[workspace.id]
-        HStack {
-            Circle().fill(dotColor(for: workspace, controller: controller)).frame(width: 8, height: 8)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(workspace.displayName)
-                Text(statusText(for: workspace, controller: controller)).font(.caption).foregroundStyle(.secondary)
-            }
-            Spacer()
-            if let controller, controller.phase == .connected {
-                Button("Start All") { Task { await controller.startAll() } }.controlSize(.small)
-                Button("Stop All") { Task { await controller.stopAll() } }.controlSize(.small)
-            }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 6)
+    private func menuTitle(for workspace: Workspace) -> String {
+        let status = statusText(for: workspace, controller: registry.controllers[workspace.id])
+        return "\(workspace.displayName) — \(status)"
     }
 
     private func statusText(for workspace: Workspace, controller: WorkspaceController?) -> String {
@@ -108,16 +106,6 @@ struct MenuBarContentView: View {
             let ready = controller.services.filter { $0.displayState == "ready" }.count
             let failed = controller.services.filter { $0.displayState == "failed" }.count
             return failed > 0 ? "\(ready)/\(controller.services.count) ready · \(failed) failed" : "\(ready)/\(controller.services.count) ready"
-        }
-    }
-
-    private func dotColor(for workspace: Workspace, controller: WorkspaceController?) -> Color {
-        guard workspace.trusted, let controller else { return .gray }
-        switch controller.phase {
-        case .failed: return .red
-        case .connected:
-            return controller.services.contains { $0.displayState == "failed" } ? .red : .green
-        default: return .yellow
         }
     }
 }

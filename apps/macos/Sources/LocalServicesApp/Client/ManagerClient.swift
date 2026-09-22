@@ -1,10 +1,8 @@
 // Thin HTTP client for one daemon's loopback API. One instance per workspace; the connection
 // (host/port/token/protocolVersion) comes from `DaemonConnection`/`lsd manager ensure --json`.
 //
-// Polling, not SSE, for v1: `GET /v1/services` on a timer (see `WorkspaceController`). The daemon's
-// `/v1/events/stream` (SSE) is the lower-latency path the TUI/CLI use, and is a documented fast
-// follow here — polling is simpler to get right on the first pass and cheap enough for a handful of
-// services on a local loopback connection.
+// Status updates prefer `/v1/events/stream` (same SSE the TUI uses). Polling `GET /v1/services` is
+// the fallback when the stream is missing or drops.
 
 import Foundation
 
@@ -15,6 +13,7 @@ enum ManagerClientError: Error, LocalizedError {
     /// An operation the daemon accepted (202) and then settled as `failed`. Its message is the
     /// daemon's own — e.g. `Dependency startup failed: db (…)`.
     case operationFailed(String)
+    case watchUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -22,6 +21,7 @@ enum ManagerClientError: Error, LocalizedError {
         case .decoding(let error): return "malformed manager response: \(error)"
         case .transport(let error): return "manager unavailable: \(error.localizedDescription)"
         case .operationFailed(let message): return message
+        case .watchUnsupported: return "event stream is not available"
         }
     }
 }
@@ -69,11 +69,6 @@ final class ManagerClient: ManagerAPI {
         return try await post("/v1/operations", body: body, as: OperationResponse.self).operation
     }
 
-    /// `POST /v1/operations/bulk-start` — brings up every one of `targets` independently and
-    /// concurrently, stopping on the first failure (same policy the CLI's `start <group> --wait`
-    /// uses). There's no bulk-stop
-    /// endpoint on the daemon (see AGENTS.md); stopping several services is a client-side loop of
-    /// individual `perform(.stop, ...)` calls instead — see `WorkspaceController.stopAll`.
     /// `GET /v1/operations/:id` — the daemon accepts an operation with `202` and runs it
     /// asynchronously, so its outcome is only ever visible by reading it back.
     func operation(id: String) async throws -> ManagerOperation {
@@ -81,6 +76,67 @@ final class ManagerClient: ManagerAPI {
         return try await get("/v1/operations/\(escaped)", as: OperationResponse.self).operation
     }
 
+    /// `GET /v1/events/stream` — same SSE the TUI uses. Yields until the connection drops.
+    func watchEvents(after: UInt64?, epoch: String?) -> AsyncThrowingStream<ManagerStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await self.streamEvents(after: after, epoch: epoch, continuation: continuation)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func streamEvents(after: UInt64?, epoch: String?, continuation: AsyncThrowingStream<ManagerStreamEvent, Error>.Continuation) async throws {
+        var query: [String] = []
+        if let after { query.append("after=\(after)") }
+        if let epoch {
+            let encoded = epoch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? epoch
+            query.append("epoch=\(encoded)")
+        }
+        var path = "/v1/events/stream"
+        if !query.isEmpty { path += "?" + query.joined(separator: "&") }
+        var req = request(path)
+        req.setValue("text/event-stream", forHTTPHeaderField: "accept")
+        req.timeoutInterval = 60 * 60 * 24
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: req)
+        } catch {
+            throw ManagerClientError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw ManagerClientError.transport(URLError(.badServerResponse))
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw ManagerClientError.http(status: http.statusCode, code: "request_failed", message: "HTTP \(http.statusCode)")
+        }
+        var buffer = ""
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            buffer += line + "\n"
+            if buffer.utf8.count > SSEParser.maxFrameBytes {
+                throw ManagerClientError.decoding(URLError(.dataLengthExceedsMaximum))
+            }
+            for frame in SSEParser.takeFrames(from: &buffer) {
+                let trimmed = frame.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty || trimmed.hasPrefix(":") { continue }
+                guard let event = SSEParser.parseFrame(frame) else { continue }
+                continuation.yield(event)
+            }
+        }
+    }
+
+    /// `POST /v1/operations/bulk-start` — brings up every one of `targets` independently and
+    /// concurrently, stopping on the first failure (same policy the CLI's `start <group> --wait`
+    /// uses). There's no bulk-stop endpoint on the daemon; stopping several services is a
+    /// client-side loop of individual `perform(.stop, ...)` calls instead — see
+    /// `WorkspaceController.stopAll`.
     @discardableResult
     func bulkStart(targets: [String]) async throws -> ManagerOperation {
         var req = request("/v1/operations/bulk-start")

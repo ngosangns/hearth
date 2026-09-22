@@ -47,4 +47,12 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(first.id, second.id)
         XCTAssertEqual(store.workspaces.count, 1)
     }
+
+    func testOpenURLSelectsAndAddsThePath() {
+        let store = WorkspaceStore(fileURL: tempFileURL())
+        store.handleOpenURL(URL(string: "local-services://open?path=/tmp/from-url")!)
+        XCTAssertEqual(store.workspaces.map(\.path), ["/tmp/from-url"])
+        XCTAssertEqual(store.selectedId, store.workspaces.first?.id)
+        XCTAssertFalse(store.workspaces[0].trusted, "URL open must not auto-trust")
+    }
 }

@@ -42,6 +42,28 @@ final class ManagerModelsTests: XCTestCase {
         XCTAssertEqual(response.services[0].displayState, "stopped")
     }
 
+    func testVisuallyEqualIgnoresUpdatedAt() {
+        let a = makeService("api", actualState: "ready")
+        let b = ServiceLifecycleState(
+            serviceId: a.serviceId,
+            desiredState: a.desiredState,
+            actualState: a.actualState,
+            readiness: a.readiness,
+            generation: a.generation,
+            identity: a.identity,
+            readinessKind: a.readinessKind,
+            readinessDetail: a.readinessDetail,
+            createdAt: a.createdAt,
+            updatedAt: "2099-01-01T00:00:00.000Z",
+            exitedAt: a.exitedAt,
+            exitCode: a.exitCode,
+            error: a.error,
+            currentOperationId: a.currentOperationId
+        )
+        XCTAssertTrue(a.isVisuallyEqual(to: b))
+        XCTAssertFalse(a.isVisuallyEqual(to: makeService("api", actualState: "stopped")))
+    }
+
     func testDecodesCatalogResponse() throws {
         let json = """
         {"catalog":{"startFailurePolicy":"stop-on-first-failure-keep-started","services":[{"id":"sleeper","profiles":{"run":{"commandStatus":"verified","readiness":{"kind":"process"},"command":{"command":{"argv":["sleep","30"]},"cwd":"."}}}}],"groups":{}}}

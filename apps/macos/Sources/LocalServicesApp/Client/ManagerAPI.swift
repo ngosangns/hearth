@@ -16,6 +16,9 @@ protocol ManagerAPI: Sendable {
     func operation(id: String) async throws -> ManagerOperation
     /// Every registered service URL, placeholders resolved (`GET /v1/urls`).
     func urls() async throws -> [ResolvedServiceUrl]
+    /// Live event stream (`GET /v1/events/stream`). Default throws `watchUnsupported` so fakes and
+    /// older daemons fall back to polling.
+    func watchEvents(after: UInt64?, epoch: String?) -> AsyncThrowingStream<ManagerStreamEvent, Error>
 }
 
 extension ManagerAPI {
@@ -50,5 +53,9 @@ extension ManagerAPI {
     /// The daemon's default log page size; kept here so callers and the protocol agree on it.
     func logs(serviceId: String, cursor: Int?, generation: Int?) async throws -> LogSlice {
         try await logs(serviceId: serviceId, cursor: cursor, generation: generation, limit: 16_384)
+    }
+
+    func watchEvents(after: UInt64?, epoch: String?) -> AsyncThrowingStream<ManagerStreamEvent, Error> {
+        AsyncThrowingStream { $0.finish(throwing: ManagerClientError.watchUnsupported) }
     }
 }

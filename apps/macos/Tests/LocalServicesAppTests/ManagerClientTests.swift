@@ -33,4 +33,10 @@ final class ManagerClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Bearer tok3n")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-local-services-protocol"), "1")
     }
+
+    func testEventStreamPathKeepsQueryInTheURLQuery() {
+        let request = makeClient().request("/v1/events/stream?after=12&epoch=abc")
+        XCTAssertEqual(request.url?.path, "/v1/events/stream")
+        XCTAssertEqual(request.url?.query, "after=12&epoch=abc")
+    }
 }

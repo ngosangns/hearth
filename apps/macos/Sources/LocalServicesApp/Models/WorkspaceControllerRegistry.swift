@@ -9,15 +9,19 @@ import Foundation
 /// `controllers` is the single source of truth and `sync(_:)` is the only thing that mutates it:
 /// views look controllers up read-only (`controllers[id]`) and never create one, because creating
 /// one from inside a SwiftUI `body` would publish a change during a view update.
+///
+/// Nested controller updates are forwarded to `menuBarPulse` only — not this object's
+/// `objectWillChange`. The main window already observes the selected `WorkspaceController`
+/// directly; republishing every 2s poll through the registry rebuilt the whole split view.
 @MainActor
 final class WorkspaceControllerRegistry: ObservableObject {
     @Published private(set) var controllers: [UUID: WorkspaceController] = [:]
+    let menuBarPulse = MenuBarPulse()
 
     /// A `WorkspaceController` is itself an `ObservableObject`, and SwiftUI does NOT propagate a
-    /// nested observable's changes through the object holding it. Without these forwarded
-    /// subscriptions the menu bar — which observes only this registry, then reads through to
-    /// `controller.services`/`controller.phase` — would render once and then never update again,
-    /// since `controllers` only mutates when a workspace is added or removed.
+    /// nested observable's changes through the object holding it. The menu bar observes
+    /// `menuBarPulse` (and then reads through to each controller) so it stays live with the window
+    /// closed, without invalidating `ContentView` on every service poll.
     private var childChanges: [UUID: AnyCancellable] = [:]
 
     /// Reconciles the live controller set against the workspace list: creates one per workspace,
@@ -52,7 +56,7 @@ final class WorkspaceControllerRegistry: ObservableObject {
         }
         let controller = WorkspaceController(workspace: workspace)
         childChanges[workspace.id] = controller.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.menuBarPulse.bump()
         }
         controllers[workspace.id] = controller
         return controller
@@ -66,4 +70,12 @@ final class WorkspaceControllerRegistry: ObservableObject {
         controllers.removeValue(forKey: id)
         childChanges.removeValue(forKey: id)
     }
+}
+
+/// Tiny observable the menu bar watches. Bumping it redraws the status item without publishing
+/// through `WorkspaceControllerRegistry` (which would rebuild the main window).
+@MainActor
+final class MenuBarPulse: ObservableObject {
+    @Published private(set) var tick: UInt = 0
+    func bump() { tick &+= 1 }
 }

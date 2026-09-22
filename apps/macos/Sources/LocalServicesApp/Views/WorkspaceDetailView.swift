@@ -23,13 +23,17 @@ struct WorkspaceDetailView: View {
         .navigationTitle(workspace.displayName)
         .toolbar {
             if workspace.trusted, controller.phase == .connected {
-                ToolbarItem { Button("Start All") { Task { await controller.startAll() } } }
                 ToolbarItem { Button("Stop All") { Task { await controller.stopAll() } } }
             }
             ToolbarItem {
                 Menu {
                     Button("Reveal in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: workspace.path)])
+                    }
+                    Button("Check for Updates…") {
+                        if let url = URL(string: "https://github.com/gnasdev/local-services/releases") {
+                            NSWorkspace.shared.open(url)
+                        }
                     }
                     Divider()
                     Button("Remove Workspace", role: .destructive) { workspaceStore.remove(id: workspace.id) }
@@ -84,15 +88,10 @@ private struct TrustPromptView: View {
 }
 
 /// A master-detail split: the service list on the left drives a live log panel on the right for
-/// whichever row is focused/selected — no separate button-into-modal-sheet step. This also closes the
-/// bug class a modal log sheet had: a sheet captured a serviceId once, at the moment it was opened, so
-/// a service removed from the catalog underneath it (a config-file edit + hot-reload) left the sheet
-/// polling a dead id forever, surfacing a raw `service_not_found` error with no way to recover short
-/// of closing it. Selection here is just a `String?` re-checked against the live `controller.services`
-/// on every update (`onChange` below), so a vanished service clears itself automatically.
+/// whichever row is focused/selected. Selection and log tails live on `WorkspaceController` so they
+/// survive switching workspaces (this view is recreated via `.id(workspace.id)`).
 private struct ServiceListView: View {
     @ObservedObject var controller: WorkspaceController
-    @State private var selectedServiceId: String?
 
     var body: some View {
         HSplitView {
@@ -107,7 +106,7 @@ private struct ServiceListView: View {
                     .padding(8)
                     .background(.red.opacity(0.1))
                 }
-                List(controller.services, selection: $selectedServiceId) { service in
+                List(controller.services, selection: $controller.selectedServiceId) { service in
                     ServiceRow(
                         service: service,
                         label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
@@ -124,21 +123,14 @@ private struct ServiceListView: View {
             logPanel
                 .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
         }
-        // A hot-reloaded catalog can drop the selected service between polls (see this type's own
-        // doc comment) — never leave the panel pointed at an id that no longer exists.
-        .onChange(of: controller.services) { services in
-            if let id = selectedServiceId, !services.contains(where: { $0.serviceId == id }) {
-                selectedServiceId = nil
-            }
-        }
     }
 
     @ViewBuilder
     private var logPanel: some View {
-        if let selectedServiceId, let logController = controller.makeLogController(serviceId: selectedServiceId) {
+        if let selectedServiceId = controller.selectedServiceId, let logController = controller.logController(for: selectedServiceId) {
             let label = controller.catalog?.services.first(where: { $0.id == selectedServiceId })?.displayName ?? selectedServiceId
-            ServiceLogPanel(serviceLabel: label, controller: logController)
-                .id(selectedServiceId) // fresh LogController (and its poll loop) per selected service
+            ServiceLogPanel(serviceLabel: label, log: logController)
+                .id(selectedServiceId)
         } else {
             VStack(spacing: 8) {
                 Image(systemName: "doc.plaintext").font(.system(size: 32)).foregroundStyle(.secondary)
@@ -178,11 +170,7 @@ private struct ServiceRow: View {
                 }
             }
             Spacer()
-            if busy {
-                ProgressView().controlSize(.small)
-            } else {
-                actions
-            }
+            actions
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle()) // the whole row is clickable/selectable, not just the text
@@ -211,26 +199,36 @@ private struct ServiceRow: View {
 
     @ViewBuilder
     private var actions: some View {
-        switch service.displayState {
-        case "stopped", "failed", "orphaned":
-            Button("Start") { onAction(.start) }
-        case "ready", "starting":
-            HStack(spacing: 6) {
-                Button("Restart") { onAction(.restart) }
-                Button("Stop") { onAction(.stop) }
+        HStack(spacing: 6) {
+            if busy {
+                ProgressView().controlSize(.small)
             }
-        // A service queued behind another operation on the same target stays `queued-start`
-        // until something clears it, and `Stop All` deliberately skips that state — so without
-        // this the row offered no way out of it at all.
-        case "queued":
-            Button("Cancel") { onAction(.stop) }
-        // Externally-owned (an adopted docker/tailnet unit): the daemon observes it rather than
-        // owning it, so Restart is not ours to offer, but Stop is what the CLI does here too.
-        case "external":
-            Button("Stop") { onAction(.stop) }
-        // `stopping` is genuinely in-flight — no action, the poll will move it to `stopped`.
-        default:
-            EmptyView()
+            if busy {
+                // Keep Stop available for the whole start/restart flight so the user can abort
+                // without waiting for readiness.
+                if service.displayState != "stopping" {
+                    Button("Stop") { onAction(.stop) }
+                }
+            } else {
+                switch service.displayState {
+                case "stopped", "failed", "orphaned":
+                    Button("Start") { onAction(.start) }
+                case "ready", "starting":
+                    Button("Restart") { onAction(.restart) }
+                    Button("Stop") { onAction(.stop) }
+                // A service queued behind another operation on the same target stays `queued-start`
+                // until something clears it — without this the row offered no way out of it at all.
+                case "queued":
+                    Button("Cancel") { onAction(.stop) }
+                // Externally-owned (an adopted docker/tailnet unit): the daemon observes it rather
+                // than owning it, so Restart is not ours to offer, but Stop is what the CLI does.
+                case "external":
+                    Button("Stop") { onAction(.stop) }
+                // `stopping` is genuinely in-flight — no extra action, the poll will move it.
+                default:
+                    EmptyView()
+                }
+            }
         }
     }
 }

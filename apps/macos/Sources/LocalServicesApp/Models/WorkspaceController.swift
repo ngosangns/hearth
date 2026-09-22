@@ -1,8 +1,8 @@
 import Foundation
 
 /// One workspace's live connection state: ensures a daemon, holds the resulting `ManagerClient`, and
-/// polls `/v1/services` on a timer while `.connected` (see `ManagerClient`'s doc comment for why
-/// polling rather than SSE in this first pass). Owned by `WorkspaceControllerRegistry` at the app
+/// watches `/v1/events/stream` (falling back to polling `GET /v1/services`). Owned by
+/// `WorkspaceControllerRegistry` at the app
 /// level — one per workspace, created and torn down only by its `sync(_:)`, so a connection outlives
 /// the detail view and the menu bar can read live status with no window open.
 @MainActor
@@ -22,7 +22,13 @@ final class WorkspaceController: ObservableObject {
     /// after each catalog reload — URLs only change when the catalog does (or the tailnet host does,
     /// which the daemon re-resolves on each request).
     @Published private(set) var urls: [ResolvedServiceUrl] = []
+    /// Hoisted out of the detail view so switching workspaces (which recreates `ServiceListView`)
+    /// restores the last focused row and its cached log tail instead of refetching from byte 0.
+    @Published var selectedServiceId: String?
     @Published private(set) var actionsInFlight: Set<String> = []
+    /// Nested start-then-stop on the same row would otherwise drop the spinner when the start
+    /// operation settled while the stop was still in flight.
+    private var inFlightCounts: [String: Int] = [:]
     @Published var lastActionError: String?
 
     private var client: (any ManagerAPI)?
@@ -35,6 +41,7 @@ final class WorkspaceController: ObservableObject {
     /// Whether `connect()` should start the config-file watcher. Off under test: it would install a
     /// real dispatch source on a real directory.
     private let watchesConfigFile: Bool
+    private var logControllers: [String: LogController] = [:]
 
     init(
         workspace: Workspace,
@@ -60,12 +67,13 @@ final class WorkspaceController: ObservableObject {
         phase = .connecting
         do {
             let client = try await connector(workspace.path)
+            dropLogControllers()
             self.client = client
             catalog = try? await client.catalog() // best-effort — service status doesn't depend on it
             await refreshUrls()
-            services = try await client.services()
+            applyServices(try await client.services())
             phase = .connected
-            startPolling()
+            startWatching()
             if watchesConfigFile {
                 startConfigWatcher()
             }
@@ -79,6 +87,7 @@ final class WorkspaceController: ObservableObject {
         pollTask = nil
         configWatcher?.stop()
         configWatcher = nil
+        dropLogControllers()
     }
 
     private func startConfigWatcher() {
@@ -114,14 +123,60 @@ final class WorkspaceController: ObservableObject {
         urls.filter { $0.serviceId == serviceId }
     }
 
-    private func startPolling() {
+    /// Prefer the daemon's SSE stream (same path as the TUI). If the client cannot stream
+    /// (`watchUnsupported` on fakes / older daemons), fall back to polling `GET /v1/services`.
+    private func startWatching() {
         pollTask?.cancel()
-        pollTask = Task { [weak self, pollInterval] in
-            while let self, !Task.isCancelled {
-                try? await Task.sleep(for: pollInterval)
+        pollTask = Task { [weak self] in
+            await self?.runWatchLoop()
+        }
+    }
+
+    private func runWatchLoop() async {
+        var after: UInt64?
+        var epoch: String?
+        while !Task.isCancelled {
+            guard let client else { return }
+            do {
+                for try await event in client.watchEvents(after: after, epoch: epoch) {
+                    if Task.isCancelled { return }
+                    switch event {
+                    case .replay(let nextEpoch, let reset, let latest):
+                        epoch = nextEpoch
+                        if reset {
+                            after = latest
+                            await refresh()
+                            await refreshUrls()
+                        }
+                    case .manager(let sequence, let type):
+                        after = sequence
+                        if type == "service.log" { continue }
+                        await refresh()
+                        if type == "manager.catalog-reloaded" {
+                            catalog = try? await client.catalog()
+                            await refreshUrls()
+                        }
+                    }
+                }
                 if Task.isCancelled { return }
-                await self.refresh()
+                try await Task.sleep(for: .seconds(1))
+            } catch is CancellationError {
+                return
+            } catch ManagerClientError.watchUnsupported {
+                await pollFallback()
+                return
+            } catch {
+                await refresh()
+                try? await Task.sleep(for: pollInterval)
             }
+        }
+    }
+
+    private func pollFallback() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: pollInterval)
+            if Task.isCancelled { return }
+            await refresh()
         }
     }
 
@@ -130,19 +185,41 @@ final class WorkspaceController: ObservableObject {
     func refresh() async {
         guard let client else { return }
         do {
-            services = try await client.services()
+            let fresh = try await client.services()
             if case .failed = phase { phase = .connected } // recovered from a transient blip
+            applyServices(fresh)
         } catch {
             phase = .failed(error.localizedDescription)
         }
     }
 
-    /// `nil` before a successful `connect()` — a log sheet should only ever be offered once
-    /// `phase == .connected`, so callers do not need to distinguish "not connected yet" from "will
-    /// never have a client" here.
-    func makeLogController(serviceId: String) -> LogController? {
+    /// Cached per service so focusing a row again resumes the existing cursor. `nil` before a
+    /// successful `connect()`.
+    func logController(for serviceId: String) -> LogController? {
         guard let client else { return nil }
-        return LogController(client: client, serviceId: serviceId)
+        if let existing = logControllers[serviceId] { return existing }
+        let created = LogController(client: client, serviceId: serviceId)
+        logControllers[serviceId] = created
+        return created
+    }
+
+    private func applyServices(_ fresh: [ServiceLifecycleState]) {
+        let unchanged = fresh.count == services.count
+            && zip(services, fresh).allSatisfy { $0.isVisuallyEqual(to: $1) }
+        if !unchanged { services = fresh }
+        let live = Set(fresh.map(\.serviceId))
+        if let selected = selectedServiceId, !live.contains(selected) {
+            selectedServiceId = nil
+        }
+        for id in logControllers.keys where !live.contains(id) {
+            logControllers[id]?.stop()
+            logControllers.removeValue(forKey: id)
+        }
+    }
+
+    private func dropLogControllers() {
+        for controller in logControllers.values { controller.stop() }
+        logControllers.removeAll()
     }
 
     /// Waits for the operation to actually settle. `POST /v1/operations` returns `202 Accepted`
@@ -152,30 +229,11 @@ final class WorkspaceController: ObservableObject {
     /// entirely (it only ever lands on the settled operation's `error`).
     func perform(_ action: ManagerAction, serviceId: String) async {
         guard let client else { return }
-        actionsInFlight.insert(serviceId)
-        defer { actionsInFlight.remove(serviceId) }
+        beginFlight(serviceId)
+        defer { endFlight(serviceId) }
         do {
             let accepted = try await client.perform(action, serviceId: serviceId)
             // Refresh while it runs so the UI tracks the intermediate states, then again after.
-            await refresh()
-            _ = try await client.waitForOperation(id: accepted.id)
-            await refresh()
-        } catch {
-            lastActionError = error.localizedDescription
-            await refresh()
-        }
-    }
-
-    /// Every catalog service, started independently and concurrently via
-    /// `/v1/operations/bulk-start` — same "stop on first failure" policy
-    /// `lsd start <group> --wait` uses.
-    func startAll() async {
-        guard let client, let catalog, !catalog.services.isEmpty else { return }
-        let targets = catalog.services.map(\.id)
-        actionsInFlight.formUnion(targets)
-        defer { actionsInFlight.subtract(targets) }
-        do {
-            let accepted = try await client.bulkStart(targets: targets)
             await refresh()
             _ = try await client.waitForOperation(id: accepted.id)
             await refresh()
@@ -189,12 +247,27 @@ final class WorkspaceController: ObservableObject {
     /// non-stopped service concurrently, client-side, the same way the TUI's `s` "stop all" key does.
     func stopAll() async {
         guard client != nil else { return }
-        let targets = services.filter { !["stopped", "queued-start"].contains($0.actualState) }.map(\.serviceId)
+        let targets = services.filter { $0.actualState != "stopped" }.map(\.serviceId)
         guard !targets.isEmpty else { return }
         await withTaskGroup(of: Void.self) { group in
             for serviceId in targets {
                 group.addTask { [weak self] in await self?.perform(.stop, serviceId: serviceId) }
             }
+        }
+    }
+
+    private func beginFlight(_ serviceId: String) {
+        inFlightCounts[serviceId, default: 0] += 1
+        actionsInFlight.insert(serviceId)
+    }
+
+    private func endFlight(_ serviceId: String) {
+        let next = (inFlightCounts[serviceId] ?? 1) - 1
+        if next <= 0 {
+            inFlightCounts.removeValue(forKey: serviceId)
+            actionsInFlight.remove(serviceId)
+        } else {
+            inFlightCounts[serviceId] = next
         }
     }
 }

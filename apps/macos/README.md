@@ -20,6 +20,10 @@ directly.
 `/Applications`, this checkout's `cargo build` output, then the login shell. See
 `SidecarLocator.swift` for the full order.
 
+Deep link: `local-services://open?path=/absolute/folder` adds that folder and selects it (trust
+prompt still gates the first daemon spawn). Status follows `/v1/events/stream` (poll fallback).
+Logs render in an append-only `NSTextView`. The main window is resizable and restores its frame.
+
 ## Requirements to build/run
 
 - Xcode 15+ / Swift 5.10 toolchain (`swift build` works standalone).
@@ -54,10 +58,12 @@ Produces an ad-hoc-signed `Local Services.app` bundling compiled `lsd` at
 - A workspace's live connection lives in `WorkspaceControllerRegistry` at the app level.
 - `MenuBarExtra` — a global "ready/total" summary across every trusted workspace.
 - Config watch: editing `local-services.yaml`/`.yml`/`.json` triggers `lsd manager reload`.
-- "Start All" / "Stop All" in the toolbar and menu bar.
+- "Stop All" in the toolbar and menu bar.
 
 ## Known limitations
 
-- **No distributable `.app`** — still ad-hoc signed. Real distribution needs a Developer ID cert +
-  notarization. A `bun build --compile` sidecar was tried and rejected (see AGENTS.md); the Rust
-  binary does not hit that issue, which is why it can be bundled directly.
+- **No distributable `.app`** — `build-app.sh` ad-hoc signs with the hardened runtime
+  (`--options runtime`) and stamps the bundle version from `lsd --version`. Shipping to another
+  machine still needs a Developer ID cert + `notarytool submit` + stapler. Sparkle's `SUFeedURL` is
+  in Info.plist pointing at GitHub Releases; **Check for Updates…** opens that page until a signed
+  appcast exists. A `bun build --compile` sidecar was tried and rejected (see AGENTS.md).

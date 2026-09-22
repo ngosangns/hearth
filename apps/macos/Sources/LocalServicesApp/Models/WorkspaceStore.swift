@@ -7,12 +7,21 @@ import Foundation
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published private(set) var workspaces: [Workspace] = []
+    @Published var selectedId: UUID? {
+        didSet { UserDefaults.standard.set(selectedId?.uuidString, forKey: Self.selectionKey) }
+    }
+
+    private static let selectionKey = "selectedWorkspaceId"
 
     private let fileURL: URL
 
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? Self.defaultFileURL()
         load()
+        if let raw = UserDefaults.standard.string(forKey: Self.selectionKey), let id = UUID(uuidString: raw),
+           workspaces.contains(where: { $0.id == id }) {
+            selectedId = id
+        }
     }
 
     private static func defaultFileURL() -> URL {
@@ -52,16 +61,32 @@ final class WorkspaceStore: ObservableObject {
     /// twice should never produce two independent connections to the same daemon.
     @discardableResult
     func add(path: String) -> Workspace {
-        if let existing = workspaces.first(where: { $0.path == path }) { return existing }
+        if let existing = workspaces.first(where: { $0.path == path }) {
+            selectedId = existing.id
+            return existing
+        }
         let workspace = Workspace(path: path)
         workspaces.append(workspace)
+        selectedId = workspace.id
         save()
         return workspace
     }
 
     func remove(id: UUID) {
         workspaces.removeAll { $0.id == id }
+        if selectedId == id { selectedId = workspaces.first?.id }
         save()
+    }
+
+    /// `local-services://open?path=/abs/folder` — adds the folder if needed and selects it.
+    /// Does not auto-trust; the trust prompt still gates the first daemon spawn.
+    func handleOpenURL(_ url: URL) {
+        guard url.scheme == "local-services" else { return }
+        guard url.host == "open" else { return }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let path = components.queryItems?.first(where: { $0.name == "path" })?.value,
+              !path.isEmpty else { return }
+        _ = add(path: path)
     }
 
     func setTrusted(_ trusted: Bool, id: UUID) {

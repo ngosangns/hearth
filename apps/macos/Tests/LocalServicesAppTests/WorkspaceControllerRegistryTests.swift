@@ -45,21 +45,26 @@ final class WorkspaceControllerRegistryTests: XCTestCase {
         XCTAssertEqual(Array(registry.controllers.keys), [a.id])
     }
 
-    /// The staleness this pins: the menu bar observes the registry but reads through to each
-    /// controller, and SwiftUI does not propagate a nested observable's changes — so the whole
-    /// "live status with the window closed" feature rendered once and then froze.
-    func testAChildControllersChangeNotifiesTheRegistry() {
+    /// Nested controller updates must reach the menu bar pulse, not the registry itself — publishing
+    /// through the registry rebuilt the main window on every 2s poll.
+    func testAChildControllersChangePulsesTheMenuBarNotTheRegistry() {
         let registry = WorkspaceControllerRegistry()
         let a = untrusted("/tmp/a")
         registry.sync([a])
 
-        var notifications = 0
-        let cancellable = registry.objectWillChange.sink { _ in notifications += 1 }
-        defer { cancellable.cancel() }
+        var registryNotes = 0
+        var pulseNotes = 0
+        let registryWatch = registry.objectWillChange.sink { registryNotes += 1 }
+        let pulseWatch = registry.menuBarPulse.objectWillChange.sink { pulseNotes += 1 }
+        defer {
+            registryWatch.cancel()
+            pulseWatch.cancel()
+        }
 
         registry.controllers[a.id]?.lastActionError = "something happened"
 
-        XCTAssertEqual(notifications, 1, "a nested controller's change must reach the registry's observers")
+        XCTAssertEqual(registryNotes, 0, "a nested controller's change must not rebuild ContentView")
+        XCTAssertEqual(pulseNotes, 1, "the menu bar pulse must still see nested controller changes")
     }
 
     func testARemovedControllersChangeNoLongerNotifiesTheRegistry() {

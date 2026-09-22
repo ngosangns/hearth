@@ -45,6 +45,20 @@ struct ServiceLifecycleState: Codable, Equatable, Identifiable {
 
     var id: String { serviceId }
 
+    /// Fields the UI actually renders. Daemon timestamps (`updatedAt`) change on every poll even
+    /// when nothing visible has moved, so comparing the whole struct would republish the service
+    /// list (and rebuild the log panel) twice a second.
+    func isVisuallyEqual(to other: ServiceLifecycleState) -> Bool {
+        serviceId == other.serviceId
+            && actualState == other.actualState
+            && readiness == other.readiness
+            && readinessDetail == other.readinessDetail
+            && identity == other.identity
+            && error == other.error
+            && currentOperationId == other.currentOperationId
+            && exitCode == other.exitCode
+    }
+
     /// A small, display-oriented collapse of `actualState` — mirrors `localctl.ts`'s own `textState`.
     var displayState: String {
         switch actualState {

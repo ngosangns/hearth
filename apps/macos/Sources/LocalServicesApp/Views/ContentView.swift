@@ -4,11 +4,9 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
-    @State private var selection: UUID?
-
     var body: some View {
         NavigationSplitView {
-            List(workspaceStore.workspaces, selection: $selection) { workspace in
+            List(workspaceStore.workspaces, selection: $workspaceStore.selectedId) { workspace in
                 WorkspaceRow(workspace: workspace).tag(workspace.id)
             }
             .navigationTitle("Workspaces")
@@ -25,7 +23,7 @@ struct ContentView: View {
                 }
             }
         } detail: {
-            if let selection, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }),
+            if let selection = workspaceStore.selectedId, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }),
                let controller = registry.controllers[workspace.id] {
                 // A read-only lookup: the registry creates controllers in `sync(_:)`, never here —
                 // creating one from inside `body` would publish a change during a view update. The
@@ -34,7 +32,7 @@ struct ContentView: View {
                 // itself in an `init`, where @EnvironmentObject cannot be read yet.
                 WorkspaceDetailView(controller: controller, workspace: workspace)
                     .id(workspace.id) // resets per-view state (e.g. an open log sheet) on selection change
-            } else if selection != nil {
+            } else if workspaceStore.selectedId != nil {
                 // Only reachable for the frame between a workspace being added and `sync(_:)`
                 // running for the changed list.
                 ContentUnavailableViewCompat(title: "Preparing…", message: "Setting up this workspace.", systemImage: "folder")
@@ -51,8 +49,7 @@ struct ContentView: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Add"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let workspace = workspaceStore.add(path: url.path)
-        selection = workspace.id
+        _ = workspaceStore.add(path: url.path)
     }
 }
 

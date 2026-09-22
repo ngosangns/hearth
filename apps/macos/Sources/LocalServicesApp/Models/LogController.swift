@@ -2,8 +2,8 @@ import Foundation
 
 /// One service's live log tail: polls `GET /v1/logs/:serviceId` on a timer, following the
 /// cursor/generation protocol `lsd logs` uses (see `ManagerClient.logs`'s doc
-/// comment). One instance per selected service (see `ServiceLogPanel`) — created fresh whenever the
-/// selection changes, not shared/cached.
+/// comment). Cached on `WorkspaceController` per service id so focusing a row again resumes the
+/// existing cursor instead of refetching the whole buffer.
 @MainActor
 final class LogController: ObservableObject {
     @Published private(set) var text: String = ""
@@ -74,14 +74,13 @@ final class LogController: ObservableObject {
     func fetchOnce() async {
         do {
             let slice = try await client.logs(serviceId: serviceId, cursor: cursor, generation: generation)
-            text = slice.reset ? slice.data : text + slice.data
+            let next = slice.reset ? slice.data : (slice.data.isEmpty ? text : text + slice.data)
             // Trim by BYTES on both sides of the comparison. `suffix(n)` counts Characters, so with
             // any multi-byte log output the trimmed string could still exceed the byte cap — the
             // condition then stayed true on every poll and re-copied a 256KB+ string on the main
             // actor every 700ms, forever, without ever converging.
-            if text.utf8.count > Self.maxDisplayedBytes {
-                text = Self.trimmingToByteCount(text, maxBytes: Self.maxDisplayedBytes)
-            }
+            let trimmed = next.utf8.count > Self.maxDisplayedBytes ? Self.trimmingToByteCount(next, maxBytes: Self.maxDisplayedBytes) : next
+            if trimmed != text { text = trimmed }
             cursor = slice.nextCursor
             generation = slice.generation
             lastError = nil

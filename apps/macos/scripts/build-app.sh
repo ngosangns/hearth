@@ -43,6 +43,7 @@ mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources/lsd/bin"
 echo "==> assembling bundle at $app_bundle"
 cp "$executable" "$app_bundle/Contents/MacOS/LocalServicesApp"
 cp "$app_root/Info.plist" "$app_bundle/Contents/Info.plist"
+printf 'APPL????' > "$app_bundle/Contents/PkgInfo"
 if [ -f "$app_root/AppIcon.icns" ]; then
   cp "$app_root/AppIcon.icns" "$app_bundle/Contents/Resources/AppIcon.icns"
 else
@@ -50,10 +51,23 @@ else
 fi
 cp "$lsd_binary" "$app_bundle/Contents/Resources/lsd/bin/lsd"
 
-echo "==> ad-hoc codesign (local use only — see this script's header comment)"
-codesign --force --sign - "$app_bundle/Contents/Resources/lsd/bin/lsd"
-codesign --force --deep --sign - "$app_bundle"
+version="$("$lsd_binary" --version | awk '{print $NF}')"
+if [ -n "$version" ]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app_bundle/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app_bundle/Contents/Info.plist"
+  echo "==> stamped bundle version $version from lsd"
+fi
+
+entitlements="$app_root/LocalServicesApp.entitlements"
+echo "==> ad-hoc codesign with hardened runtime (local use only — see this script's header comment)"
+codesign --force --sign - --options runtime "$app_bundle/Contents/Resources/lsd/bin/lsd"
+if [ -f "$entitlements" ]; then
+  codesign --force --deep --sign - --options runtime --entitlements "$entitlements" "$app_bundle"
+else
+  codesign --force --deep --sign - --options runtime "$app_bundle"
+fi
 
 echo "==> done: $app_bundle"
 echo "    First launch via Finder needs a right-click > Open (ad-hoc signed, not notarized)."
 echo "    Bundles a compiled \`lsd\` sidecar."
+echo "    Notarization still needs a Developer ID certificate — see apps/macos/README.md."
