@@ -19,7 +19,7 @@ pub use process_tree::{
     ProcessTreeEntry, PsTreeRow,
 };
 pub use types::{
-    Host, ManagedProcess, ObservedProcess, OnOutput, PreparationAdapter, ProbeAdapter, ProcessAdapter,
+    Host, ManagedProcess, ObservedProcess, OnOutput, OutputSource, PreparationAdapter, ProbeAdapter, ProcessAdapter,
     ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,
     SystemClock,
 };

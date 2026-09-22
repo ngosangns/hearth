@@ -28,9 +28,9 @@ use crate::state::ProcessIdentity;
 
 use super::fingerprint::{command_argv, normalize_observed_command_fingerprint};
 use super::types::{
-    DockerContainerRecord, ManagedProcess, ObservedProcess, OnOutput, PosixProcessRecord, ProbeAdapter,
-    ProcessAdapter, ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock, SupervisorError,
-    SupervisorOptions, SystemClock,
+    DockerContainerRecord, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, PosixProcessRecord,
+    ProbeAdapter, ProcessAdapter, ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock,
+    SupervisorError, SupervisorOptions, SystemClock,
 };
 
 const RAW_LOG_POLL_MS: u64 = 200;
@@ -277,9 +277,50 @@ fn drain_raw_log_once(path: &Path, offset: &AtomicU64, on_output: &OnOutput) {
     })();
 }
 
+/// `docker compose up` forwards only the compose CLI's own status lines — a container's real
+/// stdout/stderr lives behind `docker logs`. This follows it, bounded by `since`/`tail` — a daemon
+/// adopting a long-running external container must not replay days of retained output into the log
+/// store on every re-attach. The returned stop handle cancels the follow task, which kills the
+/// `docker logs` child; the task also ends on its own when the container stops, since
+/// `docker logs --follow` exits with it.
+fn tail_container_logs(container_name: String, since: Option<String>, tail: Option<u64>, env: HashMap<String, String>, on_output: OnOutput) -> OutputTail {
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    let task_done = done.clone();
+    tokio::spawn(async move {
+        let mut cmd = Command::new("docker");
+        cmd.arg("logs").arg("--follow");
+        if let Some(since) = &since {
+            cmd.arg("--since").arg(since);
+        }
+        if let Some(tail) = tail {
+            cmd.arg("--tail").arg(tail.to_string());
+        }
+        cmd.arg(&container_name).env_clear().envs(&env).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let stdout_task = tokio::spawn(forward_stream(child.stdout.take(), Some(on_output.clone())));
+        let stderr_task = tokio::spawn(forward_stream(child.stderr.take(), Some(on_output)));
+        tokio::select! {
+            _ = task_cancel.cancelled() => {
+                let _ = child.kill().await;
+            }
+            _ = child.wait() => {}
+        }
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        task_done.store(true, Ordering::SeqCst);
+    });
+    OutputTail::new(Box::new(move || cancel.cancel()), done)
+}
+
 /// Port of `tailFile` — polls a raw capture file every `RAW_LOG_POLL_MS`, forwarding new bytes and
-/// truncating what it's read. Returns a stop handle (drains one last time, then stops polling).
-fn tail_file(path: PathBuf, on_output: OnOutput) -> Box<dyn FnOnce() + Send> {
+/// truncating what it's read. The returned tail's `done` is the same flag `stop` sets — this
+/// follower never finishes on its own (the raw file outlives whatever wrote to it).
+fn tail_file(path: PathBuf, on_output: OnOutput) -> OutputTail {
     let stopped = Arc::new(AtomicBool::new(false));
     let offset = Arc::new(AtomicU64::new(0));
     let task_path = path.clone();
@@ -292,11 +333,15 @@ fn tail_file(path: PathBuf, on_output: OnOutput) -> Box<dyn FnOnce() + Send> {
             tokio::time::sleep(Duration::from_millis(RAW_LOG_POLL_MS)).await;
         }
     });
-    Box::new(move || {
-        stopped.store(true, Ordering::SeqCst);
-        drain_raw_log_once(&path, &offset, &on_output);
-        handle.abort();
-    })
+    let done = stopped.clone();
+    OutputTail::new(
+        Box::new(move || {
+            stopped.store(true, Ordering::SeqCst);
+            drain_raw_log_once(&path, &offset, &on_output);
+            handle.abort();
+        }),
+        done,
+    )
 }
 
 fn merged_environment(base: &HashMap<String, String>, command_env: &Option<HashMap<String, String>>) -> HashMap<String, String> {
@@ -462,8 +507,17 @@ impl ProcessAdapter for DefaultProcessAdapter {
         Some(if code != 0 { Err(SupervisorError(format!("Docker service stop exited with {code}"))) } else { Ok(()) })
     }
 
-    fn attach_output(&self, service_id: &ServiceId, on_output: OnOutput) -> Option<Box<dyn FnOnce() + Send>> {
-        Some(tail_file(raw_log_path(&self.runtime_directory, service_id), on_output))
+    fn attach_output(&self, service_id: &ServiceId, source: OutputSource<'_>, on_output: OnOutput) -> Option<OutputTail> {
+        match source {
+            OutputSource::Process => Some(tail_file(raw_log_path(&self.runtime_directory, service_id), on_output)),
+            OutputSource::Container { container_name, since, tail } => Some(tail_container_logs(
+                container_name.to_string(),
+                since.map(str::to_string),
+                tail,
+                self.base_environment.clone(),
+                on_output,
+            )),
+        }
     }
 }
 
@@ -995,6 +1049,52 @@ mod tests {
 
         supervisor.stop(&"prepped-server".to_string(), None).await.expect("stop should succeed");
         let _ = std::fs::remove_dir_all(&runtime_dir);
+    }
+
+    /// Real end-to-end test of the container log follower: `docker run` a container that prints a
+    /// marker line, attach `tail_container_logs`, and the marker must arrive through `on_output` —
+    /// the same path `attach_output` wires for a `Docker` identity. Needs a real `docker` daemon,
+    /// like the compose test above.
+    #[tokio::test]
+    async fn tail_container_logs_forwards_a_real_containers_output() {
+        let name = format!("ls-core-logtail-{}", uuid::Uuid::new_v4().simple());
+        let marker = format!("logtail-marker-{}", uuid::Uuid::new_v4().simple());
+        let run = std::process::Command::new("docker")
+            .args(["run", "-d", "--name", &name, "alpine:latest", "sh", "-c", &format!("echo {marker}; sleep 300")])
+            .output();
+        let cleanup = || {
+            let _ = std::process::Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        match run {
+            Ok(output) if output.status.success() => {}
+            other => {
+                cleanup();
+                panic!("docker run must succeed for this test: {other:?}");
+            }
+        }
+        let started_at = match container_record(&name, "test").await {
+            Some(record) => record.container_started_at,
+            None => {
+                cleanup();
+                panic!("container {name} must be inspectable after docker run");
+            }
+        };
+
+        let captured: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_cb = captured.clone();
+        let on_output: OnOutput = Arc::new(move |data: &str| captured_for_cb.lock().unwrap().push_str(data));
+        let stop = tail_container_logs(name.clone(), Some(started_at), None, std::env::vars().collect(), on_output);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if captured.lock().unwrap().contains(&marker) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop.stop();
+        cleanup();
+        assert!(captured.lock().unwrap().contains(&marker), "container stdout must flow through the tail: {:?}", captured.lock().unwrap());
     }
 
     /// Real (read-only) test of `tailnet_serving`/`DefaultProbeAdapter::tailnet` against whatever

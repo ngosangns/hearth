@@ -20,7 +20,10 @@ use crate::state::{
 
 use super::fingerprint::normalize_command_fingerprint;
 use super::process_tree::{build_process_tree, process_tree_alive, secondary_process_groups, ProcessTreeEntry};
-use super::types::{Host, ManagedProcess, OnOutput, ProcessRecord, ProcessSignal, SpawnInput, SupervisorError, SupervisorOptions};
+use super::types::{
+    Host, ManagedProcess, OnOutput, OutputSource, OutputTail, ProcessRecord, ProcessSignal, SpawnInput,
+    SupervisorError, SupervisorOptions,
+};
 
 pub const ACTIVE_STATES: [ActualServiceState; 7] = [
     ActualServiceState::QueuedStart,
@@ -35,6 +38,10 @@ pub const ACTIVE_STATES: [ActualServiceState; 7] = [
 fn is_active_state(state: ActualServiceState) -> bool {
     ACTIVE_STATES.contains(&state)
 }
+
+/// How much of an externally-owned container's existing log to replay when a tail attaches — its
+/// retained history could be days old, so the follow is bounded to a useful recent window.
+const EXTERNAL_LOG_BACKLOG_LINES: u64 = 200;
 
 /// A "task" command has no long-lived managed process to track — it runs once to bring external
 /// state into the desired shape (generalizes a tailnet-serve-config runner).
@@ -162,7 +169,7 @@ pub struct ProcessSupervisor {
     build_aborts: Mutex<HashMap<ServiceId, CancellationToken>>,
     build_serials: KeyedLock<String>,
     preparation_serials: KeyedLock<String>,
-    output_tails: Mutex<HashMap<ServiceId, Box<dyn FnOnce() + Send>>>,
+    output_tails: Mutex<HashMap<ServiceId, OutputTail>>,
     /// One ordered log-forwarding channel per service. Chunks used to be forwarded by spawning a
     /// task each, which then contended for the same per-service append lock and won it in arbitrary
     /// order — so two chunks emitted in order could land in the log file reversed, or interleaved
@@ -277,6 +284,13 @@ impl ProcessSupervisor {
             let sid = id.clone();
             self.queues.run(&id, || async move { sup.reap_persisted_posix_identity(&sid).await }).await;
         }
+
+        // Container log followers are real child processes (`docker logs -f`) in their own process
+        // group — they would outlive the daemon as orphans streaming to a dead pipe.
+        let tails: Vec<OutputTail> = self.output_tails.lock().unwrap().drain().map(|(_, tail)| tail).collect();
+        for tail in tails {
+            tail.stop();
+        }
     }
 
     async fn reap_persisted_posix_identity(self: &Arc<Self>, service_id: &ServiceId) {
@@ -381,7 +395,12 @@ impl ProcessSupervisor {
                         Changes { identity: Patch::Set(updated_identity.clone()), error: Patch::Clear, ..Default::default() },
                     )
                     .await;
-                    sup.attach_output(&service_id, &updated_identity);
+                    // Guard on a live tail rather than attaching unconditionally: `reconcile` runs
+                    // periodically, and re-attaching a container tail replays its `--since` backlog
+                    // into the log file every tick.
+                    if !sup.has_live_output_tail(&service_id) {
+                        sup.attach_output(&service_id, output_source(&updated_identity));
+                    }
                     let Ok(profile) = profile_for(&sup.host.catalog(), &service_id) else { return };
                     let token = sup.current_token(&service_id);
                     let _ = sup.readiness_with_adopted(&service_id, &profile, state.generation, Some(updated_identity), token, None, true).await;
@@ -413,7 +432,7 @@ impl ProcessSupervisor {
                         return;
                     }
                     let state = sup.state(&service_id);
-                    let ServiceRunProfile::Verified { readiness, .. } = &service.profiles.run else { return };
+                    let ServiceRunProfile::Verified { command, readiness, .. } = &service.profiles.run else { return };
                     let ready = sup.probe(readiness, &service_id).await;
                     let actual = state.as_ref().map(|s| s.actual_state);
                     if ready && matches!(actual, Some(ActualServiceState::Stopped) | Some(ActualServiceState::Failed) | None) {
@@ -435,25 +454,39 @@ impl ProcessSupervisor {
                             },
                         )
                         .await;
-                    } else if !ready {
-                        if let Some(state) = &state {
-                            if matches!(state.actual_state, ActualServiceState::Ready | ActualServiceState::RunningUnready) {
-                                sup.transition(
+                    }
+                    // Attach once per live container, not once per adoption transition — a daemon
+                    // restart drops every in-memory tail while adopted services stay `Ready`, so
+                    // the map itself is the idempotency key, not the state edge.
+                    if ready {
+                        if let Some(container_name) = &command.container_name {
+                            if !sup.has_live_output_tail(&service_id) {
+                                sup.attach_output(
                                     &service_id,
-                                    state.generation,
-                                    ActualServiceState::Stopped,
-                                    ServiceReadiness::Unknown,
-                                    Changes {
-                                        desired_state: Some(DesiredServiceState::Stopped),
-                                        exited_at: Patch::Set(sup.options.clock.now()),
-                                        error: Patch::Clear,
-                                        exit_code: Patch::Clear,
-                                        identity: Patch::Clear,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
+                                    // Backlog capped: an external container may have been running
+                                    // for days before this daemon ever adopted it.
+                                    OutputSource::Container { container_name, since: None, tail: Some(EXTERNAL_LOG_BACKLOG_LINES) },
+                                );
                             }
+                        }
+                    } else if let Some(state) = &state {
+                        if matches!(state.actual_state, ActualServiceState::Ready | ActualServiceState::RunningUnready) {
+                            sup.transition(
+                                &service_id,
+                                state.generation,
+                                ActualServiceState::Stopped,
+                                ServiceReadiness::Unknown,
+                                Changes {
+                                    desired_state: Some(DesiredServiceState::Stopped),
+                                    exited_at: Patch::Set(sup.options.clock.now()),
+                                    error: Patch::Clear,
+                                    exit_code: Patch::Clear,
+                                    identity: Patch::Clear,
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                            sup.detach_output(&service_id);
                         }
                     }
                 })
@@ -522,7 +555,7 @@ impl ProcessSupervisor {
                 },
             )
             .await;
-            self.attach_output(service_id, &identity);
+            self.attach_output(service_id, output_source(&identity));
             // An adopted identity is only worth keeping while it still answers its readiness probe.
             let outcome = self.await_readiness(service_id, &profile, generation, Some(identity.clone()), token, true).await;
             match outcome {
@@ -801,7 +834,7 @@ impl ProcessSupervisor {
             .lock()
             .unwrap()
             .insert(service_id.clone(), Active { command: profile.command.clone(), identity: identity.clone(), token, stopped: false });
-        self.attach_output(service_id, &identity);
+        self.attach_output(service_id, output_source(&identity));
         let sup = self.clone();
         let sid = service_id.clone();
         let exited = app.exited;
@@ -1031,17 +1064,19 @@ impl ProcessSupervisor {
             return Ok(());
         }
         match identity {
-            ProcessIdentity::Docker(_) => {
+            ProcessIdentity::Docker(docker) => {
                 let sink: OnOutput = Arc::new(|_| {});
-                match self.options.process.stop_container(command, sink).await {
-                    Some(result) => result?,
-                    None => return Err(SupervisorError("Docker container stop is unavailable".to_string())),
-                }
+                let result = match self.options.process.stop_container(command, sink).await {
+                    Some(result) => result,
+                    None => Err(SupervisorError("Docker container stop is unavailable".to_string())),
+                };
+                // Stop the `docker logs` follower only after the stop command has run — its last
+                // chunk carries the container's own shutdown output.
+                self.detach_output(&docker.service_id);
+                result?;
             }
             ProcessIdentity::Posix(posix) => {
-                if let Some(stop) = self.output_tails.lock().unwrap().remove(&posix.service_id) {
-                    stop();
-                }
+                self.detach_output(&posix.service_id);
                 let tree = self.process_tree(posix.pid, &posix.start_identity).await;
                 self.signal_process_tree(&tree, posix.pgid, ProcessSignal::Sigterm).await;
                 let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
@@ -1227,13 +1262,8 @@ impl ProcessSupervisor {
         }
     }
 
-    fn attach_output(self: &Arc<Self>, service_id: &ServiceId, identity: &ProcessIdentity) {
-        if matches!(identity, ProcessIdentity::Docker(_)) {
-            return;
-        }
-        if let Some(stop) = self.output_tails.lock().unwrap().remove(service_id) {
-            stop();
-        }
+    fn attach_output(self: &Arc<Self>, service_id: &ServiceId, source: OutputSource<'_>) {
+        self.detach_output(service_id);
         // `attach_output` is one of the "optional" ProcessAdapter methods (default adapters not yet
         // ported) — a `None` result (no attachment support) is a normal, expected outcome here.
         let on_output: OnOutput = {
@@ -1243,9 +1273,19 @@ impl ProcessSupervisor {
                 this.append_output(&sid, data);
             })
         };
-        if let Some(stop) = self.options.process.attach_output(service_id, on_output) {
-            self.output_tails.lock().unwrap().insert(service_id.clone(), stop);
+        if let Some(tail) = self.options.process.attach_output(service_id, source, on_output) {
+            self.output_tails.lock().unwrap().insert(service_id.clone(), tail);
         }
+    }
+
+    fn detach_output(&self, service_id: &ServiceId) {
+        if let Some(tail) = self.output_tails.lock().unwrap().remove(service_id) {
+            tail.stop();
+        }
+    }
+
+    fn has_live_output_tail(&self, service_id: &ServiceId) -> bool {
+        self.output_tails.lock().unwrap().get(service_id).map(|tail| !tail.is_done()).unwrap_or(false)
     }
 
     /// Log forwarding is fire-and-forget by design: a failure must never propagate into the caller.
@@ -1395,6 +1435,17 @@ fn with_manager_instance(identity: ProcessIdentity, instance_id: String) -> Proc
     }
 }
 
+fn output_source(identity: &ProcessIdentity) -> OutputSource<'_> {
+    match identity {
+        ProcessIdentity::Posix(_) => OutputSource::Process,
+        ProcessIdentity::Docker(d) => OutputSource::Container {
+            container_name: &d.container_name,
+            since: Some(d.container_started_at.as_str()).filter(|s| !s.is_empty()),
+            tail: None,
+        },
+    }
+}
+
 fn identity_manager_instance(identity: &ProcessIdentity) -> &str {
     match identity {
         ProcessIdentity::Posix(p) => &p.manager_instance_id,
@@ -1431,9 +1482,9 @@ mod tests {
     };
     use crate::state::{DesiredServiceState, PosixProcessIdentity, ServiceReadiness};
     use crate::supervisor::types::{
-        DockerContainerRecord, Host, ManagedProcess, ObservedProcess, OnOutput, PosixProcessRecord,
-        PreparationAdapter, ProbeAdapter, ProcessAdapter, ProcessRecord, RunBuild, SpawnInput, SupervisorClock,
-        SupervisorError, SupervisorOptions,
+        DockerContainerRecord, Host, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail,
+        PosixProcessRecord, PreparationAdapter, ProbeAdapter, ProcessAdapter, ProcessRecord, RunBuild,
+        SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,
     };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -1469,13 +1520,29 @@ mod tests {
         spawn_should_fail: HashMap<ServiceId, String>,
         container_records: HashMap<String, DockerContainerRecord>,
         exit_senders: HashMap<i64, oneshot::Sender<i32>>,
+        attach_output_calls: Vec<(ServiceId, &'static str)>,
+        tail_dones: HashMap<ServiceId, Arc<std::sync::atomic::AtomicBool>>,
+        tails_stopped: Vec<ServiceId>,
     }
     struct FakeProcessAdapter {
-        state: Mutex<FakeProcessAdapterState>,
+        state: Arc<Mutex<FakeProcessAdapterState>>,
     }
     impl FakeProcessAdapter {
         fn new() -> Arc<Self> {
-            Arc::new(Self { state: Mutex::new(FakeProcessAdapterState { next_pid: 900_001, ..Default::default() }) })
+            Arc::new(Self { state: Arc::new(Mutex::new(FakeProcessAdapterState { next_pid: 900_001, ..Default::default() })) })
+        }
+        fn attach_calls(&self) -> Vec<(ServiceId, &'static str)> {
+            self.state.lock().unwrap().attach_output_calls.clone()
+        }
+        /// Simulates a follower ending on its own — `docker logs --follow` exits when its
+        /// container does, leaving a stale stop handle in the supervisor's map.
+        fn finish_tail(&self, service_id: &str) {
+            if let Some(done) = self.state.lock().unwrap().tail_dones.get(service_id) {
+                done.store(true, Ordering::SeqCst);
+            }
+        }
+        fn tail_was_stopped(&self, service_id: &str) -> bool {
+            self.state.lock().unwrap().tails_stopped.iter().any(|id| id == service_id)
         }
         fn fail_spawn(&self, service_id: &str, message: &str) {
             self.state.lock().unwrap().spawn_should_fail.insert(service_id.to_string(), message.to_string());
@@ -1567,6 +1634,24 @@ mod tests {
             let name = command.container_name.clone()?;
             self.state.lock().unwrap().container_records.remove(&name);
             Some(Ok(()))
+        }
+
+        fn attach_output(&self, service_id: &ServiceId, source: OutputSource<'_>, _on_output: OnOutput) -> Option<OutputTail> {
+            let kind = match source {
+                OutputSource::Process => "process",
+                OutputSource::Container { .. } => "container",
+            };
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = self.state.clone();
+            let stopped_id = service_id.clone();
+            let mut state = self.state.lock().unwrap();
+            state.attach_output_calls.push((service_id.clone(), kind));
+            state.tail_dones.insert(service_id.clone(), done.clone());
+            drop(state);
+            Some(OutputTail::new(
+                Box::new(move || stopped.lock().unwrap().tails_stopped.push(stopped_id)),
+                done,
+            ))
         }
     }
 
@@ -2270,6 +2355,52 @@ mod tests {
             ProcessIdentity::Docker(d) => assert_eq!(d.container_name, "proj-db"),
             _ => panic!("expected a docker identity"),
         }
+        assert!(
+            h.process.attach_calls().contains(&("db".to_string(), "container")),
+            "a container service must get a container log tail, not skip attach_output: {:?}",
+            h.process.attach_calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn external_container_adoption_attaches_one_log_tail_and_releases_it() {
+        let mut service = argv_verified("cache", ReadinessSpec::Container);
+        service.ownership = Some(crate::catalog::ServiceOwnership::External);
+        service.profiles.run = ServiceRunProfile::Verified {
+            command: ServiceCommand {
+                command: CommandSpec::Argv { argv: vec!["docker".to_string(), "compose".to_string(), "up".to_string()] },
+                cwd: ".".to_string(),
+                environment: None,
+                container_name: Some("proj-cache".to_string()),
+                docker_stop_command: None,
+            },
+            readiness: ReadinessSpec::Container,
+            readiness_timeout_ms: None,
+            preparation: None,
+            preparation_command: None,
+        };
+        let h = build_harness(one_service_catalog(service));
+
+        h.probes.set_container_ready("proj-cache", true);
+        h.supervisor.sync_external_services().await;
+        assert_eq!(h.host.state_of("cache").unwrap().actual_state, ActualServiceState::Ready);
+        assert_eq!(h.process.attach_calls(), vec![("cache".to_string(), "container")]);
+
+        // `sync_external_services` polls on an interval — an already-attached live tail must not be
+        // replaced every tick (a container tail replays its backlog on attach, so a naive re-attach
+        // would duplicate log lines each poll).
+        h.supervisor.sync_external_services().await;
+        assert_eq!(h.process.attach_calls().len(), 1, "a live tail must not be re-attached");
+
+        // A follower that ended on its own (container restarted) is re-attached on the next tick.
+        h.process.finish_tail("cache");
+        h.supervisor.sync_external_services().await;
+        assert_eq!(h.process.attach_calls().len(), 2, "a dead tail must be re-attached");
+
+        h.probes.set_container_ready("proj-cache", false);
+        h.supervisor.sync_external_services().await;
+        assert_eq!(h.host.state_of("cache").unwrap().actual_state, ActualServiceState::Stopped);
+        assert!(h.process.tail_was_stopped("cache"), "release must stop the log tail");
     }
 
     #[tokio::test]

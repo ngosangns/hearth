@@ -1,5 +1,6 @@
 //! Traits and shared types for `ProcessSupervisor` — port of the top of `src/core/supervisor.ts`
 //! (everything above the `ProcessSupervisor` class itself).
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -85,6 +86,41 @@ impl From<String> for SupervisorError {
 
 pub type OnOutput = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Where a service's stdout/stderr stream lives — what `ProcessAdapter::attach_output` should tail
+/// for it. `Process` covers spawned/adopted POSIX services (the raw capture file their stdio was
+/// redirected into); `Container` covers Docker services, including `ownership: external` ones that
+/// are adopted without ever gaining a `ProcessIdentity`. `since`/`tail` bound the replayed
+/// backlog — without either, the container's whole retained log would be re-forwarded on every
+/// re-attach.
+pub enum OutputSource<'a> {
+    Process,
+    Container { container_name: &'a str, since: Option<&'a str>, tail: Option<u64> },
+}
+
+/// A live output tail from `ProcessAdapter::attach_output`. `is_done` reports whether the tail
+/// ended on its own (`docker logs --follow` exits when its container does, so a container restart
+/// kills the follower while the map still holds its stop handle) — a caller keying re-attach on
+/// "is there an entry" would otherwise never notice.
+pub struct OutputTail {
+    stop: Option<Box<dyn FnOnce() + Send>>,
+    done: Arc<AtomicBool>,
+}
+
+impl OutputTail {
+    pub fn new(stop: Box<dyn FnOnce() + Send>, done: Arc<AtomicBool>) -> Self {
+        Self { stop: Some(stop), done }
+    }
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
+    }
+    pub fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
 #[async_trait]
 pub trait ProcessAdapter: Send + Sync {
     async fn spawn(&self, input: SpawnInput, on_output: OnOutput) -> Result<ManagedProcess, SupervisorError>;
@@ -94,8 +130,8 @@ pub trait ProcessAdapter: Send + Sync {
     async fn stop_container(&self, _command: &ServiceCommand, _on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
         None
     }
-    /// Returns a stop handle if output attachment is supported; `None` otherwise.
-    fn attach_output(&self, _service_id: &ServiceId, _on_output: OnOutput) -> Option<Box<dyn FnOnce() + Send>> {
+    /// Returns a live tail handle if output attachment is supported; `None` otherwise.
+    fn attach_output(&self, _service_id: &ServiceId, _source: OutputSource<'_>, _on_output: OnOutput) -> Option<OutputTail> {
         None
     }
 }
