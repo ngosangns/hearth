@@ -49,7 +49,8 @@ bump there must be treated as breaking for every client.
 
 ### The self-hosted runner's environment
 
-The registered `{self-hosted, macmini}` runner (`ngosangns-Mini`) is a different physical machine
+The registered `{self-hosted, macmini}` runner (`macmini-hearth`, one of several per-repo
+instances under `~/actions-runner-<repo>` on the Mac mini) is a different physical machine
 from any dev box here, with the same username.
 
 - **It executes `run:` steps from the runner service's environment, not a login shell**, so a
