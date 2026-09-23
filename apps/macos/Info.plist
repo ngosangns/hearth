@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>LocalServicesApp</string>
+	<string>HearthApp</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>dev.gnasdev.local-services</string>
+	<string>dev.ngosangns.hearth</string>
 	<key>CFBundleName</key>
-	<string>Local Services</string>
+	<string>Hearth</string>
 	<key>CFBundleDisplayName</key>
-	<string>Local Services</string>
+	<string>Hearth</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -21,7 +21,7 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>@gnasdev/local-services</string>
+	<string>Hearth, a gnas.dev project</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>LSApplicationCategoryType</key>
@@ -37,15 +37,15 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>dev.gnasdev.local-services</string>
+			<string>dev.ngosangns.hearth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>local-services</string>
+				<string>hearth</string>
 			</array>
 		</dict>
 	</array>
 	<key>SUFeedURL</key>
-	<string>https://github.com/gnasdev/local-services/releases.atom</string>
+	<string>https://github.com/ngosangns/hearth/releases.atom</string>
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
 </dict>

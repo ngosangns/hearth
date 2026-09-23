@@ -30,8 +30,8 @@ build_and_launch() {
     wait "$pid" 2>/dev/null || true
   fi
   bin_path="$(swift build --show-bin-path)"
-  echo "==> launching $bin_path/LocalServicesApp"
-  "$bin_path/LocalServicesApp" &
+  echo "==> launching $bin_path/HearthApp"
+  "$bin_path/HearthApp" &
   pid=$!
 }
 

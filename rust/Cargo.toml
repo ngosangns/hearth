@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ls-core", "crates/ls-cli", "crates/ls-tui", "crates/ls-mcp", "bin/lsd"]
+members = ["crates/hearth-core", "crates/hearth-cli", "crates/hearth-tui", "crates/hearth-mcp", "bin/hearthd"]
 
 [workspace.package]
 edition = "2021"

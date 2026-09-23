@@ -5,22 +5,22 @@ architecture, and sharp edges. Add durable notes here as real work discovers the
 
 ## Orientation
 
-The product is the compiled `lsd` binary (`rust/bin/lsd`, crates `ls-core` `ls-cli` `ls-tui`
-`ls-mcp`) and the SwiftUI client in `apps/macos`. A project authors `local-services.yaml` (`.yml` /
+The product is the compiled `hearthd` binary (`rust/bin/hearthd`, crates `hearth-core` `hearth-cli` `hearth-tui`
+`hearth-mcp`) and the SwiftUI client in `apps/macos`. A project authors `hearth.yaml` (`.yml` /
 `.json`); TypeScript catalogs are not accepted.
 
 Consumers: `apps/macos` (bundled sidecar), `infra`, `viclass` — all spawn the app-bundled binary at
-`/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd`.
+`/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd`.
 
-`lsd manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
+`hearthd manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
 HTTP+SSE client needs. `env.rs` resolves the daemon's own base environment (login shell + `.env`)
 because a GUI-spawned daemon inherits launchd's bare `PATH`.
 
-`SidecarLocator` finds a compiled `lsd`: env override, bundled copy, `/Applications` install,
+`SidecarLocator` finds a compiled `hearthd`: env override, bundled copy, `/Applications` install,
 known locations, this checkout's `cargo build` output, then the login shell's PATH. There is no
 `bun` fallback.
 
-`scripts/build-app.sh` packages an ad-hoc-signed `Local Services.app` with that binary bundled. Not
+`scripts/build-app.sh` packages an ad-hoc-signed `Hearth.app` with that binary bundled. Not
 notarized — distribution to another machine is the one packaging step still missing. See
 `apps/macos/README.md`.
 
@@ -31,12 +31,11 @@ Also `task rust:test` / `task rust:clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
-**Installing/refreshing `lsd`** — `task rust:install`:
+**Installing/refreshing `hearthd`** — `task rust:install`:
 ```
-cargo build --release -p lsd && mkdir -p "/Applications/Local Services.app/Contents/Resources/lsd/bin" && cp target/release/lsd "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd" && codesign --sign - --force "/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd"
+cargo build --release -p hearthd && mkdir -p "/Applications/Hearth.app/Contents/Resources/hearthd/bin" && cp target/release/hearthd "/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd" && codesign --sign - --force "/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd"
 ```
-The ad-hoc re-sign is required after every copy on macOS. Do not install into Homebrew — that name
-collides with the `lsd` (lsdeluxe) formula.
+The ad-hoc re-sign is required after every copy on macOS.
 
 **macOS app.** `task macos:build` / `macos:test` / `macos:package` / `macos:install`.
 
@@ -45,7 +44,7 @@ There is no npm publish. The binary is installed by hand or bundled into the mac
 `apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`) and
 runs `swift build` only.
 
-`PROTOCOL_VERSION` in `rust/crates/ls-core/src/state.rs` is the protocol-compatibility signal — a
+`PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
 bump there must be treated as breaking for every client.
 
 ### The self-hosted runner's environment
@@ -114,22 +113,22 @@ from any dev box here, with the same username.
   first-time prepares would corrupt the cert file.
 - `ownership: 'external'` is the docker/tailnet-task adoption carve-out.
 - Service order from a config file is **document order**, not sorted — it's user-visible in
-  `/v1/catalog`, `lsd status`, and both TUIs.
+  `/v1/catalog`, `hearthd status`, and both TUIs.
 - A missing/invalid `readiness` must fail the load, not skip the service.
 
-**Consumers and the `lsd` binary**
+**Consumers and the `hearthd` binary**
 
 - Consumer scripts must use the absolute path
-  `/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd`.
+  `/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd`.
 - **Never assume tools are on `PATH`**: a Dock/Finder-launched GUI process gets launchd's bare
-  `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon inherits that, so `lsd` appends Homebrew and
+  `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon inherits that, so `hearthd` appends Homebrew and
   `~/.bun`/`~/.cargo` bin dirs (`with_known_tool_directories`) — otherwise `docker compose`,
   `tailscale serve status` and `tailscale status` fail to spawn. Test anything the app spawns under
   `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
 - `serde_json`'s `preserve_order` feature is on workspace-wide and is load-bearing: without it
-  `Value`'s object type is a `BTreeMap`, and `lsd mcp install` silently alphabetizes every key in any
+  `Value`'s object type is a `BTreeMap`, and `hearthd mcp install` silently alphabetizes every key in any
   hand-maintained config file it touches.
-- `lsd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
+- `hearthd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
 **Testing gotchas**
@@ -154,20 +153,20 @@ from any dev box here, with the same username.
 
 - A `bun build --compile` sidecar: on the `self-hosted, macmini` machine a freshly compiled, ad-hoc
   signed Bun executable is SIGKILLed on launch. The same test with a trivial Rust binary passed,
-  which is why the product is the Rust `lsd` binary.
+  which is why the product is the Rust `hearthd` binary.
 
 ## Notes on the Rust implementation
 
 - **No `Custom` readiness variant.** A closure can't cross the YAML/JSON boundary.
 - **SSE backpressure is frame-count only** (64 frames).
-- **`crossterm` + `unicode-width`** for the TUI. `ls-tui`'s `run.rs` has no automated coverage (it
+- **`crossterm` + `unicode-width`** for the TUI. `hearth-tui`'s `run.rs` has no automated coverage (it
   owns a real terminal).
 - **`truncateToWidth`/`visibleWidth`/`DEFAULT_TAB_WIDTH` were reverse-engineered** against pi-tui's
   native addon. The tab width is a fixed 3-space replacement. See `truncate_to_width`'s doc comment.
-- **`ls-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
+- **`hearth-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
   carry a runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
-- **`lsd mcp` and `lsd tui` are intercepted in the binary**, not in `ls-cli`, to avoid a crate cycle.
-  `lsd mcp install` / `lsd skill install` live in `ls-cli`.
+- **`hearthd mcp` and `hearthd tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
+  `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`.
 - **`state.json` timestamp validation is a non-empty-string check.**
 
 ## Maintaining this file

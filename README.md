@@ -1,20 +1,20 @@
-# local-services
+# hearth
 
 Local dev services manager: one long-lived daemon per project folder, plus a CLI, TUI, MCP server,
 and a macOS app. All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every
 managed process; nothing else starts or stops one directly.
 
-The product is the compiled `lsd` binary (`rust/bin/lsd`) and the SwiftUI app in `apps/macos`.
+The product is the compiled `hearthd` binary (`rust/bin/hearthd`) and the SwiftUI app in `apps/macos`.
 
 ```
  your CLI  ─┐
- your TUI   ├──HTTP + SSE (loopback)──►  daemon (lsd)
+ your TUI   ├──HTTP + SSE (loopback)──►  daemon (hearthd)
  your MCP  ─┘                                  │
  the macOS app  ───────────────────────────────┘
                                         ProcessSupervisor (spawns/probes/tails)
 ```
 
-A project supplies a `local-services.yaml` (`.yml` / `.json` also work) naming its services, how to
+A project supplies a `hearth.yaml` (`.yml` / `.json` also work) naming its services, how to
 start them, and how to tell when they are ready. TypeScript catalogs are not accepted.
 
 ```yaml
@@ -41,21 +41,20 @@ services:
       - { url: "https://{tailnetHost}:8443", label: admin, requiresRunning: false }
 ```
 
-Install `lsd` into the app bundle, then drive a project:
+Install `hearthd` into the app bundle, then drive a project:
 
 ```bash
-task rust:install   # copies rust/target/release/lsd into Local Services.app
-"/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd" --root /path/to/project status
-"/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd" --root /path/to/project tui
-"/Applications/Local Services.app/Contents/Resources/lsd/bin/lsd" --root /path/to/project mcp
+task rust:install   # copies rust/target/release/hearthd into Hearth.app
+"/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd" --root /path/to/project status
+"/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd" --root /path/to/project tui
+"/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd" --root /path/to/project mcp
 ```
 
-`lsd manager ensure --json` is the connection contract for a non-terminal client (the macOS app's
+`hearthd manager ensure --json` is the connection contract for a non-terminal client (the macOS app's
 sidecar): it ensures a daemon is running for `--root` and prints `{instanceId, port, token,
 protocolVersion, runtimeDirectory, root}`.
 
-Do not put `lsd` on Homebrew's PATH — that name belongs to the lsdeluxe formula. Consumer scripts
-must use the app-bundled absolute path.
+Consumer scripts must use the app-bundled absolute path.
 
 ## Build and test
 
@@ -68,7 +67,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 The suite needs a running `docker` daemon, `tailscale`, plus `nc`, `ps`, and `sh`.
 
 ```bash
-task macos:install   # package Local Services.app into /Applications and launch it
+task macos:install   # package Hearth.app into /Applications and launch it
 ```
 
 See [AGENTS.md](AGENTS.md) for architecture, sharp edges, and how to refresh the bundled binary.

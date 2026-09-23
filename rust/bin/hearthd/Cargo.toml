@@ -1,0 +1,23 @@
+[package]
+name = "hearthd"
+version = "0.7.0"
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hearthd"
+path = "src/main.rs"
+
+[dependencies]
+hearth-core = { path = "../../crates/hearth-core" }
+hearth-cli = { path = "../../crates/hearth-cli" }
+hearth-tui = { path = "../../crates/hearth-tui" }
+hearth-mcp = { path = "../../crates/hearth-mcp" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+rmcp = { version = "3", features = ["server", "transport-io"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rmcp = { version = "3", features = ["server", "client", "transport-io", "transport-child-process"] }
