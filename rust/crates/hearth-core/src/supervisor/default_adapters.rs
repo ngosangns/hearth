@@ -28,7 +28,7 @@ use crate::state::ProcessIdentity;
 
 use super::fingerprint::{command_argv, normalize_observed_command_fingerprint};
 use super::types::{
-    DockerContainerRecord, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, PosixProcessRecord,
+    DockerContainerRecord, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, PortHolder, PosixProcessRecord,
     ProbeAdapter, ProcessAdapter, ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock,
     SupervisorError, SupervisorOptions, SystemClock,
 };
@@ -125,6 +125,33 @@ async fn tailnet_serving() -> bool {
 async fn tcp_probe(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     tokio::time::timeout(Duration::from_millis(250), tokio::net::TcpStream::connect(&addr)).await.map(|r| r.is_ok()).unwrap_or(false)
+}
+
+/// The pids listening on `port` per `lsof`, each resolved through `observed_system_process` so a
+/// holder carries the same lstart identity the pid-reuse guard compares before signalling, and a
+/// normalized command line for the "held by pid N (`cmd`)" refusal/prompt text.
+///
+/// `None` means "no capability" — `lsof` couldn't even spawn — so callers degrade to the generic
+/// "an unowned process" wording and a kill request can't resolve a target (fails closed, not
+/// blind). `Some(vec![])` means `lsof` ran and found nobody: between `port_in_use` and this call
+/// the holder exited, which the reclaim loop treats as "nothing to signal, just re-poll the port".
+async fn port_holders(port: u16) -> Option<Vec<PortHolder>> {
+    let spec = format!("-iTCP:{port}");
+    let (code, stdout) = capture_command(&["lsof", "-nP", "-t", &spec, "-sTCP:LISTEN"]).await;
+    if code == -1 {
+        return None;
+    }
+    let mut holders = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for pid in stdout.split_whitespace().filter_map(|line| line.parse::<i64>().ok()) {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(ObservedProcess { record: ProcessRecord::Posix(record), alive: true }) = observed_system_process(pid).await {
+            holders.push(PortHolder { pid, pgid: record.pgid, start_identity: record.start_identity, command: record.command_fingerprint });
+        }
+    }
+    Some(holders)
 }
 
 async fn forward_stream<R: tokio::io::AsyncRead + Unpin>(stream: Option<R>, on_output: Option<OnOutput>) {
@@ -500,6 +527,19 @@ impl ProcessAdapter for DefaultProcessAdapter {
         send_signal_to_group(pgid, signal);
     }
 
+    async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal) {
+        if pid <= 1 {
+            return;
+        }
+        // The lstart the caller resolved is compared again at signal time — a squatter that died
+        // and had its pid recycled between resolve and kill must never take the signal.
+        if let Some(ObservedProcess { record: ProcessRecord::Posix(record), alive: true }) = observed_system_process(pid).await {
+            if record.start_identity == expected_start_identity {
+                send_signal(pid, signal);
+            }
+        }
+    }
+
     async fn stop_container(&self, command: &ServiceCommand, on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
         let default_stop = CommandSpec::Argv { argv: vec!["docker".to_string(), "compose".to_string(), "stop".to_string()] };
         let (argv, _) = command_argv(command.docker_stop_command.as_ref().unwrap_or(&default_stop));
@@ -546,6 +586,9 @@ impl ProbeAdapter for DefaultProbeAdapter {
     }
     async fn port_in_use(&self, port: u16) -> Option<bool> {
         Some(tcp_probe(port).await)
+    }
+    async fn port_holders(&self, port: u16) -> Option<Vec<PortHolder>> {
+        port_holders(port).await
     }
     async fn command(&self, command: &CommandSpec, cwd: Option<&str>) -> Option<bool> {
         let (argv, _) = command_argv(command);

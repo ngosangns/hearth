@@ -2,11 +2,12 @@ import SwiftUI
 
 @main
 struct HearthApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var workspaceStore = WorkspaceStore()
     @StateObject private var registry = WorkspaceControllerRegistry()
 
     var body: some Scene {
-        WindowGroup("Hearth", id: "main") {
+        WindowGroup("Hearth", id: MainWindow.id) {
             ContentView()
                 .environmentObject(workspaceStore)
                 .environmentObject(registry)

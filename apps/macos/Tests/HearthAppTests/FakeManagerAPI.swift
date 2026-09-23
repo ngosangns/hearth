@@ -12,7 +12,7 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     }
 
     private let lock = DispatchQueue(label: "FakeManagerAPI")
-    private var _performed: [(action: ManagerAction, serviceId: String)] = []
+    private var _performed: [(action: ManagerAction, serviceId: String, killUnowned: Bool)] = []
     private var _operationReads: [String] = []
     private var _logRequests: [(cursor: Int?, generation: Int?)] = []
     private var _servicesCalls = 0
@@ -20,12 +20,12 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     var servicesHandler: (@Sendable () async throws -> [ServiceLifecycleState])?
     var catalogHandler: (@Sendable () async throws -> ServiceCatalogSummary)?
     var logsHandler: (@Sendable (Int?, Int?) async throws -> LogSlice)?
-    var performHandler: (@Sendable (ManagerAction, String) async throws -> ManagerOperation)?
+    var performHandler: (@Sendable (ManagerAction, String, Bool) async throws -> ManagerOperation)?
     var bulkStartHandler: (@Sendable ([String]) async throws -> ManagerOperation)?
     var operationHandler: (@Sendable (String) async throws -> ManagerOperation)?
     var urlsHandler: (@Sendable () async throws -> [ResolvedServiceUrl])?
 
-    var performed: [(action: ManagerAction, serviceId: String)] {
+    var performed: [(action: ManagerAction, serviceId: String, killUnowned: Bool)] {
         lock.sync { _performed }
     }
     var operationReads: [String] {
@@ -60,10 +60,10 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     }
 
     @discardableResult
-    func perform(_ action: ManagerAction, serviceId: String) async throws -> ManagerOperation {
-        lock.sync { _performed.append((action, serviceId)) }
+    func perform(_ action: ManagerAction, serviceId: String, killUnowned: Bool) async throws -> ManagerOperation {
+        lock.sync { _performed.append((action, serviceId, killUnowned)) }
         guard let performHandler else { throw Unimplemented(what: "perform") }
-        return try await performHandler(action, serviceId)
+        return try await performHandler(action, serviceId, killUnowned)
     }
 
     @discardableResult

@@ -64,8 +64,9 @@ final class ManagerClient: ManagerAPI {
     }
 
     @discardableResult
-    func perform(_ action: ManagerAction, serviceId: String) async throws -> ManagerOperation {
-        let body: [String: String] = ["requestId": UUID().uuidString, "serviceId": serviceId, "action": action.rawValue]
+    func perform(_ action: ManagerAction, serviceId: String, killUnowned: Bool = false) async throws -> ManagerOperation {
+        var body: [String: Any] = ["requestId": UUID().uuidString, "serviceId": serviceId, "action": action.rawValue]
+        if killUnowned { body["killUnowned"] = true }
         return try await post("/v1/operations", body: body, as: OperationResponse.self).operation
     }
 
@@ -176,7 +177,7 @@ final class ManagerClient: ManagerAPI {
         try await send(request(path), as: type)
     }
 
-    private func post<T: Decodable>(_ path: String, body: [String: String], as type: T.Type) async throws -> T {
+    private func post<T: Decodable>(_ path: String, body: [String: Any], as type: T.Type) async throws -> T {
         var req = request(path)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")

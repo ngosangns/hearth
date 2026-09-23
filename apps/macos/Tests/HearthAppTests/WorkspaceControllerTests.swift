@@ -87,7 +87,7 @@ final class WorkspaceControllerTests: XCTestCase {
         let sut = controller(api)
         await sut.connect()
 
-        api.performHandler = { _, _ in makeOperation(status: "queued") }
+        api.performHandler = { _, _, _ in makeOperation(status: "queued") }
         // Two polls report "running" before it settles.
         let reads = Counter()
         api.operationHandler = { _ in
@@ -112,7 +112,7 @@ final class WorkspaceControllerTests: XCTestCase {
         let sut = controller(api)
         await sut.connect()
 
-        api.performHandler = { _, _ in makeOperation(status: "queued") }
+        api.performHandler = { _, _, _ in makeOperation(status: "queued") }
         api.operationHandler = { _ in
             makeOperation(status: "failed", error: OperationError(code: "operation_failed", message: "Dependency startup failed: db"))
         }
@@ -121,6 +121,109 @@ final class WorkspaceControllerTests: XCTestCase {
 
         XCTAssertEqual(sut.lastActionError, "Dependency startup failed: db")
         XCTAssertTrue(sut.actionsInFlight.isEmpty)
+        sut.stop()
+    }
+
+    // MARK: - Daemon restart
+
+    /// The whole point of the button: after a restart the controller must be talking to the *new*
+    /// daemon, not the one it just replaced — without a manual reconnect.
+    func testRestartDaemonReconnectsToTheNewClient() async {
+        let old = FakeManagerAPI()
+        old.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        old.servicesHandler = { [makeService("api", actualState: "ready")] }
+        let new = FakeManagerAPI()
+        new.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        new.servicesHandler = { [makeService("api", actualState: "stopped")] }
+
+        let restarts = Counter()
+        let sut = WorkspaceController(
+            workspace: workspace(),
+            watchesConfigFile: false,
+            connector: { _ in old },
+            restarter: { _ in
+                restarts.increment()
+                return new
+            }
+        )
+        await sut.connect()
+        XCTAssertEqual(sut.services.map(\.actualState), ["ready"])
+
+        await sut.restartDaemon()
+
+        XCTAssertEqual(restarts.value, 1)
+        XCTAssertEqual(sut.phase, .connected)
+        XCTAssertEqual(sut.services.map(\.actualState), ["stopped"], "the published state must come from the new daemon")
+        sut.stop()
+    }
+
+    /// A swap that fails must report why, and must leave the workspace on the daemon it still has
+    /// rather than stranding it with no connection at all.
+    func testRestartDaemonSurfacesAFailureAndKeepsTheOldConnection() async {
+        struct Boom: Error, LocalizedError {
+            var errorDescription: String? { "hearthd exited 1: manager unavailable" }
+        }
+        let api = FakeManagerAPI()
+        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.servicesHandler = { [makeService("api", actualState: "ready")] }
+        let sut = WorkspaceController(workspace: workspace(), watchesConfigFile: false, connector: { _ in api }, restarter: { _ in throw Boom() })
+        await sut.connect()
+
+        await sut.restartDaemon()
+
+        XCTAssertEqual(sut.phase, .failed("hearthd exited 1: manager unavailable"))
+        await sut.refresh()
+        XCTAssertEqual(sut.services.map(\.serviceId), ["api"], "a failed swap must leave the workspace on the daemon it still has")
+        sut.stop()
+    }
+
+    // MARK: - Daemon stop
+
+    /// A successful stop must land on `.stopped` with the whole live state dropped — nothing may
+    /// keep polling a daemon that no longer exists.
+    func testStopDaemonDropsAllLiveStateAndReportsStopped() async {
+        let api = FakeManagerAPI()
+        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.servicesHandler = { [makeService("api", actualState: "ready")] }
+        let stops = Counter()
+        let sut = WorkspaceController(
+            workspace: workspace(),
+            watchesConfigFile: false,
+            connector: { _ in api },
+            stopper: { _ in stops.increment() }
+        )
+        await sut.connect()
+
+        await sut.stopDaemon()
+
+        XCTAssertEqual(stops.value, 1)
+        XCTAssertEqual(sut.phase, .stopped)
+        XCTAssertTrue(sut.services.isEmpty)
+        XCTAssertFalse(sut.phase.mayHaveLiveDaemon)
+        sut.stop()
+    }
+
+    /// A failed stop must report why and keep the workspace on the daemon that is still running.
+    func testStopDaemonSurfacesAFailureAndKeepsTheConnection() async {
+        struct Boom: Error, LocalizedError {
+            var errorDescription: String? { "hearthd exited 1: shutdown refused" }
+        }
+        let api = FakeManagerAPI()
+        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.servicesHandler = { [makeService("api", actualState: "ready")] }
+        let sut = WorkspaceController(
+            workspace: workspace(),
+            watchesConfigFile: false,
+            connector: { _ in api },
+            stopper: { _ in throw Boom() }
+        )
+        await sut.connect()
+
+        await sut.stopDaemon()
+
+        XCTAssertEqual(sut.phase, .failed("hearthd exited 1: shutdown refused"))
+        await sut.refresh()
+        XCTAssertEqual(sut.services.map(\.serviceId), ["api"], "a failed stop must leave the workspace on the daemon it still has")
         sut.stop()
     }
 
@@ -186,7 +289,7 @@ final class WorkspaceControllerTests: XCTestCase {
         let sut = controller(api)
         await sut.connect()
 
-        api.performHandler = { _, _ in makeOperation(status: "queued") }
+        api.performHandler = { _, _, _ in makeOperation(status: "queued") }
         api.operationHandler = { _ in makeOperation(status: "succeeded") }
 
         await sut.stopAll()

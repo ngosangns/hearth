@@ -4,6 +4,8 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
         NavigationSplitView {
             List(workspaceStore.workspaces, selection: $workspaceStore.selectedId) { workspace in
@@ -40,6 +42,7 @@ struct ContentView: View {
                 ContentUnavailableViewCompat(title: "Select a workspace", message: "Choose a folder from the sidebar.", systemImage: "folder")
             }
         }
+        .onAppear { captureWindowOpener() }
     }
 
     private func addWorkspace() {
@@ -50,6 +53,12 @@ struct ContentView: View {
         panel.prompt = "Add"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         _ = workspaceStore.add(path: url.path)
+    }
+
+    /// Captures the WindowGroup's `openWindow` action so the AppDelegate can reopen the main window
+    /// after it has been closed (dock reopen, second-instance handoff).
+    private func captureWindowOpener() {
+        MainWindow.open = { openWindow(id: MainWindow.id) }
     }
 }
 

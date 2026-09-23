@@ -70,7 +70,7 @@ pub async fn run_tui(options: RunTuiOptions) -> i32 {
     let client = ManagerTuiClient::new(root, &localctl_options);
     let (columns, rows) = crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24));
 
-    let mut app = TuiApp { state: TuiState::new(service_kind_lookup), screen: ServiceScreen::new(Viewport { columns, rows }), all_targets, busy: false, disposed: false, columns, rows, urls: Vec::new() };
+    let mut app = TuiApp { state: TuiState::new(service_kind_lookup), screen: ServiceScreen::new(Viewport { columns, rows }), all_targets, busy: false, disposed: false, columns, rows, urls: Vec::new(), pending_reclaim: None };
 
     let _ = crossterm::terminal::enable_raw_mode();
     let mut stdout = std::io::stdout();
@@ -100,6 +100,10 @@ struct TuiApp {
     rows: usize,
     /// Every service's resolved URLs, refreshed alongside each snapshot.
     urls: Vec<hearth_core::catalog::ResolvedServiceUrl>,
+    /// The service name armed by a first Reclaim keypress — a second press on the same service is
+    /// the user's confirmation to kill the port-holder. Any other key or a selection move clears
+    /// it, so a stray Enter can never turn into a kill.
+    pending_reclaim: Option<String>,
 }
 
 impl TuiApp {
@@ -201,15 +205,19 @@ impl TuiApp {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let selected = self.state.selection.selected().cloned();
                 let Some(action) = keyboard_action(key, selected.as_ref()) else { return };
+                if action != TuiAction::Reclaim {
+                    self.pending_reclaim = None;
+                }
                 match action {
                     TuiAction::Quit => self.shutdown(),
                     TuiAction::Up => self.move_selection(-1, client).await,
                     TuiAction::Down => self.move_selection(1, client).await,
                     TuiAction::StartAll => self.run_all(ActionKind::Start, client).await,
                     TuiAction::StopAll => self.run_all(ActionKind::Stop, client).await,
-                    TuiAction::Start => self.run_action(ActionKind::Start, self.state.selection.selected_name.clone(), client).await,
-                    TuiAction::Stop => self.run_action(ActionKind::Stop, self.state.selection.selected_name.clone(), client).await,
-                    TuiAction::Restart => self.run_action(ActionKind::Restart, self.state.selection.selected_name.clone(), client).await,
+                    TuiAction::Start => self.run_action(ActionKind::Start, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::Stop => self.run_action(ActionKind::Stop, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::Restart => self.run_action(ActionKind::Restart, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::Reclaim => self.reclaim(selected.as_ref(), client).await,
                 }
             }
             _ => {}
@@ -225,6 +233,7 @@ impl TuiApp {
     }
 
     async fn select_service(&mut self, name: &str, client: &ManagerTuiClient<'_>) {
+        self.pending_reclaim = None;
         if !self.state.selection.select(name) {
             return;
         }
@@ -348,11 +357,27 @@ impl TuiApp {
             if self.disposed {
                 return;
             }
-            self.run_action(action, service, client).await;
+            self.run_action(action, service, client, false).await;
         }
     }
 
-    async fn run_action(&mut self, action: ActionKind, service: String, client: &ManagerTuiClient<'_>) {
+    /// First press arms the reclaim (the notice names the holder); a second press on the same
+    /// service sends `killUnowned`. Arming is per-service — switching rows re-asks.
+    async fn reclaim(&mut self, selected: Option<&crate::state::Service>, client: &ManagerTuiClient<'_>) {
+        let Some(selected) = selected else { return };
+        let service = selected.name.clone();
+        if self.pending_reclaim.as_deref() != Some(service.as_str()) {
+            self.pending_reclaim = Some(service.clone());
+            let holder = selected.error.clone().unwrap_or_else(|| format!("{service} is externally owned"));
+            self.state.notice = format!("{holder} — press again to kill it and start {service}");
+            self.draw();
+            return;
+        }
+        self.pending_reclaim = None;
+        self.run_action(ActionKind::Start, service, client, true).await;
+    }
+
+    async fn run_action(&mut self, action: ActionKind, service: String, client: &ManagerTuiClient<'_>, kill_unowned: bool) {
         if self.busy || service.is_empty() {
             return;
         }
@@ -360,7 +385,7 @@ impl TuiApp {
         self.busy = true;
         self.state.notice = format!("{} {service}…", action_verb(action));
         self.draw();
-        match client.action(&service, action).await {
+        match client.action(&service, action, kill_unowned).await {
             Ok(operation) => {
                 if self.state.apply_action(&fence, operation) {
                     self.draw();

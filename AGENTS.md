@@ -84,6 +84,25 @@ from any dev box here, with the same username.
   after a port conflict). Don't collapse these into one.
 - A failed container stop must propagate, not be swallowed — the caller transitions the service to
   `stopped` immediately after, which would record a stopped service whose container is still running.
+- **A stop must never report success without stopping something.** A service the daemon holds no
+  process identity for — an adopted `ownership: external` unit, or one whose port is held by an
+  unowned process — is stopped by running the catalog's `stop:` command, and *fails* when the catalog
+  declares none. `externally-owned` used to early-return success, and the identity-less fallthrough
+  used to `orphan()` (recording "Process ownership identity no longer matches" for a service that
+  never had one): both left the container or process running while every UI showed Stop as done.
+  The same rule applies to an identity that no longer matches — the process is alive but is not ours
+  to kill, so the operation fails rather than silently succeeding.
+- **`killUnowned` is the only path that signals a process the daemon does not own.** It is a
+  client-supplied flag on `POST /v1/operations` (`action: start` only — every surface rejects it
+  otherwise) that must only ever be set after an explicit user confirmation: CLI `--kill-unowned`
+  or its TTY `[y/N]` prompt (non-TTY always answers no), TUI's two-keypress arm-then-confirm, the
+  app's "Kill & Start" dialog, MCP's `killUnowned` argument. `ProcessSupervisor::reclaim_port`
+  resolves listeners via `ProbeAdapter::port_holders` (lsof) and signals **individual pids** via
+  `ProcessAdapter::signal_pid` — SIGTERM, poll, then a re-resolved SIGKILL pass. Never `killpg` an
+  unowned holder: its group membership is untrusted (a shared job can hold innocent siblings; pgid
+  1 must never be signalled). `signal_pid` re-verifies the resolved `lstart` before sending, so a
+  pid recycled between resolve and signal is never killed. `None` from `port_holders` means
+  "cannot resolve" — the reclaim fails closed rather than guessing a pid.
 
 **Daemon / state**
 
@@ -94,6 +113,15 @@ from any dev box here, with the same username.
   `state.json`.
 - `reloadCatalog` stops a removed-but-active service using the **old** catalog and only swaps the
   catalog afterward — the supervisor needs the old definition to know how to stop it.
+- A persisted `externally-owned` (from a port held by an unowned process) is only re-evaluated on
+  the next `start` — `sync_external_services` only polls `ownership: external` units, and `cleanup`
+  does not touch it, so a dead squatter leaves a phantom "Port N is held" row in the UI forever.
+  Manual reconcile: stop the daemon, then rewrite `state.json` `services` to `{}` (or delete the
+  stale entries) — editing while the daemon lives is overwritten on shutdown.
+  Squatters hide well: catalog `run:` commands like `exec node dist/main` leave a **relative**
+  cmdline, so a path-based `ps` grep misses them — find holders by listening port (`lsof -iTCP:N
+  -sTCP:LISTEN`) or cwd (`lsof -d cwd`), and remember non-TCP binds too (viclass `syncer` panics on
+  **UDP** 50000, invisible to a TCP-only scan).
 - Never build a client-facing state string with `format!("{:?}", state)` — `Debug` gives
   `QueuedStart`, the wire encoding is `queued-start`. Use `ActualServiceState::as_wire_str()` /
   `ReadinessKind::as_wire_str()`, which are pinned to the serde encoding by test.
@@ -131,6 +159,15 @@ from any dev box here, with the same username.
 - `hearthd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
+**macOS app**
+
+- **Single instance is enforced in `AppDelegate`**, not just `LSMultipleInstancesProhibited`:
+  `open -n` and `scripts/dev.sh`'s bare-binary launch bypass LaunchServices. The check matches bundle
+  ID, falling back to executable path when there is no bundle; the loser posts a
+  `DistributedNotificationCenter` show-window notification to the winner and terminates. Reopening a
+  closed main window goes through `MainWindow.open` — the `openWindow` action captured from
+  `ContentView` — driven by `applicationShouldHandleReopen` and that notification.
+
 **Testing gotchas**
 
 - The macOS app's controllers take `any ManagerAPI`, not the concrete `ManagerClient`, so
@@ -148,6 +185,10 @@ from any dev box here, with the same username.
   own `connect()` **is** that connection, so the service goes ready then immediately failed.
 - An in-process `rmcp` client/server pair deadlocks if both `.serve()` calls are awaited
   sequentially: drive them with `tokio::join!`.
+- `HearthManager::shutdown_completion()` is a `watch` value, and `watch::Sender::send` is a **no-op
+  when no receiver exists yet**. A test that subscribes *after* triggering a shutdown can wait
+  forever on a shutdown that already finished — subscribe first, then trigger. (The existing
+  `stop-services` test only passes because stopping a service takes long enough to lose that race.)
 
 **Rejected approaches (don't re-litigate)**
 

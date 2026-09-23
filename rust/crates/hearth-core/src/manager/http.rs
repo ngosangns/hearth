@@ -209,9 +209,10 @@ impl HearthManager {
         self.shutdown(false).await;
     }
 
-    /// `stop_services = true` mirrors the TS `"stop-services"` mode; `false` is `"refuse-if-active"`
-    /// (the caller is expected to have already checked for active services before calling this, same
-    /// as the TS `shutdownRequest` handler does).
+    /// `stop_services = true` mirrors the TS `"stop-services"` mode; `false` covers both
+    /// `"refuse-if-active"` (the caller is expected to have already checked for active services
+    /// before calling this, same as the TS `shutdownRequest` handler does) and `"leave-services"`
+    /// (shut down now, leave running services for the next daemon to re-adopt).
     pub async fn shutdown(self: &Arc<Self>, stop_services: bool) {
         self.closing.store(true, Ordering::SeqCst);
         self.operations.close_mutations();
@@ -544,7 +545,7 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
     if manager.closing.load(Ordering::SeqCst) {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
     }
-    let body = strict_body(&bytes, &["requestId", "serviceId", "action"], &["requestId", "serviceId", "action"])?;
+    let body = strict_body(&bytes, &["requestId", "serviceId", "action", "killUnowned"], &["requestId", "serviceId", "action"])?;
     let request_id = body.get("requestId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128);
     let Some(request_id) = request_id else {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string"));
@@ -560,6 +561,14 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
         Some("status") => ServiceOperationKind::Status,
         _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_action", "action must be start, stop, restart, or status")),
     };
+    let kill_unowned = match body.get("killUnowned") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "killUnowned must be a boolean")),
+    };
+    if kill_unowned && action != ServiceOperationKind::Start {
+        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "killUnowned only applies to a start action"));
+    }
     let start_services: Vec<ServiceId> = if action == ServiceOperationKind::Start { vec![service_id.clone()] } else { Vec::new() };
 
     let input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::Service, service_id: Some(service_id.clone()), target_service_ids: None, action: Some(action) };
@@ -570,7 +579,7 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
     let manager_for_execute = manager.clone();
     let start_services_for_execute = start_services.clone();
     let execute: super::operations::OperationExecute = Box::new(move |handle| {
-        run_service_operation(manager_for_execute, handle, service_id.clone(), action, start_services_for_execute)
+        run_service_operation(manager_for_execute, handle, service_id.clone(), action, start_services_for_execute, kill_unowned)
     });
     let manager_for_rejected = manager.clone();
     let start_services_for_rejected = start_services.clone();
@@ -592,13 +601,13 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
 
-fn run_service_operation(manager: Arc<HearthManager>, handle: super::operations::OperationHandle, service_id: ServiceId, action: ServiceOperationKind, start_services: Vec<ServiceId>) -> BoxFuture<'static, Result<(), OperationError>> {
+fn run_service_operation(manager: Arc<HearthManager>, handle: super::operations::OperationHandle, service_id: ServiceId, action: ServiceOperationKind, start_services: Vec<ServiceId>, kill_unowned: bool) -> BoxFuture<'static, Result<(), OperationError>> {
     async move {
         // `start_services` is `[service_id]` for a `start` action — routed through the same
         // `start_selected_dag` as bulk-start so `hearthd start <id>`, the TUI's start key and MCP
         // `manage start` all land on one code path.
         let result = match action {
-            ServiceOperationKind::Start => start_selected_dag(&manager, &start_services, &handle).await.map_err(|e| crate::supervisor::types::SupervisorError(e.message)),
+            ServiceOperationKind::Start => start_selected_dag(&manager, &start_services, &handle, kill_unowned).await.map_err(|e| crate::supervisor::types::SupervisorError(e.message)),
             ServiceOperationKind::Stop => manager.supervisor().stop(&service_id, None).await,
             ServiceOperationKind::Restart => manager.supervisor().restart(&service_id, None).await,
             ServiceOperationKind::Status => manager.supervisor().status(&service_id).await,
@@ -716,7 +725,7 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
     if manager.closing.load(Ordering::SeqCst) {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
     }
-    let body = strict_body(&bytes, &["requestId", "targets"], &["requestId", "targets"])?;
+    let body = strict_body(&bytes, &["requestId", "targets", "killUnowned"], &["requestId", "targets"])?;
     let request_id = body.get("requestId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128);
     let Some(request_id) = request_id else {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string"));
@@ -738,6 +747,11 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
     if !ok {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_targets", "targets must be a non-empty set of catalog services"));
     }
+    let kill_unowned = match body.get("killUnowned") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "killUnowned must be a boolean")),
+    };
     if targets.iter().any(|t| catalog.services.iter().find(|s| &s.id == t).map(|s| !s.profiles.run.is_verified()).unwrap_or(true)) {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "unsupported_service", "The requested catalog service is not executable"));
     }
@@ -752,7 +766,7 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
     let execute: super::operations::OperationExecute = Box::new(move |handle| {
         async move {
             let operation_id = handle.lock().unwrap().id.clone();
-            let result = start_selected_dag(&manager_for_execute, &selected_for_execute, &handle).await;
+            let result = start_selected_dag(&manager_for_execute, &selected_for_execute, &handle, kill_unowned).await;
             clear_queued_starts(&manager_for_execute, &selected_for_execute, &operation_id).await;
             result
         }
@@ -774,7 +788,7 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
 
 /// Port of `startSelectedDag`: starts every selected service concurrently and independently — no
 /// service waits on another.
-async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId], operation: &super::operations::OperationHandle) -> Result<(), OperationError> {
+async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId], operation: &super::operations::OperationHandle, kill_unowned: bool) -> Result<(), OperationError> {
     /// Two distinct non-ready outcomes, not one `ready: bool`. Only `Failed` makes the operation
     /// fail: `Skipped` because a start was cancelled mid-flight is a normal result the TS source
     /// reports as success. Collapsing both into "not ready" made a cancelled start report the
@@ -791,7 +805,7 @@ async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId]
         outcome: StartOutcome,
     }
 
-    async fn start(manager: Arc<HearthManager>, operation: super::operations::OperationHandle, service_id_owned: ServiceId) -> StartResult {
+    async fn start(manager: Arc<HearthManager>, operation: super::operations::OperationHandle, service_id_owned: ServiceId, kill_unowned: bool) -> StartResult {
         let desired_running = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| s.desired_state == crate::state::DesiredServiceState::Running).unwrap_or(false);
         if !desired_running {
             manager.operations.trace(&operation, &format!("Skipped: {service_id_owned} (start cancelled)"));
@@ -811,7 +825,7 @@ async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId]
         }
         manager.operations.trace(&operation, &format!("Starting: {service_id_owned}"));
         let operation_id = operation.lock().unwrap().id.clone();
-        match manager.supervisor().start(&service_id_owned, Some(operation_id)).await {
+        match manager.supervisor().start_with_options(&service_id_owned, Some(operation_id), crate::supervisor::types::StartOptions { kill_unowned }).await {
             Ok(()) => {
                 let settled = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| {
                     s.actual_state == crate::state::ActualServiceState::Ready || (s.actual_state == crate::state::ActualServiceState::RunningUnready && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
@@ -831,7 +845,7 @@ async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId]
         }
     }
 
-    let results = futures::future::join_all(selected.iter().map(|service_id| start(manager.clone(), operation.clone(), service_id.clone()))).await;
+    let results = futures::future::join_all(selected.iter().map(|service_id| start(manager.clone(), operation.clone(), service_id.clone(), kill_unowned))).await;
     let failures: Vec<&StartResult> = results.iter().filter(|r| matches!(r.outcome, StartOutcome::Failed(_))).collect();
     if !failures.is_empty() {
         let summary = failures.iter().map(|r| r.service_id.clone()).collect::<Vec<_>>().join(", ");
@@ -1017,8 +1031,8 @@ async fn post_shutdown_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpR
     };
     let mode = match body.get("mode") {
         None => "refuse-if-active",
-        Some(Value::String(s)) if s == "refuse-if-active" || s == "stop-services" => s.as_str(),
-        _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_shutdown_mode", "mode must be refuse-if-active or stop-services")),
+        Some(Value::String(s)) if matches!(s.as_str(), "refuse-if-active" | "stop-services" | "leave-services") => s.as_str(),
+        _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_shutdown_mode", "mode must be refuse-if-active, stop-services, or leave-services")),
     };
     let stop_services = mode == "stop-services";
     let schedule_input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::ManagerShutdown, service_id: None, target_service_ids: None, action: None };
@@ -1030,7 +1044,11 @@ async fn post_shutdown_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpR
     }
     let non_terminal = ["stopped", "queued-start", "failed", "orphaned", "externally-owned"];
     let active = manager.service_states().into_iter().any(|s| default_daemon_owned(&manager.catalog(), &s.service_id) && !non_terminal.contains(&s.actual_state.as_wire_str()));
-    if active && !stop_services {
+    // Only `refuse-if-active` guards. `leave-services` is the deliberate "restart the daemon, keep
+    // the services" path (`hearthd manager restart`): daemon-owned processes are detached and
+    // outlive this daemon, and the next one re-adopts them from their persisted identities — the
+    // same thing a SIGTERM shutdown already does.
+    if active && mode == "refuse-if-active" {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "active_services", "Manager shutdown is refused while managed services are active"));
     }
     let manager_for_shutdown = manager.clone();
@@ -1234,6 +1252,72 @@ mod tests {
         })
         .await
         .expect("manager should finish shutting down");
+    }
+
+    /// `hearthd manager restart` shuts the daemon down with `leave-services`: the daemon goes away
+    /// but a running daemon-owned service must survive it (it is detached, and the next daemon
+    /// re-adopts it from its persisted identity). The `refuse-if-active` guard must stay exactly as
+    /// strict as it was — it is the mode that exists to refuse.
+    #[tokio::test]
+    async fn leave_services_shutdown_keeps_a_running_service_alive() {
+        let port = free_port();
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ServiceCatalog {
+            services: vec![tcp_service("api", port)],
+            groups: HashMap::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: Some(false),
+        };
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }).await.unwrap();
+        manager.supervisor().start(&"api".to_string(), None).await.unwrap();
+        let pid = match manager.service_states()[0].identity.clone().unwrap() {
+            crate::state::ProcessIdentity::Posix(posix) => posix.pid,
+            other => panic!("expected a posix identity, got {other:?}"),
+        };
+        let alive = || nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok();
+        assert!(alive(), "the spawned service should be running before the shutdown");
+
+        let client = reqwest::Client::new();
+        let base = manager.base_url();
+        let token = manager.bearer_token().to_string();
+        let shutdown = |mode: &'static str| {
+            let client = client.clone();
+            let base = base.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .post(format!("{base}/v1/manager/shutdown"))
+                    .bearer_auth(&token)
+                    .header("x-hearth-protocol", "1")
+                    .json(&json!({ "requestId": format!("req-shutdown-{mode}"), "mode": mode }))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Subscribed BEFORE the shutdown is triggered: `shutdown_completion` is a `watch` value, and
+        // `watch::Sender::send` is a no-op when no receiver exists yet — a `leave-services` shutdown
+        // has nothing to stop, so it can finish before a later subscriber ever looks.
+        let mut completion = manager.shutdown_completion();
+        assert_eq!(shutdown("refuse-if-active").await.status(), 409, "an active service must still refuse a plain shutdown");
+        assert_eq!(shutdown("leave-services").await.status(), 202);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !*completion.borrow() {
+                completion.changed().await.ok();
+            }
+        })
+        .await
+        .expect("manager should finish shutting down");
+
+        assert!(alive(), "leave-services must not stop the service's process");
+        assert_eq!(manager.service_states()[0].actual_state, crate::state::ActualServiceState::Ready, "the service must still be recorded as ready for the next daemon to re-adopt");
+
+        // This test owns the process it spawned — nothing else will reap it.
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM);
     }
 
     #[tokio::test]

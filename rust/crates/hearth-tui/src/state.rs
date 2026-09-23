@@ -22,6 +22,9 @@ pub struct Service {
     pub state: String,
     pub generation: Option<u64>,
     pub current_operation_id: Option<String>,
+    /// The daemon's last error for the row — for `externally-owned` it names the port-holder
+    /// ("Port 8080 is held by pid 91600 (node dist/main)"), which the reclaim confirmation shows.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -63,7 +66,14 @@ fn actual_state_str(state: ActualServiceState) -> &'static str {
 
 pub fn service_from_lifecycle(service: &ServiceLifecycleState, service_kind: &ServiceKindLookup) -> Service {
     let state = if service.actual_state == ActualServiceState::RunningUnready { "degraded".to_string() } else { actual_state_str(service.actual_state).to_string() };
-    Service { name: service.service_id.clone(), kind: service_kind(&service.service_id), state, generation: Some(service.generation), current_operation_id: service.current_operation_id.clone() }
+    Service {
+        name: service.service_id.clone(),
+        kind: service_kind(&service.service_id),
+        state,
+        generation: Some(service.generation),
+        current_operation_id: service.current_operation_id.clone(),
+        error: service.error.clone(),
+    }
 }
 
 pub const DEFAULT_LOG_TAIL_LIMIT: usize = 16 * 1024;

@@ -20,6 +20,8 @@
 	<string>0.7.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Hearth, a gnas.dev project</string>
 	<key>NSHighResolutionCapable</key>

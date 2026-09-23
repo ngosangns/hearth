@@ -11,7 +11,9 @@ protocol ManagerAPI: Sendable {
     func catalog() async throws -> ServiceCatalogSummary
     func managerInfo() async throws -> ManagerInfo
     func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int) async throws -> LogSlice
-    @discardableResult func perform(_ action: ManagerAction, serviceId: String) async throws -> ManagerOperation
+    /// `killUnowned` is the user-confirmed "kill the process holding my port" reclaim — it only
+    /// reaches the daemon after the user approved it in the UI.
+    @discardableResult func perform(_ action: ManagerAction, serviceId: String, killUnowned: Bool) async throws -> ManagerOperation
     @discardableResult func bulkStart(targets: [String]) async throws -> ManagerOperation
     func operation(id: String) async throws -> ManagerOperation
     /// Every registered service URL, placeholders resolved (`GET /v1/urls`).

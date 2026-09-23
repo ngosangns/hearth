@@ -112,14 +112,17 @@ impl<'a> ManagerTuiClient<'a> {
         serde_json::from_value(body["operation"].clone()).map_err(malformed_error)
     }
 
-    pub async fn action(&self, service_id: &str, action: ActionKind) -> Result<Operation, LocalctlError> {
+    pub async fn action(&self, service_id: &str, action: ActionKind, kill_unowned: bool) -> Result<Operation, LocalctlError> {
         let client = self.client().await?;
         let action_str = match action {
             ActionKind::Start => "start",
             ActionKind::Stop => "stop",
             ActionKind::Restart => "restart",
         };
-        let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action_str });
+        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action_str });
+        if kill_unowned {
+            body["killUnowned"] = json!(true);
+        }
         let response = cli_request(&client, "/v1/operations", reqwest::Method::POST, Some(&body), None).await.map_err(unavailable_error)?;
         serde_json::from_value(response["operation"].clone()).map_err(malformed_error)
     }
@@ -311,5 +314,86 @@ mod tests {
     fn rejects_an_oversized_chunk_append() {
         let huge = "x".repeat(MAX_SSE_FRAME_BYTES + 1);
         assert!(append_sse_chunk("", &huge).is_err());
+    }
+
+    /// End-to-end through a real daemon: `action(..., kill_unowned: true)` is the TUI's version of
+    /// the confirmed reclaim — the squatter is terminated and the start continues on the freed port.
+    #[tokio::test]
+    #[allow(clippy::zombie_processes)] // the squatter is killed and reaped at the end of the test
+    async fn action_with_kill_unowned_reclaims_the_held_port() {
+        use hearth_core::catalog::{CommandSpec, ReadinessSpec, ServiceCatalog, ServiceCommand, ServiceDefinition, ServiceKind, ServiceProfiles, ServiceRunProfile, StartFailurePolicy};
+        use hearth_core::manager::{bootstrap, HearthManagerOptions};
+        use hearth_core::state::OperationStatus;
+        use std::collections::HashMap;
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut squatter = std::process::Command::new("nc").args(["-lk", &port.to_string()]).process_group(0).spawn().unwrap();
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let service = ServiceDefinition {
+            id: "api".to_string(),
+            label: None,
+            kind: Some(ServiceKind::Application),
+            ownership: None,
+            profiles: ServiceProfiles {
+                run: ServiceRunProfile::Verified {
+                    command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
+                    readiness: ReadinessSpec::Tcp { port },
+                    readiness_timeout_ms: Some(5_000),
+                    preparation: None,
+                    preparation_command: None,
+                },
+                build: None,
+            },
+            ports: None,
+            urls: None,
+        };
+        let catalog = ServiceCatalog {
+            services: vec![service],
+            groups: HashMap::new(),
+            compose_file: None,
+            runtime_directory: Some(dir.path().to_string_lossy().to_string()),
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: Some(false),
+        };
+        let manager = bootstrap(HearthManagerOptions {
+            runtime_directory: None,
+            root: Some(PathBuf::from("/tmp")),
+            catalog: catalog.clone(),
+            event_capacity: None,
+            log_tail_bytes: None,
+            log_max_bytes: None,
+            log_rotation_count: None,
+            supervisor: None,
+        })
+        .await
+        .unwrap();
+        let options = LocalctlOptions { catalog, spawn_daemon: Box::new(|_| panic!("must not spawn a daemon in a test")), doctor_checks: None };
+        let client = ManagerTuiClient::new(PathBuf::from("/tmp"), &options);
+
+        // Without the flag the start refuses — and the squatter is left alone.
+        let refused = client.action("api", ActionKind::Start, false).await.unwrap();
+        assert_eq!(client.wait_operation(&refused.id).await.unwrap().status, OperationStatus::Failed);
+        assert!(squatter.try_wait().unwrap().is_none());
+
+        let accepted = client.action("api", ActionKind::Start, true).await.unwrap();
+        assert_eq!(client.wait_operation(&accepted.id).await.unwrap().status, OperationStatus::Succeeded);
+        for _ in 0..50 {
+            if squatter.try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(squatter.try_wait().unwrap().is_some(), "the confirmed reclaim must terminate the squatter");
+        let _ = squatter.kill();
+        let _ = squatter.wait();
+        manager.close().await;
     }
 }

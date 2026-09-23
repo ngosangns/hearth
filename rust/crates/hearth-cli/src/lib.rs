@@ -90,6 +90,7 @@ pub enum FlagName {
     Name,
     Dest,
     Key,
+    KillUnowned,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -102,6 +103,7 @@ pub struct Flags {
     pub name: Option<String>,
     pub dest: Option<String>,
     pub key: Option<String>,
+    pub kill_unowned: bool,
 }
 
 pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> LocalctlResult<Flags> {
@@ -124,6 +126,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
             "name" => (FlagName::Name, "name"),
             "dest" => (FlagName::Dest, "dest"),
             "key" => (FlagName::Key, "key"),
+            "kill-unowned" => (FlagName::KillUnowned, "kill-unowned"),
             _ => return usage_err(format!("unknown flag: {argument}")),
         };
         if !allowed.contains(&flag) {
@@ -158,6 +161,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
                     None => return usage_err("--dest requires a value"),
                 }
             }
+            FlagName::KillUnowned => result.kill_unowned = true,
             FlagName::Key => {
                 index += 1;
                 match arguments.get(index).filter(|v| !v.is_empty()) {
@@ -271,6 +275,61 @@ pub async fn require_client(root: &Path, options: &LocalctlOptions) -> LocalctlR
         Err(e) if e.contains("unauthorized") => fail_err(EXIT_UNAUTHORIZED, "hearth manager authentication failed"),
         Err(_) => fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable"),
     }
+}
+
+/// The `manager ensure --json` payload: everything a generic HTTP+SSE client (a desktop app's
+/// connection layer) needs to talk to the daemon directly — the bearer token and runtime directory
+/// are no more exposed than the lock directory already is.
+fn ensure_payload(client: &Client) -> Value {
+    json!({
+        "instanceId": client.metadata.instance_id,
+        "port": client.metadata.port,
+        "token": client.token,
+        "protocolVersion": client.metadata.protocol_version,
+        "runtimeDirectory": client.runtime_directory,
+        "root": client.root,
+    })
+}
+
+/// Restarts the daemon for `root`: shuts the running one down *without* stopping its services
+/// (`leave-services` — daemon-owned processes are detached and outlive the daemon, and the next one
+/// re-adopts them from their persisted identities), waits for the process to actually exit, then
+/// ensures a fresh daemon. Returns the same payload `manager ensure --json` prints.
+///
+/// This is also the documented recovery path after a `PROTOCOL_VERSION` bump: the shutdown request
+/// carries the *daemon's* own protocol version so an old daemon accepts it, and the daemon `ensure`
+/// starts is this binary's.
+pub async fn restart_manager(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Value> {
+    match discover(root, &options.catalog).await {
+        Discovery::Live { client } | Discovery::Stale { client } | Discovery::Incompatible { client } => shut_down_for_restart(&client).await?,
+        _ => {}
+    }
+    Ok(ensure_payload(&ensure(root, options).await?))
+}
+
+/// Shuts one running daemon down without stopping its services, and waits for the process to exit.
+async fn shut_down_for_restart(client: &Client) -> LocalctlResult<()> {
+    let pid = client.metadata.pid;
+    let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "mode": "leave-services" });
+    match request(client, "/v1/manager/shutdown", reqwest::Method::POST, Some(&body), Some(client.metadata.protocol_version)).await {
+        Ok(_) => {}
+        // A daemon from before `leave-services` existed rejects the mode outright. Its own SIGTERM
+        // path is the same shutdown (`DaemonLifecycle` runs with `stop_services: false`), so signal
+        // it instead: a daemon that predates this command is precisely the one `restart` exists to
+        // replace, and refusing it would leave the user with no way to swap it.
+        Err(error) if error.starts_with("invalid_shutdown_mode") => {
+            if !hearth_core::platform::terminate_pid(pid) {
+                return unavailable_err(error);
+            }
+        }
+        // A recorded daemon whose pid is already gone is nothing to restart — the lock artifacts
+        // simply outlived it, and `ensure` below starts a fresh one. Anything else (a live daemon
+        // that refused, or never answered) is a real failure: falling through to `ensure` would hand
+        // back the *same* daemon and report a restart that never happened.
+        Err(_) if !hearth_core::platform::is_pid_alive(pid) => return Ok(()),
+        Err(error) => return unavailable_err(error),
+    }
+    wait_for_daemon_exit(pid, MANAGER_STOP_TIMEOUT, hearth_core::platform::is_pid_alive).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -469,6 +528,10 @@ fn print_value(value: &Value, json_output: bool) -> String {
 pub struct Io<'a> {
     pub out: &'a mut dyn FnMut(&str),
     pub err: &'a mut dyn FnMut(&str),
+    /// Interactive confirmation prompt — receives the question text, returns the user's yes/no.
+    /// `None` on non-interactive callers (scripts, tests), which makes prompt-gated behavior
+    /// (killing an unowned port-holder) simply never fire.
+    pub confirm: Option<&'a mut dyn FnMut(&str) -> bool>,
 }
 
 pub async fn main(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>) -> i32 {
@@ -618,8 +681,8 @@ fn report_to_json(report: &hearth_core::doctor::DoctorReport) -> Value {
 async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Json])?;
     let subcommand = flags.positionals.first().cloned();
-    if flags.positionals.len() != 1 || !matches!(subcommand.as_deref(), Some("ensure") | Some("status") | Some("stop") | Some("reload")) {
-        return usage_err("usage: hearth manager ensure|status|stop|reload [--json]");
+    if flags.positionals.len() != 1 || !matches!(subcommand.as_deref(), Some("ensure") | Some("status") | Some("stop") | Some("restart") | Some("reload")) {
+        return usage_err("usage: hearth manager ensure|status|stop|restart|reload [--json]");
     }
     match subcommand.as_deref().unwrap() {
         "reload" => {
@@ -631,17 +694,11 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
         }
         "ensure" => {
             let client = ensure(root, options).await?;
-            // A generic client (a desktop app's connection layer) needs the bearer token and
-            // runtime directory to talk to the daemon directly over HTTP+SSE — no more exposed
-            // than the lock directory already is.
-            let payload = json!({
-                "instanceId": client.metadata.instance_id,
-                "port": client.metadata.port,
-                "token": client.token,
-                "protocolVersion": client.metadata.protocol_version,
-                "runtimeDirectory": client.runtime_directory,
-                "root": client.root,
-            });
+            (io.out)(&print_value(&ensure_payload(&client), flags.json));
+            Ok(0)
+        }
+        "restart" => {
+            let payload = restart_manager(root, options).await?;
             (io.out)(&print_value(&payload, flags.json));
             Ok(0)
         }
@@ -657,25 +714,30 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
         }
         _ => {
             // "stop"
-            let discovered = discover(root, &options.catalog).await;
-            // `Incompatible` is deliberately included: shutting the old daemon down is THE
-            // documented recovery path after a `PROTOCOL_VERSION` bump, so it is exactly the case
-            // where `manager stop` has to work. The request below is sent with the daemon's own
-            // `protocol_version`, not ours, so the old daemon accepts it. Excluding it here sent
-            // this through `require_client`, which then failed with exit 4 — leaving a user whose
-            // daemon predates a protocol bump no way to stop it.
-            let client = match discovered {
-                Discovery::Live { client } | Discovery::Stale { client } | Discovery::Incompatible { client } => client,
-                _ => require_client(root, options).await?,
-            };
-            let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "mode": "stop-services" });
-            let result = request(&client, "/v1/manager/shutdown", reqwest::Method::POST, Some(&body), Some(client.metadata.protocol_version)).await.or_else(unavailable_err)?;
-            let operation = result.get("operation").cloned().unwrap_or(Value::Null);
-            wait_for_daemon_exit(client.metadata.pid, MANAGER_STOP_TIMEOUT, hearth_core::platform::is_pid_alive).await?;
+            let operation = stop_manager(root, options).await?;
             (io.out)(&print_value(&operation, flags.json));
             Ok(0)
         }
     }
+}
+
+/// The shared `manager stop` body, also used by the MCP `stop_daemon` tool: `stop-services`
+/// shutdown, then wait for the daemon process to actually exit. `Incompatible` is deliberately
+/// included in discovery: shutting the old daemon down is THE documented recovery path after a
+/// `PROTOCOL_VERSION` bump, so it is exactly the case where a stop has to work. The request below
+/// is sent with the daemon's own `protocol_version`, not ours, so the old daemon accepts it.
+/// Returning the shutdown operation (or null when the daemon answered without one).
+pub async fn stop_manager(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Value> {
+    let discovered = discover(root, &options.catalog).await;
+    let client = match discovered {
+        Discovery::Live { client } | Discovery::Stale { client } | Discovery::Incompatible { client } => client,
+        _ => require_client(root, options).await?,
+    };
+    let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "mode": "stop-services" });
+    let result = request(&client, "/v1/manager/shutdown", reqwest::Method::POST, Some(&body), Some(client.metadata.protocol_version)).await.or_else(unavailable_err)?;
+    let operation = result.get("operation").cloned().unwrap_or(Value::Null);
+    wait_for_daemon_exit(client.metadata.pid, MANAGER_STOP_TIMEOUT, hearth_core::platform::is_pid_alive).await?;
+    Ok(operation)
 }
 
 /// How long `manager stop` waits for the daemon to finish stopping every service and exit.
@@ -755,10 +817,27 @@ async fn urls_command(root: &Path, options: &LocalctlOptions, rest: &[String], i
     Ok(0)
 }
 
+/// The row is `externally-owned` and the caller wired an interactive `confirm` — ask whether to
+/// kill the port-holder. Returns `Some(true)` on yes (submit with `killUnowned`), `Some(false)`
+/// on a declined prompt, `None` when prompting doesn't apply (not externally owned, --json, no
+/// confirm callback, or the flag already set it).
+fn prompt_kill_unowned(service_id: &str, row: Option<&ServiceLifecycleState>, flags: &Flags, io: &mut Io<'_>) -> Option<bool> {
+    if flags.json || flags.kill_unowned {
+        return None;
+    }
+    let row = row.filter(|r| r.actual_state == ActualServiceState::ExternallyOwned)?;
+    let reason = row.error.clone().unwrap_or_else(|| "its port is held by a process this manager does not own".to_string());
+    io.confirm.as_deref_mut().map(|confirm| confirm(&format!("{service_id}: {reason}. Kill it and start? [y/N] ")))
+}
+
 async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, command: &str, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
-    let flags = parse_command_flags(rest, &[FlagName::Wait, FlagName::Json])?;
+    let flags = parse_command_flags(rest, &[FlagName::Wait, FlagName::Json, FlagName::KillUnowned])?;
+    if flags.kill_unowned && command != "start" {
+        return usage_err("--kill-unowned only applies to `hearth start`");
+    }
     if flags.positionals.len() != 1 {
-        return usage_err(format!("usage: hearth {command} <service|group> [--wait] [--json]"));
+        let flag_hint = if command == "start" { " [--kill-unowned]" } else { "" };
+        return usage_err(format!("usage: hearth {command} <service|group> [--wait] [--json]{flag_hint}"));
     }
     let target = &flags.positionals[0];
     let selected = runnable_targets(&options.catalog, Some(target))?;
@@ -769,7 +848,10 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
     let client = ensure(root, options).await?;
 
     if command == "start" && !is_single_service {
-        let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "targets": selected });
+        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "targets": selected });
+        if flags.kill_unowned {
+            body["killUnowned"] = json!(true);
+        }
         let accepted_body = request(&client, "/v1/operations/bulk-start", reqwest::Method::POST, Some(&body), None).await.or_else(unavailable_err)?;
         let accepted: Operation = serde_json::from_value(accepted_body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
         let operation = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
@@ -785,16 +867,52 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
     }
 
     let mut operations: Vec<Operation> = Vec::new();
+    let mut state_rows: Option<Vec<ServiceLifecycleState>> = None;
     for service_id in &selected {
         let action = match command {
             "start" => "start",
             "stop" => "stop",
             _ => "restart",
         };
-        let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action });
-        let accepted_body = request(&client, "/v1/operations", reqwest::Method::POST, Some(&body), None).await.or_else(unavailable_err)?;
-        let accepted: Operation = serde_json::from_value(accepted_body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
-        let completed = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
+        let mut kill_unowned = flags.kill_unowned;
+        // Pre-submit prompt: a prior attempt already persisted `externally-owned`, so the conflict
+        // is known before this start even runs — works without --wait.
+        if command == "start" {
+            if state_rows.is_none() {
+                state_rows = service_rows(&client).await.ok();
+            }
+            match prompt_kill_unowned(service_id, state_rows.as_ref().and_then(|rows| rows.iter().find(|r| &r.service_id == service_id)), &flags, io) {
+                Some(true) => kill_unowned = true,
+                Some(false) => return fail_err(EXIT_FAILED, format!("start declined: {service_id} left externally owned")),
+                None => {}
+            }
+        }
+        let mut completed;
+        loop {
+            let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action });
+            if kill_unowned {
+                body["killUnowned"] = json!(true);
+            }
+            let accepted_body = request(&client, "/v1/operations", reqwest::Method::POST, Some(&body), None).await.or_else(unavailable_err)?;
+            let accepted: Operation = serde_json::from_value(accepted_body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
+            completed = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
+            // Post-failure prompt: a FRESH conflict only surfaces once the operation completes,
+            // which needs --wait. Re-read the row — the daemon just persisted `externally-owned`
+            // with the holder's pid/command in `error`.
+            if command != "start" || !flags.wait || kill_unowned || completed.status != OperationStatus::Failed {
+                break;
+            }
+            let fresh_row = service_rows(&client).await.ok().and_then(|rows| rows.into_iter().find(|r| &r.service_id == service_id));
+            match prompt_kill_unowned(service_id, fresh_row.as_ref(), &flags, io) {
+                Some(true) => {
+                    kill_unowned = true;
+                    continue;
+                }
+                Some(false) => (io.out)(&format!("declined {service_id}")),
+                None => {}
+            }
+            break;
+        }
         let failed = completed.status == OperationStatus::Failed;
         operations.push(completed);
         if failed {
@@ -1078,7 +1196,7 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
         let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let code = main(&options, &args(&["--root", "/tmp", "status", "--json"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(&out.lock().unwrap()[0]).unwrap();
@@ -1098,13 +1216,145 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
         let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait", "--json"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(out.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(printed["operations"][0]["status"], "succeeded");
         assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::Ready);
         manager.close().await;
+    }
+
+    /// A real process squatting on the service's port — `nc -lk` in its own process group, killed
+    /// on drop so a failing assertion never leaks it into the next test.
+    struct PortSquatter {
+        child: std::process::Child,
+    }
+    impl PortSquatter {
+        #[allow(clippy::zombie_processes)] // Drop kills and reaps the child on every exit path
+        async fn hold(port: u16) -> Self {
+            use std::os::unix::process::CommandExt;
+            let child = std::process::Command::new("nc").args(["-lk", &port.to_string()]).process_group(0).spawn().unwrap();
+            // Poll for the actual bind — a fixed sleep is a flake (see AGENTS.md).
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Self { child };
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("squatter never bound port {port}");
+        }
+    }
+    impl Drop for PortSquatter {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The flag is the non-interactive "yes": the daemon SIGTERMs the squatter and the service
+    /// starts on the freed port.
+    #[tokio::test]
+    async fn start_kill_unowned_terminates_the_process_holding_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let mut squatter = PortSquatter::hold(port).await;
+        let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
+        let manager = bootstrap_manager(catalog.clone()).await;
+
+        // Without the flag the same start must refuse and leave the squatter alone.
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let out2 = out.clone();
+        let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
+        let mut err_fn = move |_: &str| {};
+        let options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon: never_spawn(), doctor_checks: None };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
+        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait", "--json"]), &mut io).await;
+        assert_ne!(code, 0, "a held port must refuse a plain start");
+        assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::ExternallyOwned);
+        assert!(squatter.child.try_wait().unwrap().is_none(), "the squatter must still be alive");
+
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
+        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait", "--json", "--kill-unowned"]), &mut io).await;
+        assert_eq!(code, 0, "{:?}", out.lock().unwrap());
+        let printed: Value = serde_json::from_str(out.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(printed["operations"][0]["status"], "succeeded");
+        assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::Ready);
+        for _ in 0..50 {
+            if squatter.child.try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(squatter.child.try_wait().unwrap().is_some(), "the squatter must have been terminated");
+        manager.close().await;
+    }
+
+    /// On an interactive terminal the held-port failure prompts instead of just failing; answering
+    /// yes resubmits the same start with `killUnowned`.
+    #[tokio::test]
+    async fn start_prompts_and_reclaims_when_the_user_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let squatter = PortSquatter::hold(port).await;
+        let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
+        let manager = bootstrap_manager(catalog.clone()).await;
+
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let prompts2 = prompts.clone();
+        let mut confirm = move |question: &str| {
+            prompts2.lock().unwrap().push(question.to_string());
+            true
+        };
+        let mut out_fn = move |_: &str| {};
+        let mut err_fn = move |_: &str| {};
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: Some(&mut confirm) };
+        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait"]), &mut io).await;
+        assert_eq!(code, 0);
+        assert_eq!(prompts.lock().unwrap().len(), 1, "the fresh conflict must prompt exactly once, after the failed submit");
+        assert!(prompts.lock().unwrap()[0].contains(&format!("api: Port {port} is held by pid")), "{:?}", prompts.lock().unwrap());
+        assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::Ready);
+        drop(squatter);
+        manager.close().await;
+    }
+
+    /// Answering no — or having no terminal at all (`confirm: None`) — never kills anything: the
+    /// service stays `externally-owned` and the squatter keeps its port.
+    #[tokio::test]
+    async fn start_declined_prompt_leaves_the_squatter_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let mut squatter = PortSquatter::hold(port).await;
+        let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
+        let manager = bootstrap_manager(catalog.clone()).await;
+
+        let mut confirm = |_: &str| false;
+        let mut out_fn = move |_: &str| {};
+        let mut err_fn = move |_: &str| {};
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: Some(&mut confirm) };
+        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait"]), &mut io).await;
+        assert_ne!(code, 0, "a declined reclaim is still a failed start");
+        assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::ExternallyOwned);
+        assert!(squatter.child.try_wait().unwrap().is_none(), "declining must never signal the squatter");
+        manager.close().await;
+    }
+
+    /// `--kill-unowned` on `stop`/`restart` is a usage error, not a silent ignore.
+    #[tokio::test]
+    async fn kill_unowned_on_a_non_start_command_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = test_catalog(dir.path(), vec![]);
+        let err = Arc::new(Mutex::new(Vec::new()));
+        let err2 = err.clone();
+        let mut out_fn = move |_: &str| {};
+        let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
+        let code = main(&options, &args(&["--root", "/tmp", "stop", "api", "--kill-unowned"]), &mut io).await;
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err.lock().unwrap()[0].contains("--kill-unowned only applies"), "{:?}", err.lock().unwrap());
     }
 
     #[tokio::test]
@@ -1118,7 +1368,7 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
         let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let code = main(&options, &args(&["--root", "/tmp", "manager", "ensure", "--json"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(&out.lock().unwrap()[0]).unwrap();
@@ -1162,6 +1412,52 @@ mod tests {
         assert!(wait_for_daemon_exit(i64::from(std::process::id()), Duration::from_millis(1), |_| true).await.is_ok());
     }
 
+    /// A daemon that predates `leave-services` rejects the mode outright — and that daemon is
+    /// exactly the one `restart` exists to replace (a running daemon is always the *old* binary
+    /// right after an install). It must be shut down through its own graceful SIGTERM path rather
+    /// than left running with the restart reported as failed.
+    #[tokio::test]
+    async fn restart_falls_back_to_sigterm_for_a_daemon_that_rejects_leave_services() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        // A stand-in for the old daemon's HTTP surface: it answers every request with the 400 an
+        // older `post_shutdown` returns for a mode it does not know.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let body = r#"{"error":{"code":"invalid_shutdown_mode","message":"mode must be refuse-if-active or stop-services"}}"#;
+                    let response = format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    use tokio::io::AsyncWriteExt as _;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        // The "daemon process": its own process group, reaped by a thread the moment it dies — a
+        // zombie still answers `kill(pid, 0)`, so nothing here may hold the pid open.
+        let mut child = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let pid = i64::from(child.id());
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        let client = Client {
+            root: PathBuf::from("/tmp"),
+            runtime_directory: PathBuf::from("/tmp"),
+            metadata: ManagerMetadata { version: 1, protocol_version: PROTOCOL_VERSION, instance_id: "old-daemon".to_string(), pid, port, started_at: "2026-01-01T00:00:00.000Z".to_string() },
+            token: "token".to_string(),
+        };
+
+        shut_down_for_restart(&client).await.expect("an old daemon must still be replaceable");
+
+        let status = reaper.join().unwrap();
+        // Nothing in this path but the fallback signals it — `sleep 30` never exits on its own.
+        assert!(status.signal().is_some(), "the old daemon must be asked to shut down, not left running");
+        assert!(!hearth_core::platform::is_pid_alive(pid), "the old daemon's process must be gone");
+    }
+
     #[tokio::test]
     async fn doctor_reports_platform_check() {
         let dir = tempfile::tempdir().unwrap();
@@ -1171,7 +1467,7 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
         let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let code = main(&options, &args(&["--root", "/tmp", "doctor"]), &mut io).await;
         assert_eq!(code, 0);
         assert!(out.lock().unwrap().iter().any(|line| line.contains("platform")));
@@ -1188,7 +1484,7 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
         let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let code = main(&options, &args(&["--root", "/tmp", "bogus"]), &mut io).await;
         assert_eq!(code, EXIT_USAGE);
         assert!(err.lock().unwrap()[0].contains("unknown command"));
@@ -1205,7 +1501,7 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
         let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let code = main(&options, &args(&["--root", "/tmp", "status"]), &mut io).await;
         assert_eq!(code, EXIT_UNAVAILABLE);
         assert!(err.lock().unwrap()[0].contains("unavailable"));
@@ -1224,7 +1520,7 @@ mod tests {
         let err2 = err.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
-        let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+        let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
         let mut full_args: Vec<&str> = vec!["--root", dir.to_str().unwrap()];
         full_args.extend_from_slice(extra_args);
         let code = main(&options, &args(&full_args), &mut io).await;
@@ -1445,7 +1741,7 @@ mod tests {
                 let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
                 let mut err_fn = move |_: &str| {};
                 let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
-                let mut io = Io { out: &mut out_fn, err: &mut err_fn };
+                let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
                 let mut argv = vec!["--root", "/tmp", "urls"];
                 argv.extend_from_slice(extra);
                 let code = main(&options, &args(&argv), &mut io).await;

@@ -52,7 +52,9 @@ task rust:install   # copies rust/target/release/hearthd into Hearth.app
 
 `hearthd manager ensure --json` is the connection contract for a non-terminal client (the macOS app's
 sidecar): it ensures a daemon is running for `--root` and prints `{instanceId, port, token,
-protocolVersion, runtimeDirectory, root}`.
+protocolVersion, runtimeDirectory, root}`. `hearthd manager restart --json` prints the same payload
+for a freshly started daemon, replacing the old one *without* stopping its services — they are
+detached, and the new daemon re-adopts them from their persisted identities.
 
 Consumer scripts must use the app-bundled absolute path.
 

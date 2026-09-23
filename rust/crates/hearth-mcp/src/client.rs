@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use hearth_cli::{require_client, request as cli_request, runnable_targets, LocalctlOptions};
+use hearth_cli::{require_client, request as cli_request, restart_manager, runnable_targets, stop_manager, LocalctlOptions};
 
 #[derive(Debug, Clone, Default)]
 pub struct StatusArguments {
@@ -55,6 +55,9 @@ impl ManageAction {
 pub struct ManageArguments {
     pub service: String,
     pub action: ManageAction,
+    /// `action: start` only — the host-approved "kill the process holding my port" reclaim,
+    /// forwarded verbatim to the daemon's `killUnowned` operation flag.
+    pub kill_unowned: bool,
 }
 
 /// The dependency-injected MCP client shape a reusable package's MCP entrypoint needs: transport-
@@ -68,6 +71,13 @@ pub trait HearthMcpClient: Send + Sync {
     async fn trace(&self, arguments: TraceArguments) -> Result<Value, String>;
     async fn events(&self, arguments: EventsArguments) -> Result<Value, String>;
     async fn manage(&self, arguments: ManageArguments) -> Result<Value, String>;
+    /// Restarts this project's daemon. Takes no arguments: there is exactly one daemon per project
+    /// root, so there is nothing to select.
+    async fn restart_daemon(&self) -> Result<Value, String>;
+    /// Stops this project's daemon AND every service it manages (`stop-services`). Takes no
+    /// arguments for the same reason — afterwards every other tool fails until a new daemon is
+    /// ensured by a client that can spawn one (this MCP server deliberately cannot).
+    async fn stop_daemon(&self) -> Result<Value, String>;
 }
 
 /// Default `HearthMcpClient` backed by the daemon's HTTP API.
@@ -117,7 +127,10 @@ impl HearthMcpClient for ManagerApiClient {
 
     async fn manage(&self, arguments: ManageArguments) -> Result<Value, String> {
         runnable_targets(&self.options.catalog, Some(&arguments.service)).map_err(|e| e.message)?;
-        let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": arguments.service, "action": arguments.action.as_str() });
+        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": arguments.service, "action": arguments.action.as_str() });
+        if arguments.kill_unowned {
+            body["killUnowned"] = json!(true);
+        }
         let mut response = self.call("/v1/operations", reqwest::Method::POST, Some(&body)).await?;
         let mut operation = response["operation"].take();
         loop {
@@ -135,6 +148,20 @@ impl HearthMcpClient for ManagerApiClient {
             return Err(message);
         }
         self.status(StatusArguments { service: Some(arguments.service) }).await
+    }
+
+    /// The same `hearthd manager restart` the CLI runs, in-process: shut the daemon down leaving its
+    /// services running, wait for it to exit, ensure a fresh one. Every later call re-discovers the
+    /// daemon through `require_client`, so this client needs no reconnection of its own.
+    async fn restart_daemon(&self) -> Result<Value, String> {
+        restart_manager(&self.root, &self.options).await.map_err(|e| e.message)
+    }
+
+    /// The same `hearthd manager stop` the CLI runs, in-process: `stop-services` shutdown, then the
+    /// wait for the daemon pid to exit — returning early would let the caller reconnect into a
+    /// still-draining daemon that answers every request with `manager_closing`.
+    async fn stop_daemon(&self) -> Result<Value, String> {
+        stop_manager(&self.root, &self.options).await.map_err(|e| e.message)
     }
 }
 

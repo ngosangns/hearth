@@ -63,32 +63,62 @@ struct MenuBarContentView: View {
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
     @EnvironmentObject private var menuBarPulse: MenuBarPulse
     @Environment(\.openWindow) private var openWindow
+    /// The workspace whose "Stop Daemon…" item armed the confirmation dialog — per-workspace, since
+    /// one content view lists them all.
+    @State private var stopDaemonTarget: Workspace?
 
     var body: some View {
         let _ = menuBarPulse.tick
-        if workspaceStore.workspaces.isEmpty {
-            Text("No workspaces yet")
-        } else {
-            ForEach(workspaceStore.workspaces) { workspace in
-                Menu(menuTitle(for: workspace)) {
-                    Button("Open") {
-                        workspaceStore.selectedId = workspace.id
-                        openWindow(id: "main")
-                    }
-                    if let controller = registry.controllers[workspace.id], controller.phase == .connected {
-                        Button("Stop All") { Task { await controller.stopAll() } }
+        Group {
+            if workspaceStore.workspaces.isEmpty {
+                Text("No workspaces yet")
+            } else {
+                ForEach(workspaceStore.workspaces) { workspace in
+                    Menu(menuTitle(for: workspace)) {
+                        Button("Open") {
+                            workspaceStore.selectedId = workspace.id
+                            openWindow(id: "main")
+                        }
+                        if workspace.trusted, let controller = registry.controllers[workspace.id], controller.phase != .connecting {
+                            Button("Restart Daemon") { Task { await controller.restartDaemon() } }
+                                .disabled(controller.daemonTransitionInFlight)
+                        }
+                        // Destructive like the toolbar button — daemon AND all its services go down,
+                        // so the menu item arms a confirmation rather than firing directly.
+                        if workspace.trusted, let controller = registry.controllers[workspace.id], controller.phase.mayHaveLiveDaemon {
+                            Button("Stop Daemon…") { stopDaemonTarget = workspace }
+                                .disabled(controller.daemonTransitionInFlight)
+                        }
+                        if let controller = registry.controllers[workspace.id], controller.phase == .connected {
+                            Button("Stop All") { Task { await controller.stopAll() } }
+                        }
                     }
                 }
             }
-        }
-        Divider()
-        Button("Open Hearth") { openWindow(id: "main") }
-        Button("Check for Updates…") {
-            if let url = URL(string: "https://github.com/gnasdev/hearth/releases") {
-                NSWorkspace.shared.open(url)
+            Divider()
+            Button("Open Hearth") { openWindow(id: "main") }
+            Button("Check for Updates…") {
+                if let url = URL(string: "https://github.com/gnasdev/hearth/releases") {
+                    NSWorkspace.shared.open(url)
+                }
             }
+            Button("Quit") { NSApp.terminate(nil) }
         }
-        Button("Quit") { NSApp.terminate(nil) }
+        .confirmationDialog(
+            "Stop this project's daemon?",
+            isPresented: Binding(
+                get: { stopDaemonTarget != nil },
+                set: { if !$0 { stopDaemonTarget = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let target = stopDaemonTarget, let controller = registry.controllers[target.id] {
+                Button("Stop Daemon", role: .destructive) { Task { await controller.stopDaemon() } }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The daemon and every service it manages will be stopped.")
+        }
     }
 
     private func menuTitle(for workspace: Workspace) -> String {
@@ -101,6 +131,7 @@ struct MenuBarContentView: View {
         guard let controller else { return "…" }
         switch controller.phase {
         case .idle, .connecting: return "connecting…"
+        case .stopped: return "stopped"
         case .failed(let message): return message
         case .connected:
             let ready = controller.services.filter { $0.displayState == "ready" }.count

@@ -125,7 +125,8 @@ usage: hearthd [--root <path>] <command> [options]
   operation get|watch <id> [--json]     inspect one operation
   doctor [--json]                       environment and catalog diagnostics
   cleanup                               remove stale runtime state
-  manager ensure|status|stop|reload     daemon lifecycle
+  manager ensure|status|stop|restart|reload
+                                        daemon lifecycle (restart keeps services running)
   daemon --root <path>                  run the daemon in the foreground (spawned internally)
   tui                                   interactive terminal UI
   mcp                                   serve the MCP tool surface over stdio
@@ -194,7 +195,22 @@ async fn run_cli(argv: &[String]) -> i32 {
     let options = hearth_cli::LocalctlOptions { catalog: loaded.catalog, spawn_daemon: Box::new(spawn_daemon), doctor_checks: None };
     let mut out = |s: &str| println!("{s}");
     let mut err = |s: &str| eprintln!("{s}");
-    let mut io = hearth_cli::Io { out: &mut out, err: &mut err };
+    // The port-conflict "kill the holder?" prompt. A non-TTY stdin (scripts, agents, piped calls)
+    // answers false unconditionally — killing an unowned process must never happen without an
+    // interactive yes.
+    let mut confirm = |prompt: &str| -> bool {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        eprint!("{prompt}");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+    let mut io = hearth_cli::Io { out: &mut out, err: &mut err, confirm: Some(&mut confirm) };
     // The *full*, un-stripped argv is passed through — `hearth_cli::main` does its own `--root`
     // extraction identically, exactly mirroring how the TS `runCli` passes its original argv to
     // `main()` rather than the root-stripped remainder computed just above for `load_catalog`.

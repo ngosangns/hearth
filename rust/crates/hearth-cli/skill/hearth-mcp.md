@@ -14,7 +14,7 @@ process, and every CLI/TUI/MCP surface reading that state would start reporting 
 
 ## MCP tools
 
-This project registers an MCP server exposing 5 tools (prefixed `local_services_` unless this
+This project registers an MCP server exposing 7 tools (prefixed `local_services_` unless this
 install customized `--name`, or the server's own `tool_prefix` differs):
 
 | Tool | Does | Mutate gate |
@@ -24,10 +24,31 @@ install customized `--name`, or the server's own `tool_prefix` differs):
 | `local_services_trace` | Look up one operation by id | free |
 | `local_services_events` | Recent manager/service lifecycle events | free |
 | `local_services_manage` | start / stop / restart a service or group | requires `confirm=true` |
+| `local_services_restart_daemon` | Restart this project's daemon, leaving running services up for the new daemon to re-adopt | requires `confirm=true` |
+| `local_services_stop_daemon` | Stop this project's daemon AND every service it manages | requires `confirm=true` |
 
 `status`/`logs`/`trace`/`events` are always safe to call for diagnosis — use them freely. Only
 call `manage` when the user has explicitly asked for that lifecycle action; never call it
-speculatively ("let me just start it to see").
+speculatively ("let me just start it to see"). `restart_daemon` is for a daemon that is wedged or
+running an older binary — it is not a way to restart a *service* (that is `manage` with
+`action: restart`), and it briefly makes every other tool call fail while the daemon is down.
+
+`stop_daemon` is the full shutdown: unlike `restart_daemon` it does **not** leave services
+running — the daemon stops every service it manages first, then exits. Only call it when the user
+has explicitly asked to stop the daemon (or the whole project). Afterwards **every** tool call —
+including `status` — fails until some other client (`hearthd`, the app, the TUI) starts a new
+daemon; there is no `start_daemon` tool.
+
+`stop` on a service this daemon does not own a process for (an adopted `ownership: external` unit,
+or one whose port is held by an unowned process) runs the catalog's `stop:` command; when the
+catalog declares none, the operation **fails** with the reason rather than reporting success. A
+failed stop means the service is still running — do not tell the user it stopped.
+
+When `manage`/`start` fails with `externally-owned` ("Port N is held by pid … (cmd)"), a process
+this daemon does not own holds the service's port. `manage` accepts `killUnowned: true`
+(`action: start` only, still gated on `confirm: true`) to terminate that process and continue the
+start — only set it when the user has explicitly asked to kill the holder; otherwise leave the
+service `externally-owned` and report the holder to the user.
 
 ## Equivalent CLI
 
@@ -37,8 +58,11 @@ seen through all:
 
 - `hearthd status [service]` / `hearthd logs <service> [--tail N] [-f]`
 - `hearthd urls [service]` — the live URLs a service is reachable at (use these rather than guessing ports)
-- `hearthd start|stop|restart <service|group> [--wait]`
-- `hearthd doctor` / `hearthd manager ensure|status|stop|reload`
+- `hearthd start|stop|restart <service|group> [--wait]` — `start` also takes `--kill-unowned`
+  (kill the process holding the service's port, then start; on a TTY `start` prompts instead)
+- `hearthd doctor` / `hearthd manager ensure|status|stop|restart|reload` (`restart` replaces the
+  daemon process and leaves its services running for the new one to re-adopt; `stop` stops all
+  managed services and then the daemon)
 - `hearthd tui`
 
 ## Architecture, in one paragraph

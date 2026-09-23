@@ -12,6 +12,18 @@ final class WorkspaceController: ObservableObject {
         case connecting
         case connected
         case failed(String)
+        /// The daemon was deliberately stopped via `stopDaemon()` — everything is down and the
+        /// view offers "Start Daemon" (a fresh `ensure`), not a retry of a failure.
+        case stopped
+
+        /// `.connected` and `.failed` are the phases where a daemon may still be running (a failed
+        /// connection does not mean the daemon is dead) — `stopDaemon` is only offered then.
+        var mayHaveLiveDaemon: Bool {
+            switch self {
+            case .connected, .failed: return true
+            case .idle, .connecting, .stopped: return false
+            }
+        }
     }
 
     let workspace: Workspace
@@ -38,6 +50,15 @@ final class WorkspaceController: ObservableObject {
     /// How `connect()` obtains a client for a project root. Injectable so the connection state
     /// machine can be driven without a real daemon — the default is the real sidecar path.
     private let connector: @Sendable (String) async throws -> any ManagerAPI
+    /// How `restartDaemon()` obtains a client for a project root — same shape as `connector`, but
+    /// the sidecar call behind it replaces the daemon instead of finding-or-starting one.
+    private let restarter: @Sendable (String) async throws -> any ManagerAPI
+    /// How `stopDaemon()` stops the daemon — `hearthd manager stop`, which only returns once the
+    /// daemon process has exited. Injectable for the same reason as `connector`/`restarter`.
+    private let stopper: @Sendable (String) async throws -> Void
+    /// A `stopDaemon` in flight is not a `connecting` phase — but every daemon-lifecycle button
+    /// must still stay disabled for its duration, so views read this alongside `phase`.
+    @Published private(set) var daemonTransitionInFlight = false
     /// Whether `connect()` should start the config-file watcher. Off under test: it would install a
     /// real dispatch source on a real directory.
     private let watchesConfigFile: Bool
@@ -47,7 +68,9 @@ final class WorkspaceController: ObservableObject {
         workspace: Workspace,
         pollInterval: Duration = .seconds(2),
         watchesConfigFile: Bool = true,
-        connector: (@Sendable (String) async throws -> any ManagerAPI)? = nil
+        connector: (@Sendable (String) async throws -> any ManagerAPI)? = nil,
+        restarter: (@Sendable (String) async throws -> any ManagerAPI)? = nil,
+        stopper: (@Sendable (String) async throws -> Void)? = nil
     ) {
         self.workspace = workspace
         self.pollInterval = pollInterval
@@ -55,6 +78,10 @@ final class WorkspaceController: ObservableObject {
         self.connector = connector ?? { root in
             ManagerClient(connection: try await DaemonConnection.ensure(root: root))
         }
+        self.restarter = restarter ?? { root in
+            ManagerClient(connection: try await DaemonConnection.restart(root: root))
+        }
+        self.stopper = stopper ?? { root in try await DaemonConnection.stopManager(root: root) }
     }
 
     deinit {
@@ -63,10 +90,52 @@ final class WorkspaceController: ObservableObject {
     }
 
     func connect() async {
-        guard phase != .connecting else { return }
+        await establish(using: connector)
+    }
+
+    /// Replaces this workspace's daemon and reconnects to the new one. The daemon's own services are
+    /// left running across the swap (they are detached, and the new daemon re-adopts them from their
+    /// persisted identities) — so this is the recovery path for a wedged daemon or one still running
+    /// an older `hearthd` binary, not a way to restart a service.
+    func restartDaemon() async {
+        await establish(using: restarter)
+    }
+
+    /// Stops this workspace's daemon AND every service it manages (`hearthd manager stop`), then
+    /// drops the whole live state — the connection, watchers, and published services are all dead
+    /// afterwards, so nothing may keep polling a daemon that no longer exists.
+    func stopDaemon() async {
+        guard phase != .connecting, !daemonTransitionInFlight else { return }
+        daemonTransitionInFlight = true
+        defer { daemonTransitionInFlight = false }
+        do {
+            try await stopper(workspace.path)
+            pollTask?.cancel()
+            pollTask = nil
+            configWatcher?.stop()
+            configWatcher = nil
+            dropLogControllers()
+            client = nil
+            services = []
+            urls = []
+            catalog = nil
+            lastActionError = nil
+            phase = .stopped
+        } catch {
+            // The daemon may still be alive (or never answered) — keep the current connection and
+            // surface the reason rather than pretending the stop landed.
+            phase = .failed(error.localizedDescription)
+        }
+    }
+
+    /// The shared body of `connect()`/`restartDaemon()`: obtain a client (find-or-start vs. replace),
+    /// then bring the published state in line with it. `phase` doubles as the re-entrancy guard, so a
+    /// restart clicked twice cannot stack two daemon swaps.
+    private func establish(using obtain: @Sendable (String) async throws -> any ManagerAPI) async {
+        guard phase != .connecting, !daemonTransitionInFlight else { return }
         phase = .connecting
         do {
-            let client = try await connector(workspace.path)
+            let client = try await obtain(workspace.path)
             dropLogControllers()
             self.client = client
             catalog = try? await client.catalog() // best-effort — service status doesn't depend on it
@@ -90,7 +159,10 @@ final class WorkspaceController: ObservableObject {
         dropLogControllers()
     }
 
+    /// Idempotent: a restart re-establishes the connection, and installing a second dispatch source
+    /// on the same directory would leak the first one.
     private func startConfigWatcher() {
+        configWatcher?.stop()
         let root = workspace.path
         configWatcher = ConfigFileWatcher(directory: root) { [weak self] in
             Task { @MainActor in await self?.handleConfigChanged(root: root) }
@@ -227,12 +299,12 @@ final class WorkspaceController: ObservableObject {
     /// soon as the POST completes cleared the busy state within milliseconds while the service was
     /// still starting, re-enabled the buttons mid-flight, and discarded the failure reason
     /// entirely (it only ever lands on the settled operation's `error`).
-    func perform(_ action: ManagerAction, serviceId: String) async {
+    func perform(_ action: ManagerAction, serviceId: String, killUnowned: Bool = false) async {
         guard let client else { return }
         beginFlight(serviceId)
         defer { endFlight(serviceId) }
         do {
-            let accepted = try await client.perform(action, serviceId: serviceId)
+            let accepted = try await client.perform(action, serviceId: serviceId, killUnowned: killUnowned)
             // Refresh while it runs so the UI tracks the intermediate states, then again after.
             await refresh()
             _ = try await client.waitForOperation(id: accepted.id)

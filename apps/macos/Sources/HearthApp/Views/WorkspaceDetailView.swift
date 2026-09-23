@@ -8,6 +8,7 @@ struct WorkspaceDetailView: View {
     /// user switching away and back, and so the menu bar sees the same live state.
     @ObservedObject var controller: WorkspaceController
     let workspace: Workspace
+    @State private var confirmStopDaemon = false
 
     var body: some View {
         Group {
@@ -24,6 +25,35 @@ struct WorkspaceDetailView: View {
         .toolbar {
             if workspace.trusted, controller.phase == .connected {
                 ToolbarItem { Button("Stop All") { Task { await controller.stopAll() } } }
+            }
+            // Available in every phase but `connecting` — a failed workspace is exactly where a
+            // daemon swap is worth trying, and `connecting` is the in-flight state (the controller
+            // guards re-entry on it too, so a double click cannot stack two swaps).
+            if workspace.trusted, controller.phase != .connecting {
+                ToolbarItem {
+                    Button("Restart Daemon") { Task { await controller.restartDaemon() } }
+                        .help("Replace this project's hearth daemon. Its services keep running and are re-adopted by the new daemon.")
+                        .disabled(controller.daemonTransitionInFlight)
+                }
+            }
+            // `stopDaemon` takes the daemon AND all its services down — destructive enough to
+            // confirm, and only offered while the daemon may be alive (connected, or failed with a
+            // possibly-wedged daemon still running).
+            if workspace.trusted, controller.phase.mayHaveLiveDaemon {
+                ToolbarItem {
+                    Button("Stop Daemon") { confirmStopDaemon = true }
+                        .disabled(controller.daemonTransitionInFlight)
+                        .confirmationDialog(
+                            "Stop this project's daemon?",
+                            isPresented: $confirmStopDaemon,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Stop Daemon", role: .destructive) { Task { await controller.stopDaemon() } }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("The daemon and every service it manages will be stopped.")
+                        }
+                }
             }
             ToolbarItem {
                 Menu {
@@ -60,6 +90,13 @@ struct WorkspaceDetailView: View {
                 Button("Retry") { Task { await controller.connect() } }
             }
             .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .stopped:
+            VStack(spacing: 12) {
+                Image(systemName: "stop.circle").font(.largeTitle).foregroundStyle(.secondary)
+                Text("Daemon stopped").foregroundStyle(.secondary)
+                Button("Start Daemon") { Task { await controller.connect() } }
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .connected:
             ServiceListView(controller: controller)
@@ -112,7 +149,9 @@ private struct ServiceListView: View {
                         label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
                         busy: controller.actionsInFlight.contains(service.serviceId),
                         urls: controller.urls(for: service.serviceId),
-                        onAction: { action in Task { await controller.perform(action, serviceId: service.serviceId) } }
+                        onAction: { action, killUnowned in
+                            Task { await controller.perform(action, serviceId: service.serviceId, killUnowned: killUnowned) }
+                        }
                     )
                     .tag(service.serviceId)
                 }
@@ -146,7 +185,8 @@ private struct ServiceRow: View {
     let label: String
     let busy: Bool
     let urls: [ResolvedServiceUrl]
-    let onAction: (ManagerAction) -> Void
+    let onAction: (ManagerAction, Bool) -> Void
+    @State private var confirmReclaim = false
 
     /// Same rule as `hearthd urls` and both TUIs: in-flight states count as running.
     private var isRunning: Bool { ["ready", "starting"].contains(service.displayState) }
@@ -163,6 +203,13 @@ private struct ServiceRow: View {
                     }
                     if let detail = service.readinessDetail, service.displayState == "failed" {
                         Text(detail).font(.caption).foregroundStyle(.red).lineLimit(1)
+                    }
+                    // `externally-owned` means a process this daemon does not own holds the service's
+                    // port — the daemon's own reason ("Port 1166 is held by an unowned process") is
+                    // the only thing that explains why Stop cannot work here, so the row shows it
+                    // rather than leaving a button that looks broken.
+                    if let reason = service.error, service.displayState == "external" {
+                        Text(reason).font(.caption).foregroundStyle(.orange).lineLimit(1)
                     }
                 }
                 if !urls.isEmpty {
@@ -207,23 +254,44 @@ private struct ServiceRow: View {
                 // Keep Stop available for the whole start/restart flight so the user can abort
                 // without waiting for readiness.
                 if service.displayState != "stopping" {
-                    Button("Stop") { onAction(.stop) }
+                    Button("Stop") { onAction(.stop, false) }
                 }
             } else {
                 switch service.displayState {
-                case "stopped", "failed", "orphaned":
-                    Button("Start") { onAction(.start) }
+                case "stopped", "failed":
+                    Button("Start") { onAction(.start, false) }
+                // `orphaned`: the daemon no longer owns the process it recorded (a reused pid, or a
+                // program that replaced it). Start re-runs the catalog's run command; Stop runs its
+                // `stop:` command — or reports why it cannot, which is the only honest answer for a
+                // process this daemon does not own.
+                case "orphaned":
+                    Button("Start") { onAction(.start, false) }
+                    Button("Stop") { onAction(.stop, false) }
                 case "ready", "starting":
-                    Button("Restart") { onAction(.restart) }
-                    Button("Stop") { onAction(.stop) }
+                    Button("Restart") { onAction(.restart, false) }
+                    Button("Stop") { onAction(.stop, false) }
                 // A service queued behind another operation on the same target stays `queued-start`
                 // until something clears it — without this the row offered no way out of it at all.
                 case "queued":
-                    Button("Cancel") { onAction(.stop) }
-                // Externally-owned (an adopted docker/tailnet unit): the daemon observes it rather
-                // than owning it, so Restart is not ours to offer, but Stop is what the CLI does.
+                    Button("Cancel") { onAction(.stop, false) }
+                // `externally-owned`: a process this daemon does not own holds the service's port, so
+                // it has no process to kill. "Kill & Start" asks the daemon to terminate that
+                // process (SIGTERM, then SIGKILL) and continue the start — destructive, so it is
+                // gated behind a confirmation. Stop is still offered because the catalog's `stop:`
+                // command is the other lever that works here.
                 case "external":
-                    Button("Stop") { onAction(.stop) }
+                    Button("Kill & Start") { confirmReclaim = true }
+                        .confirmationDialog(
+                            "Kill the process holding this port?",
+                            isPresented: $confirmReclaim,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Kill & Start", role: .destructive) { onAction(.start, true) }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text(service.error ?? "A process this manager does not own holds the port.")
+                        }
+                    Button("Stop") { onAction(.stop, false) }
                 // `stopping` is genuinely in-flight — no extra action, the poll will move it.
                 default:
                     EmptyView()

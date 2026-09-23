@@ -52,6 +52,24 @@ pub fn is_pid_alive(_pid: i64) -> bool {
     false
 }
 
+/// Sends SIGTERM to `pid` — the graceful shutdown path a daemon already has (`DaemonLifecycle` runs
+/// with `stop_services: false`, so it leaves its services running for the next daemon to re-adopt).
+/// Used to replace a daemon that predates a shutdown mode this binary knows about; the caller must
+/// have authenticated the pid first (the lock-ownership proof `discover` verifies), never a pid read
+/// from anywhere else.
+#[cfg(unix)]
+pub fn terminate_pid(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM).is_ok()
+}
+
+#[cfg(not(unix))]
+pub fn terminate_pid(_pid: i64) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +101,21 @@ mod tests {
     fn is_pid_alive_false_for_an_implausible_pid() {
         // A pid this large will not exist on any real system.
         assert!(!is_pid_alive(i32::MAX as i64));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_pid_actually_ends_a_live_process() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        assert!(!terminate_pid(0), "a non-positive pid is never signalled");
+        // Its own process group, so nothing here can signal the test harness itself.
+        let mut child = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let pid = child.id() as i64;
+        assert!(is_pid_alive(pid));
+        assert!(terminate_pid(pid));
+        // `wait` reaps it and reports the signal it died from.
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(nix::sys::signal::Signal::SIGTERM as i32));
+        assert!(!is_pid_alive(pid));
     }
 }

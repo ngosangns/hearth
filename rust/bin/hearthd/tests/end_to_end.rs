@@ -116,6 +116,46 @@ fn full_lifecycle_over_the_real_compiled_binary() {
     let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
 }
 
+/// `manager restart` is the one daemon lifecycle action that must NOT take the services down with
+/// it: the daemon process is replaced, and the service it was running is re-adopted by the new one
+/// from its persisted identity. Proven against the real compiled binary — a fresh `instanceId`, and
+/// the *same* pid still answering `status` afterwards.
+#[test]
+fn manager_restart_replaces_the_daemon_and_keeps_services_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    write_config(dir.path(), port);
+
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let first: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["start", "api", "--wait", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}, stderr: {stderr}");
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["status", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let before: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(before["services"][0]["state"], "ready");
+    let pid = before["services"][0]["pid"].as_i64().expect("a ready service should report a pid");
+
+    // `manager restart --json` prints the same payload `manager ensure --json` does — the new
+    // daemon's connection, which is what a client (the macOS app) reconnects with.
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "restart", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}, stderr: {stderr}");
+    let restarted: serde_json::Value = serde_json::from_str(stdout.trim()).expect("manager restart --json must print exactly one JSON object");
+    assert_ne!(restarted["instanceId"], first["instanceId"], "restart must produce a new daemon instance");
+    assert!(restarted["port"].as_u64().unwrap() > 0);
+    assert!(restarted["token"].as_str().unwrap().len() > 10);
+
+    let (code, stdout, stderr) = run_lsd(dir.path(), &["status", "--json"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let after: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(after["services"][0]["state"], "ready", "the service must be re-adopted, not stopped");
+    assert_eq!(after["services"][0]["pid"].as_i64().unwrap(), pid, "the same process must still be serving");
+
+    let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
+}
+
 #[test]
 fn missing_config_file_reports_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -155,7 +195,7 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
 
     let tools = client.list_all_tools().await.expect("list_tools should succeed");
     let names: Vec<String> = tools.into_iter().map(|tool| tool.name.to_string()).collect();
-    assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage"]);
+    assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage", "local_services_restart_daemon", "local_services_stop_daemon"]);
 
     let response = client.call_tool(CallToolRequestParams::new("local_services_status")).await.expect("status tool call should succeed");
     assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());

@@ -22,7 +22,7 @@ use super::fingerprint::normalize_command_fingerprint;
 use super::process_tree::{build_process_tree, process_tree_alive, secondary_process_groups, ProcessTreeEntry};
 use super::types::{
     Host, ManagedProcess, OnOutput, OutputSource, OutputTail, ProcessRecord, ProcessSignal, SpawnInput,
-    SupervisorError, SupervisorOptions,
+    StartOptions, SupervisorError, SupervisorOptions,
 };
 
 pub const ACTIVE_STATES: [ActualServiceState; 7] = [
@@ -200,9 +200,15 @@ impl ProcessSupervisor {
     // ---------------------------------------------------------------------------------------
 
     pub async fn start(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
+        self.start_with_options(service_id, operation_id, StartOptions::default()).await
+    }
+
+    /// `StartOptions::kill_unowned` is the wire-level echo of a user's explicit "yes, kill the
+    /// process holding my port" — it must only ever come from a confirmed client request.
+    pub async fn start_with_options(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>, options: StartOptions) -> Result<(), SupervisorError> {
         let sup = self.clone();
         let id = service_id.clone();
-        self.queues.run(service_id, || async move { sup.start_locked(&id, operation_id).await }).await
+        self.queues.run(service_id, || async move { sup.start_locked(&id, operation_id, options).await }).await
     }
 
     pub async fn restart(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
@@ -214,7 +220,7 @@ impl ProcessSupervisor {
         self.queues
             .run(service_id, || async move {
                 sup.stop_locked(&id, op.clone()).await?;
-                sup.start_locked(&id, op).await
+                sup.start_locked(&id, op, StartOptions::default()).await
             })
             .await
     }
@@ -498,7 +504,7 @@ impl ProcessSupervisor {
     // Locked start/stop
     // ---------------------------------------------------------------------------------------
 
-    async fn start_locked(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
+    async fn start_locked(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>, options: StartOptions) -> Result<(), SupervisorError> {
         if (self.options.is_closing)() {
             return Ok(());
         }
@@ -639,23 +645,97 @@ impl ProcessSupervisor {
         }
         if let ReadinessSpec::Tcp { port } = &profile.readiness {
             if let Some(true) = self.options.probes.port_in_use(*port).await {
-                self.transition(
-                    service_id,
-                    generation,
-                    ActualServiceState::ExternallyOwned,
-                    ServiceReadiness::Failed,
-                    Changes { error: Patch::Set(format!("Port {port} is held by an unowned process")), ..Default::default() },
-                )
-                .await;
-                return Err(SupervisorError(format!("Port {port} is externally owned")));
+                // `killUnowned` is the client's echo of "yes, kill whatever holds my port" — the
+                // ONLY path in this engine that signals a process it does not own.
+                let error = if options.kill_unowned {
+                    self.reclaim_port(*port).await.err()
+                } else {
+                    None
+                };
+                match error {
+                    None if !options.kill_unowned => {
+                        let held_by = self.describe_port_holders(*port).await;
+                        self.transition(
+                            service_id,
+                            generation,
+                            ActualServiceState::ExternallyOwned,
+                            ServiceReadiness::Failed,
+                            Changes { error: Patch::Set(format!("Port {port} is held by {held_by}")), ..Default::default() },
+                        )
+                        .await;
+                        return Err(SupervisorError(format!("Port {port} is externally owned")));
+                    }
+                    None => {}
+                    Some(error) => {
+                        self.transition(
+                            service_id,
+                            generation,
+                            ActualServiceState::ExternallyOwned,
+                            ServiceReadiness::Failed,
+                            Changes { error: Patch::Set(error.0.clone()), ..Default::default() },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
             }
         }
         self.spawn_and_wait(service_id, &profile, generation, token, operation_id).await
     }
 
+    /// Human-readable "pid 91600 (node dist/main)" for the refusal error and the client-side kill
+    /// prompt; "an unowned process" when the probe can't resolve the holder (`port_holders`
+    /// returning `None` means no adapter capability, not "nobody is there").
+    async fn describe_port_holders(&self, port: u16) -> String {
+        match self.options.probes.port_holders(port).await {
+            Some(holders) if !holders.is_empty() => holders
+                .iter()
+                .map(|h| {
+                    if h.command.is_empty() {
+                        format!("pid {}", h.pid)
+                    } else {
+                        format!("pid {} ({})", h.pid, h.command)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "an unowned process".to_string(),
+        }
+    }
+
+    /// SIGTERM each resolved port-holder, poll the port until it frees (or `termination_grace_ms`
+    /// elapses), then a second pass with SIGKILL. Holders are re-resolved each pass — a squatter
+    /// that died and had its pid recycled, or one replaced by a respawning wrapper, is never
+    /// signalled on stale information (`signal_pid` re-verifies the lstart before sending).
+    ///
+    /// Only the resolved holder pids are signalled — never `killpg`: an unowned process's group
+    /// membership is untrusted (a shared job can hold innocent sibling services; pgid 1 must never
+    /// be signalled). A socket-holding child that outlives its signalled parent is caught by the
+    /// next pass's re-resolution.
+    async fn reclaim_port(self: &Arc<Self>, port: u16) -> Result<(), SupervisorError> {
+        for signal in [ProcessSignal::Sigterm, ProcessSignal::Sigkill] {
+            if let Some(holders) = self.options.probes.port_holders(port).await {
+                for holder in holders {
+                    self.options.process.signal_pid(holder.pid, &holder.start_identity, signal).await;
+                }
+            }
+            let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
+            loop {
+                if self.options.probes.port_in_use(port).await == Some(false) {
+                    return Ok(());
+                }
+                if self.options.clock.now_millis() >= deadline {
+                    break;
+                }
+                self.options.clock.sleep(self.options.readiness_backoff_ms).await;
+            }
+        }
+        Err(SupervisorError(format!("Port {port} is still held by {} after SIGKILL", self.describe_port_holders(port).await)))
+    }
+
     async fn stop_locked(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
         let Some(state) = self.state(service_id) else { return Ok(()) };
-        if matches!(state.actual_state, ActualServiceState::Stopped | ActualServiceState::ExternallyOwned) {
+        if state.actual_state == ActualServiceState::Stopped {
             return Ok(());
         }
         let has_active = self.active.lock().unwrap().contains_key(service_id);
@@ -678,10 +758,15 @@ impl ProcessSupervisor {
                     },
                 )
                 .await;
-            } else {
-                self.orphan(&state, operation_id).await;
+                return Ok(());
             }
-            return Ok(());
+            // Everything else reaching here is a service this manager holds no process for: an
+            // adopted `ownership: external` unit, or a service whose port is held by a process it
+            // does not own. `orphan()` used to be the fallthrough — recording "Process ownership
+            // identity no longer matches" for a service that never had an identity — and
+            // `externally-owned` returned success before even getting here, so Stop reported
+            // success while nothing was stopped.
+            return self.stop_unowned(service_id, &state, operation_id).await;
         }
         if !self.owns(&state).await {
             let observed = self.options.process.inspect(state.identity.as_ref().unwrap()).await;
@@ -705,8 +790,16 @@ impl ProcessSupervisor {
                 .await;
                 return Ok(());
             }
+            // The process at this identity is alive but is no longer this manager's — a reused pid,
+            // or a program that replaced it. Killing it would be killing someone else's process, so
+            // the refusal is the answer: recording the mismatch and reporting success is the same
+            // silent no-op the identity-less path above was fixed for.
             self.orphan(&state, operation_id).await;
-            return Ok(());
+            let described = match state.identity.as_ref().unwrap() {
+                ProcessIdentity::Posix(posix) => format!("pid {}", posix.pid),
+                ProcessIdentity::Docker(docker) => format!("container {}", docker.container_name),
+            };
+            return Err(SupervisorError(format!("{service_id} cannot be stopped: the process at {described} is no longer owned by this manager")));
         }
         self.transition(
             service_id,
@@ -732,6 +825,46 @@ impl ProcessSupervisor {
             ActualServiceState::Stopped,
             ServiceReadiness::Unknown,
             Changes { desired_state: Some(DesiredServiceState::Stopped), exited_at: Patch::Set(self.options.clock.now()), error: Patch::Clear, exit_code: Patch::Clear, ..Default::default() },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Stops a service this manager holds no process identity for — an adopted `ownership: external`
+    /// unit (a docker/tailnet task it only observes), or a service whose port is held by a process it
+    /// does not own. The catalog's `stop:` command is the only lever that exists for those, so it is
+    /// what runs; with no such command, refusing loudly is the honest answer. Reporting success
+    /// without stopping anything is what made Stop look broken in the app.
+    async fn stop_unowned(self: &Arc<Self>, service_id: &ServiceId, state: &ServiceLifecycleState, operation_id: Option<String>) -> Result<(), SupervisorError> {
+        let profile = profile_for(&self.host.catalog(), service_id)?;
+        if profile.command.docker_stop_command.is_none() {
+            let reason = match state.actual_state {
+                ActualServiceState::ExternallyOwned => state.error.clone().unwrap_or_else(|| "its port is held by a process this manager does not own".to_string()),
+                _ => "it is owned externally".to_string(),
+            };
+            return Err(SupervisorError(format!("{service_id} cannot be stopped: {reason}, and its catalog declares no `stop` command")));
+        }
+        let sink: OnOutput = Arc::new(|_| {});
+        match self.options.process.stop_container(&profile.command, sink).await {
+            Some(result) => result?,
+            None => return Err(SupervisorError(format!("{service_id} cannot be stopped: this process adapter has no stop command support"))),
+        }
+        // An adopted container carries a `docker logs --follow` tail; the container is gone now, so
+        // the follower must not be left streaming into a dead pipe.
+        self.detach_output(service_id);
+        self.transition(
+            service_id,
+            state.generation,
+            ActualServiceState::Stopped,
+            ServiceReadiness::Unknown,
+            Changes {
+                desired_state: Some(DesiredServiceState::Stopped),
+                current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
+                exited_at: Patch::Set(self.options.clock.now()),
+                error: Patch::Clear,
+                exit_code: Patch::Clear,
+                ..Default::default()
+            },
         )
         .await;
         Ok(())
@@ -1483,7 +1616,7 @@ mod tests {
     use crate::state::{DesiredServiceState, PosixProcessIdentity, ServiceReadiness};
     use crate::supervisor::types::{
         DockerContainerRecord, Host, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail,
-        PosixProcessRecord, PreparationAdapter, ProbeAdapter, ProcessAdapter, ProcessRecord, RunBuild,
+        PortHolder, PosixProcessRecord, PreparationAdapter, ProbeAdapter, ProcessAdapter, ProcessRecord, RunBuild,
         SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,
     };
     use async_trait::async_trait;
@@ -1517,12 +1650,18 @@ mod tests {
         next_pid: i64,
         alive: HashMap<i64, PosixProcessRecord>,
         signals: Vec<(i64, ProcessSignal)>,
+        pid_signals: Vec<(i64, ProcessSignal)>,
+        /// Squatter processes that ignore SIGTERM (still die to SIGKILL) or never die at all —
+        /// the reclaim tests' "holder survives" knobs.
+        term_immune: std::collections::HashSet<i64>,
+        unkillable: std::collections::HashSet<i64>,
         spawn_should_fail: HashMap<ServiceId, String>,
         container_records: HashMap<String, DockerContainerRecord>,
         exit_senders: HashMap<i64, oneshot::Sender<i32>>,
         attach_output_calls: Vec<(ServiceId, &'static str)>,
         tail_dones: HashMap<ServiceId, Arc<std::sync::atomic::AtomicBool>>,
         tails_stopped: Vec<ServiceId>,
+        stop_container_calls: Vec<String>,
     }
     struct FakeProcessAdapter {
         state: Arc<Mutex<FakeProcessAdapterState>>,
@@ -1544,6 +1683,9 @@ mod tests {
         fn tail_was_stopped(&self, service_id: &str) -> bool {
             self.state.lock().unwrap().tails_stopped.iter().any(|id| id == service_id)
         }
+        fn stop_container_calls(&self) -> Vec<String> {
+            self.state.lock().unwrap().stop_container_calls.clone()
+        }
         fn fail_spawn(&self, service_id: &str, message: &str) {
             self.state.lock().unwrap().spawn_should_fail.insert(service_id.to_string(), message.to_string());
         }
@@ -1552,6 +1694,15 @@ mod tests {
         }
         fn signals(&self) -> Vec<(i64, ProcessSignal)> {
             self.state.lock().unwrap().signals.clone()
+        }
+        fn pid_signals(&self) -> Vec<(i64, ProcessSignal)> {
+            self.state.lock().unwrap().pid_signals.clone()
+        }
+        fn mark_term_immune(&self, pid: i64) {
+            self.state.lock().unwrap().term_immune.insert(pid);
+        }
+        fn mark_unkillable(&self, pid: i64) {
+            self.state.lock().unwrap().unkillable.insert(pid);
         }
         /// Simulates a process dying on its own (not via a signal from us) — fires its exit code and
         /// removes it from the alive set, exactly like a real process disappearing underneath us.
@@ -1630,9 +1781,22 @@ mod tests {
             }
         }
 
+        async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal) {
+            let mut state = self.state.lock().unwrap();
+            state.pid_signals.push((pid, signal));
+            // Same contract as the real adapter: a pid that no longer presents the resolved lstart
+            // is not ours to signal — reclaim can never kill a recycled process in the fake either.
+            let survives = state.unkillable.contains(&pid) || (state.term_immune.contains(&pid) && signal == ProcessSignal::Sigterm);
+            if state.alive.get(&pid).map(|r| r.start_identity.as_str()) == Some(expected_start_identity) && !survives {
+                state.alive.remove(&pid);
+            }
+        }
+
         async fn stop_container(&self, command: &ServiceCommand, _on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
             let name = command.container_name.clone()?;
-            self.state.lock().unwrap().container_records.remove(&name);
+            let mut state = self.state.lock().unwrap();
+            state.stop_container_calls.push(name.clone());
+            state.container_records.remove(&name);
             Some(Ok(()))
         }
 
@@ -1660,21 +1824,51 @@ mod tests {
     struct FakeProbeAdapterState {
         tcp_ready: HashMap<u16, bool>,
         port_in_use: HashMap<u16, bool>,
+        port_holders: HashMap<u16, Vec<PortHolder>>,
+        /// Simulates an adapter without holder-resolution capability — `port_holders` must return
+        /// `None`, the same answer the engine treats as "fail closed, never guess a pid".
+        port_holders_unsupported: bool,
         container_ready: HashMap<String, bool>,
         tailnet_ready: bool,
     }
     struct FakeProbeAdapter {
         state: Mutex<FakeProbeAdapterState>,
+        /// The fake process table, shared with `FakeProcessAdapter` when built `with_process` —
+        /// a holder port reads "in use" exactly while its holder pids are still in that table, so
+        /// a reclaim's `signal_pid` frees the port just like a real squatter dying would.
+        process_state: Arc<Mutex<FakeProcessAdapterState>>,
     }
     impl FakeProbeAdapter {
         fn new() -> Arc<Self> {
-            Arc::new(Self { state: Mutex::new(FakeProbeAdapterState::default()) })
+            Arc::new(Self { state: Mutex::new(FakeProbeAdapterState::default()), process_state: Arc::new(Mutex::new(FakeProcessAdapterState::default())) })
+        }
+        fn with_process(process_state: Arc<Mutex<FakeProcessAdapterState>>) -> Arc<Self> {
+            Arc::new(Self { state: Mutex::new(FakeProbeAdapterState::default()), process_state })
         }
         fn set_tcp_ready(&self, port: u16, ready: bool) {
             self.state.lock().unwrap().tcp_ready.insert(port, ready);
         }
         fn set_port_in_use(&self, port: u16, in_use: bool) {
             self.state.lock().unwrap().port_in_use.insert(port, in_use);
+        }
+        fn set_port_holders_unsupported(&self) {
+            self.state.lock().unwrap().port_holders_unsupported = true;
+        }
+        /// Registers a squatter holding `port`: the holder pid goes into the shared fake process
+        /// table (so `signal_pid` can kill it) and into the port's holder list (so `port_holders`
+        /// resolves it and `port_in_use` stays true until it dies).
+        fn set_port_holder(&self, port: u16, pid: i64, start_identity: &str, command: &str) {
+            self.process_state.lock().unwrap().alive.insert(
+                pid,
+                PosixProcessRecord { pid, pgid: pid, start_identity: start_identity.to_string(), command_fingerprint: command.to_string() },
+            );
+            self.state
+                .lock()
+                .unwrap()
+                .port_holders
+                .entry(port)
+                .or_default()
+                .push(PortHolder { pid, pgid: pid, start_identity: start_identity.to_string(), command: command.to_string() });
         }
         fn set_container_ready(&self, name: &str, ready: bool) {
             self.state.lock().unwrap().container_ready.insert(name.to_string(), ready);
@@ -1695,7 +1889,29 @@ mod tests {
             self.state.lock().unwrap().tailnet_ready
         }
         async fn port_in_use(&self, port: u16) -> Option<bool> {
-            Some(self.state.lock().unwrap().port_in_use.get(&port).copied().unwrap_or(false))
+            let state = self.state.lock().unwrap();
+            if let Some(holders) = state.port_holders.get(&port) {
+                let alive = self.process_state.lock().unwrap();
+                return Some(holders.iter().any(|h| alive.alive.contains_key(&h.pid)));
+            }
+            Some(state.port_in_use.get(&port).copied().unwrap_or(false))
+        }
+        async fn port_holders(&self, port: u16) -> Option<Vec<PortHolder>> {
+            let state = self.state.lock().unwrap();
+            if state.port_holders_unsupported {
+                return None;
+            }
+            let alive = self.process_state.lock().unwrap();
+            Some(
+                state
+                    .port_holders
+                    .get(&port)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|h| alive.alive.contains_key(&h.pid))
+                    .collect(),
+            )
         }
         // Deliberately NOT overriding `command` for the "no adapter configured" tests — the trait
         // default (`None`) is exactly the sharp edge under test. A dedicated adapter type below
@@ -1741,6 +1957,12 @@ mod tests {
         async fn port_in_use(&self, port: u16) -> Option<bool> {
             match &self.inner {
                 Some(inner) => inner.port_in_use(port).await,
+                None => None,
+            }
+        }
+        async fn port_holders(&self, port: u16) -> Option<Vec<PortHolder>> {
+            match &self.inner {
+                Some(inner) => inner.port_holders(port).await,
                 None => None,
             }
         }
@@ -1939,7 +2161,7 @@ mod tests {
     fn build_harness_with_timeout(catalog: ServiceCatalog, readiness_timeout_ms: i64) -> Harness {
         let host = FakeHost::new(catalog);
         let process = FakeProcessAdapter::new();
-        let probes = FakeProbeAdapter::new();
+        let probes = FakeProbeAdapter::with_process(process.state.clone());
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let options = SupervisorOptions {
@@ -2008,6 +2230,82 @@ mod tests {
         assert!(h.process.signals().is_empty());
     }
 
+    /// An adopted `ownership: external` unit carries no process identity, so the catalog's `stop:`
+    /// command is the only thing that can stop it. Stop used to fall through to `orphan()` —
+    /// recording "Process ownership identity no longer matches" for a service that never had an
+    /// identity — while the container kept running: exactly what "I press Stop and nothing happens"
+    /// looked like in the app.
+    #[tokio::test]
+    async fn stop_on_an_adopted_external_service_runs_its_stop_command() {
+        let h = build_harness(one_service_catalog(external_container_service("cache", "proj-cache", Some("docker compose stop cache"))));
+        h.host.seed(adopted_external_state("cache"));
+
+        h.supervisor.stop(&"cache".to_string(), None).await.unwrap();
+
+        assert_eq!(h.process.stop_container_calls(), vec!["proj-cache".to_string()], "the catalog's stop command must actually run");
+        let state = h.host.state_of("cache").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Stopped);
+        assert_eq!(state.desired_state, DesiredServiceState::Stopped);
+        assert!(state.error.is_none(), "a successful stop must not leave the old error behind");
+    }
+
+    /// The other half of the same bug: a service whose port is held by a process this manager does
+    /// not own has nothing to stop and no `stop:` command to run. Stop must say so — it used to
+    /// report success and change nothing.
+    #[tokio::test]
+    async fn stop_on_an_externally_owned_service_without_a_stop_command_fails_loudly() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_in_use(8080, true);
+        let start_error = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        assert!(start_error.0.contains("externally owned"), "{start_error:?}");
+
+        let error = h.supervisor.stop(&"api".to_string(), None).await.unwrap_err();
+
+        assert!(error.0.contains("cannot be stopped"), "{error:?}");
+        assert!(error.0.contains("Port 8080 is held by an unowned process"), "{error:?}");
+        assert!(error.0.contains("no `stop` command"), "{error:?}");
+        let state = h.host.state_of("api").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned, "a refused stop must not pretend the service is stopped");
+    }
+
+    /// An external unit with no `stop:` command cannot be stopped by this manager either — the same
+    /// loud refusal, not a silent success that leaves the container running.
+    #[tokio::test]
+    async fn stop_on_an_external_service_without_a_stop_command_fails_loudly() {
+        let h = build_harness(one_service_catalog(external_container_service("cache", "proj-cache", None)));
+        h.host.seed(adopted_external_state("cache"));
+
+        let error = h.supervisor.stop(&"cache".to_string(), None).await.unwrap_err();
+
+        assert!(error.0.contains("cannot be stopped"), "{error:?}");
+        assert!(error.0.contains("owned externally"), "{error:?}");
+        assert!(h.process.stop_container_calls().is_empty(), "nothing may be run when the catalog declares no stop command");
+        assert_eq!(h.host.state_of("cache").unwrap().actual_state, ActualServiceState::Ready);
+    }
+
+    /// A stop must never report success for a process it cannot touch: an identity that no longer
+    /// matches (a reused pid, or a program that replaced it) is alive, but killing it would be
+    /// killing someone else's process.
+    #[tokio::test]
+    async fn stop_on_an_orphaned_service_refuses_instead_of_reporting_success() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_tcp_ready(8080, true);
+        h.supervisor.start(&"api".to_string(), None).await.unwrap();
+        let pid = match h.host.state_of("api").unwrap().identity.unwrap() {
+            ProcessIdentity::Posix(posix) => posix.pid,
+            _ => panic!("expected a posix identity"),
+        };
+        // The pid is still alive, but `ps` now reports a different program at it.
+        h.process.mutate_fingerprint(pid, "not-the-same-program-anymore");
+
+        let error = h.supervisor.stop(&"api".to_string(), None).await.unwrap_err();
+
+        assert!(error.0.contains("cannot be stopped"), "{error:?}");
+        assert!(error.0.contains(&format!("pid {pid}")), "{error:?}");
+        assert!(h.process.signals().is_empty(), "a process this manager does not own must never be signalled");
+        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Orphaned);
+    }
+
     #[tokio::test]
     async fn readiness_timeout_transitions_to_failed_with_detail() {
         let h = build_harness_with_timeout(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })), 30);
@@ -2029,6 +2327,140 @@ mod tests {
         assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
         assert!(state.error.as_deref().unwrap().contains("Port 8080 is held"));
         assert!(h.process.signals().is_empty(), "must never have spawned anything");
+    }
+
+    /// The refusal error must name the squatter — `pid (command)` — so the client can show the
+    /// user exactly what would be killed before they confirm.
+    #[tokio::test]
+    async fn tcp_port_conflict_names_the_holder_in_the_error() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        assert!(err.0.contains("externally owned"));
+        let state = h.host.state_of("api").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
+        assert_eq!(state.error.as_deref().unwrap(), "Port 8080 is held by pid 41234 (node dist/main)");
+        assert!(h.process.pid_signals().is_empty(), "without kill_unowned nothing may be signalled");
+    }
+
+    /// `killUnowned` is the client's echo of the user's "yes": the squatter gets SIGTERM, the port
+    /// frees, and the start continues into the normal spawn/readiness path.
+    #[tokio::test]
+    async fn start_with_kill_unowned_terminates_the_holder_and_continues() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        h.probes.set_tcp_ready(8080, true);
+        h.supervisor
+            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .await
+            .unwrap();
+        assert_eq!(h.process.pid_signals(), vec![(41_234, ProcessSignal::Sigterm)]);
+        assert!(!h.process.state.lock().unwrap().alive.contains_key(&41_234), "the squatter must be dead");
+        let state = h.host.state_of("api").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Ready);
+        assert!(state.identity.is_some(), "the service itself must have spawned after the port freed");
+    }
+
+    /// A squatter that ignores SIGTERM is escalated to SIGKILL on a second pass — holders are
+    /// re-resolved, so the kill goes to the still-alive pid, not the stale first-pass record.
+    #[tokio::test]
+    async fn reclaim_escalates_to_sigkill_for_a_sigterm_immune_holder() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        h.probes.set_tcp_ready(8080, true);
+        h.process.mark_term_immune(41_234);
+        h.supervisor
+            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .await
+            .unwrap();
+        assert_eq!(
+            h.process.pid_signals(),
+            vec![(41_234, ProcessSignal::Sigterm), (41_234, ProcessSignal::Sigkill)]
+        );
+        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+    }
+
+    /// If the holder still owns the port after SIGKILL the start must fail loudly — the service
+    /// stays `externally-owned` instead of silently dropping the user's confirmed kill.
+    #[tokio::test]
+    async fn reclaim_fails_loudly_when_the_holder_survives_sigkill() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        h.process.mark_unkillable(41_234);
+        let err = h
+            .supervisor
+            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("still held"), "{err:?}");
+        let state = h.host.state_of("api").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
+        assert!(state.identity.is_none(), "the service must never have spawned");
+    }
+
+    /// A pid that no longer presents the resolved lstart is not ours to kill — `signal_pid`
+    /// re-verifies the identity before signalling, so a recycled pid survives reclaim untouched
+    /// and the start fails closed.
+    #[tokio::test]
+    async fn reclaim_never_kills_a_holder_whose_start_identity_no_longer_matches() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "original lstart", "node dist/main");
+        // The squatter died and its pid was recycled by something else before the signal landed.
+        h.probes.process_state.lock().unwrap().alive.get_mut(&41_234).unwrap().start_identity = "recycled lstart".to_string();
+        let err = h
+            .supervisor
+            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("still held"), "{err:?}");
+        assert!(h.process.pid_signals().iter().all(|(pid, _)| *pid == 41_234));
+        assert!(h.probes.process_state.lock().unwrap().alive.contains_key(&41_234), "a recycled pid must survive reclaim");
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminates_every_holder_of_the_port() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node a");
+        h.probes.set_port_holder(8080, 41_235, "Fake Jan  1 00:00:02 2024", "node b");
+        h.probes.set_tcp_ready(8080, true);
+        h.supervisor
+            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .await
+            .unwrap();
+        assert_eq!(
+            h.process.pid_signals(),
+            vec![(41_234, ProcessSignal::Sigterm), (41_235, ProcessSignal::Sigterm)]
+        );
+        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+    }
+
+    /// `port_holders` returning `None` means the adapter cannot resolve who holds the port —
+    /// reclaim must fail closed rather than signalling a pid it guessed.
+    #[tokio::test]
+    async fn reclaim_fails_closed_when_the_probe_cannot_resolve_holders() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_in_use(8080, true);
+        h.probes.set_port_holders_unsupported();
+        let err = h
+            .supervisor
+            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .await
+            .unwrap_err();
+        assert!(err.0.contains("still held by an unowned process"), "{err:?}");
+        assert!(h.process.pid_signals().is_empty(), "an unresolvable holder must never be signalled");
+        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::ExternallyOwned);
+    }
+
+    /// Restart always uses default options — it can end up `externally-owned`, but it must never
+    /// signal a squatter. Reclaim only ever comes from an explicit `killUnowned` start.
+    #[tokio::test]
+    async fn restart_never_reclaims_an_occupied_port() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let err = h.supervisor.restart(&"api".to_string(), None).await.unwrap_err();
+        assert!(err.0.contains("externally owned"), "{err:?}");
+        assert!(h.process.pid_signals().is_empty());
+        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::ExternallyOwned);
     }
 
     #[tokio::test]
@@ -2083,6 +2515,49 @@ mod tests {
 
     fn argv_command_for_test(id: &str) -> ServiceCommand {
         ServiceCommand { command: CommandSpec::Argv { argv: vec![id.to_string()] }, cwd: ".".to_string(), environment: None, container_name: None, docker_stop_command: None }
+    }
+
+    /// An `ownership: external` container unit, shaped like a real one (`viclass`'s mongo/redis/…):
+    /// a `docker compose up -d` run command, a container readiness probe, and — optionally — the
+    /// `stop:` command that is the only way this manager can stop it.
+    fn external_container_service(id: &str, container: &str, stop: Option<&str>) -> ServiceDefinition {
+        let mut service = argv_verified(id, ReadinessSpec::Container);
+        service.ownership = Some(ServiceOwnership::External);
+        service.profiles.run = ServiceRunProfile::Verified {
+            command: ServiceCommand {
+                command: CommandSpec::Shell { shell: format!("docker compose up -d {container}"), exec: None },
+                cwd: ".".to_string(),
+                environment: None,
+                container_name: Some(container.to_string()),
+                docker_stop_command: stop.map(|shell| CommandSpec::Shell { shell: shell.to_string(), exec: None }),
+            },
+            readiness: ReadinessSpec::Container,
+            readiness_timeout_ms: None,
+            preparation: None,
+            preparation_command: None,
+        };
+        service
+    }
+
+    /// The state `sync_external_services` leaves behind for an adopted external unit: ready, no
+    /// process identity, and a readiness detail saying where that readiness came from.
+    fn adopted_external_state(service_id: &str) -> ServiceLifecycleState {
+        ServiceLifecycleState {
+            service_id: service_id.to_string(),
+            desired_state: DesiredServiceState::Running,
+            actual_state: ActualServiceState::Ready,
+            readiness: ServiceReadiness::Ready,
+            generation: 1,
+            identity: None,
+            readiness_kind: None,
+            readiness_detail: Some("adopted from external state".to_string()),
+            created_at: "2024-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+            exited_at: None,
+            exit_code: None,
+            error: None,
+            current_operation_id: None,
+        }
     }
 
     #[tokio::test]

@@ -295,7 +295,7 @@ mod tests {
     }
 
     fn service(name: &str, state: &str) -> Service {
-        Service { name: name.to_string(), kind: None, state: state.to_string(), generation: None, current_operation_id: None }
+        Service { name: name.to_string(), kind: None, state: state.to_string(), generation: None, current_operation_id: None, error: None }
     }
 
     #[test]

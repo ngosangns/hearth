@@ -7,7 +7,8 @@
 
 import Foundation
 
-/// What `hearthd manager ensure --json` prints — see src/cli/localctl.ts's `manager ensure` handler.
+/// What `hearthd manager ensure --json` prints (and `manager restart --json`, which prints the same
+/// shape for the daemon it just started) — see src/cli/localctl.ts's `manager ensure` handler.
 /// This is the entire connection contract a generic (non-Bun) client needs.
 struct ManagerConnection: Codable, Equatable {
     let instanceId: String

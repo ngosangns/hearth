@@ -42,7 +42,7 @@ final class WorkspaceControllerRegistry: ObservableObject {
             // already connecting, so this cannot stack up.
             guard workspace.trusted else { continue }
             switch controller.phase {
-            case .idle, .failed:
+            case .idle, .failed, .stopped:
                 Task { await controller.connect() }
             case .connecting, .connected:
                 break

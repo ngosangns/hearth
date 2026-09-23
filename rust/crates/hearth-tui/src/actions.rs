@@ -16,12 +16,17 @@ pub enum TuiAction {
     Start,
     Stop,
     Restart,
+    /// "Kill whatever holds my port, then start" — only ever produced for an `externally-owned`
+    /// row, and the runner still gates it behind a second keypress (the raw-mode TUI's version of
+    /// the CLI's [y/N] prompt).
+    Reclaim,
 }
 
 pub fn keyboard_action(key: KeyEvent, selected: Option<&Service>) -> Option<TuiAction> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(TuiAction::Quit);
     }
+    let externally_owned = selected.map(|s| s.state.as_str()) == Some("externally-owned");
     match key.code {
         KeyCode::Char('q') => Some(TuiAction::Quit),
         KeyCode::Up | KeyCode::Char('k') => Some(TuiAction::Up),
@@ -30,7 +35,13 @@ pub fn keyboard_action(key: KeyEvent, selected: Option<&Service>) -> Option<TuiA
         KeyCode::Char('x') => Some(TuiAction::Stop),
         KeyCode::Char('a') => Some(TuiAction::StartAll),
         KeyCode::Char('s') => Some(TuiAction::StopAll),
+        KeyCode::Char('K') if externally_owned => Some(TuiAction::Reclaim),
         KeyCode::Enter | KeyCode::Char(' ') => {
+            if externally_owned {
+                // Stopping an externally-owned row fails loudly anyway — the only useful action
+                // is the reclaim.
+                return Some(TuiAction::Reclaim);
+            }
             let starting = matches!(selected.map(|s| s.state.as_str()), Some("stopped") | Some("queued-start"));
             Some(if starting { TuiAction::Start } else { TuiAction::Stop })
         }
@@ -48,7 +59,7 @@ mod tests {
     }
 
     fn service(state: &str) -> Service {
-        Service { name: "metadata".to_string(), kind: None, state: state.to_string(), generation: None, current_operation_id: None }
+        Service { name: "metadata".to_string(), kind: None, state: state.to_string(), generation: None, current_operation_id: None, error: None }
     }
 
     #[test]
@@ -70,5 +81,22 @@ mod tests {
         let selected = service("ready");
         assert_eq!(keyboard_action(key('x'), Some(&selected)), Some(TuiAction::Stop));
         assert_eq!(keyboard_action(key('x'), None), Some(TuiAction::Stop));
+    }
+
+    /// An `externally-owned` row has no daemon-owned process to stop — Enter, Space and `K` all
+    /// mean "reclaim my port" there, and only there.
+    #[test]
+    fn externally_owned_rows_map_their_actions_to_reclaim() {
+        let selected = service("externally-owned");
+        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&selected)), Some(TuiAction::Reclaim));
+        assert_eq!(keyboard_action(key(' '), Some(&selected)), Some(TuiAction::Reclaim));
+        assert_eq!(keyboard_action(key('K'), Some(&selected)), Some(TuiAction::Reclaim));
+
+        // Any other state: no reclaim — `K` is unmapped and Enter still toggles start/stop.
+        let ready = service("ready");
+        assert_eq!(keyboard_action(key('K'), Some(&ready)), None);
+        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&ready)), Some(TuiAction::Stop));
+        let stopped = service("stopped");
+        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&stopped)), Some(TuiAction::Start));
     }
 }

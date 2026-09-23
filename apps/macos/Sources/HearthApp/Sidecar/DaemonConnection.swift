@@ -38,6 +38,18 @@ enum DaemonConnection {
         _ = try await runHearthd(root: root, args: ["manager", "stop", "--json"], timeout: .seconds(330))
     }
 
+    /// Replaces the daemon for `root` with a freshly started one — `hearthd manager restart`, which
+    /// shuts the old daemon down *without* stopping its services (they are detached and re-adopted
+    /// by the new daemon), waits for it to exit, then ensures a new one and prints its connection.
+    /// Like `stopManager`, this outlasts the daemon's own 300s shutdown limit.
+    static func restart(root: String) async throws -> ManagerConnection {
+        let output = try await runHearthd(root: root, args: ["manager", "restart", "--json"], timeout: .seconds(330))
+        guard let data = output.data(using: .utf8), let connection = try? JSONDecoder().decode(ManagerConnection.self, from: data) else {
+            throw DaemonConnectionError.malformedOutput(output)
+        }
+        return connection
+    }
+
     /// Re-reads `root`'s config file and pushes it to the running daemon — `hearthd manager reload`
     /// (loads fresh from disk on every `hearthd` invocation). Used by `ConfigFileWatcher` to react to
     /// a `hearth.yaml` edit.

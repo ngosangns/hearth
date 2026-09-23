@@ -86,6 +86,14 @@ impl From<String> for SupervisorError {
 
 pub type OnOutput = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Per-call opt-ins for `ProcessSupervisor::start_with_options`. `kill_unowned` is the
+/// wire-level echo of the user's explicit "yes, kill the process holding this port" — the
+/// engine never sets it itself, so a queued restart or a sync path can never turn into a kill.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StartOptions {
+    pub kill_unowned: bool,
+}
+
 /// Where a service's stdout/stderr stream lives — what `ProcessAdapter::attach_output` should tail
 /// for it. `Process` covers spawned/adopted POSIX services (the raw capture file their stdio was
 /// redirected into); `Container` covers Docker services, including `ownership: external` ones that
@@ -126,6 +134,12 @@ pub trait ProcessAdapter: Send + Sync {
     async fn spawn(&self, input: SpawnInput, on_output: OnOutput) -> Result<ManagedProcess, SupervisorError>;
     async fn inspect(&self, identity: &ProcessIdentity) -> Option<ObservedProcess>;
     async fn signal_group(&self, pgid: i64, signal: ProcessSignal);
+    /// Signals exactly one pid, and only if the pid still presents `expected_start_identity` —
+    /// the pid-reuse guard lives here so the signal can never land on a recycled process.
+    /// Used for unowned port-holders, where `signal_group` is unsafe: an unowned process's group
+    /// membership is untrusted (a shared job can hold innocent siblings; pgid 1 must never be
+    /// signalled), so only the resolved holder pids are signalled, one at a time.
+    async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal);
     /// `None` if unsupported by this adapter (the TS "optional" `stopContainer`/`attachOutput`).
     async fn stop_container(&self, _command: &ServiceCommand, _on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
         None
@@ -141,6 +155,18 @@ pub trait PreparationAdapter: Send + Sync {
     async fn prepare(&self, service_id: &ServiceId, steps: &[String]) -> Result<(), SupervisorError>;
 }
 
+/// One process holding a TCP listen socket on a catalog port — what `port_in_use` reports only as
+/// a bool. `pgid`/`command` describe it for the "held by pid N (`cmd`)" refusal/prompt text;
+/// `start_identity` is the `ps lstart` value the pid-reuse guard compares before signalling, so a
+/// holder whose pid was recycled between resolve and kill can never pull an unrelated tree in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortHolder {
+    pub pid: i64,
+    pub pgid: i64,
+    pub start_identity: String,
+    pub command: String,
+}
+
 #[async_trait]
 pub trait ProbeAdapter: Send + Sync {
     async fn tcp(&self, port: u16) -> bool;
@@ -148,6 +174,12 @@ pub trait ProbeAdapter: Send + Sync {
     async fn container(&self, container_name: &str) -> bool;
     async fn tailnet(&self) -> bool;
     async fn port_in_use(&self, _port: u16) -> Option<bool> {
+        None
+    }
+    /// Who holds the port, when the adapter can resolve it. `None` means "no adapter capability"
+    /// (degrades to the generic "an unowned process" wording); `Some(vec![])` means it looked and
+    /// the port is free/nobody identifiable was found.
+    async fn port_holders(&self, _port: u16) -> Option<Vec<PortHolder>> {
         None
     }
     /// Backs `{ kind: "command" }` readiness. `None` (not just `Some(false)`) means "no adapter
