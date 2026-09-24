@@ -13,6 +13,7 @@ pub mod file_io;
 pub mod manager;
 pub mod paths;
 pub mod platform;
+pub mod shared;
 pub mod state;
 pub mod supervisor;
 

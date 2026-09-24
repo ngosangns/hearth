@@ -372,6 +372,7 @@ mod tests {
             log_max_bytes: None,
             log_rotation_count: None,
             supervisor: None,
+        shared: None,
         })
         .await
         .unwrap();

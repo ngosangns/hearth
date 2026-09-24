@@ -57,13 +57,24 @@ enum DaemonConnection {
         _ = try await runHearthd(root: root, args: ["manager", "reload", "--json"])
     }
 
-    private static func runHearthd(root: String, args: [String], timeout: Duration = .seconds(60)) async throws -> String {
+    /// Ensures the machine-global smp daemon (`hearthd smp`) is running and returns the same
+    /// `ManagerConnection` shape — `hearthd shared ensure --json`. smp owns no project root, so the
+    /// subprocess runs without `--root`.
+    static func ensureShared() async throws -> ManagerConnection {
+        let output = try await runHearthd(root: nil, args: ["shared", "ensure", "--json"])
+        guard let data = output.data(using: .utf8), let connection = try? JSONDecoder().decode(ManagerConnection.self, from: data) else {
+            throw DaemonConnectionError.malformedOutput(output)
+        }
+        return connection
+    }
+
+    private static func runHearthd(root: String?, args: [String], timeout: Duration = .seconds(60)) async throws -> String {
         let process = Process()
         guard let hearthdBinary = SidecarLocator.findHearthdBinary() else {
             throw DaemonConnectionError.sidecarUnavailable(SidecarLocatorError.hearthdBinaryNotFound)
         }
         process.executableURL = URL(fileURLWithPath: hearthdBinary)
-        process.arguments = ["--root", root] + args
+        process.arguments = (root.map { ["--root", $0] } ?? []) + args
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout

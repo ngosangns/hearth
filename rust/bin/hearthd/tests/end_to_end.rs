@@ -195,7 +195,7 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
 
     let tools = client.list_all_tools().await.expect("list_tools should succeed");
     let names: Vec<String> = tools.into_iter().map(|tool| tool.name.to_string()).collect();
-    assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage", "local_services_restart_daemon", "local_services_stop_daemon"]);
+    assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage", "local_services_restart_daemon", "local_services_stop_daemon", "local_services_shared_list", "local_services_shared_status", "local_services_shared_connection"]);
 
     let response = client.call_tool(CallToolRequestParams::new("local_services_status")).await.expect("status tool call should succeed");
     assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());

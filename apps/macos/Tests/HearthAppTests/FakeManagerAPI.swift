@@ -24,6 +24,15 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     var bulkStartHandler: (@Sendable ([String]) async throws -> ManagerOperation)?
     var operationHandler: (@Sendable (String) async throws -> ManagerOperation)?
     var urlsHandler: (@Sendable () async throws -> [ResolvedServiceUrl])?
+    /// smp-side handlers (`SharedAPI`) — same closure-per-method convention.
+    var sharedInstancesHandler: (@Sendable () async throws -> [SharedInstance])?
+    var sharedCatalogHandler: (@Sendable () async throws -> SharedCatalogDocument)?
+    var sharedInstallHandler: (@Sendable (String) async throws -> SharedMutationResponse)?
+    var sharedRemoveHandler: (@Sendable (String) async throws -> SharedMutationResponse)?
+    private var _installed: [String] = []
+    private var _removed: [String] = []
+    var installed: [String] { lock.sync { _installed } }
+    var removed: [String] { lock.sync { _removed } }
 
     var performed: [(action: ManagerAction, serviceId: String, killUnowned: Bool)] {
         lock.sync { _performed }
@@ -81,6 +90,32 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
         lock.sync { _operationReads.append(id) }
         guard let operationHandler else { throw Unimplemented(what: "operation") }
         return try await operationHandler(id)
+    }
+}
+
+// MARK: - SharedAPI
+
+extension FakeManagerAPI: SharedAPI {
+    func sharedInstances() async throws -> [SharedInstance] {
+        guard let sharedInstancesHandler else { throw Unimplemented(what: "sharedInstances") }
+        return try await sharedInstancesHandler()
+    }
+
+    func sharedCatalog() async throws -> SharedCatalogDocument {
+        guard let sharedCatalogHandler else { throw Unimplemented(what: "sharedCatalog") }
+        return try await sharedCatalogHandler()
+    }
+
+    func sharedInstall(service: String) async throws -> SharedMutationResponse {
+        lock.sync { _installed.append(service) }
+        guard let sharedInstallHandler else { return SharedMutationResponse(service: service, port: nil, installState: "installed") }
+        return try await sharedInstallHandler(service)
+    }
+
+    func sharedRemove(service: String) async throws -> SharedMutationResponse {
+        lock.sync { _removed.append(service) }
+        guard let sharedRemoveHandler else { return SharedMutationResponse(service: service, port: nil, installState: nil) }
+        return try await sharedRemoveHandler(service)
     }
 }
 

@@ -9,6 +9,7 @@ pub mod lock;
 pub mod log_store;
 pub mod operations;
 pub mod service_urls;
+pub mod shared;
 pub mod state_store;
 
 pub use event_store::{ManagerEventStore, Replay, DEFAULT_EVENT_CAPACITY};

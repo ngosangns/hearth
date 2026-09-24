@@ -49,6 +49,15 @@ fn is_task_command(readiness: &ReadinessSpec) -> bool {
     matches!(readiness, ReadinessSpec::Tailnet)
 }
 
+/// An `ownership: external` service whose readiness is a `command` probe is also a task: its run
+/// command is a one-shot "bring the external thing up" trigger (e.g. the generated
+/// `hearthd shared attach` for a `shared:` entry), not the service process itself. Only the
+/// external+ccommand combination is treated this way — a daemon-owned service with `command`
+/// readiness still runs a real long-lived process.
+fn is_external_task(definition: Option<&ServiceDefinition>, profile: &VerifiedProfile) -> bool {
+    matches!(definition.and_then(|d| d.ownership), Some(ServiceOwnership::External)) && matches!(profile.readiness, ReadinessSpec::Command { .. })
+}
+
 fn readiness_kind_of(readiness: &ReadinessSpec) -> ReadinessKind {
     match readiness {
         ReadinessSpec::Process => ReadinessKind::Process,
@@ -924,7 +933,9 @@ impl ProcessSupervisor {
             }
         };
 
-        if is_task_command(&profile.readiness) && !app.record.is_docker() {
+        let catalog = self.host.catalog();
+        let definition = definition_for(&catalog, service_id);
+        if (is_task_command(&profile.readiness) || is_external_task(definition, profile)) && !app.record.is_docker() {
             self.transition(
                 service_id,
                 generation,
@@ -1610,7 +1621,7 @@ async fn run_ps(args: &[&str]) -> Result<String, std::io::Error> {
 mod tests {
     use super::*;
     use crate::catalog::{
-        CommandSpec, ReadinessSpec, ServiceBuildProfile, ServiceCommand, ServiceDefinition, ServiceKind,
+        CommandSpec, ReadinessSpec, ServiceBuildProfile, ServiceCommand, ServiceDefinition, ServiceKind, ServiceOwnership,
         ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
     };
     use crate::state::{DesiredServiceState, PosixProcessIdentity, ServiceReadiness};
@@ -2887,6 +2898,37 @@ mod tests {
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
         assert_eq!(state.error.as_deref(), Some("no such file or directory"));
+    }
+
+    /// The `shared:` expansion relies on this: an `ownership: external` service whose readiness is a
+    /// `command` probe treats its run command as a one-shot task (`hearthd shared attach`), not the
+    /// service process — the service adopts when the probe reports ready and carries no identity.
+    #[tokio::test]
+    async fn an_external_command_readiness_service_runs_its_command_as_a_one_shot_task() {
+        let mut service = argv_verified("api", ReadinessSpec::Command { command: CommandSpec::Argv { argv: vec!["attach".to_string()] }, cwd: None });
+        service.ownership = Some(ServiceOwnership::External);
+        let host = FakeHost::new(one_service_catalog(service));
+        let process = FakeProcessAdapter::new();
+        let probes = Arc::new(CommandCapableProbeAdapter { result: std::sync::Mutex::new(Some(true)), ..Default::default() });
+        let supervisor = ProcessSupervisor::new(
+            host.clone(),
+            SupervisorOptions {
+                process: process.clone(),
+                run_build: FakeRunBuild::new(),
+                probes,
+                preparation: Some(Arc::new(NoPreparation)),
+                clock: FakeClock::new(),
+                readiness_timeout_ms: 200,
+                readiness_backoff_ms: 5,
+                termination_grace_ms: 50,
+                is_closing: Arc::new(|| false),
+            },
+        );
+        supervisor.start(&"api".to_string(), None).await.unwrap();
+        let state = host.state_of("api").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Ready);
+        assert!(state.identity.is_none(), "a task run must not track a process identity");
+        assert!(process.state.lock().unwrap().alive.len() == 1, "the attach task must still be spawned once");
     }
 
     #[tokio::test]

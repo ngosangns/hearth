@@ -376,7 +376,7 @@ fn resolve_service_cwd(cwd: Option<&str>, path: &str, errors: &mut Vec<String>) 
 
 /// A key outside these sets is a typo (e.g. `command:` for `run:`), which would otherwise be silently
 /// dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
-const TOP_LEVEL_KEYS: &[&str] = &["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services"];
+const TOP_LEVEL_KEYS: &[&str] = &["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services", "shared"];
 const SERVICE_KEYS: &[&str] = &[
     "label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "readinessTimeoutMs", "preparationCommand", "ports", "urls",
 ];
@@ -400,6 +400,14 @@ fn check_known_keys(value: &serde_json::Map<String, Value>, known: &[&str], path
             errors.push(format!("{path} has unknown key \"{key}\" (known: {})", known.join(", ")));
         }
     }
+}
+
+/// `shared:` keys become both service ids and smp instance names — restrict to the charset both
+/// sides can carry safely (also a valid filename under `installs/`).
+fn is_valid_shared_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCatalog, Vec<String>> {
@@ -438,8 +446,30 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             errors.push("groups must be a map of string to string[]".to_string());
         }
     }
+    if let Some(shared) = top.get("shared") {
+        match shared.as_object() {
+            None => errors.push("shared must be a map of service name to version (or { version })".to_string()),
+            Some(entries) => {
+                for (name, value) in entries {
+                    let path = format!("shared.{name}");
+                    if !is_valid_shared_name(name) {
+                        errors.push(format!("{path} has an invalid service name (expected [a-zA-Z0-9][a-zA-Z0-9._-]*)"));
+                    }
+                    match value {
+                        Value::String(_) => {}
+                        Value::Object(o) => match o.get("version") {
+                            Some(Value::String(s)) if !s.is_empty() => {}
+                            _ => errors.push(format!("{path}.version must be a non-empty string")),
+                        },
+                        _ => errors.push(format!("{path} must be a version string or an object with version")),
+                    }
+                }
+            }
+        }
+    }
     let services_raw = top.get("services").and_then(Value::as_object);
-    if services_raw.map(|s| s.is_empty()).unwrap_or(true) {
+    let shared_raw = top.get("shared").and_then(Value::as_object);
+    if services_raw.map(|s| s.is_empty()).unwrap_or(true) && shared_raw.map(|s| s.is_empty()).unwrap_or(true) {
         errors.push("services must be a non-empty map of service id to service definition".to_string());
     }
     if !errors.is_empty() {
@@ -458,7 +488,8 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
     base_env.extend(global_env);
 
     let mut services: Vec<ServiceDefinition> = Vec::new();
-    let services_raw = services_raw.unwrap();
+    // May be absent/empty when a project only declares `shared:` services — allowed above.
+    let services_raw = services_raw.cloned().unwrap_or_default();
     // Document order, not sorted: the TS loader iterates `Object.entries` (insertion order), and
     // this order is user-visible — it drives `/v1/catalog`, `hearthd status` row order, and the TUI
     // list. Sorting here made the same YAML file present differently depending on which
@@ -595,15 +626,41 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             urls: urls.filter(|u| !u.is_empty()),
         });
     }
+
+    // `shared:` entries expand into generated `ownership: external` services (document order,
+    // after the project's own services). A key colliding with a `services` id fails validation
+    // through the existing `duplicate service` check — both lists share `services` below.
+    let mut shared_ids: Vec<String> = Vec::new();
+    if let Some(entries) = top.get("shared").and_then(Value::as_object) {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearthd"));
+        for (name, value) in entries {
+            let version = match value {
+                Value::String(s) => s.clone(),
+                Value::Object(o) => o.get("version").and_then(Value::as_str).unwrap_or_default().to_string(),
+                _ => continue, // shape errors already recorded above
+            };
+            if !is_valid_shared_name(name) || version.is_empty() {
+                continue;
+            }
+            let instance = crate::shared::instance_id(name, &version);
+            services.push(crate::shared::synthesize::project_service_entry(name.clone(), &instance, &exe));
+            shared_ids.push(name.clone());
+        }
+    }
     if !errors.is_empty() {
         return Err(errors);
     }
 
-    let groups: HashMap<String, Vec<String>> = top
+    let mut groups: HashMap<String, Vec<String>> = top
         .get("groups")
         .and_then(Value::as_object)
         .map(|g| g.iter().map(|(k, v)| (k.clone(), string_array(v))).collect())
         .unwrap_or_default();
+    // Shared services join the conventional `all` group when the project defines one — so
+    // `hearthd start all` brings them up too. No `all` group → no implicit membership.
+    if let Some(all) = groups.get_mut("all") {
+        all.extend(shared_ids);
+    }
 
     Ok(ServiceCatalog {
         start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -866,6 +923,66 @@ services:
         );
         let err = load_catalog(dir.path()).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("is shared by")), "{:?}", err.errors);
+    }
+
+    /// `shared:` expands into generated `ownership: external` services — run is the one-shot
+    /// `hearthd shared attach` task, readiness is the `hearthd shared probe` command, and the
+    /// service joins `all` so `hearthd start all` covers it.
+    #[test]
+    fn shared_entries_expand_into_generated_external_services() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nshared:\n  postgres: \"16.4\"\n  redis: { version: \"7.2\" }\ngroups: { all: [api] }\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let catalog = load_catalog(dir.path()).unwrap().catalog;
+        assert_eq!(catalog.services.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["api", "postgres", "redis"]);
+        let postgres = catalog.services.iter().find(|s| s.id == "postgres").unwrap();
+        assert_eq!(postgres.ownership, Some(crate::catalog::ServiceOwnership::External));
+        assert_eq!(postgres.kind, Some(crate::catalog::ServiceKind::Infrastructure));
+        assert_eq!(postgres.label.as_deref(), Some("postgres@16.4 (shared)"));
+        let crate::catalog::ServiceRunProfile::Verified { command, readiness, .. } = &postgres.profiles.run else { panic!("shared entries must be verified") };
+        let crate::catalog::CommandSpec::Argv { argv } = &command.command else { panic!("attach must be argv") };
+        assert_eq!(&argv[argv.len() - 3..], ["shared", "attach", "postgres@16.4"]);
+        let crate::catalog::ReadinessSpec::Command { command: probe, .. } = readiness else { panic!("probe must be a command readiness") };
+        let crate::catalog::CommandSpec::Argv { argv: probe_argv } = probe else { panic!("probe must be argv") };
+        assert_eq!(&probe_argv[probe_argv.len() - 3..], ["shared", "probe", "postgres@16.4"]);
+        assert!(command.docker_stop_command.is_some(), "stop must detach");
+        assert_eq!(catalog.groups.get("all").unwrap(), &vec!["api".to_string(), "postgres".to_string(), "redis".to_string()]);
+    }
+
+    #[test]
+    fn a_project_may_declare_only_shared_services() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "hearth.yaml", "version: 1\nshared:\n  redis: \"7.2\"\n");
+        let catalog = load_catalog(dir.path()).unwrap().catalog;
+        assert_eq!(catalog.services.len(), 1);
+    }
+
+    #[test]
+    fn shared_entries_reject_bad_names_and_missing_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nshared:\n  \"bad name\": \"1.0\"\n  redis: {}\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+        assert!(errors.iter().any(|e| e.contains("invalid service name")), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("version")), "{errors:?}");
+    }
+
+    #[test]
+    fn a_shared_key_colliding_with_a_service_id_is_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nshared:\n  api: \"1.0\"\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+        assert!(errors.iter().any(|e| e.contains("duplicate service api")), "{errors:?}");
     }
 
     /// A missing `readiness` used to be swallowed by an `and_then` on the absent key: no error was

@@ -14,7 +14,7 @@ process, and every CLI/TUI/MCP surface reading that state would start reporting 
 
 ## MCP tools
 
-This project registers an MCP server exposing 7 tools (prefixed `local_services_` unless this
+This project registers an MCP server exposing 10 tools (prefixed `local_services_` unless this
 install customized `--name`, or the server's own `tool_prefix` differs):
 
 | Tool | Does | Mutate gate |
@@ -26,6 +26,20 @@ install customized `--name`, or the server's own `tool_prefix` differs):
 | `local_services_manage` | start / stop / restart a service or group | requires `confirm=true` |
 | `local_services_restart_daemon` | Restart this project's daemon, leaving running services up for the new daemon to re-adopt | requires `confirm=true` |
 | `local_services_stop_daemon` | Stop this project's daemon AND every service it manages | requires `confirm=true` |
+| `local_services_shared_list` | Services/versions installable from the shared-services registry | free |
+| `local_services_shared_status` | Shared instances on this machine: ports, install state, attachments | free |
+| `local_services_shared_connection` | This project's connection info (url/env) for an attached shared service | free |
+
+## Shared services (`shared:` in hearth.yaml)
+
+A `shared:` block registers machine-global singletons (e.g. `postgres: "16.4"`) managed by a
+separate daemon (`smp`), shared across every repo that registers the same `name@version`. They show
+up as ordinary `infrastructure` services — start them with `manage` like any other service; the
+first start installs the service into `~/.hearth/shared` and may take a while. **Connection info is
+not injected into env**: after the service is `ready`, call `local_services_shared_connection` with
+the service id (`postgres`) or instance id (`postgres@16.4`) and wire the returned `connection`
+(`url`/`env`) into the app's own config. Each project gets its own logical resources (database,
+user) inside the shared instance — do not hand-edit shared data for another project.
 
 `status`/`logs`/`trace`/`events` are always safe to call for diagnosis — use them freely. Only
 call `manage` when the user has explicitly asked for that lifecycle action; never call it

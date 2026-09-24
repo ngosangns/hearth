@@ -78,7 +78,7 @@ private struct WorkspaceRow: View {
 }
 
 /// `ContentUnavailableView` is macOS 14+; this app targets macOS 13, so a small compatible stand-in.
-private struct ContentUnavailableViewCompat: View {
+struct ContentUnavailableViewCompat: View {
     let title: String
     let message: String
     let systemImage: String

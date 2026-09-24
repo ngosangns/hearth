@@ -26,7 +26,7 @@ enum ManagerClientError: Error, LocalizedError {
     }
 }
 
-final class ManagerClient: ManagerAPI {
+final class ManagerClient: ManagerAPI, SharedAPI {
     private let connection: ManagerConnection
     private let session: URLSession
 
@@ -147,6 +147,26 @@ final class ManagerClient: ManagerAPI {
         return try await send(req, as: OperationResponse.self).operation
     }
 
+    // MARK: - Shared services (`/v1/shared/*` — only meaningful when `connection` is an smp daemon)
+
+    func sharedInstances() async throws -> [SharedInstance] {
+        try await get("/v1/shared", as: SharedInstancesResponse.self).instances
+    }
+
+    func sharedCatalog() async throws -> SharedCatalogDocument {
+        try await get("/v1/shared/catalog", as: SharedCatalogResponse.self).catalog
+    }
+
+    /// First installs download and extract a tarball server-side — far past the 60s URLSession
+    /// default, so these requests get an explicit long timeout (same as the CLI's unbounded attach).
+    func sharedInstall(service: String) async throws -> SharedMutationResponse {
+        try await post("/v1/shared/install", body: ["service": service], timeout: 900, as: SharedMutationResponse.self)
+    }
+
+    func sharedRemove(service: String) async throws -> SharedMutationResponse {
+        try await post("/v1/shared/remove", body: ["service": service], timeout: 120, as: SharedMutationResponse.self)
+    }
+
     // MARK: - Transport
 
     // `appendingPathComponent` percent-encodes `?`/`&` as literal path characters instead of treating
@@ -177,11 +197,12 @@ final class ManagerClient: ManagerAPI {
         try await send(request(path), as: type)
     }
 
-    private func post<T: Decodable>(_ path: String, body: [String: Any], as type: T.Type) async throws -> T {
+    private func post<T: Decodable>(_ path: String, body: [String: Any], timeout: TimeInterval? = nil, as type: T.Type) async throws -> T {
         var req = request(path)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        if let timeout { req.timeoutInterval = timeout }
         return try await send(req, as: type)
     }
 

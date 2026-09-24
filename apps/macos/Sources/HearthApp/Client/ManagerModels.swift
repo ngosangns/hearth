@@ -172,3 +172,83 @@ struct ManagerErrorEnvelope: Codable {
 enum ManagerAction: String {
     case start, stop, restart
 }
+
+// MARK: - Shared services (`smp` daemon, `GET /v1/shared*`)
+
+/// A project attached to a shared instance. `connection` is the rendered per-project connection
+/// block from the service recipe (`{ url, env }`) — present once the instance provisioned it.
+struct SharedAttachment: Codable, Equatable {
+    let projectId: String
+    let projectRoot: String
+    let provisioned: Bool
+    let connection: SharedConnection?
+}
+
+struct SharedConnection: Codable, Equatable {
+    let url: String?
+    let env: [String: String]?
+}
+
+struct SharedInstanceState: Codable, Equatable {
+    let actualState: String?
+    let readiness: String?
+}
+
+/// One `name@version` singleton under smp (`GET /v1/shared`).
+struct SharedInstance: Codable, Equatable, Identifiable {
+    let id: String
+    let name: String
+    let version: String
+    let port: Int
+    let installState: String
+    let installError: String?
+    let state: SharedInstanceState?
+    let attachments: [SharedAttachment]
+
+    /// Same display collapse as `ServiceLifecycleState.displayState` — the wire states are the
+    /// same supervisor states, just nested under `state` here.
+    var displayState: String {
+        switch state?.actualState {
+        case "ready": return "ready"
+        case "queued-start": return "queued"
+        case "running", "running-unready", "starting", "preparing": return "starting"
+        case "stopping": return "stopping"
+        case "failed": return "failed"
+        case "orphaned": return "orphaned"
+        case "externally-owned": return "external"
+        default: return "stopped"
+        }
+    }
+}
+
+struct SharedInstancesResponse: Codable {
+    let instances: [SharedInstance]
+}
+
+/// A recipe as the catalog UI needs it — the version key is the datum; the body is only decoded
+/// for an optional human description. Permissive on purpose (see this file's header comment).
+struct SharedRecipeSummary: Codable, Equatable {
+    let description: String?
+}
+
+struct SharedFamily: Codable, Equatable {
+    let versions: [String: SharedRecipeSummary]
+}
+
+/// The remote shared-services registry (`GET /v1/shared/catalog`).
+struct SharedCatalogDocument: Codable, Equatable {
+    let version: Int?
+    let services: [String: SharedFamily]
+}
+
+struct SharedCatalogResponse: Codable {
+    let catalog: SharedCatalogDocument
+}
+
+/// The `POST /v1/shared/install|remove` reply — fields optional because a client shouldn't break on
+/// additive response keys.
+struct SharedMutationResponse: Codable {
+    let service: String?
+    let port: Int?
+    let installState: String?
+}

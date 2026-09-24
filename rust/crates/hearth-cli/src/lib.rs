@@ -8,6 +8,8 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{json, Value};
 
+pub mod shared;
+
 use hearth_core::catalog::{ServiceCatalog, ServiceId};
 use hearth_core::doctor::{run_doctor, DefaultDoctorAdapter, DoctorChecks};
 use hearth_core::file_io::{create_file_io, remove_directory};
@@ -57,10 +59,10 @@ impl std::fmt::Display for LocalctlError {
 impl std::error::Error for LocalctlError {}
 pub type LocalctlResult<T> = Result<T, LocalctlError>;
 
-fn usage_err<T>(message: impl Into<String>) -> LocalctlResult<T> {
+pub(crate) fn usage_err<T>(message: impl Into<String>) -> LocalctlResult<T> {
     Err(LocalctlError { exit_code: EXIT_USAGE, message: message.into() })
 }
-fn fail_err<T>(exit_code: i32, message: impl Into<String>) -> LocalctlResult<T> {
+pub(crate) fn fail_err<T>(exit_code: i32, message: impl Into<String>) -> LocalctlResult<T> {
     Err(LocalctlError { exit_code, message: message.into() })
 }
 fn unavailable_err<T>(message: impl std::fmt::Display) -> LocalctlResult<T> {
@@ -187,16 +189,26 @@ fn valid_metadata(metadata: &ManagerMetadata) -> bool {
 /// transport failures to the same plain-text error shapes the TS source uses (`"manager unavailable"`
 /// / a timeout message), since callers pattern-match on the string containing `"unauthorized"`.
 pub async fn request(client: &Client, path: &str, method: reqwest::Method, body: Option<&Value>, protocol_version: Option<u32>) -> Result<Value, String> {
+    request_with_timeout(client, path, method, body, protocol_version, Some(MANAGER_REQUEST_TIMEOUT)).await
+}
+
+/// `request` with a caller-chosen transport timeout (`None` = unbounded). `shared attach`/`install`
+/// can legitimately take minutes — a first-time install downloads and extracts a tarball — so the
+/// shared CLI uses this rather than the 10s manager default.
+pub async fn request_with_timeout(client: &Client, path: &str, method: reqwest::Method, body: Option<&Value>, protocol_version: Option<u32>, timeout: Option<Duration>) -> Result<Value, String> {
     let url = format!("http://127.0.0.1:{}{}", client.metadata.port, path);
     let protocol = protocol_version.unwrap_or(PROTOCOL_VERSION);
     let http_client = reqwest::Client::new();
-    let mut builder = http_client.request(method, &url).bearer_auth(&client.token).header("x-hearth-protocol", protocol.to_string()).timeout(MANAGER_REQUEST_TIMEOUT);
+    let mut builder = http_client.request(method, &url).bearer_auth(&client.token).header("x-hearth-protocol", protocol.to_string());
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
     if let Some(body) = body {
         builder = builder.json(body);
     }
     let response = match builder.send().await {
         Ok(response) => response,
-        Err(error) if error.is_timeout() => return Err(format!("manager request timed out after {}ms", MANAGER_REQUEST_TIMEOUT.as_millis())),
+        Err(error) if error.is_timeout() => return Err("manager request timed out".to_string()),
         Err(_) => return Err("manager unavailable".to_string()),
     };
     let status = response.status();
@@ -279,8 +291,9 @@ pub async fn require_client(root: &Path, options: &LocalctlOptions) -> LocalctlR
 
 /// The `manager ensure --json` payload: everything a generic HTTP+SSE client (a desktop app's
 /// connection layer) needs to talk to the daemon directly — the bearer token and runtime directory
-/// are no more exposed than the lock directory already is.
-fn ensure_payload(client: &Client) -> Value {
+/// are no more exposed than the lock directory already is. `pub(crate)` because `hearthd shared
+/// ensure --json` prints the same contract for the smp daemon.
+pub(crate) fn ensure_payload(client: &Client) -> Value {
     json!({
         "instanceId": client.metadata.instance_id,
         "port": client.metadata.port,
@@ -932,7 +945,7 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
     Ok(0)
 }
 
-fn operation_status_str(status: OperationStatus) -> &'static str {
+pub(crate) fn operation_status_str(status: OperationStatus) -> &'static str {
     match status {
         OperationStatus::Queued => "queued",
         OperationStatus::Running => "running",
@@ -1179,6 +1192,7 @@ mod tests {
             log_max_bytes: None,
             log_rotation_count: None,
             supervisor: None,
+        shared: None,
         })
         .await
         .unwrap()
@@ -1387,7 +1401,7 @@ mod tests {
             let root = root.to_path_buf();
             let catalog = catalog_for_spawn.clone();
             tokio::spawn(async move {
-                hearth_core::daemon::run_daemon(HearthManagerOptions { runtime_directory: None, root: Some(root), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }, false).await;
+                hearth_core::daemon::run_daemon(HearthManagerOptions { runtime_directory: None, root: Some(root), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }, false).await;
             });
         });
         let options = LocalctlOptions { catalog, spawn_daemon, doctor_checks: None };

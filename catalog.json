@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "_comment": "Shared-services registry served to smp daemons over HTTPS (see docs/shared-services.md). Each entry: artifacts per platform (darwin-arm64 only for now), run/readiness/stop command templates with {installDir}/{dataDir}/{port}, optional per-project provision/deprovision steps with {projectId}/{projectDb}/{projectUser}, and a connection template returned to attaching projects.",
+  "services": {}
+}

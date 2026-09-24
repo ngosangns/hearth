@@ -9,6 +9,12 @@ enum MainWindow {
     static var open: (() -> Void)?
 }
 
+/// The shared-services catalog window (`hearthd smp` browser) — a `Window` scene, so single-instance
+/// by construction; no reopen-capture needed like `MainWindow`'s.
+enum SharedWindow {
+    static let id = "shared"
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// A second instance posts this to ask the already-running one to show a window.
     private static let showWindowNotification = Notification.Name("dev.ngosangns.hearth.show-main-window")

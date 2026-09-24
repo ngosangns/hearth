@@ -41,6 +41,19 @@ services:
       - { url: "https://{tailnetHost}:8443", label: admin, requiresRunning: false }
 ```
 
+A `shared:` block registers machine-global singletons (postgres, redis, …) installed on the host
+under `~/.hearth/shared` and run by a separate global daemon (`hearthd smp`). Every repo that
+registers the same `name@version` shares one instance; different versions run side by side.
+Shared entries show up as ordinary `infrastructure` services — `start` attaches this project
+(first start installs the service), `stop` only detaches, and connection info is read via the
+`local_services_shared_*` MCP tools or `hearthd shared status`. See `docs/shared-services.md`.
+
+```yaml
+shared:
+  postgres: "16.4"
+  redis: "7.2"
+```
+
 Install `hearthd` into the app bundle, then drive a project:
 
 ```bash

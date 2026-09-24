@@ -49,6 +49,7 @@ async fn run_daemon_subcommand(argv: &[String]) -> i32 {
             log_max_bytes: None,
             log_rotation_count: None,
             supervisor: Some(supervisor),
+            shared: None,
         },
         false,
     )
@@ -72,6 +73,71 @@ fn spawn_daemon(root: &Path) {
     let root_arg = root.to_string_lossy().to_string();
     let mut command = std::process::Command::new(exe);
     command.args(["daemon", "--root", &root_arg]).current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
+}
+
+/// The smp (service manager) daemon for shared services — one global daemon per machine, rooted at
+/// `~/.hearth/shared`, whose catalog is synthesized from `registry.json` rather than a `hearth.yaml`.
+/// Everything else (lock, token, state.json, HTTP+SSE surface, `ensure`/`discover`) is identical to
+/// a project daemon.
+async fn run_smp_subcommand(argv: &[String]) -> i32 {
+    if !argv.is_empty() {
+        eprintln!("usage: hearthd smp");
+        return 2;
+    }
+    let root = hearth_core::shared::shared_root();
+    // Dev/test escape hatch: point smp at a local registry file instead of the pinned GitHub URL.
+    let catalog_url = std::env::var("HEARTH_SHARED_CATALOG_URL").ok();
+    let ctx = match hearth_core::shared::SharedContext::open(root.clone(), catalog_url) {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            eprintln!("hearthd smp: cannot open {}: {}", root.display(), error);
+            return 1;
+        }
+    };
+    let catalog = match hearth_core::shared::synthesize::synthesize_catalog(&ctx.root, &ctx.registry.list()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("hearthd smp: cannot synthesize catalog: {error}");
+            return 1;
+        }
+    };
+    let runtime_directory = ctx.runtime_directory();
+    let base_environment = hearth_core::env::resolve_base_environment(hearth_core::env::BaseEnvironmentOptions { root: Some(root.clone()), ..Default::default() });
+    let supervisor = hearth_core::supervisor::default_supervisor_options(root.clone(), Some(runtime_directory.clone()), Some(base_environment));
+    let started = hearth_core::daemon::run_daemon(
+        hearth_core::manager::HearthManagerOptions {
+            runtime_directory: Some(runtime_directory),
+            root: Some(root),
+            catalog,
+            event_capacity: None,
+            log_tail_bytes: None,
+            log_max_bytes: None,
+            log_rotation_count: None,
+            supervisor: Some(supervisor),
+            shared: Some(ctx),
+        },
+        false,
+    )
+    .await;
+    if started {
+        0
+    } else {
+        1
+    }
+}
+
+/// Spawns `hearthd smp` detached — the smp counterpart of `spawn_daemon`, used by `ensure` for the
+/// shared-services manager.
+fn spawn_smp(_root: &Path) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearthd"));
+    let mut command = std::process::Command::new(exe);
+    command.arg("smp").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -128,6 +194,10 @@ usage: hearthd [--root <path>] <command> [options]
   manager ensure|status|stop|restart|reload
                                         daemon lifecycle (restart keeps services running)
   daemon --root <path>                  run the daemon in the foreground (spawned internally)
+  smp                                   run the machine-global shared-services daemon
+  shared list|installed|status          inspect the shared service registry and smp
+  shared attach|detach|probe <id>       attach this project to a shared service (used by hearth.yaml `shared:`)
+  shared install|start|stop|remove <id> manage a shared service instance
   tui                                   interactive terminal UI
   mcp                                   serve the MCP tool surface over stdio
   mcp install [--name N] [--key K] <config-file>...
@@ -151,6 +221,12 @@ async fn run_cli(argv: &[String]) -> i32 {
             return 0;
         }
         _ => {}
+    }
+    // `shared` manages the machine-global smp daemon — it deliberately does NOT require a
+    // project `hearth.yaml` (the project root, when a command needs one for attach/probe identity,
+    // is just the cwd).
+    if rest.first().map(String::as_str) == Some("shared") {
+        return hearth_cli::shared::run(&root, &rest[1..], &mut hearth_cli::Io { out: &mut |s: &str| println!("{s}"), err: &mut |s: &str| eprintln!("{s}"), confirm: None }, std::sync::Arc::new(spawn_smp)).await;
     }
     let loaded = match hearth_core::config_file::load_catalog(&root) {
         Ok(loaded) => loaded,
@@ -230,6 +306,8 @@ fn main() {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         if argv.first().map(String::as_str) == Some("daemon") {
             run_daemon_subcommand(&argv[1..]).await
+        } else if argv.first().map(String::as_str) == Some("smp") {
+            run_smp_subcommand(&argv[1..]).await
         } else {
             run_cli(&argv).await
         }

@@ -215,6 +215,18 @@ impl HearthMcpServer {
                 self.parse_daemon_lifecycle("stop_daemon", &arguments)?;
                 self.client.stop_daemon().await
             }
+            "shared_list" => {
+                require_only_keys(&arguments, &[])?;
+                self.client.shared_list().await
+            }
+            "shared_status" => {
+                require_only_keys(&arguments, &[])?;
+                self.client.shared_status().await
+            }
+            "shared_connection" => {
+                require_only_keys(&arguments, &["service"])?;
+                self.client.shared_connection(required_string(arguments.get("service"), "service")?).await
+            }
             _ => Err(format!("unknown tool: {name}")),
         }
     }
@@ -283,6 +295,21 @@ impl HearthMcpServer {
             Tool::new(format!("{prefix}manage"), manage_description, schema(json!({ "type": "object", "properties": manage_properties, "required": manage_required, "additionalProperties": false }))),
             Tool::new(format!("{prefix}restart_daemon"), restart_description, schema(json!({ "type": "object", "properties": restart_properties, "required": restart_required, "additionalProperties": false }))),
             Tool::new(format!("{prefix}stop_daemon"), stop_daemon_description, schema(json!({ "type": "object", "properties": stop_daemon_properties, "required": stop_daemon_required, "additionalProperties": false }))),
+            Tool::new(
+                format!("{prefix}shared_list"),
+                "Read-only: services and versions available from the shared-services registry (installed on this machine by smp on demand, shared across projects). No approval needed.",
+                schema(json!({ "type": "object", "properties": {}, "additionalProperties": false })),
+            ),
+            Tool::new(
+                format!("{prefix}shared_status"),
+                "Read-only: shared service instances on this machine — ports, install state, and which projects are attached. No approval needed.",
+                schema(json!({ "type": "object", "properties": {}, "additionalProperties": false })),
+            ),
+            Tool::new(
+                format!("{prefix}shared_connection"),
+                "Read-only: this project's connection info (url/env) for a shared service it has attached via `shared:` in hearth.yaml. Pass the service id (e.g. \"postgres\") or the instance id (\"postgres@16.4\"). No approval needed.",
+                schema(json!({ "type": "object", "properties": { "service": { "type": "string" } }, "required": ["service"], "additionalProperties": false })),
+            ),
         ]
     }
 }
@@ -486,7 +513,21 @@ mod tests {
         let (server, client) = connect(fake, base_options()).await;
         let tools = client.list_all_tools().await.unwrap();
         let names: Vec<String> = tools.into_iter().map(|tool| tool.name.to_string()).collect();
-        assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage", "local_services_restart_daemon", "local_services_stop_daemon"]);
+        assert_eq!(
+            names,
+            vec![
+                "local_services_status",
+                "local_services_logs",
+                "local_services_trace",
+                "local_services_events",
+                "local_services_manage",
+                "local_services_restart_daemon",
+                "local_services_stop_daemon",
+                "local_services_shared_list",
+                "local_services_shared_status",
+                "local_services_shared_connection"
+            ]
+        );
         let response = client.call_tool(CallToolRequestParams::new("local_services_status")).await.unwrap();
         assert_ne!(response.is_error, Some(true));
         let _ = client.cancel().await;

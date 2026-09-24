@@ -145,6 +145,30 @@ from any dev box here, with the same username.
   `/v1/catalog`, `hearthd status`, and both TUIs.
 - A missing/invalid `readiness` must fail the load, not skip the service.
 
+**Shared services (`smp`)**
+
+- A top-level `shared:` map in `hearth.yaml` (`postgres: "16.4"`) expands into generated
+  `ownership: external` services (`config_file.rs` → `shared::synthesize::project_service_entry`):
+  run = one-shot `hearthd shared attach <name@ver>` task, readiness = `hearthd shared probe`
+  (exit 0 iff the instance is ready **and this project is attached**), stop = `hearthd shared
+  detach`. `projectId` = sha256 of the canonicalized cwd, so attach/probe/stop commands all agree
+  by running with the project root as cwd.
+- The task semantics depend on a supervisor rule: `ownership: external` + `command` readiness ⇒
+  the run command is a one-shot trigger, not the service process (`is_external_task`). A
+  daemon-owned `command`-readiness service is still a normal long-lived process — don't widen it.
+- **`smp` = `hearthd smp`** — the same binary, rooted at `~/.hearth/shared`, catalog *synthesized*
+  from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
+  `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
+- Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
+  `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance.
+- Install = tarball + sha256 into `installs/<name>/<version>` (atomic rename; `.hearth-installed`
+  marker last). Recipe snapshots live in `registry.json`, so installed instances survive upstream
+  removal from `catalog.json`. `catalog.json` at the repo root is the registry the pinned
+  `SHARED_CATALOG_URL` serves; `HEARTH_SHARED_CATALOG_URL` overrides it for dev/tests (`file://`
+  works for both the catalog and artifact URLs).
+- `POST /v1/shared/attach` blocks through install+start+provision — clients must not use the 10s
+  manager timeout for it (`request_with_timeout` with `None`).
+
 **Consumers and the `hearthd` binary**
 
 - Consumer scripts must use the absolute path

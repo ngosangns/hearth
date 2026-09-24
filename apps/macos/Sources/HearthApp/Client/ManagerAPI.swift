@@ -23,6 +23,21 @@ protocol ManagerAPI: Sendable {
     func watchEvents(after: UInt64?, epoch: String?) -> AsyncThrowingStream<ManagerStreamEvent, Error>
 }
 
+/// The smp (shared-services manager) surface — inherits the ordinary manager calls (`perform` for
+/// start/stop, `logs` for instance logs, `watchEvents` for live state) since smp is the same daemon
+/// shape, and adds the `/v1/shared/*` endpoints. `ManagerClient` conforms once connected to an smp
+/// `ManagerConnection` (`hearthd shared ensure --json`).
+protocol SharedAPI: ManagerAPI {
+    /// Registered instances with install state, live service state, and per-project attachments.
+    func sharedInstances() async throws -> [SharedInstance]
+    /// The remote registry's cached document (service → versions → recipe summary).
+    func sharedCatalog() async throws -> SharedCatalogDocument
+    /// Downloads+verifies+installs `name@version` — can take minutes on first use.
+    func sharedInstall(service: String) async throws -> SharedMutationResponse
+    /// Stops the instance and deletes its install + data — the only removal path.
+    func sharedRemove(service: String) async throws -> SharedMutationResponse
+}
+
 extension ManagerAPI {
     /// Polls an accepted operation until it reaches a terminal status, mirroring the CLI's
     /// `waitOperation`.

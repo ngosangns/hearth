@@ -59,7 +59,7 @@ pub struct ManagerHttpError {
     pub message: String,
 }
 impl ManagerHttpError {
-    fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Self {
         Self { status, code: code.to_string(), message: message.into() }
     }
 }
@@ -69,9 +69,9 @@ impl IntoResponse for ManagerHttpError {
         (self.status, [("cache-control", "no-store")], Json(body)).into_response()
     }
 }
-type HttpResult<T> = Result<T, ManagerHttpError>;
+pub(crate) type HttpResult<T> = Result<T, ManagerHttpError>;
 
-fn json_response(body: impl serde::Serialize, status: StatusCode) -> Response {
+pub(crate) fn json_response(body: impl serde::Serialize, status: StatusCode) -> Response {
     (status, [("cache-control", "no-store")], Json(body)).into_response()
 }
 
@@ -88,6 +88,8 @@ pub struct HearthManagerOptions {
     pub log_max_bytes: Option<u64>,
     pub log_rotation_count: Option<usize>,
     pub supervisor: Option<SupervisorOptions>,
+    /// Set only for the smp daemon (`hearthd smp`) — enables the `/v1/shared/*` route surface.
+    pub shared: Option<Arc<crate::shared::SharedContext>>,
 }
 
 pub struct HearthManager {
@@ -104,12 +106,13 @@ pub struct HearthManager {
     state: Mutex<PersistedManagerState>,
     metadata: Mutex<Option<ManagerMetadata>>,
     closed: AtomicBool,
-    closing: AtomicBool,
+    pub(crate) closing: AtomicBool,
     lifecycle: tokio::sync::Mutex<()>,
     catalog_reload_serial: tokio::sync::Mutex<()>,
     supervisor: OnceLock<Arc<ProcessSupervisor>>,
     external_sync_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_done: watch::Sender<bool>,
+    pub shared: Option<Arc<crate::shared::SharedContext>>,
 }
 
 pub struct ReloadOutcome {
@@ -118,7 +121,7 @@ pub struct ReloadOutcome {
 }
 
 impl HearthManager {
-    fn supervisor(&self) -> &Arc<ProcessSupervisor> {
+    pub(crate) fn supervisor(&self) -> &Arc<ProcessSupervisor> {
         self.supervisor.get().expect("supervisor is set immediately after construction, before any other method can run")
     }
 
@@ -379,6 +382,7 @@ pub async fn bootstrap(options: HearthManagerOptions) -> Result<Arc<HearthManage
         supervisor: OnceLock::new(),
         external_sync_task: Mutex::new(None),
         shutdown_done,
+        shared: options.shared.clone(),
     });
 
     let supervisor_options = match options.supervisor {
@@ -456,8 +460,13 @@ pub fn router(manager: Arc<HearthManager>) -> Router {
         .route("/v1/events", get(get_events))
         .route("/v1/events/stream", get(get_events_stream))
         .route("/v1/logs/:id", get(get_logs))
-        .route("/v1/manager/shutdown", post(post_shutdown))
-        .route_layer(middleware::from_fn_with_state(manager.clone(), require_authorized_and_protocol));
+        .route("/v1/manager/shutdown", post(post_shutdown));
+    let authorized_routes = if manager.shared.is_some() {
+        authorized_routes.merge(super::shared::shared_routes())
+    } else {
+        authorized_routes
+    };
+    let authorized_routes = authorized_routes.route_layer(middleware::from_fn_with_state(manager.clone(), require_authorized_and_protocol));
 
     // Unmatched paths and wrong methods get the same `{error:{code,message}}` envelope every other
     // failure uses. Axum's own 404/405 have an empty body, so a client parsing the error shape got
@@ -518,7 +527,7 @@ async fn get_services(State(manager): State<Arc<HearthManager>>) -> Response {
     json_response(json!({ "services": manager.service_states() }), StatusCode::OK)
 }
 
-fn strict_body(bytes: &Bytes, allowed: &[&str], required: &[&str]) -> HttpResult<Map<String, Value>> {
+pub(crate) fn strict_body(bytes: &Bytes, allowed: &[&str], required: &[&str]) -> HttpResult<Map<String, Value>> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_json", "Request body must be JSON"))?;
     let Some(obj) = value.as_object() else {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "Request schema is invalid"));
@@ -1132,6 +1141,7 @@ mod tests {
             log_max_bytes: None,
             log_rotation_count: None,
             supervisor: None,
+        shared: None,
         })
         .await
         .unwrap();
@@ -1270,7 +1280,7 @@ mod tests {
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
             private_file_guard: Some(false),
         };
-        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }).await.unwrap();
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         manager.supervisor().start(&"api".to_string(), None).await.unwrap();
         let pid = match manager.service_states()[0].identity.clone().unwrap() {
             crate::state::ProcessIdentity::Posix(posix) => posix.pid,
@@ -1324,7 +1334,7 @@ mod tests {
     async fn unknown_route_is_404() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
-        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }).await.unwrap();
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         let client = reqwest::Client::new();
         let response = client.get(format!("{}/v1/does-not-exist", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", "1").send().await.unwrap();
         assert_eq!(response.status(), 404);
@@ -1343,7 +1353,7 @@ mod tests {
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
             private_file_guard: Some(false),
         };
-        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }).await.unwrap();
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         manager.supervisor().start(&"api".to_string(), None).await.unwrap();
         assert_eq!(manager.service_states()[0].actual_state, crate::state::ActualServiceState::Ready);
 
@@ -1384,6 +1394,7 @@ mod tests {
             log_max_bytes: None,
             log_rotation_count: None,
             supervisor: None,
+        shared: None,
         })
         .await
         .unwrap();
@@ -1434,7 +1445,7 @@ mod tests {
         api.urls = Some(vec![crate::catalog::ServiceUrl { url: "http://127.0.0.1:18080/app".into(), label: Some("app".into()), requires_running: Some(false) }]);
         let catalog = ServiceCatalog { services: vec![api], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let dir = tempfile::tempdir().unwrap();
-        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None }).await.unwrap();
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
 
         let body: Value = reqwest::Client::new()
             .get(format!("{}/v1/urls", manager.base_url()))

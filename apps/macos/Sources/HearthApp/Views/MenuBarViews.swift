@@ -96,6 +96,8 @@ struct MenuBarContentView: View {
                 }
             }
             Divider()
+            Button("Shared Services…") { openWindow(id: SharedWindow.id) }
+            Divider()
             Button("Open Hearth") { openWindow(id: "main") }
             Button("Check for Updates…") {
                 if let url = URL(string: "https://github.com/gnasdev/hearth/releases") {
