@@ -7,7 +7,7 @@ vars:
 
 tasks:
   dev:
-    desc: Build, launch, and watch the macOS app — rebuilds and relaunches on every source change (fswatch)
+    desc: Build, launch, and watch the app — rebuilds and relaunches on every source change (fswatch)
     dir: "{{.MACOS_DIR}}"
     cmds:
       - ./scripts/dev.sh
@@ -37,19 +37,20 @@ tasks:
       - echo "installed $("{{.HEARTHD_BIN}}" --version) at {{.HEARTHD_BIN}}"
 
   ci:
-    desc: Everything CI runs (Rust test + clippy)
+    desc: Everything CI runs (Rust test + clippy, macOS app build)
     cmds:
       - task: rust:test
       - task: rust:clippy
+      - task: macos:build
 
   macos:build:
-    desc: Build the macOS app (debug)
+    desc: Build the SwiftUI desktop app (debug)
     dir: "{{.MACOS_DIR}}"
     cmds:
       - swift build
 
   macos:test:
-    desc: Run the macOS app's Swift test suite (local only — the CI runner has no XCTest)
+    desc: Run the SwiftUI app's unit tests (needs a full Xcode install — absent on the CI runner)
     dir: "{{.MACOS_DIR}}"
     cmds:
       - swift test
@@ -75,3 +76,4 @@ tasks:
       - rm -rf "/Applications/{{.APP_NAME}}"
       - cp -R ".build/{{.APP_NAME}}" "/Applications/{{.APP_NAME}}"
       - open "/Applications/{{.APP_NAME}}"
+

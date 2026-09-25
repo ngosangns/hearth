@@ -4,7 +4,8 @@ Local dev services manager: one long-lived daemon per project folder, plus a CLI
 and a macOS app. All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every
 managed process; nothing else starts or stops one directly.
 
-The product is the compiled `hearthd` binary (`rust/bin/hearthd`) and the SwiftUI app in `apps/macos`.
+The product is the compiled `hearthd` binary (`rust/bin/hearthd`) and the SwiftUI desktop app
+in `apps/macos`.
 
 ```
  your CLI  ─┐

@@ -54,7 +54,7 @@ fn full_lifecycle_over_the_real_compiled_binary() {
     let port = free_port();
     write_config(dir.path(), port);
 
-    // `manager ensure --json` — this is exactly the contract apps/macos's SidecarLocator.swift
+    // `manager ensure --json` — this is exactly the contract apps/macos's SidecarLocator
     // depends on: it must spawn a detached daemon and print {instanceId, port, token,
     // protocolVersion, runtimeDirectory, root} as its sole stdout.
     let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
@@ -184,7 +184,7 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
     write_config(dir.path(), port);
 
     // A running daemon isn't required for `mcp` to start serving tools — but `status` needs one to
-    // actually answer, so ensure one's up first (same contract SidecarLocator/apps/macos rely on).
+    // actually answer, so ensure one's up first (same contract apps/macos's SidecarLocator relies on).
     let (code, _, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 

@@ -9,19 +9,19 @@ The product is the compiled `hearthd` binary (`rust/bin/hearthd`, crates `hearth
 `hearth-mcp`) and the SwiftUI client in `apps/macos`. A project authors `hearth.yaml` (`.yml` /
 `.json`); TypeScript catalogs are not accepted.
 
-Consumers: `apps/macos` (bundled sidecar), `infra`, `viclass` — all spawn the app-bundled binary at
+Consumers: `apps/macos`, `infra`, `viclass` — all spawn the app-bundled binary at
 `/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd`.
 
 `hearthd manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
 HTTP+SSE client needs. `env.rs` resolves the daemon's own base environment (login shell + `.env`)
 because a GUI-spawned daemon inherits launchd's bare `PATH`.
 
-`SidecarLocator` finds a compiled `hearthd`: env override, bundled copy, `/Applications` install,
-known locations, this checkout's `cargo build` output, then the login shell's PATH. There is no
-`bun` fallback.
+`SidecarLocator` (`apps/macos`) finds a compiled `hearthd`: env override, bundled copy,
+`/Applications` install, known locations, this checkout's `cargo build` output, then the login
+shell's PATH. There is no `bun` fallback.
 
-`scripts/build-app.sh` packages an ad-hoc-signed `Hearth.app` with that binary bundled. Not
-notarized — distribution to another machine is the one packaging step still missing. See
+`apps/macos/scripts/build-app.sh` packages an ad-hoc-signed `Hearth.app` with that binary bundled.
+Not notarized — distribution to another machine is the one packaging step still missing. See
 `apps/macos/README.md`.
 
 ## Build, test, release
@@ -37,12 +37,13 @@ cargo build --release -p hearthd && mkdir -p "/Applications/Hearth.app/Contents/
 ```
 The ad-hoc re-sign is required after every copy on macOS.
 
-**macOS app.** `task macos:build` / `macos:test` / `macos:package` / `macos:install`.
+**macOS app.** `task macos:build` / `macos:test` / `macos:package` / `macos:install` (+ `dev` for
+the fswatch rebuild loop).
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags.
 There is no npm publish. The binary is installed by hand or bundled into the macOS app.
-`apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`) and
-runs `swift build` only.
+`apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`)
+and runs `swift build` only — its tests need XCTest, which the self-hosted runner lacks.
 
 `PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
 bump there must be treated as breaking for every client.
@@ -59,9 +60,6 @@ from any dev box here, with the same username.
 - **Its Rust is managed by rustup, whose stable toolchain does not include clippy**, while dev
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
-- **Its Swift toolchain has no XCTest** (Command Line Tools only, no full Xcode.app), so
-  `apps/macos/Tests/` passes locally but is not in CI. Don't re-add `swift test` to
-  `macos-app.yml` without first fixing the runner's Xcode install.
 
 ## Sharp edges
 
@@ -192,7 +190,7 @@ from any dev box here, with the same username.
 - `hearthd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
-**macOS app**
+**macOS app (apps/macos)**
 
 - **Single instance is enforced in `AppDelegate`**, not just `LSMultipleInstancesProhibited`:
   `open -n` and `scripts/dev.sh`'s bare-binary launch bypass LaunchServices. The check matches bundle

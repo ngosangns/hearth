@@ -3,6 +3,5 @@ node_modules/
 .DS_Store
 .claude/settings.local.json
 apps/macos/.build/
-apps/macos/.swiftpm/
 rust/target/
 /dist/
