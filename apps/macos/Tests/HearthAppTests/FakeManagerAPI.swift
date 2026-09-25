@@ -16,10 +16,12 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     private var _operationReads: [String] = []
     private var _logRequests: [(cursor: Int?, generation: Int?)] = []
     private var _servicesCalls = 0
+    private var _daemonLogCalls = 0
 
     var servicesHandler: (@Sendable () async throws -> [ServiceLifecycleState])?
     var catalogHandler: (@Sendable () async throws -> ServiceCatalogSummary)?
     var logsHandler: (@Sendable (Int?, Int?) async throws -> LogSlice)?
+    var daemonLogHandler: (@Sendable () async throws -> LogSlice)?
     var performHandler: (@Sendable (ManagerAction, String, Bool) async throws -> ManagerOperation)?
     var bulkStartHandler: (@Sendable ([String]) async throws -> ManagerOperation)?
     var operationHandler: (@Sendable (String) async throws -> ManagerOperation)?
@@ -46,6 +48,9 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     var servicesCalls: Int {
         lock.sync { _servicesCalls }
     }
+    var daemonLogCalls: Int {
+        lock.sync { _daemonLogCalls }
+    }
 
     func services() async throws -> [ServiceLifecycleState] {
         lock.sync { _servicesCalls += 1 }
@@ -60,6 +65,12 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
 
     func managerInfo() async throws -> ManagerInfo {
         throw Unimplemented(what: "managerInfo")
+    }
+
+    func daemonLog() async throws -> LogSlice {
+        lock.sync { _daemonLogCalls += 1 }
+        guard let daemonLogHandler else { throw Unimplemented(what: "daemonLog") }
+        return try await daemonLogHandler()
     }
 
     func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int) async throws -> LogSlice {

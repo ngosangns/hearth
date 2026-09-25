@@ -136,7 +136,8 @@ final class LogTextViewHostingTests: XCTestCase {
             return
         }
 
-        let rowRect = table.rect(ofRow: 0)
+        // Row 0 is the pinned "daemon log" row — the first service is row 1.
+        let rowRect = table.rect(ofRow: 1)
         let pointInWindow = table.convert(NSPoint(x: rowRect.midX, y: rowRect.midY), to: nil)
         let pointOnScreen = window.convertPoint(toScreen: pointInWindow)
         guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: pointOnScreen, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
@@ -155,7 +156,7 @@ final class LogTextViewHostingTests: XCTestCase {
         if controller.selectedServiceId != "api" {
             // Isolate whether the failure is click delivery or the binding itself: drive the same
             // delegate path programmatically.
-            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
             try await Task.sleep(for: .milliseconds(100))
             XCTAssertEqual(controller.selectedServiceId, "api", "neither click nor programmatic selection reached the binding")
         }

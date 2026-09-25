@@ -63,4 +63,27 @@ final class SharedServicesControllerTests: XCTestCase {
         guard case .failed(let message) = failing.phase else { return XCTFail("expected failed, got \(failing.phase)") }
         XCTAssertTrue(message.contains("no sidecar"))
     }
+
+    /// A `.failed` refresh drops the stale client: a restarted smp listens on a different port with
+    /// a new token, so `connect()` must run `ensure` again rather than reuse it.
+    @MainActor
+    func testFailedRefreshDropsTheClientAndConnectReEnsures() async throws {
+        let ensureCalls = Box(0)
+        let api = FakeManagerAPI()
+        api.sharedInstancesHandler = { [] }
+        api.sharedCatalogHandler = { SharedCatalogDocument(version: 1, services: [:]) }
+        let sut = SharedServicesController(connector: { ensureCalls.value += 1; return api })
+
+        await sut.connect()
+        XCTAssertEqual(ensureCalls.value, 1)
+
+        api.sharedInstancesHandler = { throw FakeManagerAPI.Unimplemented(what: "sharedInstances") }
+        await sut.refresh()
+        guard case .failed = sut.phase else { return XCTFail("expected failed, got \(sut.phase)") }
+
+        api.sharedInstancesHandler = { [] }
+        await sut.connect()
+        XCTAssertEqual(ensureCalls.value, 2, "connect() from .failed must rediscover, not reuse the dead client")
+        guard case .connected = sut.phase else { return XCTFail("expected connected, got \(sut.phase)") }
+    }
 }

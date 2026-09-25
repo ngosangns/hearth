@@ -76,13 +76,20 @@ struct SharedCatalogView: View {
                         }
                     }
                 }
+                if let error = controller.catalogError {
+                    Section {
+                        Label("Registry unavailable", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                        Text(error).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
             }
             .navigationTitle("Catalog")
             .overlay {
                 if controller.instances.isEmpty && (controller.catalogDoc?.services.isEmpty ?? true) {
                     ContentUnavailableViewCompat(
-                        title: "Empty catalog",
-                        message: "The shared-services registry lists nothing this machine can install.",
+                        title: controller.catalogError != nil ? "Registry unavailable" : "Empty catalog",
+                        message: controller.catalogError ?? "The shared-services registry lists nothing this machine can install.",
                         systemImage: "shippingbox"
                     )
                 }

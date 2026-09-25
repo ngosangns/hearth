@@ -63,6 +63,10 @@ final class ManagerClient: ManagerAPI, SharedAPI {
         return try await get(path, as: LogSlice.self)
     }
 
+    func daemonLog() async throws -> LogSlice {
+        try await get("/v1/daemon/log?bytes=131072", as: LogSlice.self)
+    }
+
     @discardableResult
     func perform(_ action: ManagerAction, serviceId: String, killUnowned: Bool = false) async throws -> ManagerOperation {
         var body: [String: Any] = ["requestId": UUID().uuidString, "serviceId": serviceId, "action": action.rawValue]

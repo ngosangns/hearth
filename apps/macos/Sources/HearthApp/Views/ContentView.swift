@@ -14,6 +14,13 @@ struct ContentView: View {
             .navigationTitle("Workspaces")
             .toolbar {
                 ToolbarItem { Button(action: addWorkspace) { Label("Add Folder", systemImage: "plus") } }
+                // The catalog window is otherwise only reachable from the menu bar extra.
+                ToolbarItem {
+                    Button { openWindow(id: SharedWindow.id) } label: {
+                        Label("Shared Services", systemImage: "shippingbox")
+                    }
+                    .help("Open the shared services catalog")
+                }
             }
             .overlay {
                 if workspaceStore.workspaces.isEmpty {

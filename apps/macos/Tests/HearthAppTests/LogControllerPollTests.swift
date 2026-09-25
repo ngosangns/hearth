@@ -44,6 +44,28 @@ final class LogControllerPollTests: XCTestCase {
         XCTAssertEqual(api.logRequests[1].generation, 1, "the stale generation is what tells the daemon to reset")
     }
 
+    /// The daemon log row is a `LogController` too — `fetchOnce` must hit `GET /v1/daemon/log`
+    /// (never `/v1/logs/$daemon`), and every answer is a `reset` tail the buffer replaces.
+    func testDaemonLogPollsTheDaemonEndpointAndReplaces() async {
+        let api = FakeManagerAPI()
+        let slices = Box<[LogSlice]>([
+            makeLogSlice(data: "old\n", nextCursor: 0, generation: 0, reset: true),
+            makeLogSlice(data: "fresh tail\n", nextCursor: 0, generation: 0, reset: true),
+        ])
+        api.daemonLogHandler = { slices.value.removeFirst() }
+        api.logsHandler = { _, _ in
+            XCTFail("the daemon log must not go through the per-service endpoint")
+            throw FakeManagerAPI.Unimplemented(what: "logs")
+        }
+
+        let sut = LogController(client: api, daemonLog: ())
+        await sut.fetchOnce()
+        await sut.fetchOnce()
+
+        XCTAssertEqual(api.daemonLogCalls, 2)
+        XCTAssertEqual(sut.text, "fresh tail\n", "daemon.log is a full tail — each slice replaces")
+    }
+
     /// A service removed from the catalog will never become valid again, so polling stops for good
     /// rather than hammering the daemon with the same 404.
     func testServiceNotFoundStopsPollingPermanently() async {

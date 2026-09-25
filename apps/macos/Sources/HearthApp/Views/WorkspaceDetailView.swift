@@ -143,17 +143,22 @@ private struct ServiceListView: View {
                     .padding(8)
                     .background(.red.opacity(0.1))
                 }
-                List(controller.services, selection: $controller.selectedServiceId) { service in
-                    ServiceRow(
-                        service: service,
-                        label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
-                        busy: controller.actionsInFlight.contains(service.serviceId),
-                        urls: controller.urls(for: service.serviceId),
-                        onAction: { action, killUnowned in
-                            Task { await controller.perform(action, serviceId: service.serviceId, killUnowned: killUnowned) }
-                        }
-                    )
-                    .tag(service.serviceId)
+                List(selection: $controller.selectedServiceId) {
+                    // Pinned above the services: the daemon's own `daemon.log`, same panel.
+                    Label("daemon log", systemImage: "terminal")
+                        .tag(LogController.daemonServiceId)
+                    ForEach(controller.services) { service in
+                        ServiceRow(
+                            service: service,
+                            label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
+                            busy: controller.actionsInFlight.contains(service.serviceId),
+                            urls: controller.urls(for: service.serviceId),
+                            onAction: { action, killUnowned in
+                                Task { await controller.perform(action, serviceId: service.serviceId, killUnowned: killUnowned) }
+                            }
+                        )
+                        .tag(service.serviceId)
+                    }
                 }
                 .listStyle(.inset)
             }
@@ -167,7 +172,9 @@ private struct ServiceListView: View {
     @ViewBuilder
     private var logPanel: some View {
         if let selectedServiceId = controller.selectedServiceId, let logController = controller.logController(for: selectedServiceId) {
-            let label = controller.catalog?.services.first(where: { $0.id == selectedServiceId })?.displayName ?? selectedServiceId
+            let label = selectedServiceId == LogController.daemonServiceId
+                ? "daemon log"
+                : controller.catalog?.services.first(where: { $0.id == selectedServiceId })?.displayName ?? selectedServiceId
             ServiceLogPanel(serviceLabel: label, log: logController)
                 .id(selectedServiceId)
         } else {

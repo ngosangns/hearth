@@ -266,11 +266,14 @@ final class WorkspaceController: ObservableObject {
     }
 
     /// Cached per service so focusing a row again resumes the existing cursor. `nil` before a
-    /// successful `connect()`.
+    /// successful `connect()`. `LogController.daemonServiceId` selects the daemon's own log —
+    /// the pinned "daemon" row, backed by `GET /v1/daemon/log` rather than a service's store.
     func logController(for serviceId: String) -> LogController? {
         guard let client else { return nil }
         if let existing = logControllers[serviceId] { return existing }
-        let created = LogController(client: client, serviceId: serviceId)
+        let created = serviceId == LogController.daemonServiceId
+            ? LogController(client: client, daemonLog: ())
+            : LogController(client: client, serviceId: serviceId)
         logControllers[serviceId] = created
         return created
     }
@@ -280,10 +283,10 @@ final class WorkspaceController: ObservableObject {
             && zip(services, fresh).allSatisfy { $0.isVisuallyEqual(to: $1) }
         if !unchanged { services = fresh }
         let live = Set(fresh.map(\.serviceId))
-        if let selected = selectedServiceId, !live.contains(selected) {
+        if let selected = selectedServiceId, !live.contains(selected), selected != LogController.daemonServiceId {
             selectedServiceId = nil
         }
-        for id in logControllers.keys where !live.contains(id) {
+        for id in logControllers.keys where !live.contains(id) && id != LogController.daemonServiceId {
             logControllers[id]?.stop()
             logControllers.removeValue(forKey: id)
         }

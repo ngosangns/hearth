@@ -11,6 +11,9 @@ protocol ManagerAPI: Sendable {
     func catalog() async throws -> ServiceCatalogSummary
     func managerInfo() async throws -> ManagerInfo
     func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int) async throws -> LogSlice
+    /// `GET /v1/daemon/log` — the daemon's own `daemon.log`, returned as a `LogSlice` tail
+    /// (`reset` is always true; the endpoint sends the whole tail, not an incremental cursor).
+    func daemonLog() async throws -> LogSlice
     /// `killUnowned` is the user-confirmed "kill the process holding my port" reclaim — it only
     /// reaches the daemon after the user approved it in the UI.
     @discardableResult func perform(_ action: ManagerAction, serviceId: String, killUnowned: Bool) async throws -> ManagerOperation

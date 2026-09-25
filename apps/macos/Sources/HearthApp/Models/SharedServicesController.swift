@@ -21,6 +21,9 @@ final class SharedServicesController: ObservableObject {
     @Published private(set) var instances: [SharedInstance] = []
     /// The remote registry document — what *could* be installed. `nil` until the first fetch.
     @Published private(set) var catalogDoc: SharedCatalogDocument?
+    /// Why the last registry fetch failed. The UI must show this — a silent nil `catalogDoc`
+    /// renders as an empty "Available" section with no hint anything went wrong.
+    @Published private(set) var catalogError: String?
     /// Sidebar selection — an instance id (`postgres@16.4`) or a catalog version key
     /// (`postgres@16.4` from the registry; the two spell the same id by design).
     @Published var selectedId: String?
@@ -48,10 +51,18 @@ final class SharedServicesController: ObservableObject {
     }
 
     /// Find-or-start smp, then publish instances + the registry document and start watching its
-    /// event stream. Idempotent while connecting and cheap to re-call once connected.
+    /// event stream. Idempotent while connecting and a no-op once connected — except from
+    /// `.failed`, where the daemon may have been replaced (new port + token), so the stale
+    /// client is dropped and `ensure` rediscovers the live one.
     func connect() async {
-        guard phase != .connecting, client == nil else { return }
+        guard phase != .connecting else { return }
+        if client != nil, case .connected = phase { return }
         phase = .connecting
+        client = nil
+        logControllers.removeAll()
+        // No `watchTask?.cancel()` here — connect() can run *inside* the watch task, and an
+        // early cancel would propagate into `ensure`'s subprocess timeout and fail the whole
+        // reconnect. `startWatching()` below cancels the old task once the new client is live.
         do {
             let client = try await connector()
             self.client = client
@@ -81,7 +92,12 @@ final class SharedServicesController: ObservableObject {
     /// when upstream publishes, not while the user watches.
     func refreshCatalog() async {
         guard let client else { return }
-        catalogDoc = try? await client.sharedCatalog()
+        do {
+            catalogDoc = try await client.sharedCatalog()
+            catalogError = nil
+        } catch {
+            catalogError = error.localizedDescription
+        }
     }
 
     /// A catalog row's selection id spells the same `name@version` as a registered instance, so
@@ -157,7 +173,14 @@ final class SharedServicesController: ObservableObject {
         var after: UInt64?
         var epoch: String?
         while !Task.isCancelled {
-            guard let client else { return }
+            guard let client else {
+                // Dropped after a hard failure — a restarted smp listens on a new port with a
+                // new token, so reconnect through `ensure` instead of polling a dead port.
+                // Retries every pollInterval until the daemon answers.
+                await connect()
+                try? await Task.sleep(for: pollInterval)
+                continue
+            }
             do {
                 for try await event in client.watchEvents(after: after, epoch: epoch) {
                     if Task.isCancelled { return }
@@ -183,6 +206,9 @@ final class SharedServicesController: ObservableObject {
                 return
             } catch {
                 await refresh()
+                if case .failed = phase {
+                    self.client = nil
+                }
                 try? await Task.sleep(for: pollInterval)
             }
         }

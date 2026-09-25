@@ -201,6 +201,10 @@ from any dev box here, with the same username.
   closed main window goes through `MainWindow.open` — the `openWindow` action captured from
   `ContentView` — driven by `applicationShouldHandleReopen` and that notification.
 
+- The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
+  a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
+  catalog reloads and is exempt from the apply-services prune.
+
 **Testing gotchas**
 
 - The macOS app's controllers take `any ManagerAPI`, not the concrete `ManagerClient`, so

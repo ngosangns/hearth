@@ -241,6 +241,30 @@ final class WorkspaceControllerTests: XCTestCase {
         sut.stop()
     }
 
+    /// The pinned daemon row must survive catalog reloads: its selection is not cleared and its
+    /// log controller is not pruned like a dead service's.
+    func testDaemonLogRowIsNotPrunedByRefresh() async {
+        let api = FakeManagerAPI()
+        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.servicesHandler = { [makeService("api", actualState: "ready")] }
+        api.daemonLogHandler = { makeLogSlice(data: "d\n", nextCursor: 0, generation: 0, reset: true) }
+        api.logsHandler = { _, _ in throw FakeManagerAPI.Unimplemented(what: "logs") }
+
+        let sut = controller(api)
+        await sut.connect()
+        sut.selectedServiceId = LogController.daemonServiceId
+        let daemonLog = sut.logController(for: LogController.daemonServiceId)
+        XCTAssertNotNil(daemonLog)
+
+        await sut.refresh()
+
+        XCTAssertEqual(sut.selectedServiceId, LogController.daemonServiceId,
+            "the daemon row is not a service — refresh must not deselect it")
+        XCTAssertTrue(sut.logController(for: LogController.daemonServiceId) === daemonLog,
+            "the daemon log controller must not be pruned")
+        sut.stop()
+    }
+
     func testRefreshKeepsThePublishedSnapshotWhenOnlyTimestampsChange() async {
         let api = FakeManagerAPI()
         api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }

@@ -19,15 +19,28 @@ final class LogController: ObservableObject {
     /// Keeps the displayed buffer bounded — this is a live tail view, not a full-log archive.
     private static let maxDisplayedBytes = 262_144
 
-    private let client: any ManagerAPI
-    private let serviceId: String
+    private let fetch: (Int?, Int?) async throws -> LogSlice
     private var cursor: Int?
     private var generation: Int?
     private var pollTask: Task<Void, Never>?
 
     init(client: any ManagerAPI, serviceId: String) {
-        self.client = client
-        self.serviceId = serviceId
+        self.fetch = { cursor, generation in
+            try await client.logs(serviceId: serviceId, cursor: cursor, generation: generation)
+        }
+    }
+
+    /// The daemon's own log — the same panel, sourced from `GET /v1/daemon/log` instead of
+    /// `/v1/logs/:id`. Used for the pinned "daemon" row; its pseudo-id never collides with a real
+    /// service because `$` is outside the service-id charset.
+    static let daemonServiceId = "$daemon"
+
+    convenience init(client: any ManagerAPI, daemonLog: Void) {
+        self.init(fetch: { _, _ in try await client.daemonLog() })
+    }
+
+    private init(fetch: @escaping (Int?, Int?) async throws -> LogSlice) {
+        self.fetch = fetch
     }
 
     func start(interval: Duration = .milliseconds(700)) {
@@ -73,7 +86,7 @@ final class LogController: ObservableObject {
     /// waiting on the real timer.
     func fetchOnce() async {
         do {
-            let slice = try await client.logs(serviceId: serviceId, cursor: cursor, generation: generation)
+            let slice = try await fetch(cursor, generation)
             let next = slice.reset ? slice.data : (slice.data.isEmpty ? text : text + slice.data)
             // Trim by BYTES on both sides of the comparison. `suffix(n)` counts Characters, so with
             // any multi-byte log output the trimmed string could still exceed the byte cap — the
