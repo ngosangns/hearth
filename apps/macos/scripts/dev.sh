@@ -4,9 +4,12 @@
 # every relaunch) — there's no Xcode project here to wire up an injection tool against; fswatch-driven
 # rebuild is the pragmatic equivalent for a plain SPM package. Ctrl+C stops the watch and kills the app.
 set -euo pipefail
-# Background jobs (the app, fswatch) get their own process group, so Ctrl+C reaches this shell
-# instead of being swallowed by the GUI app.
-set -m
+# No `set -m`: with job control on, each foreground job (perl below, `swift build`) gets its own
+# process group AND the terminal's foreground — Ctrl+C would deliver SIGINT only to that job, never
+# to this shell, so the INT trap would never run and the loop would just respawn perl forever.
+# Without it, SIGINT hits the whole foreground process group — script, watcher, and app all die
+# together — and the EXIT trap still runs `stop_pid` on anything that survived (e.g. a binary that
+# catches SIGINT).
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 app_root="$script_dir/.."
@@ -83,8 +86,13 @@ watch_pid=$!
 # builtin returns, and it never returns while fswatch (which ignores SIGINT) holds
 # the pipe. `perl` is a normal foreground process, so Ctrl+C kills it and the trap runs.
 while kill -0 "$watch_pid" 2>/dev/null; do
+  # perl must stay inside `if` — a bare non-zero command under `set -e` would kill the script on
+  # the first poll timeout, before any Ctrl+C ever lands.
   if /usr/bin/perl -e 'use IO::Select; exit(IO::Select->new(\*STDIN)->can_read(0.2) ? 0 : 1)' <&3; then
     IFS= read -r _ <&3 || true
     build_and_launch
+  elif [ "$?" -ge 128 ]; then
+    # perl died to a signal (SIGINT et al.) — treat it as our own: exit, let the traps clean up.
+    exit 130
   fi
 done
