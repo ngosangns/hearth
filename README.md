@@ -50,8 +50,11 @@ Shared entries show up as ordinary `infrastructure` services — `start` attache
 
 ```yaml
 shared:
-  postgres: "16.4"
-  redis: "7.2"
+  redis: "8.2.10"
+  mongodb: "8.0.32"
+  minio: "RELEASE.2025-10-15T17-29-55Z"
+  nginx: "1.30.5"
+  kafka: "4.3.1"
 ```
 
 Install `hearthd` into the app bundle, then drive a project:

@@ -18,11 +18,39 @@ use super::{SharedError, SHARED_CATALOG_URL};
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const CACHE_FILE_NAME: &str = "catalog.json";
 
+/// Where the darwin-arm64 tarball comes from. Exactly one of `url` or `script`.
+///
+/// `url` is a tarball that already exists on the internet (or a `file://` fixture). `script` is a
+/// path relative to this catalog file — or an absolute `http(s)`/`file` URL — run as
+/// `bash <script> <scriptArgs...> <out.tar.gz>`. The script does the packaging; the daemon only
+/// invokes it and checks `sha256`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedArtifact {
-    pub url: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// Arguments before the output path. `["redis"]` makes the call `bash pack.sh redis <out>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_args: Vec<String>,
+}
+
+impl SharedArtifact {
+    pub fn validate(&self, what: &str) -> Result<(), SharedError> {
+        let url = self.url.as_deref().filter(|s| !s.is_empty());
+        let script = self.script.as_deref().filter(|s| !s.is_empty());
+        match (url, script) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (Some(_), Some(_)) => Err(SharedError(format!(
+                "{what}: artifact must set url or script, not both"
+            ))),
+            (None, None) => Err(SharedError(format!(
+                "{what}: artifact needs a url or a script"
+            ))),
+        }
+    }
 }
 
 /// How a connection to a provisioned instance is described back to an attaching project. `url` and
@@ -62,6 +90,24 @@ pub struct SharedRecipe {
     /// Extra environment for the run command, rendered with the same templates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
+    /// Idempotent setup run before every start (mapped onto the supervisor's
+    /// `preparation_command`). Exit 0 when already initialized — this is not a one-shot hook.
+    /// The supervised `run` argv stays the real server binary so its `ps` line matches the
+    /// stored fingerprint; do the init here instead of in a wrapper that `exec`s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare: Option<CommandSpec>,
+    /// Ports reserved contiguously after `{port}` (`{port2}`, `{port3}`, …). `0` keeps the
+    /// historical single-port allocation. Capped by `ports::MAX_SHARED_PORTS`.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub additional_ports: u16,
+    /// Display labels for `additional_ports`, in order (`"console"`, `"controller"`, …).
+    /// Missing entries fall back to `port2`, `port3`, …
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_port_labels: Vec<String>,
+}
+
+fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,9 +128,20 @@ impl SharedCatalogDocument {
 }
 
 fn parse_document(text: &str) -> Result<SharedCatalogDocument, SharedError> {
-    let doc: SharedCatalogDocument = serde_json::from_str(text).map_err(|e| SharedError(format!("shared catalog is not valid JSON: {e}")))?;
+    let doc: SharedCatalogDocument = serde_json::from_str(text)
+        .map_err(|e| SharedError(format!("shared catalog is not valid JSON: {e}")))?;
     if doc.version != 1 {
-        return Err(SharedError(format!("shared catalog version must be 1, got {}", doc.version)));
+        return Err(SharedError(format!(
+            "shared catalog version must be 1, got {}",
+            doc.version
+        )));
+    }
+    for (name, family) in &doc.services {
+        for (version, recipe) in &family.versions {
+            for (platform, artifact) in &recipe.artifacts {
+                artifact.validate(&format!("{name}@{version} {platform}"))?;
+            }
+        }
     }
     Ok(doc)
 }
@@ -152,7 +209,8 @@ impl RemoteCatalog {
         // file:// URLs exist for tests/local development of the whole attach path without
         // publishing a real registry — the cache write-through still applies.
         if let Some(rest) = self.url.strip_prefix("file://") {
-            let text = std::fs::read_to_string(rest).map_err(|e| SharedError(format!("failed to read shared catalog {rest}: {e}")))?;
+            let text = std::fs::read_to_string(rest)
+                .map_err(|e| SharedError(format!("failed to read shared catalog {rest}: {e}")))?;
             let doc = Arc::new(parse_document(&text)?);
             let _ = std::fs::write(&self.cache_path, &text);
             return Ok(doc);
@@ -163,11 +221,22 @@ impl RemoteCatalog {
             .timeout(FETCH_TIMEOUT)
             .send()
             .await
-            .map_err(|e| SharedError(format!("failed to fetch shared catalog from {}: {e}", self.url)))?;
+            .map_err(|e| {
+                SharedError(format!(
+                    "failed to fetch shared catalog from {}: {e}",
+                    self.url
+                ))
+            })?;
         if !response.status().is_success() {
-            return Err(SharedError(format!("shared catalog fetch failed: HTTP {}", response.status())));
+            return Err(SharedError(format!(
+                "shared catalog fetch failed: HTTP {}",
+                response.status()
+            )));
         }
-        let text = response.text().await.map_err(|e| SharedError(format!("failed to read shared catalog body: {e}")))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| SharedError(format!("failed to read shared catalog body: {e}")))?;
         let doc = Arc::new(parse_document(&text)?);
         // Write-through cache; a cache write failure must not fail the fetch itself.
         if let Some(parent) = self.cache_path.parent() {
@@ -212,6 +281,71 @@ mod tests {
     }
 
     #[test]
+    fn parses_prepare_and_additional_ports() {
+        let doc = parse_document(
+            r#"{
+              "version": 1,
+              "services": {
+                "kafka": {
+                  "versions": {
+                    "4.1.0": {
+                      "artifacts": { "darwin-arm64": { "url": "file:///k.tgz", "sha256": "abc" } },
+                      "additionalPorts": 1,
+                      "extraPortLabels": ["controller"],
+                      "prepare": { "argv": ["{installDir}/bin/hearth-prepare", "{dataDir}", "{port}", "{port2}"] },
+                      "run": { "shell": "exec {installDir}/jre/bin/java @{dataDir}/jvm.args", "exec": true },
+                      "readiness": { "kind": "command", "command": { "argv": ["{installDir}/bin/hearth-ready", "{port}"] } }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let recipe = doc.recipe("kafka", "4.1.0").unwrap();
+        assert_eq!(recipe.additional_ports, 1);
+        assert_eq!(recipe.extra_port_labels, vec!["controller".to_string()]);
+        assert!(recipe.prepare.is_some());
+        assert!(recipe.artifacts["darwin-arm64"].script.is_none());
+    }
+
+    #[test]
+    fn rejects_an_artifact_that_sets_both_sources() {
+        let err = parse_document(
+            r#"{
+              "version": 1,
+              "services": {
+                "redis": { "versions": { "1": {
+                  "artifacts": { "darwin-arm64": { "url": "https://example.com/a.tgz", "script": "pack.sh", "sha256": "abc" } },
+                  "run": { "argv": ["redis-server"] },
+                  "readiness": { "kind": "process" }
+                } } }
+              }
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_artifact_with_no_source() {
+        let err = parse_document(
+            r#"{
+              "version": 1,
+              "services": {
+                "redis": { "versions": { "1": {
+                  "artifacts": { "darwin-arm64": { "sha256": "abc" } },
+                  "run": { "argv": ["redis-server"] },
+                  "readiness": { "kind": "process" }
+                } } }
+              }
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("needs a url or a script"), "{err}");
+    }
+
+    #[test]
     fn rejects_wrong_version() {
         let err = parse_document(r#"{"version": 2, "services": {}}"#).unwrap_err();
         assert!(err.0.contains("version must be 1"), "{err}");
@@ -221,8 +355,123 @@ mod tests {
     async fn falls_back_to_cache_when_remote_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(CACHE_FILE_NAME), sample_doc()).unwrap();
-        let remote = RemoteCatalog::new(dir.path(), Some("http://127.0.0.1:1/unreachable".to_string()));
+        let remote = RemoteCatalog::new(
+            dir.path(),
+            Some("http://127.0.0.1:1/unreachable".to_string()),
+        );
         let doc = remote.load(true).await.unwrap();
         assert!(doc.recipe("postgres", "16.4").is_some());
+    }
+
+    fn brace_names(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rest = text;
+        while let Some(open) = rest.find('{') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('}') else { break };
+            let name = &after[..close];
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                names.push(name.to_string());
+            }
+            rest = &after[close + 1..];
+        }
+        names
+    }
+
+    fn walk_strings(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::String(text) => out.push((path.to_string(), text.clone())),
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk_strings(item, &format!("{path}[{index}]"), out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    walk_strings(item, &format!("{path}.{key}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_extra_port(name: &str) -> bool {
+        name.starts_with("port") && name.len() > 4 && name[4..].chars().all(|c| c.is_ascii_digit())
+    }
+
+    #[test]
+    fn shipped_catalog_templates_only_use_known_vars() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../catalog.json");
+        let text = std::fs::read_to_string(&path).expect("catalog.json");
+        let doc = parse_document(&text).expect("catalog.json parses");
+        for name in ["redis", "mongodb", "minio", "nginx", "kafka"] {
+            assert!(doc.services.contains_key(name), "{name} missing");
+        }
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut strings = Vec::new();
+        walk_strings(&value["services"], "services", &mut strings);
+        let instance = [
+            "installDir",
+            "dataDir",
+            "port",
+            "name",
+            "version",
+            "instanceId",
+        ];
+        let project = ["projectId", "projectDb", "projectUser", "projectBucket"];
+        for (path, text) in &strings {
+            let in_attachment = path.contains(".provision")
+                || path.contains(".deprovision")
+                || path.contains(".connection");
+            for name in brace_names(text) {
+                let known = instance.contains(&name.as_str())
+                    || is_extra_port(&name)
+                    || (in_attachment && project.contains(&name.as_str()))
+                    || (path.contains(".connection") && name == "url");
+                assert!(known, "{path} uses unknown template {{{name}}}");
+            }
+        }
+        for (service, family) in &doc.services {
+            for (version, recipe) in &family.versions {
+                let blob = serde_json::to_string(recipe).unwrap();
+                if brace_names(&blob).iter().any(|name| name == "port2") {
+                    assert!(
+                        recipe.additional_ports >= 1,
+                        "{service}@{version} uses {{port2}} without additionalPorts"
+                    );
+                }
+                let sha = &recipe.artifacts["darwin-arm64"].sha256;
+                assert!(
+                    sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{service}@{version} sha256"
+                );
+            }
+        }
+        assert!(doc.services["minio"]
+            .versions
+            .values()
+            .all(|recipe| recipe.additional_ports == 1));
+        assert!(doc.services["kafka"]
+            .versions
+            .values()
+            .all(|recipe| recipe.additional_ports == 1));
+        assert!(doc.services["redis"]
+            .versions
+            .values()
+            .all(|recipe| recipe.additional_ports == 0));
+        assert!(doc.services["nginx"]
+            .versions
+            .values()
+            .all(|recipe| recipe.prepare.is_some()));
+        let mongo = doc.recipe("mongodb", "8.0.32").unwrap();
+        assert!(mongo.artifacts["darwin-arm64"]
+            .url
+            .as_deref()
+            .unwrap()
+            .contains("fastdl.mongodb.org"));
+        assert!(doc.services["redis"]
+            .versions
+            .values()
+            .all(|recipe| recipe.artifacts["darwin-arm64"].script.is_some()));
     }
 }

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Bucket name is the project db (`h_<projectId>`). Credentials match the recipe env and are
+# loopback-only shared dev credentials, not per-project secrets.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DATA="$1"
+PORT="$2"
+BUCKET="$3"
+export MC_CONFIG_DIR="$DATA/mc"
+mkdir -p "$MC_CONFIG_DIR"
+"$ROOT/bin/mc" alias set hearth "http://127.0.0.1:${PORT}" hearth hearth-local-dev >/dev/null
+"$ROOT/bin/mc" mb --ignore-existing "hearth/${BUCKET}" >/dev/null

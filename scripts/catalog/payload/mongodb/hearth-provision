@@ -1,0 +1,8 @@
+#!/bin/bash
+# Create the per-project database by upserting a marker document. Detach does not drop it.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="$2"
+DB="$3"
+export MONGOSH_NO_TELEMETRY=1
+exec "$ROOT/bin/mongosh" --quiet --norc --host 127.0.0.1 --port "$PORT" "$DB" --eval 'db.hearth.updateOne({_id:"hearth"}, {$set:{ok:1}}, {upsert:true})'

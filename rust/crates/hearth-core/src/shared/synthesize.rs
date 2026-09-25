@@ -5,25 +5,38 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::catalog::{
-    CommandSpec, ReadinessSpec, ServiceCatalog, ServiceCommand, ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership,
-    ServicePort, ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
+    CommandSpec, PreparationCommand, ReadinessSpec, ServiceCatalog, ServiceCommand,
+    ServiceDefinition, ServiceId, ServiceKind, ServiceOwnership, ServicePort, ServiceProfiles,
+    ServiceRunProfile, StartFailurePolicy,
 };
 
 use super::registry::SharedInstance;
-use super::render::{instance_vars, render_command, render_env, render_readiness};
+use super::render::{
+    check_unrendered, instance_vars, render_command_checked, render_env, render_readiness,
+};
 use super::SHARED_RUNTIME_DIRECTORY_NAME;
+
+/// First boot of a JVM or WiredTiger can outlast the supervisor's 10s default. Install itself
+/// happens before `start`, so this bound is only the process becoming ready.
+const SHARED_INSTANCE_READINESS_TIMEOUT_MS: u64 = 120_000;
 
 /// Instances in `installing`/`failed` state still synthesize a definition: a failed install is
 /// retried by the next attach, and the service must exist in the catalog for the supervisor to
 /// start it once install succeeds.
-pub fn synthesize_catalog(root: &Path, instances: &[SharedInstance]) -> Result<ServiceCatalog, crate::shared::SharedError> {
+pub fn synthesize_catalog(
+    root: &Path,
+    instances: &[SharedInstance],
+) -> Result<ServiceCatalog, crate::shared::SharedError> {
     let mut services = Vec::new();
     for instance in instances {
         services.push(synthesize_service(root, instance)?);
     }
     Ok(ServiceCatalog {
         services,
-        groups: HashMap::from([("all".to_string(), instances.iter().map(|i| i.id()).collect::<Vec<ServiceId>>())]),
+        groups: HashMap::from([(
+            "all".to_string(),
+            instances.iter().map(|i| i.id()).collect::<Vec<ServiceId>>(),
+        )]),
         compose_file: None,
         runtime_directory: Some(SHARED_RUNTIME_DIRECTORY_NAME.to_string()),
         start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -31,10 +44,48 @@ pub fn synthesize_catalog(root: &Path, instances: &[SharedInstance]) -> Result<S
     })
 }
 
-pub fn synthesize_service(root: &Path, instance: &SharedInstance) -> Result<ServiceDefinition, crate::shared::SharedError> {
+pub fn synthesize_service(
+    root: &Path,
+    instance: &SharedInstance,
+) -> Result<ServiceDefinition, crate::shared::SharedError> {
     let vars = instance_vars(instance, root);
     let readiness = render_readiness(&instance.recipe.readiness, &vars)?;
-    let environment = instance.recipe.env.as_ref().map(|e| render_env(e, &vars)).filter(|e| !e.is_empty());
+    let environment = match instance.recipe.env.as_ref() {
+        Some(env) => {
+            let rendered = render_env(env, &vars);
+            for value in rendered.values() {
+                check_unrendered(value, "env")?;
+            }
+            Some(rendered).filter(|e| !e.is_empty())
+        }
+        None => None,
+    };
+    let preparation_command = match instance.recipe.prepare.as_ref() {
+        Some(command) => Some(PreparationCommand {
+            command: render_command_checked(command, &vars, "prepare")?,
+            cwd: None,
+            serialization_key: None,
+        }),
+        None => None,
+    };
+    let mut ports = vec![ServicePort {
+        port: instance.port,
+        label: "shared".to_string(),
+        requires_running: None,
+    }];
+    for (index, port) in instance.extra_ports.iter().enumerate() {
+        let label = instance
+            .recipe
+            .extra_port_labels
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("port{}", index + 2));
+        ports.push(ServicePort {
+            port: *port,
+            label,
+            requires_running: None,
+        });
+    }
     Ok(ServiceDefinition {
         id: instance.id(),
         label: Some(format!("{}@{} (shared)", instance.name, instance.version)),
@@ -43,21 +94,26 @@ pub fn synthesize_service(root: &Path, instance: &SharedInstance) -> Result<Serv
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
                 command: ServiceCommand {
-                    command: render_command(&instance.recipe.run, &vars),
+                    command: render_command_checked(&instance.recipe.run, &vars, "run")?,
                     // The data dir as cwd: recipe binaries write their state under {dataDir}.
                     cwd: instance.data_dir(root).display().to_string(),
                     environment,
                     container_name: None,
-                    docker_stop_command: instance.recipe.stop.as_ref().map(|s| render_command(s, &vars)),
+                    docker_stop_command: instance
+                        .recipe
+                        .stop
+                        .as_ref()
+                        .map(|spec| render_command_checked(spec, &vars, "stop"))
+                        .transpose()?,
                 },
                 readiness,
-                readiness_timeout_ms: None,
+                readiness_timeout_ms: Some(SHARED_INSTANCE_READINESS_TIMEOUT_MS),
                 preparation: None,
-                preparation_command: None,
+                preparation_command,
             },
             build: None,
         },
-        ports: Some(vec![ServicePort { port: instance.port, label: "shared".to_string(), requires_running: None }]),
+        ports: Some(ports),
         urls: None,
     })
 }
@@ -82,14 +138,35 @@ pub fn project_service_entry(id: ServiceId, instance: &str, exe: &Path) -> Servi
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
                 command: ServiceCommand {
-                    command: CommandSpec::Argv { argv: vec![exe.clone(), "shared".to_string(), "attach".to_string(), instance.to_string()] },
+                    command: CommandSpec::Argv {
+                        argv: vec![
+                            exe.clone(),
+                            "shared".to_string(),
+                            "attach".to_string(),
+                            instance.to_string(),
+                        ],
+                    },
                     cwd: ".".to_string(),
                     environment: None,
                     container_name: None,
-                    docker_stop_command: Some(CommandSpec::Argv { argv: vec![exe.clone(), "shared".to_string(), "detach".to_string(), instance.to_string()] }),
+                    docker_stop_command: Some(CommandSpec::Argv {
+                        argv: vec![
+                            exe.clone(),
+                            "shared".to_string(),
+                            "detach".to_string(),
+                            instance.to_string(),
+                        ],
+                    }),
                 },
                 readiness: ReadinessSpec::Command {
-                    command: CommandSpec::Argv { argv: vec![exe, "shared".to_string(), "probe".to_string(), instance.to_string()] },
+                    command: CommandSpec::Argv {
+                        argv: vec![
+                            exe,
+                            "shared".to_string(),
+                            "probe".to_string(),
+                            instance.to_string(),
+                        ],
+                    },
                     cwd: None,
                 },
                 readiness_timeout_ms: Some(SHARED_READINESS_TIMEOUT_MS),
@@ -100,5 +177,122 @@ pub fn project_service_entry(id: ServiceId, instance: &str, exe: &Path) -> Servi
         },
         ports: None,
         urls: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::registry::InstallState;
+    use crate::shared::remote::{SharedArtifact, SharedRecipe};
+    use std::collections::{BTreeMap, HashMap};
+
+    fn instance(extra: Vec<u16>) -> SharedInstance {
+        SharedInstance {
+            name: "minio".to_string(),
+            version: "1".to_string(),
+            port: 43110,
+            extra_ports: extra,
+            install_state: InstallState::Installed,
+            install_error: None,
+            recipe: SharedRecipe {
+                artifacts: HashMap::from([(
+                    "darwin-arm64".to_string(),
+                    SharedArtifact {
+                        url: Some("file:///x".to_string()),
+                        sha256: "abc".to_string(),
+                        script: None,
+                        script_args: vec![],
+                    },
+                )]),
+                run: CommandSpec::Argv {
+                    argv: vec![
+                        "{installDir}/bin/minio".to_string(),
+                        "--address".to_string(),
+                        "127.0.0.1:{port}".to_string(),
+                        "--console-address".to_string(),
+                        "127.0.0.1:{port2}".to_string(),
+                    ],
+                },
+                stop: None,
+                readiness: ReadinessSpec::Http {
+                    url: "http://127.0.0.1:{port}/minio/health/live".to_string(),
+                },
+                provision: vec![],
+                deprovision: vec![],
+                connection: None,
+                env: Some(HashMap::from([(
+                    "MINIO_ROOT_USER".to_string(),
+                    "hearth".to_string(),
+                )])),
+                prepare: Some(CommandSpec::Argv {
+                    argv: vec![
+                        "{installDir}/bin/hearth-prepare".to_string(),
+                        "{dataDir}".to_string(),
+                        "{port}".to_string(),
+                    ],
+                }),
+                additional_ports: 1,
+                extra_port_labels: vec!["console".to_string()],
+            },
+            attachments: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn maps_prepare_and_the_extra_port() {
+        let service = synthesize_service(Path::new("/shared"), &instance(vec![43111])).unwrap();
+        let ServiceRunProfile::Verified {
+            command,
+            preparation_command,
+            readiness,
+            readiness_timeout_ms,
+            ..
+        } = &service.profiles.run
+        else {
+            panic!("shared instance must be a verified run profile")
+        };
+        let CommandSpec::Argv { argv } = &command.command else {
+            panic!("argv run")
+        };
+        assert_eq!(argv[2], "127.0.0.1:43110");
+        assert_eq!(argv[4], "127.0.0.1:43111");
+        let PreparationCommand {
+            command: prepare, ..
+        } = preparation_command.as_ref().expect("prepare mapped");
+        let CommandSpec::Argv { argv: prepare_argv } = prepare else {
+            panic!("argv prepare")
+        };
+        assert_eq!(
+            prepare_argv[0],
+            "/shared/installs/minio/1/bin/hearth-prepare"
+        );
+        assert_eq!(prepare_argv[1], "/shared/instances/minio@1");
+        assert!(
+            matches!(readiness, ReadinessSpec::Http { url } if url == "http://127.0.0.1:43110/minio/health/live")
+        );
+        assert_eq!(
+            *readiness_timeout_ms,
+            Some(SHARED_INSTANCE_READINESS_TIMEOUT_MS)
+        );
+        assert_eq!(
+            command
+                .environment
+                .as_ref()
+                .unwrap()
+                .get("MINIO_ROOT_USER")
+                .map(String::as_str),
+            Some("hearth")
+        );
+        let ports = service.ports.as_ref().expect("ports");
+        assert_eq!(ports[0].port, 43110);
+        assert_eq!(ports[1].label, "console");
+        assert_eq!(ports[1].port, 43111);
+    }
+
+    #[test]
+    fn rejects_port2_when_no_extra_port_was_reserved() {
+        let err = synthesize_service(Path::new("/shared"), &instance(vec![])).unwrap_err();
+        assert!(err.0.contains("{port2}"), "{err}");
     }
 }

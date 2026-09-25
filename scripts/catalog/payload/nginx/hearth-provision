@@ -1,0 +1,19 @@
+#!/bin/bash
+# One path prefix per project on the shared listener. The snippet stays after detach so files
+# dropped in www/ are not deleted out from under the user. Reload keeps the master pid.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DATA="$1"
+PROJECT="$5"
+WWW="$DATA/www/$PROJECT"
+mkdir -p "$WWW" "$DATA/conf.d"
+if [[ ! -f "$WWW/index.html" ]]; then
+  printf 'hearth nginx %s\n' "$PROJECT" > "$WWW/index.html"
+fi
+cat > "$DATA/conf.d/${PROJECT}.conf" <<EOF
+location /${PROJECT}/ {
+    alias ${WWW}/;
+    index index.html;
+}
+EOF
+"$ROOT/bin/nginx" -p "$DATA" -c "$DATA/nginx.conf" -s reload

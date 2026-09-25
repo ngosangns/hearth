@@ -1,0 +1,16 @@
+#!/bin/bash
+# Rewrite redis.conf on every start. The supervised process is redis-server itself;
+# this script only runs as preparation and must stay idempotent.
+set -euo pipefail
+DATA="$1"
+PORT="$2"
+cat > "$DATA/redis.conf" <<EOF
+bind 127.0.0.1
+port ${PORT}
+daemonize no
+protected-mode yes
+dir ${DATA}
+appendonly yes
+save ""
+logfile ""
+EOF

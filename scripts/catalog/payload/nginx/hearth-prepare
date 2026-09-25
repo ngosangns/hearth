@@ -1,0 +1,42 @@
+#!/bin/bash
+# Rewrite the main config every start so the listen port stays the allocated one.
+# conf.d snippets created by provision are left in place.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DATA="$1"
+PORT="$2"
+mkdir -p "$DATA/conf.d" "$DATA/www" "$DATA/logs" "$DATA/temp/client_body" "$DATA/temp/proxy" \
+  "$DATA/temp/fastcgi" "$DATA/temp/uwsgi" "$DATA/temp/scgi"
+if [[ ! -f "$DATA/conf.d/00-empty.conf" ]]; then
+  printf '# hearth\n' > "$DATA/conf.d/00-empty.conf"
+fi
+cat > "$DATA/nginx.conf" <<EOF
+worker_processes 1;
+daemon off;
+error_log stderr info;
+pid ${DATA}/nginx.pid;
+
+events { worker_connections 64; }
+
+http {
+    include ${ROOT}/conf/mime.types;
+    default_type application/octet-stream;
+    access_log off;
+    sendfile on;
+    client_body_temp_path ${DATA}/temp/client_body;
+    proxy_temp_path ${DATA}/temp/proxy;
+    fastcgi_temp_path ${DATA}/temp/fastcgi;
+    uwsgi_temp_path ${DATA}/temp/uwsgi;
+    scgi_temp_path ${DATA}/temp/scgi;
+
+    server {
+        listen 127.0.0.1:${PORT};
+        server_name _;
+        location = /healthz {
+            default_type text/plain;
+            return 200 "ok\\n";
+        }
+        include ${DATA}/conf.d/*.conf;
+    }
+}
+EOF

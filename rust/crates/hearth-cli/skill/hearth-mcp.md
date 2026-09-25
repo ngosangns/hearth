@@ -32,14 +32,17 @@ install customized `--name`, or the server's own `tool_prefix` differs):
 
 ## Shared services (`shared:` in hearth.yaml)
 
-A `shared:` block registers machine-global singletons (e.g. `postgres: "16.4"`) managed by a
-separate daemon (`smp`), shared across every repo that registers the same `name@version`. They show
-up as ordinary `infrastructure` services — start them with `manage` like any other service; the
-first start installs the service into `~/.hearth/shared` and may take a while. **Connection info is
-not injected into env**: after the service is `ready`, call `local_services_shared_connection` with
-the service id (`postgres`) or instance id (`postgres@16.4`) and wire the returned `connection`
-(`url`/`env`) into the app's own config. Each project gets its own logical resources (database,
-user) inside the shared instance — do not hand-edit shared data for another project.
+A `shared:` block registers machine-global singletons managed by a separate daemon (`smp`), shared
+across every repo that registers the same `name@version`. The shipped catalog is `redis`, `mongodb`,
+`minio`, `nginx`, and `kafka` (exact versions live in the repo `catalog.json`). They show up as
+ordinary `infrastructure` services — start them with `manage` like any other service; the first
+start installs the service into `~/.hearth/shared` and may take a while. **Connection info is not
+injected into env**: after the service is `ready`, call `local_services_shared_connection` with the
+service id (`redis`) or instance id (`redis@8.2.10`) and wire the returned `connection` (`url`/`env`)
+into the app's own config. Mongo, nginx, and Kafka provision a per-project resource named
+`h_<projectId>` (database, path prefix, topic). MinIO's bucket is `h-<projectId>` because S3 names
+reject underscores. Redis is one shared DB 0. Detach does not delete that data. Do not hand-edit
+shared data for another project.
 
 `status`/`logs`/`trace`/`events` are always safe to call for diagnosis — use them freely. Only
 call `manage` when the user has explicitly asked for that lifecycle action; never call it

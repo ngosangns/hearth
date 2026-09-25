@@ -23,12 +23,17 @@ pub mod render;
 pub mod synthesize;
 
 pub use registry::{InstallState, SharedAttachment, SharedInstance, SharedRegistry};
-pub use remote::{RemoteCatalog, SharedArtifact, SharedCatalogDocument, SharedConnection, SharedRecipe, SharedServiceFamily};
+pub use remote::{
+    RemoteCatalog, SharedArtifact, SharedCatalogDocument, SharedConnection, SharedRecipe,
+    SharedServiceFamily,
+};
 
 /// The smp daemon's root directory: `~/.hearth/shared`. Unlike project daemons this root contains
 /// no `hearth.yaml` — the manager's catalog is synthesized from `registry.json` instead.
 pub fn shared_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
     home.join(".hearth").join("shared")
 }
 
@@ -44,7 +49,8 @@ pub const SHARED_PORT_RANGE_SIZE: u16 = 900;
 
 /// The pinned remote registry. HTTPS is the trust boundary — tarball sha256s live in this file,
 /// so a signed/forked copy would defeat them anyway.
-pub const SHARED_CATALOG_URL: &str = "https://raw.githubusercontent.com/ngosangns/hearth/main/catalog.json";
+pub const SHARED_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/ngosangns/hearth/main/catalog.json";
 
 /// v1 supports exactly one artifact platform.
 pub const SHARED_ARTIFACT_PLATFORM: &str = "darwin-arm64";
@@ -87,6 +93,10 @@ pub fn project_db_name(project: &str) -> String {
 pub fn project_user_name(project: &str) -> String {
     format!("u_{project}")
 }
+/// S3 bucket names reject `_`. Same identity as `{projectDb}`, with a hyphen so MinIO accepts it.
+pub fn project_bucket_name(project: &str) -> String {
+    format!("h-{project}")
+}
 
 /// Everything the smp daemon's HTTP handlers need that isn't already on `HearthManager`: the
 /// instance registry, the remote catalog client, and per-instance serialization for
@@ -103,7 +113,8 @@ pub struct SharedContext {
 impl SharedContext {
     pub fn open(root: PathBuf, catalog_url: Option<String>) -> Result<Arc<Self>, SharedError> {
         let io: Arc<dyn FileIo> = Arc::from(create_file_io(true));
-        io.ensure_directory(&root).map_err(|e| SharedError(e.to_string()))?;
+        io.ensure_directory(&root)
+            .map_err(|e| SharedError(e.to_string()))?;
         let registry = SharedRegistry::load(io.clone(), &root)?;
         Ok(Arc::new(Self {
             remote: Arc::new(RemoteCatalog::new(&root, catalog_url)),

@@ -58,7 +58,10 @@ itself is trusted on TLS alone — fetching anywhere else is not supported.
       "versions": {
         "16.4": {
           "artifacts": {
-            "darwin-arm64": { "url": "https://github.com/ngosangns/hearth/releases/download/catalog-v1/postgres-16.4-darwin-arm64.tar.gz", "sha256": "…" }
+            "darwin-arm64": {
+              "url": "https://example.com/postgres-16.4-darwin-arm64.tar.gz",
+              "sha256": "…"
+            }
           },
           "run":       { "argv": ["{installDir}/bin/postgres", "-D", "{dataDir}", "-p", "{port}"] },
           "stop":      { "argv": ["{installDir}/bin/pg_ctl", "-D", "{dataDir}", "stop", "-m", "fast"] },
@@ -74,14 +77,63 @@ itself is trusted on TLS alone — fetching anywhere else is not supported.
 }
 ```
 
-Template vars: `{installDir}`, `{dataDir}`, `{port}`, `{projectId}`, `{projectDb}`, `{projectUser}`.
-`file://` artifact URLs are accepted (tests/local fixtures).
+An artifact sets **one** of:
+
+- `url` — a tarball that already exists (`https://…` or `file://` in tests). The daemon downloads it.
+- `script` — a path relative to this catalog file (`scripts/catalog/pack.sh`) plus optional
+  `scriptArgs`. The daemon runs `bash <script> <scriptArgs...> <out.tar.gz>`. The script does the
+  packaging; the daemon does not invent an archive layout of its own. A remote catalog resolves the
+  path next to `catalog.json` and downloads that script. The script is given `HEARTH_CATALOG_ORIGIN`
+  so it can pull sibling files from the same place.
+
+`sha256` is the digest of the tarball either source produced. `file://` artifact URLs are accepted
+for tests.
+
+Template vars: `{installDir}`, `{dataDir}`, `{port}`, `{port2}`…, `{projectId}`, `{projectDb}`,
+`{projectUser}`, `{projectBucket}`. `{port2}` exists only when the recipe sets `additionalPorts`.
+`{projectBucket}` is `h-<projectId>` — the S3-safe form of `{projectDb}`.
+
+Optional recipe fields beyond the example above:
+
+- `prepare` — one command, run before every start (supervisor `preparation_command`). Idempotent.
+  First-boot work (write a config, `kafka-storage format`) goes here. `run` stays the real server
+  binary, because that is the command line `ps` must keep showing.
+- `additionalPorts` — extra listeners reserved as one contiguous block after `{port}`. MinIO uses
+  one for the console (`{port2}`); Kafka uses one for the KRaft controller.
+- `extraPortLabels` — display labels for those ports, in order.
+
+`deprovision` is left empty for the shipped recipes: detach drops the attachment and leaves the
+database, bucket, topic, or nginx snippet in place.
+
+## Shipped recipes
+
+MongoDB's artifact is the official `fastdl.mongodb.org` tarball (`url`). Redis, MinIO, Nginx, and
+Kafka are `script` entries: `scripts/catalog/pack.sh` builds the tarball, because those publishers
+do not ship a darwin-arm64 archive in the layout the recipe runs. Versions and sha256 live in
+`catalog.json`.
+Every listener is `127.0.0.1`. There is no per-project auth; MinIO's root credentials are the fixed
+dev pair `hearth` / `hearth-local-dev`.
+
+| Service | What `start` provisions | Connection |
+|---|---|---|
+| redis | nothing — every project shares DB 0 | `redis://127.0.0.1:{port}/0` |
+| mongodb | database name `h_<projectId>` (created on first use; the official tarball has no shell) | `mongodb://127.0.0.1:{port}/{projectDb}` |
+| minio | bucket `h-<projectId>` (hyphen: S3 names reject `_`); API on `{port}`, console on `{port2}` | `http://127.0.0.1:{port}` plus `S3_*` / `AWS_*` env |
+| nginx | `location /<projectId>/` on the shared listener, static files under the instance data dir | `http://127.0.0.1:{port}/{projectId}/` |
+| kafka | topic `h_<projectId>` on a single KRaft broker; controller on `{port2}` | `127.0.0.1:{port}` plus `KAFKA_BROKERS` / `KAFKA_TOPIC` |
+
+Kafka's tarball bundles a Temurin 21 JRE, so the broker does not need `java` on `PATH`. Nginx is
+built from the stable source with vendored PCRE2 and zlib. Redis is built from the upstream tag.
+MongoDB is the official darwin-arm64 server tarball plus mongosh. MinIO and `mc` are built from
+their pinned release tags (`CGO_ENABLED=0`), not downloaded from `dl.min.io`.
 
 ## Port allocation
 
 `base = 43100 + sha256(name@version)[..8] mod 900`. At instance registration, if `base` is taken by
 another registry entry or a live listener, probe `base+1…` (wrapping inside the range); the winner
-is persisted in `registry.json`. Deterministic-first keeps the common case stateless.
+is persisted in `registry.json`. A recipe with `additionalPorts: N` takes a contiguous block of
+`1+N` ports that does not wrap off the end of the range; every port in the block counts as taken.
+Deterministic-first keeps the common case stateless.
 
 ## Project side
 

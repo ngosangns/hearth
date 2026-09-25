@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="$1"
+export JAVA_HOME="$ROOT/jre"
+export PATH="$JAVA_HOME/bin:$PATH"
+export KAFKA_HEAP_OPTS="-Xms64M -Xmx256M"
+exec "$ROOT/kafka/bin/kafka-broker-api-versions.sh" --bootstrap-server "127.0.0.1:${PORT}"

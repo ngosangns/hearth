@@ -1,5 +1,245 @@
 {
   "version": 1,
-  "_comment": "Shared-services registry served to smp daemons over HTTPS (see docs/shared-services.md). Each entry: artifacts per platform (darwin-arm64 only for now), run/readiness/stop command templates with {installDir}/{dataDir}/{port}, optional per-project provision/deprovision steps with {projectId}/{projectDb}/{projectUser}, and a connection template returned to attaching projects.",
-  "services": {}
+  "_comment": "Shared-services registry (see docs/shared-services.md). Each darwin-arm64 artifact sets exactly one of url (a tarball that already exists on the internet) or script (a path relative to this file that writes the tarball). sha256 is of that tarball.",
+  "services": {
+    "redis": {
+      "versions": {
+        "8.2.10": {
+          "artifacts": {
+            "darwin-arm64": {
+              "script": "scripts/catalog/pack.sh",
+              "scriptArgs": ["redis"],
+              "sha256": "795d4aabfc75b745e462a3e14fb3564c1e045ab53690f17cc38558c74a69dafa"
+            }
+          },
+          "prepare": {
+            "argv": [
+              "{installDir}/bin/hearth-prepare",
+              "{dataDir}",
+              "{port}"
+            ]
+          },
+          "run": {
+            "argv": [
+              "{installDir}/bin/redis-server",
+              "{dataDir}/redis.conf"
+            ]
+          },
+          "readiness": {
+            "kind": "command",
+            "command": {
+              "argv": [
+                "{installDir}/bin/hearth-ready",
+                "{port}"
+              ]
+            }
+          },
+          "connection": {
+            "url": "redis://127.0.0.1:{port}/0",
+            "env": {
+              "REDIS_URL": "{url}"
+            }
+          }
+        }
+      }
+    },
+    "mongodb": {
+      "versions": {
+        "8.0.32": {
+          "artifacts": {
+            "darwin-arm64": {
+              "url": "https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.0.32.tgz",
+              "sha256": "f81cb258434d548dca7244d599c82eb339043d8dedd0b1b807870c9d263117f2"
+            }
+          },
+          "run": {
+            "argv": [
+              "{installDir}/bin/mongod",
+              "--bind_ip",
+              "127.0.0.1",
+              "--port",
+              "{port}",
+              "--dbpath",
+              "{dataDir}",
+              "--nounixsocket"
+            ]
+          },
+          "readiness": {
+            "kind": "command",
+            "command": {
+              "shell": "perl -e 'use IO::Socket::INET; my $p = shift; exit(IO::Socket::INET->new(PeerAddr => \"127.0.0.1:$p\", Timeout => 1) ? 0 : 1)' {port}"
+            }
+          },
+          "connection": {
+            "url": "mongodb://127.0.0.1:{port}/{projectDb}",
+            "env": {
+              "MONGODB_URI": "{url}"
+            }
+          }
+        }
+      }
+    },
+    "minio": {
+      "versions": {
+        "RELEASE.2025-10-15T17-29-55Z": {
+          "artifacts": {
+            "darwin-arm64": {
+              "script": "scripts/catalog/pack.sh",
+              "scriptArgs": ["minio"],
+              "sha256": "8ceb91cd2888f9f8b49a9a7409dd2548d703260c689eb77847761ccd44553cbd"
+            }
+          },
+          "additionalPorts": 1,
+          "extraPortLabels": [
+            "console"
+          ],
+          "env": {
+            "MINIO_ROOT_USER": "hearth",
+            "MINIO_ROOT_PASSWORD": "hearth-local-dev"
+          },
+          "run": {
+            "argv": [
+              "{installDir}/bin/minio",
+              "server",
+              "{dataDir}",
+              "--address",
+              "127.0.0.1:{port}",
+              "--console-address",
+              "127.0.0.1:{port2}"
+            ]
+          },
+          "readiness": {
+            "kind": "http",
+            "url": "http://127.0.0.1:{port}/minio/health/live"
+          },
+          "provision": [
+            {
+              "argv": [
+                "{installDir}/bin/hearth-provision",
+                "{dataDir}",
+                "{port}",
+                "{projectBucket}",
+                "{projectUser}",
+                "{projectId}"
+              ]
+            }
+          ],
+          "connection": {
+            "url": "http://127.0.0.1:{port}",
+            "env": {
+              "S3_ENDPOINT": "{url}",
+              "S3_BUCKET": "{projectBucket}",
+              "AWS_ACCESS_KEY_ID": "hearth",
+              "AWS_SECRET_ACCESS_KEY": "hearth-local-dev",
+              "AWS_REGION": "us-east-1",
+              "S3_FORCE_PATH_STYLE": "true",
+              "MINIO_CONSOLE_URL": "http://127.0.0.1:{port2}"
+            }
+          }
+        }
+      }
+    },
+    "nginx": {
+      "versions": {
+        "1.30.5": {
+          "artifacts": {
+            "darwin-arm64": {
+              "script": "scripts/catalog/pack.sh",
+              "scriptArgs": ["nginx"],
+              "sha256": "7f2d347ff9afbf8903265d942c85f7869c3e1c67fae0fefb92b6b8eeb7a18124"
+            }
+          },
+          "prepare": {
+            "argv": [
+              "{installDir}/bin/hearth-prepare",
+              "{dataDir}",
+              "{port}"
+            ]
+          },
+          "run": {
+            "shell": "exec {installDir}/bin/nginx -p {dataDir} -c {dataDir}/nginx.conf",
+            "exec": true
+          },
+          "readiness": {
+            "kind": "http",
+            "url": "http://127.0.0.1:{port}/healthz"
+          },
+          "provision": [
+            {
+              "argv": [
+                "{installDir}/bin/hearth-provision",
+                "{dataDir}",
+                "{port}",
+                "{projectDb}",
+                "{projectUser}",
+                "{projectId}"
+              ]
+            }
+          ],
+          "connection": {
+            "url": "http://127.0.0.1:{port}/{projectId}/"
+          }
+        }
+      }
+    },
+    "kafka": {
+      "versions": {
+        "4.3.1": {
+          "artifacts": {
+            "darwin-arm64": {
+              "script": "scripts/catalog/pack.sh",
+              "scriptArgs": ["kafka"],
+              "sha256": "a2449517e5834a3c8cc89f8348b462905bb404d879d6345c7039a9c2f51f3122"
+            }
+          },
+          "additionalPorts": 1,
+          "extraPortLabels": [
+            "controller"
+          ],
+          "prepare": {
+            "argv": [
+              "{installDir}/bin/hearth-prepare",
+              "{dataDir}",
+              "{port}",
+              "{port2}"
+            ]
+          },
+          "run": {
+            "argv": [
+              "{installDir}/jre/bin/java",
+              "@{dataDir}/jvm.args"
+            ]
+          },
+          "readiness": {
+            "kind": "command",
+            "command": {
+              "argv": [
+                "{installDir}/bin/hearth-ready",
+                "{port}"
+              ]
+            }
+          },
+          "provision": [
+            {
+              "argv": [
+                "{installDir}/bin/hearth-provision",
+                "{dataDir}",
+                "{port}",
+                "{projectDb}",
+                "{projectUser}",
+                "{projectId}"
+              ]
+            }
+          ],
+          "connection": {
+            "url": "127.0.0.1:{port}",
+            "env": {
+              "KAFKA_BROKERS": "{url}",
+              "KAFKA_TOPIC": "{projectDb}"
+            }
+          }
+        }
+      }
+    }
+  }
 }

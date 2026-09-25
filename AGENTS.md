@@ -160,10 +160,18 @@ from any dev box here, with the same username.
   from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
-  `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance.
+  `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance. A recipe's
+  `additionalPorts` reserves that many extra ports in one contiguous block (`{port2}`, …); every
+  port in the block is taken. `prepare` is the idempotent init hook (runs before every start via
+  `preparation_command`). `run` must stay the process `ps` keeps showing. A wrapper that does work
+  and then `exec`s is adopted as the wrapper and orphaned once the real server replaces it. A
+  server that rewrites its own title (nginx's `nginx: master process …`) has to be started with
+  `shell` + `exec: true` so the stored identity is that settled line, not the pre-title argv.
+  `{projectBucket}` is `h-<projectId>` — S3 bucket names reject the underscore in `{projectDb}`.
 - Install = tarball + sha256 into `installs/<name>/<version>` (atomic rename; `.hearth-installed`
-  marker last). Recipe snapshots live in `registry.json`, so installed instances survive upstream
-  removal from `catalog.json`. `catalog.json` at the repo root is the registry the pinned
+  marker last). The catalog artifact is either a `url` (download that archive) or a `script`
+  (run it to write the archive). Recipe snapshots live in `registry.json`, so installed instances
+  survive upstream removal from `catalog.json`. `catalog.json` at the repo root is the registry the pinned
   `SHARED_CATALOG_URL` serves; `HEARTH_SHARED_CATALOG_URL` overrides it for dev/tests (`file://`
   works for both the catalog and artifact URLs).
 - `POST /v1/shared/attach` blocks through install+start+provision — clients must not use the 10s

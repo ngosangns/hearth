@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PORT="$1"
+exec "$ROOT/bin/redis-cli" -h 127.0.0.1 -p "$PORT" ping

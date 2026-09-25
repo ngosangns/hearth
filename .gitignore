@@ -5,3 +5,4 @@ node_modules/
 apps/macos/.build/
 apps/macos/.swiftpm/
 rust/target/
+/dist/

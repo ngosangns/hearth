@@ -9,14 +9,14 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::Response;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
 
 use crate::shared::install::ensure_installed;
-use crate::shared::ports::allocate_port;
+use crate::shared::ports::{allocate_ports, MAX_SHARED_PORTS};
 use crate::shared::registry::{InstallState, SharedAttachment, SharedInstance};
 use crate::shared::render::{instance_vars, project_vars, render_command, render_connection};
 use crate::shared::synthesize::synthesize_catalog;
@@ -38,7 +38,13 @@ pub fn shared_routes() -> Router<Arc<HearthManager>> {
 }
 
 fn shared_ctx(manager: &HearthManager) -> HttpResult<Arc<SharedContext>> {
-    manager.shared.clone().ok_or_else(|| ManagerHttpError::new(StatusCode::NOT_FOUND, "not_shared", "This daemon does not manage shared services"))
+    manager.shared.clone().ok_or_else(|| {
+        ManagerHttpError::new(
+            StatusCode::NOT_FOUND,
+            "not_shared",
+            "This daemon does not manage shared services",
+        )
+    })
 }
 
 fn shared_err(e: SharedError) -> ManagerHttpError {
@@ -46,7 +52,10 @@ fn shared_err(e: SharedError) -> ManagerHttpError {
 }
 
 fn now() -> String {
-    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     crate::supervisor::types::format_iso8601_millis(millis)
 }
 
@@ -55,10 +64,18 @@ fn now() -> String {
 fn parse_instance_id(value: &Value) -> HttpResult<(String, String)> {
     let raw = value.as_str().unwrap_or("");
     let Some((name, version)) = raw.split_once('@') else {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_service", "service must be <name>@<version>"));
+        return Err(ManagerHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_service",
+            "service must be <name>@<version>",
+        ));
     };
     if name.is_empty() || version.is_empty() || version.contains('@') {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_service", "service must be <name>@<version>"));
+        return Err(ManagerHttpError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_service",
+            "service must be <name>@<version>",
+        ));
     }
     Ok((name.to_string(), version.to_string()))
 }
@@ -75,7 +92,12 @@ async fn get_shared(State(manager): State<Arc<HearthManager>>) -> Response {
     let states: HashMap<String, Value> = manager
         .service_states()
         .into_iter()
-        .map(|s| (s.service_id.clone(), json!({ "actualState": s.actual_state.as_wire_str(), "readiness": s.readiness })))
+        .map(|s| {
+            (
+                s.service_id.clone(),
+                json!({ "actualState": s.actual_state.as_wire_str(), "readiness": s.readiness }),
+            )
+        })
         .collect();
     let instances: Vec<Value> = ctx
         .registry
@@ -88,6 +110,7 @@ async fn get_shared(State(manager): State<Arc<HearthManager>>) -> Response {
                 "name": i.name,
                 "version": i.version,
                 "port": i.port,
+                "extraPorts": i.extra_ports,
                 "installState": i.install_state.as_wire_str(),
                 "installError": i.install_error,
                 "state": states.get(&id).cloned().unwrap_or(Value::Null),
@@ -148,7 +171,10 @@ async fn post_shared_install(State(manager): State<Arc<HearthManager>>, bytes: B
         Err(e) => return e.into_response(),
     };
     match ensure_registered_and_installed(&manager, &ctx, &name, &version).await {
-        Ok(instance) => json_response(json!({ "service": instance.id(), "port": instance.port, "installState": instance.install_state.as_wire_str() }), StatusCode::OK),
+        Ok(instance) => json_response(
+            json!({ "service": instance.id(), "port": instance.port, "installState": instance.install_state.as_wire_str() }),
+            StatusCode::OK,
+        ),
         Err(e) => e.into_response(),
     }
 }
@@ -170,7 +196,12 @@ async fn post_shared_remove(State(manager): State<Arc<HearthManager>>, bytes: By
     let lock = ctx.instance_lock(&id);
     let _lock = lock.lock().await;
     let Some(instance) = ctx.registry.get(&id) else {
-        return ManagerHttpError::new(StatusCode::NOT_FOUND, "unknown_shared_service", format!("{id} is not registered")).into_response();
+        return ManagerHttpError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_shared_service",
+            format!("{id} is not registered"),
+        )
+        .into_response();
     };
     if let Err(e) = manager.supervisor().stop(&id, None).await {
         return shared_err(SharedError(e.0)).into_response();
@@ -193,27 +224,64 @@ async fn post_shared_remove(State(manager): State<Arc<HearthManager>>, bytes: By
 /// Re-synthesizes smp's catalog from the registry and swaps it in — `reload_catalog` handles
 /// stopping removed-but-active services with the old catalog, so this is the only mutation path
 /// for smp's service set.
-async fn sync_catalog(manager: &Arc<HearthManager>, ctx: &SharedContext) -> Result<(), SharedError> {
+async fn sync_catalog(
+    manager: &Arc<HearthManager>,
+    ctx: &SharedContext,
+) -> Result<(), SharedError> {
     let catalog = synthesize_catalog(&ctx.root, &ctx.registry.list())?;
-    manager.reload_catalog(catalog).await.map(|_| ()).map_err(|errors| SharedError(errors.join("; ")))
+    manager
+        .reload_catalog(catalog)
+        .await
+        .map(|_| ())
+        .map_err(|errors| SharedError(errors.join("; ")))
 }
 
 /// Registers `name@version` in the registry if absent (fetching the remote recipe + allocating a
 /// port), ensures it is installed, and makes sure the running catalog knows the service. Returns
 /// the registry row; the caller holds the instance lock.
-async fn ensure_registered_and_installed(manager: &Arc<HearthManager>, ctx: &Arc<SharedContext>, name: &str, version: &str) -> HttpResult<SharedInstance> {
+async fn ensure_registered_and_installed(
+    manager: &Arc<HearthManager>,
+    ctx: &Arc<SharedContext>,
+    name: &str,
+    version: &str,
+) -> HttpResult<SharedInstance> {
     let id = crate::shared::instance_id(name, version);
     let instance = match ctx.registry.get(&id) {
         Some(instance) => instance,
         None => {
-            let document = ctx.remote.load(true).await.map_err(|e| ManagerHttpError::new(StatusCode::BAD_GATEWAY, "catalog_unavailable", e.0.clone()))?;
+            let document = ctx.remote.load(true).await.map_err(|e| {
+                ManagerHttpError::new(StatusCode::BAD_GATEWAY, "catalog_unavailable", e.0.clone())
+            })?;
             let Some(recipe) = document.recipe(name, version).cloned() else {
-                return Err(ManagerHttpError::new(StatusCode::NOT_FOUND, "unknown_shared_service", format!("{id} is not in the shared catalog")));
+                return Err(ManagerHttpError::new(
+                    StatusCode::NOT_FOUND,
+                    "unknown_shared_service",
+                    format!("{id} is not in the shared catalog"),
+                ));
             };
-            let taken: HashSet<u16> = ctx.registry.list().iter().map(|i| i.port).collect();
-            let port = allocate_port(&id, &taken)
-                .await
-                .ok_or_else(|| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "no_free_port", "no free port in the shared range"))?;
+            let count = recipe.additional_ports.saturating_add(1);
+            if count > MAX_SHARED_PORTS {
+                return Err(ManagerHttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "too_many_ports",
+                    format!("{id} asks for {count} ports; the maximum is {MAX_SHARED_PORTS}"),
+                ));
+            }
+            let taken: HashSet<u16> = ctx
+                .registry
+                .list()
+                .iter()
+                .flat_map(|i| i.all_ports())
+                .collect();
+            let ports = allocate_ports(&id, count, &taken).await.ok_or_else(|| {
+                ManagerHttpError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "no_free_port",
+                    "no free port block in the shared range",
+                )
+            })?;
+            let port = ports[0];
+            let extra_ports = ports[1..].to_vec();
             ctx.registry
                 .update(|data| {
                     data.instances.insert(
@@ -222,6 +290,7 @@ async fn ensure_registered_and_installed(manager: &Arc<HearthManager>, ctx: &Arc
                             name: name.to_string(),
                             version: version.to_string(),
                             port,
+                            extra_ports,
                             install_state: InstallState::Pending,
                             install_error: None,
                             recipe,
@@ -259,15 +328,22 @@ async fn ensure_registered_and_installed(manager: &Arc<HearthManager>, ctx: &Arc
         .map_err(shared_err)?;
     manager.events.publish(
         "shared.install",
-        json!({ "service": id, "installState": "installing" }).as_object().unwrap().clone(),
+        json!({ "service": id, "installState": "installing" })
+            .as_object()
+            .unwrap()
+            .clone(),
     );
     let progress = {
         let manager = manager.clone();
         let id = id.clone();
         move |line: &str| {
-            manager
-                .events
-                .publish("shared.install", json!({ "service": id, "installState": "installing", "message": line }).as_object().unwrap().clone());
+            manager.events.publish(
+                "shared.install",
+                json!({ "service": id, "installState": "installing", "message": line })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
         }
     };
     match ensure_installed(ctx, &instance, progress).await {
@@ -280,9 +356,13 @@ async fn ensure_registered_and_installed(manager: &Arc<HearthManager>, ctx: &Arc
                     }
                 })
                 .map_err(shared_err)?;
-            manager
-                .events
-                .publish("shared.install", json!({ "service": id, "installState": "installed" }).as_object().unwrap().clone());
+            manager.events.publish(
+                "shared.install",
+                json!({ "service": id, "installState": "installed" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
             Ok(ctx.registry.get(&id).expect("just installed"))
         }
         Err(error) => {
@@ -294,32 +374,50 @@ async fn ensure_registered_and_installed(manager: &Arc<HearthManager>, ctx: &Arc
                     }
                 })
                 .map_err(shared_err)?;
-            manager
-                .events
-                .publish("shared.install", json!({ "service": id, "installState": "failed", "message": error.0 }).as_object().unwrap().clone());
-            Err(ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "install_failed", error.0))
+            manager.events.publish(
+                "shared.install",
+                json!({ "service": id, "installState": "failed", "message": error.0 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            Err(ManagerHttpError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "install_failed",
+                error.0,
+            ))
         }
     }
 }
 
 async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResult<Value> {
     if manager.closing.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
+        return Err(ManagerHttpError::new(
+            StatusCode::CONFLICT,
+            "manager_closing",
+            "Manager is shutting down",
+        ));
     }
     let ctx = shared_ctx(manager)?;
-    let body = strict_body(bytes, &["requestId", "service", "projectRoot"], &["service"])?;
+    let body = strict_body(
+        bytes,
+        &["requestId", "service", "projectRoot"],
+        &["service"],
+    )?;
     let (name, version) = parse_instance_id(body.get("service").unwrap_or(&Value::Null))?;
     let id = crate::shared::instance_id(&name, &version);
-    let project_root = body
-        .get("projectRoot")
-        .and_then(Value::as_str)
-        .map(|s| PathBuf::from(s).canonicalize().unwrap_or_else(|_| PathBuf::from(s)));
+    let project_root = body.get("projectRoot").and_then(Value::as_str).map(|s| {
+        PathBuf::from(s)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(s))
+    });
 
     let lock = ctx.instance_lock(&id);
     let _lock = lock.lock().await;
     let instance = ensure_registered_and_installed(manager, &ctx, &name, &version).await?;
     // The synthesized run command uses dataDir as cwd — it must exist before spawn.
-    std::fs::create_dir_all(instance.data_dir(&ctx.root)).map_err(|e| shared_err(SharedError(format!("cannot create data dir: {e}"))))?;
+    std::fs::create_dir_all(instance.data_dir(&ctx.root))
+        .map_err(|e| shared_err(SharedError(format!("cannot create data dir: {e}"))))?;
 
     // Start the instance. `supervisor().start` already awaits readiness, so on Ok the service is
     // Ready; a failure lands as `failed` in state.json and propagates as the attach error.
@@ -328,11 +426,9 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
         .map(|s| s.actual_state == ActualServiceState::Ready)
         .unwrap_or(false);
     if !already_ready {
-        manager
-            .supervisor()
-            .start(&id, None)
-            .await
-            .map_err(|e| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "start_failed", e.0))?;
+        manager.supervisor().start(&id, None).await.map_err(|e| {
+            ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "start_failed", e.0)
+        })?;
     }
 
     let mut result = json!({ "service": id, "port": instance.port });
@@ -341,7 +437,11 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     };
 
     let pid = project_id(&project_root);
-    if let Some(existing) = ctx.registry.get(&id).and_then(|i| i.attachments.get(&pid).cloned()) {
+    if let Some(existing) = ctx
+        .registry
+        .get(&id)
+        .and_then(|i| i.attachments.get(&pid).cloned())
+    {
         if existing.provisioned {
             result["attachment"] = json!({ "projectId": pid, "projectRoot": project_root, "connection": existing.connection });
             return Ok(result);
@@ -370,7 +470,9 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     }
 
     let connection = match &instance.recipe.connection {
-        Some(conn) if provision_error.is_none() => Some(render_connection(conn, &vars).map_err(shared_err)?),
+        Some(conn) if provision_error.is_none() => {
+            Some(render_connection(conn, &vars).map_err(shared_err)?)
+        }
         _ => None,
     };
     ctx.registry
@@ -391,29 +493,55 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
         .map_err(shared_err)?;
     manager.events.publish(
         "shared.attach",
-        json!({ "service": id, "projectId": pid, "provisioned": provision_error.is_none() }).as_object().unwrap().clone(),
+        json!({ "service": id, "projectId": pid, "provisioned": provision_error.is_none() })
+            .as_object()
+            .unwrap()
+            .clone(),
     );
     if let Some(error) = provision_error {
-        return Err(ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "provision_failed", error));
+        return Err(ManagerHttpError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provision_failed",
+            error,
+        ));
     }
-    result["attachment"] = json!({ "projectId": pid, "projectRoot": project_root, "connection": connection });
+    result["attachment"] =
+        json!({ "projectId": pid, "projectRoot": project_root, "connection": connection });
     Ok(result)
 }
 
 async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResult<Value> {
     let ctx = shared_ctx(manager)?;
-    let body = strict_body(bytes, &["service", "projectRoot"], &["service", "projectRoot"])?;
+    let body = strict_body(
+        bytes,
+        &["service", "projectRoot"],
+        &["service", "projectRoot"],
+    )?;
     let (name, version) = parse_instance_id(body.get("service").unwrap_or(&Value::Null))?;
     let id = crate::shared::instance_id(&name, &version);
-    let project_root = PathBuf::from(body.get("projectRoot").and_then(Value::as_str).unwrap_or_default())
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(body.get("projectRoot").and_then(Value::as_str).unwrap_or_default()));
+    let project_root = PathBuf::from(
+        body.get("projectRoot")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .canonicalize()
+    .unwrap_or_else(|_| {
+        PathBuf::from(
+            body.get("projectRoot")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+    });
     let pid = project_id(&project_root);
 
     let lock = ctx.instance_lock(&id);
     let _lock = lock.lock().await;
     let Some(instance) = ctx.registry.get(&id) else {
-        return Err(ManagerHttpError::new(StatusCode::NOT_FOUND, "unknown_shared_service", format!("{id} is not registered")));
+        return Err(ManagerHttpError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_shared_service",
+            format!("{id} is not registered"),
+        ));
     };
     let Some(attachment) = instance.attachments.get(&pid).cloned() else {
         // Detaching what was never attached is a no-op — `stop` in a project must be idempotent.
@@ -436,26 +564,44 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
         })
         .map_err(shared_err)?;
     let _ = attachment;
-    manager.events.publish("shared.detach", json!({ "service": id, "projectId": pid }).as_object().unwrap().clone());
+    manager.events.publish(
+        "shared.detach",
+        json!({ "service": id, "projectId": pid })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
     Ok(json!({ "detached": id, "projectId": pid }))
 }
 
 /// Runs one rendered recipe command (provision/deprovision) with a bounded timeout and its output
 /// discarded — provision output is not a service log; failures surface via the exit code.
-async fn run_recipe_command(command: &crate::catalog::CommandSpec, cwd: &Path) -> Result<i32, SharedError> {
+async fn run_recipe_command(
+    command: &crate::catalog::CommandSpec,
+    cwd: &Path,
+) -> Result<i32, SharedError> {
     let (argv, _) = command_argv(command);
     if argv.is_empty() {
         return Err(SharedError("empty recipe command".to_string()));
     }
     let mut cmd = tokio::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..]).current_dir(cwd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| SharedError(format!("failed to spawn {:?}: {e}", argv[0])))?;
+    cmd.args(&argv[1..])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| SharedError(format!("failed to spawn {:?}: {e}", argv[0])))?;
     match tokio::time::timeout(std::time::Duration::from_secs(60), child.wait()).await {
         Ok(Ok(status)) => Ok(status.code().unwrap_or(-1)),
         Ok(Err(e)) => Err(SharedError(format!("failed to wait on {:?}: {e}", argv[0]))),
         Err(_) => {
             let _ = child.kill().await;
-            Err(SharedError(format!("recipe command timed out: {:?}", argv[0])))
+            Err(SharedError(format!(
+                "recipe command timed out: {:?}",
+                argv[0]
+            )))
         }
     }
 }
@@ -478,9 +624,19 @@ mod tests {
         std::fs::create_dir_all(&payload).unwrap();
         std::fs::write(payload.join("hello"), "world").unwrap();
         let archive = dir.join("pkg.tar.gz");
-        let status = std::process::Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(dir).arg("pkg").status().unwrap();
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(dir)
+            .arg("pkg")
+            .status()
+            .unwrap();
         assert!(status.success());
-        let sha = sha2::Sha256::digest(std::fs::read(&archive).unwrap()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let sha = sha2::Sha256::digest(std::fs::read(&archive).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         (archive, sha)
     }
 
@@ -526,8 +682,16 @@ mod tests {
         reqwest::Client::new()
     }
 
-    fn authed(client: &reqwest::Client, manager: &HearthManager, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        client.request(method, format!("{}{}", manager.base_url(), path)).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", "1")
+    fn authed(
+        client: &reqwest::Client,
+        manager: &HearthManager,
+        method: reqwest::Method,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        client
+            .request(method, format!("{}{}", manager.base_url(), path))
+            .bearer_auth(manager.bearer_token())
+            .header("x-hearth-protocol", "1")
     }
 
     #[tokio::test]
@@ -536,7 +700,11 @@ mod tests {
         let (archive, sha) = make_tarball(src.path());
         let shared_root = tempfile::tempdir().unwrap();
         // Seed the catalog cache — RemoteCatalog::load(false) reads it without any network.
-        std::fs::write(shared_root.path().join("catalog.json"), catalog_json(&archive, &sha)).unwrap();
+        std::fs::write(
+            shared_root.path().join("catalog.json"),
+            catalog_json(&archive, &sha),
+        )
+        .unwrap();
 
         let manager = boot_smp(shared_root.path()).await;
         let http = client();
@@ -551,24 +719,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(attach["service"], json!("fakesvc@1.0"), "{attach}");
-        let conn_url = attach["attachment"]["connection"]["url"].as_str().unwrap_or("");
+        let conn_url = attach["attachment"]["connection"]["url"]
+            .as_str()
+            .unwrap_or("");
         let pid = project_id(&project.path().canonicalize().unwrap());
         assert!(conn_url.contains(&format!("/h_{pid}")), "{conn_url}");
-        assert_eq!(attach["attachment"]["connection"]["env"]["FAKE_URL"], json!(conn_url));
+        assert_eq!(
+            attach["attachment"]["connection"]["env"]["FAKE_URL"],
+            json!(conn_url)
+        );
 
         // The instance is a real managed service in smp's own state.
-        let services: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/services").send().await.unwrap().json().await.unwrap();
-        let row = services["services"].as_array().unwrap().iter().find(|s| s["serviceId"] == "fakesvc@1.0").unwrap();
+        let services: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/services")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = services["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["serviceId"] == "fakesvc@1.0")
+            .unwrap();
         assert_eq!(row["actualState"], json!("ready"), "{row}");
 
         // The install actually landed under the isolated prefix.
         let install_dir = shared_root.path().join("installs/fakesvc/1.0");
         assert!(install_dir.join("bin/hello").exists());
         // Provision ran for this project.
-        assert!(shared_root.path().join(format!("instances/fakesvc@1.0/h_{pid}.provisioned")).exists());
+        assert!(shared_root
+            .path()
+            .join(format!("instances/fakesvc@1.0/h_{pid}.provisioned"))
+            .exists());
 
         // /v1/shared reports the attachment.
-        let shared: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/shared").send().await.unwrap().json().await.unwrap();
+        let shared: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/shared")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let inst = &shared["instances"][0];
         assert_eq!(inst["id"], json!("fakesvc@1.0"));
         assert_eq!(inst["attachments"][0]["projectId"], json!(pid));
@@ -591,11 +784,35 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let shared: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/shared").send().await.unwrap().json().await.unwrap();
-        assert!(shared["instances"][0]["attachments"].as_array().unwrap().is_empty());
-        let services: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/services").send().await.unwrap().json().await.unwrap();
-        let row = services["services"].as_array().unwrap().iter().find(|s| s["serviceId"] == "fakesvc@1.0").unwrap();
-        assert_eq!(row["actualState"], json!("ready"), "detach must not stop the shared instance");
+        let shared: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/shared")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(shared["instances"][0]["attachments"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let services: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/services")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = services["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["serviceId"] == "fakesvc@1.0")
+            .unwrap();
+        assert_eq!(
+            row["actualState"],
+            json!("ready"),
+            "detach must not stop the shared instance"
+        );
 
         manager.close().await;
     }
@@ -603,7 +820,11 @@ mod tests {
     #[tokio::test]
     async fn attach_rejects_an_unknown_version() {
         let shared_root = tempfile::tempdir().unwrap();
-        std::fs::write(shared_root.path().join("catalog.json"), json!({ "version": 1, "services": {} }).to_string()).unwrap();
+        std::fs::write(
+            shared_root.path().join("catalog.json"),
+            json!({ "version": 1, "services": {} }).to_string(),
+        )
+        .unwrap();
         let manager = boot_smp(shared_root.path()).await;
         let http = client();
         let resp = authed(&http, &manager, reqwest::Method::POST, "/v1/shared/attach")
@@ -617,4 +838,3 @@ mod tests {
         manager.close().await;
     }
 }
-

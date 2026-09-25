@@ -4,20 +4,55 @@
 # every relaunch) — there's no Xcode project here to wire up an injection tool against; fswatch-driven
 # rebuild is the pragmatic equivalent for a plain SPM package. Ctrl+C stops the watch and kills the app.
 set -euo pipefail
+# Background jobs (the app, fswatch) get their own process group, so Ctrl+C reaches this shell
+# instead of being swallowed by the GUI app.
+set -m
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 app_root="$script_dir/.."
 cd "$app_root"
 
-pid=""
+app_pid=""
+watch_pid=""
+watch_dir=""
+
+# SIGTERM, then SIGKILL. An unbounded `wait` in the Ctrl+C trap blocks every later Ctrl+C:
+# bash does not deliver the signal again until the trap returns.
+stop_pid() {
+  local target="$1"
+  if [ -z "$target" ] || ! kill -0 "$target" 2>/dev/null; then
+    return 0
+  fi
+  kill "$target" 2>/dev/null || true
+  local i=0
+  while kill -0 "$target" 2>/dev/null && [ "$i" -lt 20 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$target" 2>/dev/null; then
+    kill -9 "$target" 2>/dev/null || true
+  fi
+  wait "$target" 2>/dev/null || true
+}
 
 cleanup() {
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+  trap - EXIT INT TERM
+  stop_pid "$app_pid"
+  stop_pid "$watch_pid"
+  app_pid=""
+  watch_pid=""
+  if [ -n "$watch_dir" ]; then
+    rm -rf "$watch_dir"
+    watch_dir=""
   fi
 }
-trap cleanup EXIT INT TERM
+
+# A trapped SIGINT is deferred until the current command finishes. The old loop blocked in
+# `read` on fswatch, which ignores SIGINT, so the trap never ran. This handler exits; the
+# watch loop blocks in `perl` instead, which Ctrl+C actually kills.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 build_and_launch() {
   echo "==> building"
@@ -25,21 +60,31 @@ build_and_launch() {
     echo "!! build failed — waiting for the next change"
     return
   fi
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-  fi
+  stop_pid "$app_pid"
+  app_pid=""
   bin_path="$(swift build --show-bin-path)"
   echo "==> launching $bin_path/HearthApp"
   "$bin_path/HearthApp" &
-  pid=$!
+  app_pid=$!
 }
 
 build_and_launch
 
 echo "==> watching Sources/ and Package.swift for changes (Ctrl+C to stop)"
-# Process substitution (not a trailing pipe) keeps this loop in the current shell, so $pid set inside
-# build_and_launch persists across iterations for the EXIT trap above.
-while read -r _; do
-  build_and_launch
-done < <(fswatch -o -l 0.5 "$app_root/Sources" "$app_root/Package.swift")
+# The fifo keeps this loop in the current shell, so $app_pid stays visible to the EXIT trap.
+watch_dir="$(mktemp -d)"
+watch_fifo="$watch_dir/events"
+mkfifo "$watch_fifo"
+exec 3<>"$watch_fifo"
+fswatch -o -l 0.5 "$app_root/Sources" "$app_root/Package.swift" >"$watch_fifo" &
+watch_pid=$!
+
+# `read` cannot be the thing we block on: bash defers a trapped SIGINT until that
+# builtin returns, and it never returns while fswatch (which ignores SIGINT) holds
+# the pipe. `perl` is a normal foreground process, so Ctrl+C kills it and the trap runs.
+while kill -0 "$watch_pid" 2>/dev/null; do
+  if /usr/bin/perl -e 'use IO::Select; exit(IO::Select->new(\*STDIN)->can_read(0.2) ? 0 : 1)' <&3; then
+    IFS= read -r _ <&3 || true
+    build_and_launch
+  fi
+done
