@@ -23,8 +23,6 @@ def sha(name: str, version: str) -> str:
 
 
 def artifact(name: str, version: str) -> dict:
-    # Packaging scripts produce these archives. MongoDB is the exception: catalog.json points `url`
-    # at the official tarball and is not rewritten by this helper.
     return {
         "darwin-arm64": {
             "script": "scripts/catalog/pack.sh",
@@ -65,12 +63,9 @@ document = {
         "mongodb": {
             "versions": {
                 mongodb: {
-                    "artifacts": {
-                        "darwin-arm64": {
-                            "url": "https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.0.32.tgz",
-                            "sha256": "f81cb258434d548dca7244d599c82eb339043d8dedd0b1b807870c9d263117f2",
-                        }
-                    },
+                    # Repacked tarball (mongod + mongosh + payload): the recipe needs mongosh for
+                    # the replica-set initiate in provision, which the upstream tarball lacks.
+                    "artifacts": artifact("mongodb", mongodb),
                     "run": argv(
                         "{installDir}/bin/mongod",
                         "--bind_ip",
@@ -80,6 +75,10 @@ document = {
                         "--dbpath",
                         "{dataDir}",
                         "--nounixsocket",
+                        "--replSet",
+                        "rs0",
+                        "--wiredTigerCacheSizeGB",
+                        "0.25",
                     ),
                     "readiness": {
                         "kind": "command",
@@ -87,7 +86,11 @@ document = {
                             "shell": "perl -e 'use IO::Socket::INET; my $p = shift; exit(IO::Socket::INET->new(PeerAddr => \"127.0.0.1:$p\", Timeout => 1) ? 0 : 1)' {port}"
                         },
                     },
-                    "connection": {"url": "mongodb://127.0.0.1:{port}/{projectDb}", "env": {"MONGODB_URI": "{url}"}},
+                    # provision runs after the first ready: hearth-provision initiates rs0
+                    # (idempotent) before writing the project-db marker — rs state then persists
+                    # in dataDir across restarts.
+                    "provision": [argv("{installDir}/bin/hearth-provision", "{dataDir}", "{port}", "{projectDb}", "{projectUser}", "{projectId}")],
+                    "connection": {"url": "mongodb://127.0.0.1:{port}/{projectDb}?replicaSet=rs0&directConnection=true", "env": {"MONGODB_URI": "{url}"}},
                 }
             }
         },
@@ -128,7 +131,14 @@ document = {
             "versions": {
                 nginx: {
                     "artifacts": artifact("nginx", nginx),
-                    "prepare": argv("{installDir}/bin/hearth-prepare", "{dataDir}", "{port}"),
+                    # Pinned, not hashed — the whole point of this recipe is being THE edge nginx.
+                    # Modern macOS keeps <1024 privileged for everyone; the public :80/:443
+                    # listeners come from a pf rdr anchor onto these loopback ports:
+                    #   rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80  -> 127.0.0.1 port 18080
+                    #   rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 18443
+                    "ports": [18080, 18443],
+                    "extraPortLabels": ["https"],
+                    "prepare": argv("{installDir}/bin/hearth-prepare", "{dataDir}", "{port}", "{port2}"),
                     # nginx rewrites its process title (`nginx: master process …`). `exec: true`
                     # stores that settled ps line, which a plain argv identity would reject.
                     "run": {
@@ -137,6 +147,7 @@ document = {
                     },
                     "readiness": {"kind": "http", "url": "http://127.0.0.1:{port}/healthz"},
                     "provision": [argv("{installDir}/bin/hearth-provision", "{dataDir}", "{port}", "{projectDb}", "{projectUser}", "{projectId}")],
+                    "deprovision": [argv("{installDir}/bin/hearth-deprovision", "{dataDir}", "{port}", "{projectDb}", "{projectUser}", "{projectId}")],
                     "connection": {"url": "http://127.0.0.1:{port}/{projectId}/"},
                 }
             }

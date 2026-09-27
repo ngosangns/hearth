@@ -1,8 +1,31 @@
 #!/bin/bash
-# Create the per-project database by upserting a marker document. Detach does not drop it.
+# Ensure the single-node replica set is initiated (mongod runs --replSet rs0; an uninitiated
+# member refuses writes and transactions), then create the per-project database by upserting a
+# marker document. Detach does not drop it.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="$2"
 DB="$3"
 export MONGOSH_NO_TELEMETRY=1
-exec "$ROOT/bin/mongosh" --quiet --norc --host 127.0.0.1 --port "$PORT" "$DB" --eval 'db.hearth.updateOne({_id:"hearth"}, {$set:{ok:1}}, {upsert:true})'
+MONGOSH=("$ROOT/bin/mongosh" --quiet --norc --host 127.0.0.1 --port "$PORT")
+
+"${MONGOSH[@]}" --quiet --eval '
+  try {
+    const h = db.hello();
+    if (!(h && (h.isWritablePrimary || h.ismaster))) {
+      try { rs.status(); } catch (e) {
+        rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:'"$PORT"'"}]});
+      }
+    }
+  } catch (e) { print("hearth-provision: rs check failed: " + e); quit(1); }
+' >/dev/null
+
+for _ in $(seq 1 60); do
+  if "${MONGOSH[@]}" --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)' 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+"${MONGOSH[@]}" --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)'
+
+exec "${MONGOSH[@]}" "$DB" --eval 'db.hearth.updateOne({_id:"hearth"}, {$set:{ok:1}}, {upsert:true})'

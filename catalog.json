@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "Shared-services registry (see docs/shared-services.md). Each darwin-arm64 artifact sets exactly one of url (a tarball that already exists on the internet) or script (a path relative to this file that writes the tarball). sha256 is of that tarball.",
+  "_comment": "Shared-services registry served to smp daemons over HTTPS (see docs/shared-services.md). darwin-arm64 only. Tarballs are built by scripts/catalog/package.sh and published on the catalog-v1 release.",
   "services": {
     "redis": {
       "versions": {
@@ -8,8 +8,10 @@
           "artifacts": {
             "darwin-arm64": {
               "script": "scripts/catalog/pack.sh",
-              "scriptArgs": ["redis"],
-              "sha256": "795d4aabfc75b745e462a3e14fb3564c1e045ab53690f17cc38558c74a69dafa"
+              "scriptArgs": [
+                "redis"
+              ],
+              "sha256": "7b005088f9dd4ed7bb532c1b4c8c70cf1dc9bbe4c96cc68d4604fb1d3d9c62b8"
             }
           },
           "prepare": {
@@ -48,8 +50,11 @@
         "8.0.32": {
           "artifacts": {
             "darwin-arm64": {
-              "url": "https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.0.32.tgz",
-              "sha256": "f81cb258434d548dca7244d599c82eb339043d8dedd0b1b807870c9d263117f2"
+              "script": "scripts/catalog/pack.sh",
+              "scriptArgs": [
+                "mongodb"
+              ],
+              "sha256": "a8d5e38b00d22ead1d9d4af7c0e0b1ab23e172258009993e2a8b85d5f09d7fbc"
             }
           },
           "run": {
@@ -61,7 +66,11 @@
               "{port}",
               "--dbpath",
               "{dataDir}",
-              "--nounixsocket"
+              "--nounixsocket",
+              "--replSet",
+              "rs0",
+              "--wiredTigerCacheSizeGB",
+              "0.25"
             ]
           },
           "readiness": {
@@ -70,8 +79,20 @@
               "shell": "perl -e 'use IO::Socket::INET; my $p = shift; exit(IO::Socket::INET->new(PeerAddr => \"127.0.0.1:$p\", Timeout => 1) ? 0 : 1)' {port}"
             }
           },
+          "provision": [
+            {
+              "argv": [
+                "{installDir}/bin/hearth-provision",
+                "{dataDir}",
+                "{port}",
+                "{projectDb}",
+                "{projectUser}",
+                "{projectId}"
+              ]
+            }
+          ],
           "connection": {
-            "url": "mongodb://127.0.0.1:{port}/{projectDb}",
+            "url": "mongodb://127.0.0.1:{port}/{projectDb}?replicaSet=rs0&directConnection=true",
             "env": {
               "MONGODB_URI": "{url}"
             }
@@ -85,8 +106,10 @@
           "artifacts": {
             "darwin-arm64": {
               "script": "scripts/catalog/pack.sh",
-              "scriptArgs": ["minio"],
-              "sha256": "8ceb91cd2888f9f8b49a9a7409dd2548d703260c689eb77847761ccd44553cbd"
+              "scriptArgs": [
+                "minio"
+              ],
+              "sha256": "e90694252e5179c613332ceb304bc4ee6e683c6abaef859bd231862ddd080ae1"
             }
           },
           "additionalPorts": 1,
@@ -145,15 +168,25 @@
           "artifacts": {
             "darwin-arm64": {
               "script": "scripts/catalog/pack.sh",
-              "scriptArgs": ["nginx"],
-              "sha256": "7f2d347ff9afbf8903265d942c85f7869c3e1c67fae0fefb92b6b8eeb7a18124"
+              "scriptArgs": [
+                "nginx"
+              ],
+              "sha256": "147f971a80dde53f6d7638f80e40df7aa4cf517a126ebc51c0b9c9de3129b0a8"
             }
           },
+          "ports": [
+            18080,
+            18443
+          ],
+          "extraPortLabels": [
+            "https"
+          ],
           "prepare": {
             "argv": [
               "{installDir}/bin/hearth-prepare",
               "{dataDir}",
-              "{port}"
+              "{port}",
+              "{port2}"
             ]
           },
           "run": {
@@ -176,6 +209,18 @@
               ]
             }
           ],
+          "deprovision": [
+            {
+              "argv": [
+                "{installDir}/bin/hearth-deprovision",
+                "{dataDir}",
+                "{port}",
+                "{projectDb}",
+                "{projectUser}",
+                "{projectId}"
+              ]
+            }
+          ],
           "connection": {
             "url": "http://127.0.0.1:{port}/{projectId}/"
           }
@@ -188,8 +233,10 @@
           "artifacts": {
             "darwin-arm64": {
               "script": "scripts/catalog/pack.sh",
-              "scriptArgs": ["kafka"],
-              "sha256": "a2449517e5834a3c8cc89f8348b462905bb404d879d6345c7039a9c2f51f3122"
+              "scriptArgs": [
+                "kafka"
+              ],
+              "sha256": "a0faf00ab6c85ccf492002b0ce6bed5dd676b7f0ac28e6de2c6ce174a54af13e"
             }
           },
           "additionalPorts": 1,

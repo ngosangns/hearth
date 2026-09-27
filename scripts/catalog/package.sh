@@ -149,26 +149,34 @@ package_nginx() {
   local nginx_archive="$CACHE/nginx-${NGINX_VERSION}.tar.gz"
   local pcre_archive="$CACHE/pcre2-${PCRE2_VERSION}.tar.gz"
   local zlib_archive="$CACHE/zlib-${ZLIB_VERSION}.tar.gz"
+  local openssl_archive="$CACHE/openssl-${OPENSSL_VERSION}.tar.gz"
   local nginx_dest="$WORK/nginx-src"
   local pcre_dest="$WORK/pcre-src"
   local zlib_dest="$WORK/zlib-src"
+  local openssl_dest="$WORK/openssl-src"
   local stage="$WORK/stage-nginx"
   fetch "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" "$nginx_archive"
   fetch "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/pcre2-${PCRE2_VERSION}.tar.gz" "$pcre_archive"
   fetch "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz" "$zlib_archive"
+  fetch "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" "$openssl_archive"
   extract_tgz "$nginx_archive" "$nginx_dest"
   extract_tgz "$pcre_archive" "$pcre_dest"
   extract_tgz "$zlib_archive" "$zlib_dest"
-  local nginx_src pcre_src zlib_src
+  extract_tgz "$openssl_archive" "$openssl_dest"
+  local nginx_src pcre_src zlib_src openssl_src
   nginx_src="$(topdir "$nginx_dest")"
   pcre_src="$(topdir "$pcre_dest")"
   zlib_src="$(topdir "$zlib_dest")"
+  openssl_src="$(topdir "$openssl_dest")"
   (
     cd "$nginx_src"
     ./configure \
       --with-cc-opt="-O2 -Wno-deprecated-declarations" \
       --with-pcre="$pcre_src" \
-      --with-zlib="$zlib_src"
+      --with-zlib="$zlib_src" \
+      --with-http_ssl_module \
+      --with-http_auth_request_module \
+      --with-openssl="$openssl_src"
     make -j "$NCPU"
   )
   rm -rf "$stage"
@@ -177,7 +185,7 @@ package_nginx() {
   cp "$nginx_src/conf/mime.types" "$stage/conf/mime.types"
   chmod +x "$stage/bin/nginx"
   copy_payload nginx "$stage/bin"
-  rm -rf "$nginx_dest" "$pcre_dest" "$zlib_dest"
+  rm -rf "$nginx_dest" "$pcre_dest" "$zlib_dest" "$openssl_dest"
   pack nginx "$NGINX_VERSION" "$stage"
 }
 

@@ -1,28 +1,53 @@
 #!/bin/bash
-# Rewrite the main config every start so the listen port stays the allocated one.
-# conf.d snippets created by provision are left in place.
+# Rewrite the main config every start so the listen ports stay the pinned ones.
+# conf.d/locations/*.conf render inside the base :{port} server (per-project location blocks);
+# conf.d/servers/** hold whole server blocks that attaching projects publish via provision.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA="$1"
 PORT="$2"
-mkdir -p "$DATA/conf.d" "$DATA/www" "$DATA/logs" "$DATA/temp/client_body" "$DATA/temp/proxy" \
+PORT2="${3:-}"
+mkdir -p "$DATA/conf.d/locations" "$DATA/conf.d/servers" "$DATA/www" "$DATA/logs" "$DATA/temp/client_body" "$DATA/temp/proxy" \
   "$DATA/temp/fastcgi" "$DATA/temp/uwsgi" "$DATA/temp/scgi"
-if [[ ! -f "$DATA/conf.d/00-empty.conf" ]]; then
-  printf '# hearth\n' > "$DATA/conf.d/00-empty.conf"
+if [[ ! -f "$DATA/conf.d/locations/00-empty.conf" ]]; then
+  printf '# hearth\n' > "$DATA/conf.d/locations/00-empty.conf"
 fi
+
+# Fail loudly at prepare rather than at readiness: a pinned port held by another process is
+# unrecoverable until fixed. The public :80/:443 listeners come from the pf rdr anchor onto
+# these loopback pins — nothing binds privileged ports directly.
+bind_probe() {
+  nc -l 127.0.0.1 "$1" </dev/null >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.3
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+for p in "$PORT" ${PORT2:+"$PORT2"}; do
+  if ! bind_probe "$p"; then
+    echo "shared-nginx: cannot bind 127.0.0.1:$p — held by another process." >&2
+    exit 1
+  fi
+done
+
 cat > "$DATA/nginx.conf" <<EOF
 worker_processes 1;
 daemon off;
 error_log stderr info;
 pid ${DATA}/nginx.pid;
 
-events { worker_connections 64; }
+events { worker_connections 256; }
 
 http {
     include ${ROOT}/conf/mime.types;
     default_type application/octet-stream;
     access_log off;
     sendfile on;
+    server_names_hash_bucket_size 128;
     client_body_temp_path ${DATA}/temp/client_body;
     proxy_temp_path ${DATA}/temp/proxy;
     fastcgi_temp_path ${DATA}/temp/fastcgi;
@@ -36,7 +61,10 @@ http {
             default_type text/plain;
             return 200 "ok\\n";
         }
-        include ${DATA}/conf.d/*.conf;
+        include ${DATA}/conf.d/locations/*.conf;
     }
+
+    include ${DATA}/conf.d/servers/*.conf;
+    include ${DATA}/conf.d/servers/*/*.conf;
 }
 EOF

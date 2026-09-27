@@ -1,19 +1,42 @@
 #!/bin/bash
-# One path prefix per project on the shared listener. The snippet stays after detach so files
-# dropped in www/ are not deleted out from under the user. Reload keeps the master pid.
+# $1 dataDir $2 port $3 projectDb $4 projectUser $5 projectId [$6 conf source]
+# With a conf source the attaching project publishes whole server blocks: a directory is copied
+# to conf.d/servers/<projectId>/, a file lands as conf.d/servers/<projectId>.conf. Without one
+# the project gets the legacy www/<projectId>/ root + location block. `nginx -t` runs before any
+# reload so a bad drop fails the attach instead of wedging the shared master.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA="$1"
 PROJECT="$5"
-WWW="$DATA/www/$PROJECT"
-mkdir -p "$WWW" "$DATA/conf.d"
-if [[ ! -f "$WWW/index.html" ]]; then
-  printf 'hearth nginx %s\n' "$PROJECT" > "$WWW/index.html"
-fi
-cat > "$DATA/conf.d/${PROJECT}.conf" <<EOF
+SRC="${6:-}"
+mkdir -p "$DATA/conf.d/locations" "$DATA/conf.d/servers" "$DATA/www"
+if [[ -n "$SRC" ]]; then
+  if [[ -d "$SRC" ]]; then
+    mkdir -p "$DATA/conf.d/servers/$PROJECT"
+    cp -Rf "$SRC"/. "$DATA/conf.d/servers/$PROJECT/"
+  elif [[ -f "$SRC" ]]; then
+    cp -f "$SRC" "$DATA/conf.d/servers/$PROJECT.conf"
+  else
+    echo "conf source not found: $SRC" >&2
+    exit 1
+  fi
+else
+  WWW="$DATA/www/$PROJECT"
+  mkdir -p "$WWW"
+  if [[ ! -f "$WWW/index.html" ]]; then
+    printf 'hearth nginx %s\n' "$PROJECT" > "$WWW/index.html"
+  fi
+  cat > "$DATA/conf.d/locations/${PROJECT}.conf" <<EOF
 location /${PROJECT}/ {
     alias ${WWW}/;
     index index.html;
 }
 EOF
-"$ROOT/bin/nginx" -p "$DATA" -c "$DATA/nginx.conf" -s reload
+fi
+
+"$ROOT/bin/nginx" -p "$DATA" -c "$DATA/nginx.conf" -t -q
+# No live master yet on first attach — the fresh start loads the conf itself; reload only matters
+# for re-attach while the shared instance keeps running.
+if [[ -f "$DATA/nginx.pid" ]] && kill -0 "$(cat "$DATA/nginx.pid")" 2>/dev/null; then
+  "$ROOT/bin/nginx" -p "$DATA" -c "$DATA/nginx.conf" -s reload
+fi

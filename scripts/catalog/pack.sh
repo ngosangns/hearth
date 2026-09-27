@@ -22,6 +22,7 @@ if [[ ! -f "$here/package.sh" ]]; then
     scripts/catalog/payload/minio/hearth-provision
     scripts/catalog/payload/nginx/hearth-prepare
     scripts/catalog/payload/nginx/hearth-provision
+    scripts/catalog/payload/nginx/hearth-deprovision
     scripts/catalog/payload/kafka/hearth-prepare
     scripts/catalog/payload/kafka/hearth-provision
     scripts/catalog/payload/kafka/hearth-ready

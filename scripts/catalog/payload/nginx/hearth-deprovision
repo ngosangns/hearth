@@ -1,0 +1,11 @@
+#!/bin/bash
+# Detach removes the project's published confs; www stays (user files).
+# $1 dataDir $2 port $3 projectDb $4 projectUser $5 projectId
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DATA="$1"
+PROJECT="$5"
+rm -rf "$DATA/conf.d/servers/$PROJECT" "$DATA/conf.d/servers/$PROJECT.conf" "$DATA/conf.d/locations/$PROJECT.conf"
+if [[ -f "$DATA/nginx.pid" ]] && kill -0 "$(cat "$DATA/nginx.pid")" 2>/dev/null; then
+  "$ROOT/bin/nginx" -p "$DATA" -c "$DATA/nginx.conf" -s reload
+fi
