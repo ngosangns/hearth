@@ -20,7 +20,8 @@ pub fn derive_base_port(instance_id: &str) -> u16 {
 pub const MAX_SHARED_PORTS: u16 = 4;
 
 /// Single-port allocation. Equivalent to `allocate_ports(id, 1, taken)` and returning the only port.
-pub async fn allocate_port(instance_id: &str, taken: &HashSet<u16>) -> Option<u16> {
+#[cfg(test)]
+async fn allocate_port(instance_id: &str, taken: &HashSet<u16>) -> Option<u16> {
     allocate_ports(instance_id, 1, taken)
         .await
         .map(|ports| ports[0])
@@ -58,14 +59,10 @@ pub async fn allocate_ports(
     None
 }
 
-/// Bind-check only — for recipes with pinned ports (outside the shared range) there is nothing
-/// to probe, just the question of whether the requested set is free.
-pub async fn ports_free(ports: &[u16]) -> bool {
-    bind_all(ports).await
-}
-
-/// Holds listeners for the whole block until every bind has succeeded, then drops them together.
-async fn bind_all(ports: &[u16]) -> bool {
+/// Bind-check: holds listeners for the whole block until every bind has succeeded, then drops them
+/// together. Also the whole check for recipes with pinned ports (outside the shared range) — there
+/// is nothing to probe, just the question of whether the requested set is free.
+pub async fn bind_all(ports: &[u16]) -> bool {
     let mut listeners = Vec::with_capacity(ports.len());
     for port in ports {
         match tokio::net::TcpListener::bind(("127.0.0.1", *port)).await {

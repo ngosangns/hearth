@@ -1,8 +1,6 @@
-//! Port of `src/tui/tui-actions.ts`. Deliberate deviation from a 1:1 port: the TS source matches
-//! raw terminal byte sequences (`matchesKey(data, ...)`) because pi-tui parses input at a lower
-//! level than this port's terminal library; `crossterm` already parses input into structured
-//! `KeyEvent`s, so this takes one directly rather than re-deriving that parsing.
+//! Key bindings: a `crossterm` `KeyEvent` (plus the focused row) to a `TuiAction`.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use hearth_core::state::ActualServiceState;
 
 use crate::state::Service;
 
@@ -26,7 +24,7 @@ pub fn keyboard_action(key: KeyEvent, selected: Option<&Service>) -> Option<TuiA
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(TuiAction::Quit);
     }
-    let externally_owned = selected.map(|s| s.state.as_str()) == Some("externally-owned");
+    let externally_owned = selected.map(|s| s.state) == Some(ActualServiceState::ExternallyOwned);
     match key.code {
         KeyCode::Char('q') => Some(TuiAction::Quit),
         KeyCode::Up | KeyCode::Char('k') => Some(TuiAction::Up),
@@ -42,7 +40,7 @@ pub fn keyboard_action(key: KeyEvent, selected: Option<&Service>) -> Option<TuiA
                 // is the reclaim.
                 return Some(TuiAction::Reclaim);
             }
-            let starting = matches!(selected.map(|s| s.state.as_str()), Some("stopped") | Some("queued-start"));
+            let starting = matches!(selected.map(|s| s.state), Some(ActualServiceState::Stopped | ActualServiceState::QueuedStart));
             Some(if starting { TuiAction::Start } else { TuiAction::Stop })
         }
         _ => None,
@@ -59,7 +57,8 @@ mod tests {
     }
 
     fn service(state: &str) -> Service {
-        Service { name: "metadata".to_string(), kind: None, state: state.to_string(), generation: None, current_operation_id: None, error: None }
+        let state = serde_json::from_value(serde_json::json!(state)).unwrap();
+        Service { name: "metadata".to_string(), kind: None, state, generation: None, current_operation_id: None, error: None }
     }
 
     #[test]

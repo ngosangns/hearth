@@ -1,14 +1,9 @@
-//! Port of the `createHearthMcpServer` half of `src/mcp/mcp-server.ts` — manual
-//! `ServerHandler` implementation (not the `#[tool_router]`/`#[tool]` declarative macros) because
-//! the tool set here is only known at construction time: tool names carry a runtime-configurable
-//! prefix, the `manage`/`status`/`logs` schemas embed an `enum` of the caller's actual
-//! `knownServiceIds`, and the `manage` tool's required-fields list depends on `requireConfirm`. None
-//! of that fits a compile-time-generated schema, so this overrides `get_info`/`list_tools`/
-//! `call_tool` directly and leaves every other `ServerHandler` method (resources, prompts,
-//! subscriptions, tasks, discover — none of which this server implements) at its provided default,
-//! exactly mirroring how the TS source's `Server` only ever registers `ListToolsRequestSchema` and
-//! `CallToolRequestSchema` handlers and lets the SDK answer everything else.
-use std::sync::Arc;
+//! The MCP tool surface — a manual `ServerHandler` (not `rmcp`'s `#[tool]` macros) because the tool
+//! set is only known at runtime: tool names carry a configurable prefix, the `manage`/`status`/
+//! `logs` schemas embed an `enum` of the daemon's current service ids, and `manage`'s required
+//! fields depend on `requireConfirm`. Only `get_info`/`list_tools`/`call_tool` are overridden;
+//! every other `ServerHandler` method stays at its default.
+use std::sync::{Arc, RwLock};
 
 use regex::Regex;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool};
@@ -16,7 +11,9 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 
-use crate::client::{EventsArguments, HearthMcpClient, LogsArguments, ManageAction, ManageArguments, StatusArguments, TraceArguments};
+use hearth_core::state::ServiceOperationKind;
+
+use crate::client::{EventsArguments, HearthMcpClient, LogsArguments, ManageArguments, StatusArguments, TraceArguments};
 
 fn secret_key_pattern() -> &'static Regex {
     use std::sync::OnceLock;
@@ -28,6 +25,19 @@ fn secret_key_pattern() -> &'static Regex {
 /// recurses through arrays/objects, dropping any object key matching `SECRET_KEY_PATTERN`.
 fn redact(value: &Value) -> Value {
     redact_at_depth(value, 0)
+}
+
+/// `redact`, except for `shared_connection`'s `connection` subtree: handing the agent a shared
+/// service's env values (`AWS_SECRET_ACCESS_KEY`, a `DATABASE_URL` password) is that tool's whole
+/// purpose, and they are local-dev constants from the shared catalog, not real credentials.
+fn redact_tool_result(tool: &str, value: &Value) -> Value {
+    let mut redacted = redact(value);
+    if tool == "shared_connection" {
+        if let (Some(object), Some(connection)) = (redacted.as_object_mut(), value.get("connection")) {
+            object.insert("connection".to_string(), connection.clone());
+        }
+    }
+    redacted
 }
 
 fn redact_at_depth(value: &Value, depth: u32) -> Value {
@@ -57,6 +67,8 @@ pub struct CreateHearthMcpServerOptions {
     /// — the safer default: an MCP host that ignores prose advice still can't invoke it
     /// accidentally, because the tool's own JSON schema demands the field.
     pub require_confirm: bool,
+    /// The service ids to start with. Refreshed from `HearthMcpClient::service_ids` on every
+    /// `tools/list` and whenever a call names an id not in the list.
     pub known_service_ids: Vec<String>,
 }
 
@@ -70,10 +82,12 @@ impl Default for CreateHearthMcpServerOptions {
 pub struct HearthMcpServer {
     client: Arc<dyn HearthMcpClient>,
     options: Arc<CreateHearthMcpServerOptions>,
+    service_ids: Arc<RwLock<Vec<String>>>,
 }
 
 pub fn create_hearth_mcp_server(client: Arc<dyn HearthMcpClient>, options: CreateHearthMcpServerOptions) -> HearthMcpServer {
-    HearthMcpServer { client, options: Arc::new(options) }
+    let service_ids = Arc::new(RwLock::new(options.known_service_ids.clone()));
+    HearthMcpServer { client, options: Arc::new(options), service_ids }
 }
 
 fn require_only_keys(value: &JsonObject, allowed: &[&str]) -> Result<(), String> {
@@ -106,12 +120,9 @@ fn optional_integer(value: Option<&Value>, name: &str, minimum: i64, maximum: Op
         };
         format!("{name} must be an integer {range}")
     };
-    // Matches JavaScript's `Number.isSafeInteger`, which is what the TS server validates with —
-    // and what every MCP host's JSON layer ultimately produces. Two ways this used to diverge:
-    // a host that serializes numbers as floats sent `1000.0`, which `as_i64()` rejects even though
-    // it is an integer; and a value beyond 2^53 was accepted here while the TS server rejected it
-    // as unrepresentable. Both made the same tool call succeed on one implementation and fail on
-    // the other.
+    // JavaScript's `Number.isSafeInteger` — what every MCP host's JSON layer produces: an
+    // integral float (`1000.0`, from a host that serializes numbers as floats) is accepted, and
+    // anything beyond 2^53 is rejected as unrepresentable.
     const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
     match value {
         None => Ok(None),
@@ -130,12 +141,25 @@ fn optional_integer(value: Option<&Value>, name: &str, minimum: i64, maximum: Op
 }
 
 impl HearthMcpServer {
+    fn known_service_ids(&self) -> Vec<String> {
+        self.service_ids.read().unwrap().clone()
+    }
+
+    /// Re-reads the daemon's current service ids (after a `manager reload`), keeping the old list
+    /// when the client can't answer.
+    async fn refresh_service_ids(&self) {
+        if let Some(ids) = self.client.service_ids().await {
+            *self.service_ids.write().unwrap() = ids;
+        }
+    }
+
     fn require_service(&self, value: Option<&Value>) -> Result<String, String> {
         let service = required_string(value, "service")?;
-        if self.options.known_service_ids.iter().any(|id| id == &service) {
+        let known = self.known_service_ids();
+        if known.iter().any(|id| id == &service) {
             Ok(service)
         } else {
-            Err(format!("unknown service: {service}. Known services: {}", self.options.known_service_ids.join(", ")))
+            Err(format!("unknown service: {service}. Known services: {}", known.join(", ")))
         }
     }
 
@@ -172,9 +196,9 @@ impl HearthMcpServer {
         }
         let service = self.require_service(arguments.get("service"))?;
         let action = match arguments.get("action").and_then(Value::as_str) {
-            Some("start") => ManageAction::Start,
-            Some("stop") => ManageAction::Stop,
-            Some("restart") => ManageAction::Restart,
+            Some("start") => ServiceOperationKind::Start,
+            Some("stop") => ServiceOperationKind::Stop,
+            Some("restart") => ServiceOperationKind::Restart,
             _ => return Err("action must be one of: start, stop, restart".to_string()),
         };
         let kill_unowned = match arguments.get("killUnowned") {
@@ -182,7 +206,7 @@ impl HearthMcpServer {
             Some(Value::Bool(true)) => true,
             _ => return Err("killUnowned must be a boolean".to_string()),
         };
-        if kill_unowned && action != ManageAction::Start {
+        if kill_unowned && action != ServiceOperationKind::Start {
             return Err("killUnowned only applies to action=start".to_string());
         }
         Ok(ManageArguments { service, action, kill_unowned })
@@ -199,8 +223,14 @@ impl HearthMcpServer {
         Ok(())
     }
 
-    async fn dispatch(&self, name: &str, arguments: JsonObject) -> Result<Value, String> {
-        let Some(tool) = name.strip_prefix(self.options.tool_prefix.as_str()) else { return Err(format!("unknown tool: {name}")) };
+    async fn dispatch(&self, tool: &str, arguments: JsonObject) -> Result<Value, String> {
+        if matches!(tool, "status" | "logs" | "manage") {
+            if let Some(Value::String(service)) = arguments.get("service") {
+                if !self.known_service_ids().contains(service) {
+                    self.refresh_service_ids().await;
+                }
+            }
+        }
         match tool {
             "status" => self.client.status(self.parse_status(&arguments)?).await,
             "logs" => self.client.logs(self.parse_logs(&arguments)?).await,
@@ -227,14 +257,14 @@ impl HearthMcpServer {
                 require_only_keys(&arguments, &["service"])?;
                 self.client.shared_connection(required_string(arguments.get("service"), "service")?).await
             }
-            _ => Err(format!("unknown tool: {name}")),
+            _ => Err(format!("unknown tool: {}{tool}", self.options.tool_prefix)),
         }
     }
 
     fn tool_definitions(&self) -> Vec<Tool> {
         let prefix = &self.options.tool_prefix;
         let require_confirm = self.options.require_confirm;
-        let service_ids = &self.options.known_service_ids;
+        let service_ids = &self.known_service_ids();
         let schema = |value: Value| -> Arc<JsonObject> { Arc::new(value.as_object().cloned().unwrap_or_default()) };
 
         let mut manage_properties = json!({
@@ -320,13 +350,19 @@ impl ServerHandler for HearthMcpServer {
     }
 
     async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, McpError> {
+        self.refresh_service_ids().await;
         Ok(ListToolsResult::with_all_items(self.tool_definitions()))
     }
 
     async fn call_tool(&self, request: CallToolRequestParams, _context: RequestContext<RoleServer>) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.unwrap_or_default();
-        let result = match self.dispatch(&request.name, arguments).await {
-            Ok(value) => CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&redact(&value)).unwrap())]),
+        let tool = request.name.strip_prefix(self.options.tool_prefix.as_str());
+        let dispatched = match tool {
+            Some(tool) => self.dispatch(tool, arguments).await,
+            None => Err(format!("unknown tool: {}", request.name)),
+        };
+        let result = match dispatched {
+            Ok(value) => CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&redact_tool_result(tool.unwrap_or_default(), &value)).unwrap())]),
             Err(message) => CallToolResult::error(vec![ContentBlock::text(safe_error_message(&message))]),
         };
         Ok(result.into())
@@ -342,6 +378,7 @@ mod tests {
 
     use super::*;
     use crate::client::ManageArguments;
+    use hearth_core::state::ServiceOperationKind;
 
     #[derive(Clone, Default)]
     struct NoopClientHandler;
@@ -352,6 +389,8 @@ mod tests {
         managed: Mutex<Option<ManageArguments>>,
         restarts: std::sync::atomic::AtomicU32,
         stops: std::sync::atomic::AtomicU32,
+        /// What `service_ids` answers — `None` keeps the server's startup list.
+        service_ids: Mutex<Option<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -379,6 +418,12 @@ mod tests {
         async fn stop_daemon(&self) -> Result<Value, String> {
             self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({ "operation": "accepted" }))
+        }
+        async fn shared_connection(&self, service: String) -> Result<Value, String> {
+            Ok(json!({ "service": service, "projectId": "p", "connection": { "env": { "AWS_SECRET_ACCESS_KEY": "minioadmin" } }, "token": "must-not-leak" }))
+        }
+        async fn service_ids(&self) -> Option<Vec<String>> {
+            self.service_ids.lock().unwrap().clone()
         }
     }
 
@@ -409,7 +454,7 @@ mod tests {
         assert_ne!(response.is_error, Some(true));
         let managed = fake.managed.lock().unwrap().clone().unwrap();
         assert_eq!(managed.service, "metadata");
-        assert_eq!(managed.action, ManageAction::Restart);
+        assert_eq!(managed.action, ServiceOperationKind::Restart);
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }
@@ -422,7 +467,7 @@ mod tests {
         assert_ne!(response.is_error, Some(true));
         let managed = fake.managed.lock().unwrap().clone().unwrap();
         assert_eq!(managed.service, "mongo");
-        assert_eq!(managed.action, ManageAction::Restart);
+        assert_eq!(managed.action, ServiceOperationKind::Restart);
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }
@@ -502,7 +547,7 @@ mod tests {
         assert_ne!(response.is_error, Some(true));
         let managed = fake.managed.lock().unwrap().clone().unwrap();
         assert_eq!(managed.service, "metadata");
-        assert_eq!(managed.action, ManageAction::Restart);
+        assert_eq!(managed.action, ServiceOperationKind::Restart);
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }
@@ -602,6 +647,37 @@ mod tests {
         let response = client.call_tool(CallToolRequestParams::new("local_services_stop_daemon")).await.unwrap();
         assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
         assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = client.cancel().await;
+        let _ = server.cancel().await;
+    }
+
+    /// A service added by `manager reload` after the server started is accepted without an MCP
+    /// server restart, and shows up in the tool schemas.
+    #[tokio::test]
+    async fn a_reloaded_catalog_is_picked_up_without_a_restart() {
+        let fake = Arc::new(FakeClient::default());
+        let (server, client) = connect(fake.clone(), base_options()).await;
+        *fake.service_ids.lock().unwrap() = Some(vec!["metadata".to_string(), "mongo".to_string(), "search".to_string()]);
+        let response = client.call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "search", "action": "start", "confirm": true })))).await.unwrap();
+        assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+        assert_eq!(fake.managed.lock().unwrap().clone().unwrap().service, "search");
+        let tools = client.list_all_tools().await.unwrap();
+        let manage = tools.iter().find(|tool| tool.name == "local_services_manage").unwrap();
+        assert!(serde_json::to_string(&manage.input_schema).unwrap().contains("search"));
+        let _ = client.cancel().await;
+        let _ = server.cancel().await;
+    }
+
+    /// `shared_connection` exists to hand the agent a shared service's env — its `connection`
+    /// subtree is not redacted, while the rest of the reply still is.
+    #[tokio::test]
+    async fn shared_connection_keeps_its_connection_env_but_redacts_everything_else() {
+        let fake = Arc::new(FakeClient::default());
+        let (server, client) = connect(fake, base_options()).await;
+        let response = client.call_tool(CallToolRequestParams::new("local_services_shared_connection").with_arguments(args(json!({ "service": "minio" })))).await.unwrap();
+        let text = response.content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("AWS_SECRET_ACCESS_KEY"), "{text}");
+        assert!(!text.contains("must-not-leak"), "{text}");
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }

@@ -1,10 +1,10 @@
 #!/bin/bash
 # Packages a local, ad-hoc-signed Hearth.app — NOT a distributable build. Ad-hoc signing
 # (`codesign --sign -`, no Developer ID) satisfies Gatekeeper only loosely: launching via Finder will
-# still show an "unidentified developer" prompt the first time (right-click > Open once), and copying
-# this .app to a different machine is not expected to work at all. Shipping something that opens
-# cleanly on someone else's Mac needs a real Apple Developer ID certificate + notarization — this
-# script does not attempt that; see apps/macos/README.md's "Known limitations".
+# still show an "unidentified developer" prompt the first time (right-click > Open once) — on this
+# machine and on any other the release zip (.github/workflows/release.yml) is unpacked on. Shipping
+# something that opens cleanly on someone else's Mac needs a real Apple Developer ID certificate +
+# notarization — this script does not attempt that; see apps/macos/README.md's "Known limitations".
 #
 # Usage: apps/macos/scripts/build-app.sh [debug|release]  (default: release)
 set -euo pipefail

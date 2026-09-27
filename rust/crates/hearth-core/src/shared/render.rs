@@ -7,14 +7,14 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::catalog::{CommandSpec, ReadinessSpec};
+use crate::catalog::{template_var_spans, unknown_template_var, CommandSpec, ReadinessSpec};
 
 use super::registry::SharedInstance;
 use super::{project_bucket_name, project_db_name, project_user_name, SharedError};
 
 /// Instance-level vars — available to every field of a recipe. Extra listeners are `{port2}`,
 /// `{port3}`, … in allocation order. A recipe that mentions `{port2}` without a reserved extra
-/// port fails `check_unrendered` rather than spawning with the placeholder intact.
+/// port fails `check_vars` rather than spawning with the placeholder intact.
 pub fn instance_vars(instance: &SharedInstance, root: &Path) -> HashMap<String, String> {
     let mut vars = HashMap::from([
         (
@@ -42,16 +42,18 @@ pub fn render_command_checked(
     vars: &HashMap<String, String>,
     what: &str,
 ) -> Result<CommandSpec, SharedError> {
-    let rendered = render_command(spec, vars);
-    match &rendered {
-        CommandSpec::Argv { argv } => {
-            for arg in argv {
-                check_unrendered(arg, what)?;
-            }
-        }
-        CommandSpec::Shell { shell, .. } => check_unrendered(shell, what)?,
+    for text in command_strings(spec) {
+        check_vars(text, vars, what)?;
     }
-    Ok(rendered)
+    Ok(render_command(spec, vars))
+}
+
+/// Every template string inside a command — the argv entries, or the one shell string.
+pub fn command_strings(spec: &CommandSpec) -> Vec<&str> {
+    match spec {
+        CommandSpec::Argv { argv } => argv.iter().map(String::as_str).collect(),
+        CommandSpec::Shell { shell, .. } => vec![shell.as_str()],
+    }
 }
 
 /// Adds the per-project vars used by `provision`/`deprovision`/`connection`.
@@ -62,11 +64,19 @@ pub fn project_vars(vars: &mut HashMap<String, String>, project_id: &str) {
     vars.insert("projectBucket".to_string(), project_bucket_name(project_id));
 }
 
+/// Substitutes every `{name}` var `vars` defines in one pass; unknown vars and `${NAME}` shell
+/// expansions are left as written.
 pub fn render_str(template: &str, vars: &HashMap<String, String>) -> String {
-    let mut out = template.to_string();
-    for (key, value) in vars {
-        out = out.replace(&format!("{{{key}}}"), value);
+    let mut out = String::with_capacity(template.len());
+    let mut last = 0;
+    for (start, name) in template_var_spans(template) {
+        if let Some(value) = vars.get(name) {
+            out.push_str(&template[last..start]);
+            out.push_str(value);
+            last = start + name.len() + 2;
+        }
     }
+    out.push_str(&template[last..]);
     out
 }
 
@@ -82,22 +92,20 @@ pub fn render_command(spec: &CommandSpec, vars: &HashMap<String, String>) -> Com
     }
 }
 
-/// Leftover `{var}` after rendering means the recipe referenced a var this context doesn't define
-/// — surface it rather than silently running a command with a literal `{projectDb}` in it.
-pub fn check_unrendered(rendered: &str, what: &str) -> Result<(), SharedError> {
-    if let Some(rest) = rendered.split('{').nth(1) {
-        if let Some(name) = rest.split('}').next() {
-            if name
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-            {
-                return Err(SharedError(format!(
-                    "{what} references unknown template var {{{name}}}"
-                )));
-            }
-        }
+/// A `{var}` this context doesn't define means the recipe referenced something it can't have —
+/// surface it rather than silently running a command with a literal `{projectDb}` in it. Checked
+/// on the template, before rendering; shell `${NAME}` expansions are never template vars.
+pub fn check_vars(
+    template: &str,
+    vars: &HashMap<String, String>,
+    what: &str,
+) -> Result<(), SharedError> {
+    match unknown_template_var(template, |name| vars.contains_key(name)) {
+        Some(name) => Err(SharedError(format!(
+            "{what} references unknown template var {{{name}}}"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 pub fn render_readiness(
@@ -108,9 +116,10 @@ pub fn render_readiness(
         ReadinessSpec::Process => ReadinessSpec::Process,
         ReadinessSpec::Tcp { port } => ReadinessSpec::Tcp { port: *port },
         ReadinessSpec::Http { url } => {
-            let url = render_str(url, vars);
-            check_unrendered(&url, "readiness.url")?;
-            ReadinessSpec::Http { url }
+            check_vars(url, vars, "readiness.url")?;
+            ReadinessSpec::Http {
+                url: render_str(url, vars),
+            }
         }
         ReadinessSpec::Container => ReadinessSpec::Container,
         ReadinessSpec::Tailnet => ReadinessSpec::Tailnet,
@@ -138,9 +147,9 @@ pub fn render_connection(
 ) -> Result<Value, SharedError> {
     let mut vars = vars.clone();
     if let Some(url) = &connection.url {
+        check_vars(url, &vars, "connection.url")?;
         let url = render_str(url, &vars);
-        check_unrendered(&url, "connection.url")?;
-        vars.insert("url".to_string(), url.clone());
+        vars.insert("url".to_string(), url);
     }
     let mut out = serde_json::Map::new();
     if let Some(url) = vars.get("url") {
@@ -149,9 +158,8 @@ pub fn render_connection(
     if let Some(env) = &connection.env {
         let mut rendered = serde_json::Map::new();
         for (key, value) in env {
-            let value = render_str(value, &vars);
-            check_unrendered(&value, "connection.env")?;
-            rendered.insert(key.clone(), json!(value));
+            check_vars(value, &vars, "connection.env")?;
+            rendered.insert(key.clone(), json!(render_str(value, &vars)));
         }
         out.insert("env".to_string(), Value::Object(rendered));
     }
@@ -225,6 +233,28 @@ mod tests {
         let expected = "postgres://u_abc123@127.0.0.1:43500/h_abc123";
         assert_eq!(value["url"], json!(expected));
         assert_eq!(value["env"]["DATABASE_URL"], json!(expected));
+    }
+
+    #[test]
+    fn checks_every_var_and_leaves_shell_expansions_alone() {
+        let vars = instance_vars(&instance(), Path::new("/shared"));
+        let spec = CommandSpec::Shell {
+            shell: "cd ${HOME} && awk '{print $1}' {dataDir}/x -p {port}".to_string(),
+            exec: None,
+        };
+        let CommandSpec::Shell { shell, .. } = render_command_checked(&spec, &vars, "run").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            shell,
+            "cd ${HOME} && awk '{print $1}' /shared/instances/postgres@16.4/x -p 43500"
+        );
+        // Only the second brace pair is a var — it must still be caught.
+        let spec = CommandSpec::Argv {
+            argv: vec!["{a b} {port2}".to_string()],
+        };
+        assert!(render_command_checked(&spec, &vars, "run").is_err());
     }
 
     #[test]

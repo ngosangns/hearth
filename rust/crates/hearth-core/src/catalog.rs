@@ -1,4 +1,4 @@
-//! Public config/catalog API — port of `src/core/catalog.ts`. A consumer authors one
+//! Public config/catalog API. A consumer authors one
 //! `ServiceCatalog` value describing its own services and passes it to every other entry point;
 //! nothing in this crate imports a catalog directly.
 use std::collections::HashMap;
@@ -34,10 +34,6 @@ pub struct ServiceCommand {
     pub container_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_stop_command: Option<CommandSpec>,
-}
-
-pub struct ReadinessProbeContext {
-    pub service_id: ServiceId,
 }
 
 /// The `custom` variant (an in-process closure) can't be represented in the JSON-serializable
@@ -110,6 +106,8 @@ pub enum ServiceRunProfile {
         readiness: ReadinessSpec,
         #[serde(skip_serializing_if = "Option::is_none")]
         readiness_timeout_ms: Option<u64>,
+        /// Deprecated: opaque preparation markers from the TS era — no catalog producer sets them.
+        /// Use `preparation_command`. Kept only so older wire payloads still deserialize.
         #[serde(skip_serializing_if = "Option::is_none")]
         preparation: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +117,8 @@ pub enum ServiceRunProfile {
         readiness: ReadinessSpec,
         #[serde(skip_serializing_if = "Option::is_none")]
         readiness_timeout_ms: Option<u64>,
+        /// Deprecated: opaque preparation markers from the TS era — no catalog producer sets them.
+        /// Use `preparation_command`. Kept only so older wire payloads still deserialize.
         #[serde(skip_serializing_if = "Option::is_none")]
         preparation: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,22 +215,53 @@ pub struct ServiceUrl {
 /// typo'd placeholder fails the catalog load instead of rendering a dead link.
 pub const SERVICE_URL_PLACEHOLDERS: [&str; 1] = ["tailnetHost"];
 
-/// Names of every `{placeholder}` in a URL template, in order of appearance.
-pub fn service_url_placeholders(url: &str) -> Vec<&str> {
-    let mut names = Vec::new();
-    let mut rest = url;
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
+/// Every innermost `{…}` pair in `text` as `(byte offset of '{', body)`, in order of appearance.
+/// The one brace tokenizer behind URL placeholders and command template vars.
+fn brace_spans(text: &str) -> Vec<(usize, &str)> {
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while let Some(open) = text[offset..].find('{') {
+        let start = offset + open;
+        let after = &text[start + 1..];
         match after.find(['{', '}']) {
             Some(close) if after.as_bytes()[close] == b'}' => {
-                names.push(&after[..close]);
-                rest = &after[close + 1..];
+                spans.push((start, &after[..close]));
+                offset = start + 1 + close + 1;
             }
-            Some(close) => rest = &after[close..],
+            Some(close) => offset = start + 1 + close,
             None => break,
         }
     }
-    names
+    spans
+}
+
+/// Names of every `{placeholder}` in a URL template, in order of appearance.
+pub fn service_url_placeholders(url: &str) -> Vec<&str> {
+    brace_spans(url).into_iter().map(|(_, name)| name).collect()
+}
+
+/// Every `{name}` template var in a command/env/url template as `(byte offset of '{', name)`, in
+/// order of appearance. Only an identifier-shaped body counts, and a `${NAME}` shell expansion
+/// never does — so `${HOME}` and `awk '{print $1}'` pass through untouched.
+pub fn template_var_spans(text: &str) -> Vec<(usize, &str)> {
+    brace_spans(text)
+        .into_iter()
+        .filter(|(start, name)| {
+            !text[..*start].ends_with('$')
+                && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        })
+        .collect()
+}
+
+/// Names of every `{name}` template var in `text` — see `template_var_spans`.
+pub fn template_vars(text: &str) -> Vec<&str> {
+    template_var_spans(text).into_iter().map(|(_, name)| name).collect()
+}
+
+/// The first template var in `text` that `is_known` rejects.
+pub fn unknown_template_var(text: &str, is_known: impl Fn(&str) -> bool) -> Option<&str> {
+    template_vars(text).into_iter().find(|name| !is_known(name))
 }
 
 /// A service URL with its placeholders substituted, as served by `GET /v1/urls`.
@@ -333,11 +364,15 @@ pub struct ServiceCatalog {
     /// Declaration order + raw members (group names included) for grouped display.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_tree: Vec<CatalogGroup>,
+    /// Reserved: a TS-era field no catalog producer sets and nothing reads. Kept so existing
+    /// struct literals across the workspace and older wire payloads keep compiling/loading.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_file: Option<String>,
     /// Runtime state directory, relative to the manager's root. Default: `.hearth/runtime-v1`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_directory: Option<String>,
+    /// Single-variant today; defaulted so a catalog that omits it still loads.
+    #[serde(default)]
     pub start_failure_policy: StartFailurePolicy,
     /// O_NOFOLLOW + dev/ino private-file guard layer for every lock/state/log file operation.
     /// Default on.
@@ -345,9 +380,10 @@ pub struct ServiceCatalog {
     pub private_file_guard: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StartFailurePolicy {
+    #[default]
     StopOnFirstFailureKeepStarted,
 }
 
@@ -628,5 +664,14 @@ mod tests {
     fn extracts_placeholder_names_in_order() {
         assert_eq!(service_url_placeholders("https://{tailnetHost}:{port}/x"), vec!["tailnetHost", "port"]);
         assert!(service_url_placeholders("http://127.0.0.1:1").is_empty());
+    }
+
+    #[test]
+    fn template_vars_scan_every_brace_and_skip_shell_expansions() {
+        assert_eq!(template_vars("{a b} {port2}"), vec!["port2"]);
+        assert_eq!(template_vars("cd ${HOME} && awk '{print $1}' {dataDir}"), vec!["dataDir"]);
+        assert_eq!(template_vars("{{installDir}}"), vec!["installDir"]);
+        assert_eq!(unknown_template_var("{port} {projectDB}", |n| n == "port"), Some("projectDB"));
+        assert_eq!(unknown_template_var("${HOME}/{port}", |n| n == "port"), None);
     }
 }

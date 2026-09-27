@@ -17,6 +17,7 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     private var _logRequests: [(cursor: Int?, generation: Int?)] = []
     private var _servicesCalls = 0
     private var _daemonLogCalls = 0
+    private var _watchRequests: [(after: UInt64?, epoch: String?)] = []
 
     var servicesHandler: (@Sendable () async throws -> [ServiceLifecycleState])?
     var catalogHandler: (@Sendable () async throws -> ServiceCatalogSummary)?
@@ -26,11 +27,14 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     var bulkStartHandler: (@Sendable ([String]) async throws -> ManagerOperation)?
     var operationHandler: (@Sendable (String) async throws -> ManagerOperation)?
     var urlsHandler: (@Sendable () async throws -> [ResolvedServiceUrl])?
+    /// Each `watchEvents` call gets the stream this returns. Unset keeps the protocol default —
+    /// `watchUnsupported`, i.e. the poll fallback.
+    var watchEventsHandler: (@Sendable (UInt64?, String?) -> AsyncThrowingStream<ManagerStreamEvent, Error>)?
     /// smp-side handlers (`SharedAPI`) — same closure-per-method convention.
     var sharedInstancesHandler: (@Sendable () async throws -> [SharedInstance])?
     var sharedCatalogHandler: (@Sendable () async throws -> SharedCatalogDocument)?
     var sharedInstallHandler: (@Sendable (String) async throws -> SharedMutationResponse)?
-    var sharedRemoveHandler: (@Sendable (String) async throws -> SharedMutationResponse)?
+    var sharedRemoveHandler: (@Sendable (String, Bool) async throws -> SharedMutationResponse)?
     private var _installed: [String] = []
     private var _removed: [String] = []
     var installed: [String] { lock.sync { _installed } }
@@ -51,6 +55,17 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     var daemonLogCalls: Int {
         lock.sync { _daemonLogCalls }
     }
+    var watchRequests: [(after: UInt64?, epoch: String?)] {
+        lock.sync { _watchRequests }
+    }
+
+    func watchEvents(after: UInt64?, epoch: String?) -> AsyncThrowingStream<ManagerStreamEvent, Error> {
+        lock.sync { _watchRequests.append((after, epoch)) }
+        guard let watchEventsHandler else {
+            return AsyncThrowingStream { $0.finish(throwing: ManagerClientError.watchUnsupported) }
+        }
+        return watchEventsHandler(after, epoch)
+    }
 
     func services() async throws -> [ServiceLifecycleState] {
         lock.sync { _servicesCalls += 1 }
@@ -61,10 +76,6 @@ final class FakeManagerAPI: ManagerAPI, @unchecked Sendable {
     func catalog() async throws -> ServiceCatalogSummary {
         guard let catalogHandler else { throw Unimplemented(what: "catalog") }
         return try await catalogHandler()
-    }
-
-    func managerInfo() async throws -> ManagerInfo {
-        throw Unimplemented(what: "managerInfo")
     }
 
     func daemonLog() async throws -> LogSlice {
@@ -123,10 +134,10 @@ extension FakeManagerAPI: SharedAPI {
         return try await sharedInstallHandler(service)
     }
 
-    func sharedRemove(service: String) async throws -> SharedMutationResponse {
+    func sharedRemove(service: String, force: Bool) async throws -> SharedMutationResponse {
         lock.sync { _removed.append(service) }
         guard let sharedRemoveHandler else { return SharedMutationResponse(service: service, port: nil, installState: nil) }
-        return try await sharedRemoveHandler(service)
+        return try await sharedRemoveHandler(service, force)
     }
 }
 
@@ -142,7 +153,6 @@ func makeOperation(id: String = "op-1", status: String, error: OperationError? =
         status: status,
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
-        trace: [],
         error: error
     )
 }
@@ -166,6 +176,6 @@ func makeService(_ serviceId: String, actualState: String, readiness: String = "
     )
 }
 
-func makeLogSlice(data: String, nextCursor: Int, generation: Int, reset: Bool = false, truncated: Bool = false) -> LogSlice {
-    LogSlice(serviceId: "api", generation: generation, cursor: 0, nextCursor: nextCursor, data: data, reset: reset, truncated: truncated)
+func makeLogSlice(data: String, nextCursor: Int, generation: Int, reset: Bool = false) -> LogSlice {
+    LogSlice(serviceId: "api", generation: generation, nextCursor: nextCursor, data: data, reset: reset)
 }

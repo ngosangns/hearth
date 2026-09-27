@@ -126,11 +126,23 @@ or topic in place.
 
 ## Shipped recipes
 
-All shipped artifacts are `script` entries: `scripts/catalog/pack.sh` builds the tarball, because
-the publishers either do not ship a darwin-arm64 archive in the layout the recipe runs or (MongoDB)
-the recipe needs payload files repacked alongside it. Versions and sha256 live in `catalog.json`;
-`scripts/catalog/write-catalog.py` regenerates that file from `dist/catalog/*.sha256` after
-`package.sh` runs.
+All shipped artifacts are `script` entries: `scripts/catalog/pack.sh` builds the tarball on demand,
+because the publishers either do not ship a darwin-arm64 archive in the layout the recipe runs or
+(MongoDB) the recipe needs payload files repacked alongside it. Nothing is published as a release
+asset. Run from a remote catalog, `pack.sh` downloads the rest of `scripts/catalog` from
+`$HEARTH_CATALOG_ORIGIN` using the file list in `scripts/catalog/MANIFEST`.
+
+Versions and sha256 live in `catalog.json`. The daemon does not verify sha256 for `script`
+artifacts (a rebuild is not byte-reproducible); the recorded hash is what the smoke test checks.
+The pipeline, from the repo root:
+
+- `task catalog:package` (`scripts/catalog/package.sh [service]`) — build the tarballs and their
+  `.sha256` files into `dist/catalog/`.
+- `task catalog:write` (`scripts/catalog/write-catalog.py`) — regenerate `catalog.json` and
+  `scripts/catalog/MANIFEST` from those `.sha256` files. Re-run it after adding a payload file.
+- `task catalog:smoke` (`scripts/catalog/smoke.sh`) — attach every shipped service against the
+  local tarballs under a throwaway `HOME`, and fail if `MANIFEST` is stale.
+
 Every listener is `127.0.0.1`. There is no per-project auth; MinIO's root credentials are the fixed
 dev pair `hearth` / `hearth-local-dev`.
 

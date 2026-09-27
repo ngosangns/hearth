@@ -1,4 +1,4 @@
-//! Port of `src/core/paths.ts` — path-joining helpers for the runtime directory layout.
+//! Path-joining helpers for the runtime directory layout.
 use std::path::{Path, PathBuf};
 
 pub use crate::state::{
@@ -49,10 +49,6 @@ pub fn raw_log_path(runtime_directory: &Path, service_id: &str) -> PathBuf {
     logs_dir(runtime_directory).join(format!("{service_id}.raw"))
 }
 
-pub fn log_stream_state_path(runtime_directory: &Path) -> PathBuf {
-    logs_dir(runtime_directory).join("streams.json")
-}
-
 /// Where a service's `artifact:` tarball extracts to — versioned so an upgrade installs into a
 /// fresh directory and never mutates a running install.
 pub fn install_dir(runtime_directory: &Path, service_id: &str, version: &str) -> PathBuf {
@@ -101,6 +97,5 @@ mod tests {
         assert_eq!(logs_dir(&runtime), runtime.join("logs"));
         assert_eq!(log_path(&runtime, "api"), runtime.join("logs/api.log"));
         assert_eq!(raw_log_path(&runtime, "api"), runtime.join("logs/api.raw"));
-        assert_eq!(log_stream_state_path(&runtime), runtime.join("logs/streams.json"));
     }
 }

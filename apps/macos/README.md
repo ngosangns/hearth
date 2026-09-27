@@ -53,7 +53,11 @@ Produces an ad-hoc-signed `Hearth.app` bundling compiled `hearthd` at
 - Add/remove workspaces (folders), persisted locally.
 - Per-folder trust prompt before the first daemon connection.
 - Connect (spawn-or-adopt the daemon via `hearthd manager ensure`), list services with live status
-  (polling `/v1/services` every 2s), start/stop/restart per service and per catalog `groups:` section.
+  (following `/v1/events/stream`; polling `/v1/services` every 2s only if the stream is unavailable),
+  start/stop/restart per service and per catalog `groups:` section. A daemon that stops answering
+  (replaced by a CLI `manager restart`, or crashed) is rediscovered via `ensure`, with backoff.
+- The app refuses a daemon whose `protocolVersion` differs from the one it was built for, with a
+  message saying to update and restart the daemon.
 - `disabled: true` services render inert — the catalog keeps them listed, the row offers no actions.
 - Live-status collapse: `running`/`running-unready` → `running` (mint), `starting`/`preparing` →
   `starting` (yellow) — a `kind: process` service never reads as a stuck boot. Both `ready` and
@@ -65,13 +69,14 @@ Produces an ad-hoc-signed `Hearth.app` bundling compiled `hearthd` at
 - `MenuBarExtra` — a global "ready/total" summary across every trusted workspace, plus a
   `Shared Services` window (`hearthd shared ensure`) listing machine-global instances and the
   installable catalog.
-- Config watch: editing `hearth.yaml`/`.yml`/`.json` triggers `hearthd manager reload`.
+- Config watch (FSEvents, per-file): editing `hearth.yaml`/`.yml`/`.json` — in place or by atomic
+  save — triggers `hearthd manager reload`.
 - "Stop All", "Restart Daemon", and a confirmed "Stop Daemon…" in the toolbar and menu bar.
 
 ## Known limitations
 
 - **No distributable `.app`** — `build-app.sh` ad-hoc signs with the hardened runtime
   (`--options runtime`) and stamps the bundle version from `hearthd --version`. Shipping to another
-  machine still needs a Developer ID cert + `notarytool submit` + stapler. Sparkle's `SUFeedURL` is
-  in Info.plist pointing at GitHub Releases; **Check for Updates…** opens that page until a signed
-  appcast exists. A `bun build --compile` sidecar was tried and rejected (see AGENTS.md).
+  machine still needs a Developer ID cert + `notarytool submit` + stapler. Sparkle is not linked (so
+  Info.plist carries no `SUFeedURL`); **Check for Updates…** opens the GitHub Releases page
+  (`AppLinks.releases`) until a signed appcast exists. A `bun build --compile` sidecar was tried and rejected (see AGENTS.md).

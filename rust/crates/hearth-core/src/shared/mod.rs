@@ -7,13 +7,13 @@
 //! registry (`registry`), port allocation (`ports`), the tarball installer (`install`), recipe
 //! template rendering (`render`), and smp's in-memory catalog synthesis (`synthesize`). The HTTP
 //! orchestration that drives these lives in `crate::manager::shared`.
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::Digest;
 
 use crate::file_io::{create_file_io, FileIo};
+use crate::sync::KeyedLock;
 
 pub mod install;
 pub mod ports;
@@ -81,7 +81,67 @@ pub fn instance_id(name: &str, version: &str) -> String {
 pub fn project_id(root: &Path) -> String {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let digest = sha2::Sha256::digest(canonical.to_string_lossy().as_bytes());
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    hex(&digest[..8])
+}
+
+/// Lowercase hex of `bytes` — sha256 digests and project ids.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Spawns `command` in its own process group and waits up to `limit` for it. On timeout the whole
+/// group — a packaging script's or recipe's grandchildren included — is SIGKILLed and `Ok(None)`
+/// returned, but only while the leader is still unreaped: `child.id()` goes `None` once it is
+/// reaped, and a group whose leader pid may have been recycled is never signalled. `kill_on_drop`
+/// covers a caller whose future is itself dropped mid-wait.
+pub(crate) async fn output_with_timeout(
+    mut command: tokio::process::Command,
+    limit: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    command.kill_on_drop(true).process_group(0);
+    let mut child = command.spawn()?;
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let wait = async {
+        let read_out = async move {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = out_pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+            }
+            buf
+        };
+        let read_err = async move {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = err_pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+            }
+            buf
+        };
+        let (status, stdout, stderr) = tokio::join!(child.wait(), read_out, read_err);
+        status.map(|status| std::process::Output { status, stdout, stderr })
+    };
+    match tokio::time::timeout(limit, wait).await {
+        Ok(result) => result.map(Some),
+        Err(_) => {
+            if let Some(pid) = child.id() {
+                // SAFETY: plain syscall; `pid` is our own unreaped child's process group.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            Ok(None)
+        }
+    }
+}
+
+/// Runs blocking filesystem work on the blocking pool instead of a runtime worker.
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, SharedError> + Send + 'static,
+) -> Result<T, SharedError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| SharedError(format!("blocking task failed: {e}")))?
 }
 
 /// Per-project logical resource names handed to a recipe's `provision`/`connection` templates.
@@ -99,15 +159,20 @@ pub fn project_bucket_name(project: &str) -> String {
 }
 
 /// Everything the smp daemon's HTTP handlers need that isn't already on `HearthManager`: the
-/// instance registry, the remote catalog client, and per-instance serialization for
-/// install/attach so two projects racing the same `name@version` can't double-install.
+/// instance registry, the remote catalog client, per-instance serialization for install/attach so
+/// two projects racing the same `name@version` can't double-install, and one machine-wide port
+/// allocation lock so two *different* new instances can't be handed the same port.
 pub struct SharedContext {
     pub root: PathBuf,
     pub io: Arc<dyn FileIo>,
     pub registry: Arc<SharedRegistry>,
     pub remote: Arc<RemoteCatalog>,
     pub http: reqwest::Client,
-    instance_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    instance_locks: KeyedLock<String>,
+    /// Held across read-taken → bind-probe → registry insert. Per-instance locks don't cover it:
+    /// concurrent attaches of two new ids whose hash slots are close can both pass the bind probe
+    /// (neither has bound yet) and be handed the same port.
+    pub port_allocation: tokio::sync::Mutex<()>,
 }
 
 impl SharedContext {
@@ -133,20 +198,13 @@ impl SharedContext {
             io,
             root,
             http: reqwest::Client::new(),
-            instance_locks: std::sync::Mutex::new(HashMap::new()),
+            instance_locks: KeyedLock::new(),
+            port_allocation: tokio::sync::Mutex::new(()),
         }))
     }
 
     pub fn runtime_directory(&self) -> PathBuf {
         self.root.join(SHARED_RUNTIME_DIRECTORY_NAME)
-    }
-
-    pub fn installs_dir(&self) -> PathBuf {
-        self.root.join("installs")
-    }
-
-    pub fn instances_dir(&self) -> PathBuf {
-        self.root.join("instances")
     }
 
     pub fn downloads_dir(&self) -> PathBuf {
@@ -157,11 +215,6 @@ impl SharedContext {
     /// keyed by instance id and kept forever — the map is bounded by the number of distinct
     /// `name@version` keys a machine ever registers, which is tiny.
     pub fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.instance_locks
-            .lock()
-            .unwrap()
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        self.instance_locks.get(&id.to_string())
     }
 }

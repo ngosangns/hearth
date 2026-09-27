@@ -32,7 +32,7 @@ final class WorkspaceControllerUrlTests: XCTestCase {
 
     func testConnectFetchesUrlsAndFiltersThemPerService() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready"), makeService("web", actualState: "stopped")] }
         api.urlsHandler = {
             [
@@ -53,7 +53,7 @@ final class WorkspaceControllerUrlTests: XCTestCase {
     /// A daemon from before `/v1/urls` existed must not break the connection — URLs are optional.
     func testConnectSucceedsWhenTheDaemonHasNoUrlsEndpoint() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         // urlsHandler left unset -> throws, like a 404 from an older daemon.
         let sut = WorkspaceController(workspace: workspace(), watchesConfigFile: false, connector: { _ in api })

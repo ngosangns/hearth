@@ -1,4 +1,4 @@
-//! Port of `CursorLogStore` (`src/core/manager.ts`) — per-service append-only log files with
+//! `CursorLogStore` — per-service append-only log files with
 //! crash-safe rotation and a cursor/generation tailing protocol for `GET /v1/logs/:id`.
 //!
 //! **Sharp edges (AGENTS.md)**:
@@ -8,7 +8,6 @@
 //! 2. Cursor/generation log-tailing must never split a UTF-8 sequence across a read boundary, and
 //!    must signal `reset: true` on a stale generation or an invalid/out-of-range cursor.
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,6 +18,7 @@ use serde_json::Value;
 use crate::catalog::ServiceId;
 use crate::file_io::FileIo;
 use crate::state::LogSlice;
+use crate::sync::KeyedLock;
 
 pub const DEFAULT_LOG_TAIL_BYTES: u64 = 16 * 1024;
 pub const DEFAULT_LOG_MAX_BYTES: u64 = 256 * 1024;
@@ -49,18 +49,6 @@ struct LogRotationJournal {
     from_generation: u64,
     to_generation: u64,
     phase: String,
-}
-
-struct KeyedLock<K: Eq + Hash + Clone> {
-    locks: Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>,
-}
-impl<K: Eq + Hash + Clone> KeyedLock<K> {
-    fn new() -> Self {
-        Self { locks: Mutex::new(HashMap::new()) }
-    }
-    fn get(&self, key: &K) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks.lock().unwrap().entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
-    }
 }
 
 pub struct CursorLogStore {
@@ -94,8 +82,7 @@ impl CursorLogStore {
     }
 
     pub async fn append(&self, service_id: &ServiceId, data: &str) -> Result<(), LogStoreError> {
-        let lock = self.append_queues.get(service_id);
-        let _guard = lock.lock().await;
+        let _guard = self.append_queues.lock(service_id).await;
         self.ensure_loaded().await;
         let encoded = data.as_bytes();
         if encoded.len() as u64 > self.max_bytes {
@@ -120,20 +107,27 @@ impl CursorLogStore {
     }
 
     pub async fn read(&self, service_id: &ServiceId, cursor: Option<u64>, limit: Option<u64>, lifecycle_generation: u64, requested_generation: Option<u64>) -> LogSlice {
-        let lock = self.append_queues.get(service_id);
-        let _guard = lock.lock().await;
+        let _guard = self.append_queues.lock(service_id).await;
         self.ensure_loaded().await;
         let path = self.path_for(service_id);
-        let size = self.size(&path);
         let safe_limit = limit.unwrap_or(self.latest_tail_bytes).clamp(1, self.latest_tail_bytes);
         let stale_generation = requested_generation.map(|g| g != lifecycle_generation).unwrap_or(false);
-        let invalid_cursor = cursor.map(|c| c > size || !self.is_utf8_boundary(&path, c, size)).unwrap_or(false);
+        // One handle for the whole request: the cursor check, and a single window read. Appends and
+        // rotations hold this same per-service lock, so its view of the file cannot shift. The tail
+        // used to be located by re-opening the file once per byte it stepped over.
+        let mut file = std::fs::File::open(&path).ok();
+        let size = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+        let invalid_cursor = cursor.is_some_and(|c| c > size || !is_utf8_boundary(file.as_mut(), c, size));
         let reset = stale_generation || invalid_cursor;
-        let start = match cursor {
-            Some(c) if !reset => c,
-            _ => self.tail_start(&path, size, safe_limit),
+        let (start, data, bytes_read) = match (cursor, file.as_mut()) {
+            (Some(c), Some(file)) if !reset && c < size => {
+                let (data, bytes_read) = read_framed(file, c, size, safe_limit);
+                (c, data, bytes_read)
+            }
+            (Some(c), _) if !reset => (c, String::new(), 0),
+            (_, Some(file)) => read_tail(file, size, safe_limit),
+            (_, None) => (0, String::new(), 0),
         };
-        let (data, bytes_read) = if start >= size { (String::new(), 0) } else { self.read_framed(&path, start, size, safe_limit) };
         LogSlice {
             service_id: service_id.clone(),
             generation: lifecycle_generation,
@@ -233,63 +227,6 @@ impl CursorLogStore {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
 
-    fn read_byte_at(&self, path: &Path, offset: u64) -> Option<u8> {
-        let mut file = std::fs::File::open(path).ok()?;
-        file.seek(SeekFrom::Start(offset)).ok()?;
-        let mut buf = [0u8; 1];
-        file.read_exact(&mut buf).ok()?;
-        Some(buf[0])
-    }
-
-    fn is_utf8_boundary(&self, path: &Path, cursor: u64, size: u64) -> bool {
-        if cursor == 0 || cursor == size {
-            return true;
-        }
-        match self.read_byte_at(path, cursor) {
-            Some(byte) => (byte & 0xc0) != 0x80,
-            None => false,
-        }
-    }
-
-    fn tail_start(&self, path: &Path, size: u64, limit: u64) -> u64 {
-        let mut start = size.saturating_sub(limit);
-        while start < size && !self.is_utf8_boundary(path, start, size) {
-            start += 1;
-        }
-        start
-    }
-
-    /// Reads up to `limit` bytes starting at `start`, never splitting a multi-byte UTF-8 sequence
-    /// across the end of the returned slice — port of `readFramed`.
-    fn read_framed(&self, path: &Path, start: u64, size: u64, limit: u64) -> (String, u64) {
-        let maximum = (size - start).min(limit + 3);
-        let mut buffer = vec![0u8; maximum as usize];
-        let bytes_read: u64 = (|| -> std::io::Result<usize> {
-            let mut file = std::fs::File::open(path)?;
-            file.seek(SeekFrom::Start(start))?;
-            file.read(&mut buffer)
-        })()
-        .unwrap_or(0) as u64;
-        let mut end = bytes_read.min(limit);
-        while end < bytes_read && (buffer[end as usize] & 0xc0) == 0x80 {
-            end += 1;
-        }
-        if end < bytes_read && end > 0 && (buffer[(end - 1) as usize] & 0xe0) == 0xc0 {
-            end = bytes_read.min(end + 1);
-        }
-        if end < bytes_read && end > 0 && (buffer[(end - 1) as usize] & 0xf0) == 0xe0 {
-            end = bytes_read.min(end + 2);
-        }
-        if end < bytes_read && end > 0 && (buffer[(end - 1) as usize] & 0xf8) == 0xf0 {
-            end = bytes_read.min(end + 3);
-        }
-        while end < bytes_read && (buffer[end as usize] & 0xc0) == 0x80 {
-            end += 1;
-        }
-        let data = String::from_utf8_lossy(&buffer[..end as usize]).to_string();
-        (data, end)
-    }
-
     async fn rotate(&self, service_id: &ServiceId) -> Result<(), LogStoreError> {
         let path = self.path_for(service_id);
         let from_generation = *self.rotation_generations.lock().unwrap().get(service_id).unwrap_or(&1);
@@ -327,6 +264,71 @@ impl CursorLogStore {
         let _ = self.io.remove_file(&journal_path);
         Ok(())
     }
+}
+
+/// Reads from `offset` until `buffer` is full or the file ends; returns the bytes read.
+fn read_at(file: &mut std::fs::File, offset: u64, buffer: &mut [u8]) -> usize {
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return 0;
+    }
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+    }
+    filled
+}
+
+fn is_utf8_continuation(byte: u8) -> bool {
+    (byte & 0xc0) == 0x80
+}
+
+fn is_utf8_boundary(file: Option<&mut std::fs::File>, cursor: u64, size: u64) -> bool {
+    if cursor == 0 || cursor == size {
+        return true;
+    }
+    let Some(file) = file else { return false };
+    let mut byte = [0u8; 1];
+    read_at(file, cursor, &mut byte) == 1 && !is_utf8_continuation(byte[0])
+}
+
+/// The last `limit` bytes, moved forward past any leading continuation bytes so the slice starts on
+/// a character boundary. Returns `(start, data, bytes_read)`.
+fn read_tail(file: &mut std::fs::File, size: u64, limit: u64) -> (u64, String, u64) {
+    let window_start = size.saturating_sub(limit);
+    let mut buffer = vec![0u8; (size - window_start) as usize];
+    let read = read_at(file, window_start, &mut buffer);
+    let skip = buffer[..read].iter().take_while(|byte| is_utf8_continuation(**byte)).count();
+    let data = String::from_utf8_lossy(&buffer[skip..read]).into_owned();
+    (window_start + skip as u64, data, (read - skip) as u64)
+}
+
+/// Reads up to `limit` bytes starting at `start`, never splitting a multi-byte UTF-8 sequence
+/// across the end of the returned slice.
+fn read_framed(file: &mut std::fs::File, start: u64, size: u64, limit: u64) -> (String, u64) {
+    let maximum = (size - start).min(limit + 3);
+    let mut buffer = vec![0u8; maximum as usize];
+    let bytes_read = read_at(file, start, &mut buffer) as u64;
+    let mut end = bytes_read.min(limit);
+    while end < bytes_read && is_utf8_continuation(buffer[end as usize]) {
+        end += 1;
+    }
+    if end < bytes_read && end > 0 && (buffer[(end - 1) as usize] & 0xe0) == 0xc0 {
+        end = bytes_read.min(end + 1);
+    }
+    if end < bytes_read && end > 0 && (buffer[(end - 1) as usize] & 0xf0) == 0xe0 {
+        end = bytes_read.min(end + 2);
+    }
+    if end < bytes_read && end > 0 && (buffer[(end - 1) as usize] & 0xf8) == 0xf0 {
+        end = bytes_read.min(end + 3);
+    }
+    while end < bytes_read && is_utf8_continuation(buffer[end as usize]) {
+        end += 1;
+    }
+    let data = String::from_utf8_lossy(&buffer[..end as usize]).to_string();
+    (data, end)
 }
 
 #[cfg(test)]

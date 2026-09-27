@@ -12,7 +12,7 @@ use crate::catalog::{
 
 use super::registry::SharedInstance;
 use super::render::{
-    check_unrendered, instance_vars, render_command_checked, render_env, render_readiness,
+    check_vars, instance_vars, render_command_checked, render_env, render_readiness,
 };
 use super::SHARED_RUNTIME_DIRECTORY_NAME;
 
@@ -53,11 +53,10 @@ pub fn synthesize_service(
     let readiness = render_readiness(&instance.recipe.readiness, &vars)?;
     let environment = match instance.recipe.env.as_ref() {
         Some(env) => {
-            let rendered = render_env(env, &vars);
-            for value in rendered.values() {
-                check_unrendered(value, "env")?;
+            for value in env.values() {
+                check_vars(value, &vars, "env")?;
             }
-            Some(rendered).filter(|e| !e.is_empty())
+            Some(render_env(env, &vars)).filter(|e| !e.is_empty())
         }
         None => None,
     };

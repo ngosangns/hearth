@@ -103,6 +103,14 @@ struct RegistryFile {
     data: SharedRegistryData,
 }
 
+/// Borrowing twin of `RegistryFile` so a save serializes the live data without cloning it.
+#[derive(Serialize)]
+struct RegistryFileRef<'a> {
+    version: u32,
+    #[serde(flatten)]
+    data: &'a SharedRegistryData,
+}
+
 pub struct SharedRegistry {
     io: Arc<dyn FileIo>,
     path: PathBuf,
@@ -150,24 +158,24 @@ impl SharedRegistry {
     }
 
     /// Mutate + persist atomically. The closure runs under the registry mutex; keep it sync and
-    /// small.
+    /// small. The file write happens under the same mutex: writing after unlocking let two
+    /// concurrent updates land on disk out of order, leaving `registry.json` without the later
+    /// change (a port reservation or attachment row) until the next write. The file is tiny.
     pub fn update<R>(
         &self,
         f: impl FnOnce(&mut SharedRegistryData) -> R,
     ) -> Result<R, SharedError> {
-        let result = {
-            let mut data = self.data.lock().unwrap();
-            let result = f(&mut data);
-            let file = RegistryFile {
-                version: REGISTRY_VERSION,
-                data: data.clone(),
-            };
-            (result, serde_json::to_string_pretty(&file).unwrap())
-        };
+        let mut data = self.data.lock().unwrap();
+        let result = f(&mut data);
+        let text = serde_json::to_string_pretty(&RegistryFileRef {
+            version: REGISTRY_VERSION,
+            data: &data,
+        })
+        .unwrap();
         self.io
-            .write_file(&self.path, &result.1)
+            .write_file(&self.path, &text)
             .map_err(|e| SharedError(e.to_string()))?;
-        Ok(result.0)
+        Ok(result)
     }
 
     pub fn remove(&self, id: &str) -> Result<Option<SharedInstance>, SharedError> {

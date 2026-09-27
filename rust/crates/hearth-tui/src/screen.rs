@@ -1,6 +1,8 @@
-//! Port of `src/tui/screen.ts` — the pure `(state, geometry) -> lines` layout engine backing the
-//! TUI's single frame: header, a scrollable service list, then the selected service's log.
-use crate::state::Service;
+//! The pure `(state, geometry) -> lines` layout engine backing the TUI's single frame: header, a
+//! scrollable service list, then the selected service's log.
+use hearth_core::state::ActualServiceState;
+
+use crate::state::{display_state, Service};
 use crate::text_utils::{sanitize_terminal_text, truncate_to_width};
 
 #[derive(Debug, Clone, Copy)]
@@ -155,7 +157,7 @@ impl ServiceScreen {
                 let service = services.get(index).copied();
                 let kind = if service.and_then(|s| s.kind) == Some(hearth_core::catalog::ServiceKind::Infrastructure) { " infra" } else { "" };
                 let content = match service {
-                    Some(service) => format!("{} {} {}{}", if service.name == self.state.selected_name { ">" } else { " " }, status_label(&service.state), service.name, kind),
+                    Some(service) => format!("{} {} {}{}", if service.name == self.state.selected_name { ">" } else { " " }, status_label(service.state), service.name, kind),
                     None => String::new(),
                 };
                 let scrollbar = if has_service_scrollbar { scrollbar_cell(index, start, service_height, self.state.services.len()) } else { "" };
@@ -216,25 +218,30 @@ impl ServiceScreen {
     pub fn invalidate(&mut self) {
         self.cache_key.clear();
     }
+
+    /// Adopts a new terminal size, so selection scrolling uses the real height.
+    pub fn resize(&mut self, terminal: Viewport) {
+        self.terminal = terminal;
+        self.invalidate();
+    }
 }
 
 fn fit(text: &str, width: usize) -> String {
     truncate_to_width(&sanitize_terminal_text(text), width, true)
 }
 
-fn status_colour(state: &str) -> u8 {
+fn status_colour(state: ActualServiceState) -> u8 {
     match state {
-        "ready" => 32,
-        "running" => 36,
-        "preparing" | "queued-start" | "starting" | "stopping" | "degraded" => 33,
-        "stopped" => 90,
-        "failed" | "orphaned" | "externally-owned" => 31,
-        _ => 37,
+        ActualServiceState::Ready => 32,
+        ActualServiceState::Running => 36,
+        ActualServiceState::Preparing | ActualServiceState::QueuedStart | ActualServiceState::Starting | ActualServiceState::Stopping | ActualServiceState::RunningUnready => 33,
+        ActualServiceState::Stopped => 90,
+        ActualServiceState::Failed | ActualServiceState::Orphaned | ActualServiceState::ExternallyOwned => 31,
     }
 }
 
-fn status_label(state: &str) -> String {
-    format!("\x1b[{}m{:<9}\x1b[0m", status_colour(state), state)
+fn status_label(state: ActualServiceState) -> String {
+    format!("\x1b[{}m{:<9}\x1b[0m", status_colour(state), display_state(state))
 }
 
 fn scrollbar_cell(index: usize, start: usize, height: usize, total: usize) -> &'static str {
@@ -295,7 +302,8 @@ mod tests {
     }
 
     fn service(name: &str, state: &str) -> Service {
-        Service { name: name.to_string(), kind: None, state: state.to_string(), generation: None, current_operation_id: None, error: None }
+        let state = serde_json::from_value(serde_json::json!(state)).unwrap();
+        Service { name: name.to_string(), kind: None, state, generation: None, current_operation_id: None, error: None }
     }
 
     #[test]
@@ -468,6 +476,18 @@ mod tests {
         assert!(lines.iter().any(|l| strip_ansi(l).contains("> ready     svc-19")));
         assert!(lines.iter().any(|l| l.ends_with('█')));
         assert!(lines.iter().any(|l| l.ends_with('░')));
+    }
+
+    /// After the terminal shrinks, keyboard selection must scroll against the new height.
+    #[test]
+    fn keeps_the_selection_visible_after_a_resize() {
+        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
+        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 80 });
+        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("svc-0".to_string()), ..Default::default() });
+        screen.resize(Viewport { columns: 80, rows: 20 });
+        screen.update(ScreenUpdate { selected_name: Some("svc-19".to_string()), ..Default::default() });
+        let lines = screen.render(80, Some(20)).to_vec();
+        assert!(lines.iter().any(|l| strip_ansi(l).contains("> ready     svc-19")));
     }
 
     #[test]

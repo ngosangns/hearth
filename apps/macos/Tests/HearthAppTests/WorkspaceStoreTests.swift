@@ -55,4 +55,37 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.selectedId, store.workspaces.first?.id)
         XCTAssertFalse(store.workspaces[0].trusted, "URL open must not auto-trust")
     }
+
+    /// A file that does not decode used to become `[]` — and the next save overwrote the user's
+    /// list with it. It must be moved aside intact, with the reason surfaced.
+    func testACorruptFileIsMovedAsideNotOverwritten() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("workspaces.json")
+        try Data("{ not json".utf8).write(to: fileURL)
+
+        let store = WorkspaceStore(fileURL: fileURL)
+        XCTAssertTrue(store.workspaces.isEmpty)
+        XCTAssertNotNil(store.loadError)
+
+        store.add(path: "/tmp/after-corruption")
+        let aside = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix("workspaces.json.corrupt-") }
+        XCTAssertEqual(aside.count, 1)
+        XCTAssertEqual(try String(contentsOf: directory.appendingPathComponent(aside[0]), encoding: .utf8), "{ not json")
+    }
+
+    func testSpellingsOfTheSameFolderAreOneWorkspace() {
+        let store = WorkspaceStore(fileURL: tempFileURL())
+        let first = store.add(path: "/tmp/dup")
+        XCTAssertEqual(store.add(path: "/tmp/dup/").id, first.id)
+        XCTAssertEqual(store.add(path: "/tmp/./other/../dup").id, first.id)
+        XCTAssertEqual(store.workspaces.count, 1)
+    }
+
+    func testARelativeDeepLinkPathIsRejected() {
+        let store = WorkspaceStore(fileURL: tempFileURL())
+        store.handleOpenURL(URL(string: "hearth://open?path=relative/folder")!)
+        XCTAssertTrue(store.workspaces.isEmpty)
+    }
 }

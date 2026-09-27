@@ -55,7 +55,7 @@ final class LogTextViewHostingTests: XCTestCase {
     func testSelectingAServiceRendersItsLog() async throws {
         let api = FakeManagerAPI()
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
-        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)]) }
         api.urlsHandler = { [] }
         api.logsHandler = { _, _ in makeLogSlice(data: "api log line\n", nextCursor: 13, generation: 1) }
 
@@ -102,7 +102,7 @@ final class LogTextViewHostingTests: XCTestCase {
     func testClickingAListRowSetsSelectedServiceId() async throws {
         let api = FakeManagerAPI()
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
-        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)]) }
         api.urlsHandler = { [] }
         api.logsHandler = { _, _ in makeLogSlice(data: "api log line\n", nextCursor: 13, generation: 1) }
 
@@ -188,7 +188,7 @@ final class LogTextViewHostingTests: XCTestCase {
     func testLogPanelInsideNavigationSplitViewDetail() async throws {
         let api = FakeManagerAPI()
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
-        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)]) }
         api.urlsHandler = { [] }
         api.logsHandler = { _, _ in makeLogSlice(data: "api log line\n", nextCursor: 13, generation: 1) }
 
@@ -263,5 +263,31 @@ final class LogTextViewHostingTests: XCTestCase {
         let textView = try XCTUnwrap(findTextView(in: hosting.view))
         XCTAssertTrue(textView.string.contains("api log line"), "log text never reached the NSTextView; current: \(textView.string.debugDescription)")
         XCTAssertGreaterThan(textView.frame.width, 0, "log text view stayed zero-width after the scroll view was resized — content is laid out but invisible")
+    }
+
+    /// Appends past the byte cap trim the text storage's head in place; what the view shows must
+    /// still be exactly the controller's buffer.
+    @MainActor
+    func testTrimmedAppendsKeepTheViewEqualToTheBuffer() async throws {
+        let api = FakeManagerAPI()
+        let chunk = String(repeating: "→ a log line\n", count: 5_000) // ~75KB
+        api.logsHandler = { _, _ in makeLogSlice(data: chunk, nextCursor: 1, generation: 1) }
+        let log = LogController(client: api, serviceId: "api")
+
+        let hosting = NSHostingController(rootView: ServiceLogPanel(serviceLabel: "api", log: log))
+        let window = NSWindow(contentViewController: hosting)
+        window.setContentSize(NSSize(width: 480, height: 320))
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        for _ in 0 ..< 50 where findTextView(in: hosting.view) == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        log.stop() // the panel's `onAppear` started polling; step it by hand instead
+
+        for _ in 0 ..< 6 {
+            await log.fetchOnce()
+        }
+        let textView = try XCTUnwrap(findTextView(in: hosting.view))
+        XCTAssertEqual(textView.string, log.text)
     }
 }

@@ -12,7 +12,7 @@ final class ManagerModelsTests: XCTestCase {
         {"instanceId":"c9dce777-795b-4158-a7f5-04277f130739","port":62066,"token":"dkzb_LkMKHIbJTrMOu0H3iM8RkbXwU9KBjcmjWvd1aQ","protocolVersion":1,"runtimeDirectory":"/tmp/hearthd-json-sample/.hearth/runtime-v1","root":"/tmp/hearthd-json-sample"}
         """
         let connection = try JSONDecoder().decode(ManagerConnection.self, from: Data(json.utf8))
-        XCTAssertEqual(connection.instanceId, "c9dce777-795b-4158-a7f5-04277f130739")
+        XCTAssertEqual(connection.token, "dkzb_LkMKHIbJTrMOu0H3iM8RkbXwU9KBjcmjWvd1aQ")
         XCTAssertEqual(connection.port, 62066)
         XCTAssertEqual(connection.protocolVersion, 1)
         XCTAssertEqual(connection.baseURL, URL(string: "http://127.0.0.1:62066"))
@@ -33,7 +33,7 @@ final class ManagerModelsTests: XCTestCase {
 
     func testDecodesServicesResponseWithNoIdentityOrOptionalFields() throws {
         // A never-started service, as it appears on a fresh runtime directory — every optional field
-        // absent, matching manager.test.ts's "lists every catalog service as stopped" coverage.
+        // absent — how every catalog service is listed before its first start.
         let json = """
         {"services":[{"serviceId":"sleeper","desiredState":"stopped","actualState":"stopped","readiness":"unknown","generation":0,"createdAt":"2026-09-19T16:35:17.744Z","updatedAt":"2026-09-19T16:35:17.744Z"}]}
         """
@@ -71,7 +71,7 @@ final class ManagerModelsTests: XCTestCase {
         let response = try JSONDecoder().decode(CatalogResponse.self, from: Data(json.utf8))
         XCTAssertEqual(response.catalog.services.map(\.id), ["sleeper"])
         XCTAssertEqual(response.catalog.services[0].displayName, "sleeper") // falls back to id when label is absent
-        XCTAssertEqual(response.catalog.groups, [:])
+        XCTAssertNil(response.catalog.groupTree)
     }
 
     func testDecodesLogSlice() throws {
@@ -84,7 +84,8 @@ final class ManagerModelsTests: XCTestCase {
     }
 
     func testDecodesManagerErrorEnvelope() throws {
-        // Real shape from ManagerHttpError's json() response (manager.ts) on e.g. an unknown service.
+        // Real shape from `ManagerHttpError`'s JSON response (rust/crates/hearth-core/src/manager/http.rs)
+        // on e.g. an unknown service.
         let json = """
         {"error":{"code":"invalid_service","message":"serviceId must be a catalog service"}}
         """

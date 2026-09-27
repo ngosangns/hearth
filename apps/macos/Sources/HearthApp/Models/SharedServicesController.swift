@@ -31,7 +31,17 @@ final class SharedServicesController: ObservableObject {
     @Published var lastActionError: String?
 
     private var client: (any SharedAPI)?
-    private var watchTask: Task<Void, Never>?
+    /// Same SSE stream every client uses — smp is a normal manager, so `manager.*` events and
+    /// service transitions drive `refresh()` exactly like a project daemon's.
+    private lazy var watchLoop = EventWatchLoop(pollInterval: pollInterval, handlers: .init(
+        client: { [weak self] in self?.client },
+        sync: { [weak self] _ in await self?.refresh() },
+        isFailed: { [weak self] in
+            if case .failed = self?.phase { return true }
+            return false
+        },
+        reconnect: { [weak self] in await self?.connect() }
+    ))
     private let pollInterval: Duration
     /// How `connect()` obtains the client — injectable so tests can drive the controller without
     /// spawning `hearthd shared ensure` (the default is the real sidecar path).
@@ -46,10 +56,6 @@ final class SharedServicesController: ObservableObject {
         self.connector = connector ?? { ManagerClient(connection: try await DaemonConnection.ensureShared()) }
     }
 
-    deinit {
-        watchTask?.cancel()
-    }
-
     /// Find-or-start smp, then publish instances + the registry document and start watching its
     /// event stream. Idempotent while connecting and a no-op once connected — except from
     /// `.failed`, where the daemon may have been replaced (new port + token), so the stale
@@ -59,17 +65,21 @@ final class SharedServicesController: ObservableObject {
         if client != nil, case .connected = phase { return }
         phase = .connecting
         client = nil
+        for controller in logControllers.values { controller.stop() }
         logControllers.removeAll()
-        // No `watchTask?.cancel()` here — connect() can run *inside* the watch task, and an
-        // early cancel would propagate into `ensure`'s subprocess timeout and fail the whole
-        // reconnect. `startWatching()` below cancels the old task once the new client is live.
+        // No `watchLoop.stop()` here — connect() can run *inside* the watch loop, and an early
+        // cancel would propagate into `ensure`'s subprocess and fail the whole reconnect.
+        // `watchLoop.start()` below cancels the old loop once the new client is live.
         do {
             let client = try await connector()
+            // Not `refresh()`: it swallows its error into `.failed`, which the `.connected` below
+            // would then paper over — a daemon whose `/v1/shared` fails is not connected.
+            instances = try await client.sharedInstances()
             self.client = client
-            await refresh()
+            dropStaleSelection()
             await refreshCatalog()
             phase = .connected
-            startWatching()
+            watchLoop.start()
         } catch {
             phase = .failed(error.localizedDescription)
         }
@@ -79,12 +89,16 @@ final class SharedServicesController: ObservableObject {
         guard let client else { return }
         do {
             instances = try await client.sharedInstances()
-            if let selected = selectedId, !instances.contains(where: { $0.id == selected }), catalogEntry(selected) == nil {
-                selectedId = nil
-            }
+            dropStaleSelection()
             if case .failed = phase { phase = .connected }
         } catch {
             phase = .failed(error.localizedDescription)
+        }
+    }
+
+    private func dropStaleSelection() {
+        if let selected = selectedId, !instances.contains(where: { $0.id == selected }), catalogEntry(selected) == nil {
+            selectedId = nil
         }
     }
 
@@ -122,9 +136,10 @@ final class SharedServicesController: ObservableObject {
         run(id) { client in _ = try await client.sharedInstall(service: id) }
     }
 
-    /// Stop the instance and delete its install + data. The view confirms before calling this.
-    func remove(_ id: String) {
-        run(id) { client in _ = try await client.sharedRemove(service: id) }
+    /// Stop the instance and delete its install + data. The view confirms before calling this;
+    /// `force` is required when the instance still has project attachments.
+    func remove(_ id: String, force: Bool = false) {
+        run(id) { client in _ = try await client.sharedRemove(service: id, force: force) }
     }
 
     /// Start/stop the instance's process — the ordinary operations API on `name@version`.
@@ -158,67 +173,5 @@ final class SharedServicesController: ObservableObject {
         let created = LogController(client: client, serviceId: id)
         logControllers[id] = created
         return created
-    }
-
-    // MARK: - Watching
-
-    /// Same SSE stream every client uses — smp is a normal manager, so `manager.*` events and
-    /// service transitions drive `refresh()` exactly like a project daemon's.
-    private func startWatching() {
-        watchTask?.cancel()
-        watchTask = Task { [weak self] in await self?.runWatchLoop() }
-    }
-
-    private func runWatchLoop() async {
-        var after: UInt64?
-        var epoch: String?
-        while !Task.isCancelled {
-            guard let client else {
-                // Dropped after a hard failure — a restarted smp listens on a new port with a
-                // new token, so reconnect through `ensure` instead of polling a dead port.
-                // Retries every pollInterval until the daemon answers.
-                await connect()
-                try? await Task.sleep(for: pollInterval)
-                continue
-            }
-            do {
-                for try await event in client.watchEvents(after: after, epoch: epoch) {
-                    if Task.isCancelled { return }
-                    switch event {
-                    case .replay(let nextEpoch, let reset, let latest):
-                        epoch = nextEpoch
-                        if reset {
-                            after = latest
-                            await refresh()
-                        }
-                    case .manager(let sequence, let type):
-                        after = sequence
-                        if type == "service.log" { continue }
-                        await refresh()
-                    }
-                }
-                if Task.isCancelled { return }
-                try await Task.sleep(for: .seconds(1))
-            } catch is CancellationError {
-                return
-            } catch ManagerClientError.watchUnsupported {
-                await pollFallback()
-                return
-            } catch {
-                await refresh()
-                if case .failed = phase {
-                    self.client = nil
-                }
-                try? await Task.sleep(for: pollInterval)
-            }
-        }
-    }
-
-    private func pollFallback() async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: pollInterval)
-            if Task.isCancelled { return }
-            await refresh()
-        }
     }
 }

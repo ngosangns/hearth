@@ -1,9 +1,10 @@
-//! Port of `OperationScheduler` (`src/core/manager.ts`) — schedules and serializes operations
-//! per target (`serviceId`, or `"__manager__"` for manager-wide operations like shutdown),
-//! publishing `operation.accepted`/`operation.updated` events as they progress.
-use std::collections::HashMap;
+//! `OperationScheduler` — schedules and serializes operations per target (`serviceId`, or
+//! `"__manager__"` for manager-wide operations like shutdown), publishing
+//! `operation.accepted`/`operation.updated` events as they progress.
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use uuid::Uuid;
@@ -11,10 +12,19 @@ use uuid::Uuid;
 use crate::catalog::ServiceId;
 use crate::state::{Operation, OperationError, OperationKind, OperationStatus, OperationTraceEntry, ServiceOperationKind};
 use crate::supervisor::types::format_iso8601_millis;
+use crate::sync::KeyedLock;
 
 use super::event_store::ManagerEventStore;
 
 const MANAGER_TARGET: &str = "__manager__";
+
+/// How long a settled operation stays readable (`GET /v1/operations/:id`) and its `requestId`
+/// stays idempotent. Operations used to be kept for the daemon's whole life — one entry in each of
+/// three maps per start/stop/restart, forever.
+const SETTLED_OPERATION_TTL: Duration = Duration::from_secs(10 * 60);
+/// Upper bound on settled operations kept, whatever their age — a burst (a client retry loop, a
+/// scripted bulk restart) is evicted oldest-first rather than waiting out the TTL.
+const MAX_SETTLED_OPERATIONS: usize = 1024;
 
 fn now() -> String {
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -38,18 +48,6 @@ pub type OperationHandle = Arc<Mutex<Operation>>;
 pub type OperationExecute = Box<dyn FnOnce(OperationHandle) -> BoxFuture<'static, Result<(), OperationError>> + Send>;
 pub type OperationRejected = Box<dyn FnOnce(OperationHandle) -> BoxFuture<'static, ()> + Send>;
 
-struct KeyedLock {
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-}
-impl KeyedLock {
-    fn new() -> Self {
-        Self { locks: Mutex::new(HashMap::new()) }
-    }
-    fn get(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks.lock().unwrap().entry(key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
-    }
-}
-
 pub struct OperationScheduler {
     events: Arc<ManagerEventStore>,
     closing: AtomicBool,
@@ -60,7 +58,7 @@ pub struct OperationScheduler {
     /// `is_queued`/`drain_services` need — the *current* occupant, not some earlier completed
     /// operation that happened to share the same target.
     active_targets: Mutex<HashMap<String, String>>,
-    queues: KeyedLock,
+    queues: KeyedLock<String>,
     /// One `watch` cell per scheduled operation, flipped to `true` once its spawned task finishes.
     /// `wait()`/`drain_services()` key off this instead of racing to (re-)acquire the target's
     /// `KeyedLock` themselves: `tokio::spawn` only *schedules* the operation's task, it doesn't
@@ -70,6 +68,9 @@ pub struct OperationScheduler {
     /// created before the sender's value flips always observes the flip, and one created after simply
     /// sees the already-`true` initial read.
     done: Mutex<HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+    /// Settled operation ids, oldest first, with when they settled — the eviction queue for
+    /// `operations`/`request_ids`/`done`.
+    settled: Mutex<VecDeque<(Instant, String)>>,
 }
 
 fn target_of(service_id: &Option<ServiceId>) -> String {
@@ -94,7 +95,39 @@ impl OperationScheduler {
             active_targets: Mutex::new(HashMap::new()),
             queues: KeyedLock::new(),
             done: Mutex::new(HashMap::new()),
+            settled: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// Records `id` as settled and evicts every settled operation past the TTL or the cap.
+    fn settle(&self, id: &str) {
+        let now = Instant::now();
+        let evicted: Vec<String> = {
+            let mut settled = self.settled.lock().unwrap();
+            settled.push_back((now, id.to_string()));
+            let mut evicted = Vec::new();
+            while settled.front().is_some_and(|(at, _)| now.duration_since(*at) > SETTLED_OPERATION_TTL) || settled.len() > MAX_SETTLED_OPERATIONS {
+                if let Some((_, id)) = settled.pop_front() {
+                    evicted.push(id);
+                }
+            }
+            evicted
+        };
+        if evicted.is_empty() {
+            return;
+        }
+        let mut operations = self.operations.lock().unwrap();
+        let mut request_ids = self.request_ids.lock().unwrap();
+        let mut done = self.done.lock().unwrap();
+        for id in evicted {
+            done.remove(&id);
+            let Some(handle) = operations.remove(&id) else { continue };
+            let request_id = handle.lock().unwrap().request_id.clone();
+            // Only if the request id still maps to this operation — never evict a newer one.
+            if request_ids.get(&request_id).is_some_and(|current| Arc::ptr_eq(current, &handle)) {
+                request_ids.remove(&request_id);
+            }
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Operation> {
@@ -185,8 +218,7 @@ impl OperationScheduler {
         let operation_id_for_task = operation.id.clone();
         let handle_for_task = handle.clone();
         tokio::spawn(async move {
-            let lock = scheduler.queues.get(&target_for_task);
-            let _guard = lock.lock().await;
+            let guard = scheduler.queues.lock(&target_for_task).await;
             let is_closing = scheduler.closing.load(Ordering::SeqCst);
             if is_closing && matches!(kind, OperationKind::Service | OperationKind::BulkStart) {
                 if let Some(rejected) = rejected {
@@ -216,7 +248,9 @@ impl OperationScheduler {
                     active.remove(&target_for_task);
                 }
             }
+            drop(guard);
             let _ = done_tx.send(true);
+            scheduler.settle(&operation_id_for_task);
         });
         Ok(operation)
     }
@@ -428,6 +462,30 @@ mod tests {
         gate.notify_one();
         scheduler.wait(&operation).await;
         assert!(!scheduler.is_queued(&operation));
+    }
+
+    #[tokio::test]
+    async fn settled_operations_beyond_the_cap_are_evicted_oldest_first() {
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let mut ids = Vec::new();
+        for n in 0..(MAX_SETTLED_OPERATIONS + 2) {
+            let operation = scheduler
+                .schedule(service_input(&format!("req-{n}"), "api", ServiceOperationKind::Status), Box::new(|_h| Box::pin(async { Ok(()) })), None)
+                .unwrap();
+            scheduler.wait(&operation).await;
+            ids.push(operation.id);
+        }
+        // `wait` returns on the done signal, just before `settle` runs; wait for the last settle.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.settled.lock().unwrap().back().map(|(_, id)| id.as_str()) != Some(ids.last().unwrap().as_str()) {
+            assert!(Instant::now() < deadline, "the last operation never settled");
+            tokio::task::yield_now().await;
+        }
+        assert!(scheduler.get(&ids[0]).is_none(), "the oldest settled operation is evicted");
+        assert!(scheduler.get(ids.last().unwrap()).is_some(), "the newest is kept");
+        assert!(scheduler.operations.lock().unwrap().len() <= MAX_SETTLED_OPERATIONS);
+        assert!(scheduler.request_ids.lock().unwrap().len() <= MAX_SETTLED_OPERATIONS);
+        assert!(scheduler.resolve_request(&service_input("req-0", "api", ServiceOperationKind::Status)).unwrap().is_none(), "an evicted request id is free again");
     }
 
     #[tokio::test]

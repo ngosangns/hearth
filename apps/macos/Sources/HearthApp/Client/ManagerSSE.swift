@@ -26,15 +26,50 @@ enum SSEParser {
         guard let event = try? JSONDecoder().decode(ManagerEventDTO.self, from: data) else { return nil }
         return .manager(sequence: event.sequence, type: event.type)
     }
+}
 
-    /// Pulls complete `\\n\\n`-delimited frames off `buffer`, returning them and the remainder.
-    static func takeFrames(from buffer: inout String) -> [String] {
-        var frames: [String] = []
-        while let range = buffer.range(of: "\n\n") {
-            frames.append(String(buffer[buffer.startIndex..<range.lowerBound]))
-            buffer = String(buffer[range.upperBound...])
+/// Splits a raw SSE byte stream into frames — the lines between two blank lines, joined by `\n`.
+///
+/// Fed byte by byte rather than from `AsyncBytes.lines`: `.lines` drops empty lines, and the blank
+/// line IS the frame delimiter, so a line-based reader never saw a frame end and no event was ever
+/// delivered. Any of `\n`, `\r\n` or a lone `\r` ends a line, per the SSE spec.
+struct SSEFrameSplitter {
+    struct FrameTooLarge: Error {}
+
+    private var line: [UInt8] = []
+    private var frame: [UInt8] = []
+    private var afterCR = false
+
+    /// Returns a completed frame when `byte` finishes one. Comment-only (`: keepalive`) and empty
+    /// frames are returned too — `SSEParser.parseFrame` answers `nil` for them.
+    mutating func push(_ byte: UInt8) throws -> String? {
+        let wasCR = afterCR
+        afterCR = false
+        switch byte {
+        case UInt8(ascii: "\n") where wasCR:
+            return nil // second half of a `\r\n` already handled at the `\r`
+        case UInt8(ascii: "\r"):
+            afterCR = true
+            return endLine()
+        case UInt8(ascii: "\n"):
+            return endLine()
+        default:
+            line.append(byte)
+            if line.count + frame.count > SSEParser.maxFrameBytes { throw FrameTooLarge() }
+            return nil
         }
-        return frames
+    }
+
+    private mutating func endLine() -> String? {
+        guard line.isEmpty else {
+            if !frame.isEmpty { frame.append(UInt8(ascii: "\n")) }
+            frame.append(contentsOf: line)
+            line.removeAll(keepingCapacity: true)
+            return nil
+        }
+        guard !frame.isEmpty else { return nil }
+        defer { frame.removeAll(keepingCapacity: true) }
+        return String(decoding: frame, as: UTF8.self)
     }
 }
 

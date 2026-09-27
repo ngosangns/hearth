@@ -1,4 +1,6 @@
 //! Values for the placeholders a catalog's service URLs may contain (`SERVICE_URL_PLACEHOLDERS`).
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -6,6 +8,8 @@ use std::time::{Duration, Instant};
 /// catalog reload; spawning `tailscale` each time is needless, but the host can change (a re-login,
 /// a renamed machine), so it is not cached forever either.
 const TAILNET_HOST_TTL: Duration = Duration::from_secs(60);
+/// `tailscale status` against a wedged tailscaled would otherwise block `/v1/urls` indefinitely.
+const TAILNET_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 static TAILNET_HOST: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
 
@@ -24,23 +28,44 @@ pub fn tailnet_host() -> Option<String> {
     if let Some(value) = std::env::var("HEARTH_TAILNET_HOST").ok().filter(|v| !v.trim().is_empty()) {
         return Some(value.trim().trim_end_matches('.').to_string());
     }
-    let mut cache = TAILNET_HOST.lock().unwrap();
-    if let Some((at, value)) = cache.as_ref() {
+    // The cache lock is never held across the `tailscale` spawn: a slow query would otherwise stall
+    // every other caller behind it. Two concurrent misses both query, which is harmless.
+    if let Some((at, value)) = TAILNET_HOST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref() {
         if at.elapsed() < TAILNET_HOST_TTL {
             return value.clone();
         }
     }
     let value = query_tailnet_host();
-    *cache = Some((Instant::now(), value.clone()));
+    *TAILNET_HOST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), value.clone()));
     value
 }
 
 fn query_tailnet_host() -> Option<String> {
-    let output = std::process::Command::new("tailscale").args(["status", "--json"]).output().ok()?;
-    if !output.status.success() {
+    let mut child = Command::new("tailscale").args(["status", "--json"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + TAILNET_QUERY_TIMEOUT;
+    let succeeded = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                // Killing it closes its stdout, which ends the reader thread.
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let text = reader.join().ok()?;
+    if !succeeded {
         return None;
     }
-    parse_tailnet_host(&String::from_utf8_lossy(&output.stdout))
+    parse_tailnet_host(&text)
 }
 
 /// `Self.DNSName` without its trailing root dot.

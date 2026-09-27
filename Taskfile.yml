@@ -29,12 +29,26 @@ tasks:
     dir: rust
     cmds:
       - cargo build --release -p hearthd
-      - mkdir -p "/Applications/Hearth.app/Contents/Resources/hearthd/bin"
+      - mkdir -p "$(dirname "{{.HEARTHD_BIN}}")"
       - cp target/release/hearthd "{{.HEARTHD_BIN}}"
       # Required after every copy on macOS, or the binary won't launch.
       - codesign --sign - --force "{{.HEARTHD_BIN}}"
-      - rm -f /opt/homebrew/bin/hearthd
       - echo "installed $("{{.HEARTHD_BIN}}" --version) at {{.HEARTHD_BIN}}"
+
+  catalog:package:
+    desc: Build shared-service tarballs into dist/catalog (`task catalog:package -- redis`; default all)
+    cmds:
+      - scripts/catalog/package.sh {{.CLI_ARGS}}
+
+  catalog:write:
+    desc: Regenerate catalog.json and scripts/catalog/MANIFEST from dist/catalog/*.sha256
+    cmds:
+      - python3 scripts/catalog/write-catalog.py
+
+  catalog:smoke:
+    desc: Attach every shipped shared service against the local dist/catalog tarballs (throwaway HOME)
+    cmds:
+      - scripts/catalog/smoke.sh
 
   ci:
     desc: Everything CI runs (Rust test + clippy, macOS app build)

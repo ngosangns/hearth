@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -102,9 +101,12 @@ pub fn is_stale_lock_marker(marker: &StaleLockMarker, key: &str, metadata: &Mana
         && verify_lock_ownership_proof(Some(key), metadata, token, expected_proof)
 }
 
+/// 32 bytes from two v4 UUIDs: `uuid` draws them from the OS CSPRNG (`getrandom`), so this is
+/// 244 random bits without a separate `rand` dependency, encoded as 43 URL-safe chars.
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     base64_url_no_pad(&bytes)
 }
 

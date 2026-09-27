@@ -1,8 +1,9 @@
-//! Port of `HearthManager` and its HTTP+SSE route table (`src/core/manager.ts`) — ties
-//! together every store built so far (`ManagerEventStore`, `OperationScheduler`, `CursorLogStore`,
-//! `AtomicStateStore`, the lock-claim protocol) plus a `ProcessSupervisor`, behind an `axum` server
-//! on a loopback, OS-assigned port.
-use std::collections::HashMap;
+//! `HearthManager` and its HTTP+SSE route table — ties together the event store
+//! (`ManagerEventStore`), `OperationScheduler`, `CursorLogStore`, `AtomicStateStore`, the
+//! lock-claim protocol and a `ProcessSupervisor`, behind an `axum` server on a loopback,
+//! OS-assigned port.
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -25,7 +26,7 @@ use crate::catalog::{validate_catalog, ServiceCatalog, ServiceId, ServiceOwnersh
 use crate::file_io::{create_file_io, FileIo};
 use crate::platform::{is_supported_hearth_platform, unsupported_platform_message};
 use crate::state::{
-    LogSlice, ManagerInfo, ManagerMetadata, OperationError, OperationKind, PersistedManagerState, ServiceLifecycleState, ServiceOperationKind, PROTOCOL_VERSION, STATE_VERSION,
+    ActualServiceState, LogSlice, ManagerInfo, ManagerMetadata, OperationError, OperationKind, PersistedManagerState, ServiceLifecycleState, ServiceOperationKind, PROTOCOL_VERSION, STATE_VERSION,
 };
 use crate::supervisor::engine::ACTIVE_STATES;
 use crate::supervisor::types::{format_iso8601_millis, Host, SupervisorOptions};
@@ -34,14 +35,26 @@ use crate::supervisor::ProcessSupervisor;
 use super::event_store::ManagerEventStore;
 use super::lock::{claim_lock, prepare_owned_lock_release, read_lock_ownership_key, release_owned_lock, ClaimLockError, LockHandle};
 use super::log_store::CursorLogStore;
-use super::operations::{OperationInput, OperationScheduler};
+use super::operations::{OperationInput, OperationScheduler, RequestIdConflict};
 use super::state_store::AtomicStateStore;
 
 const MANAGER_METADATA_VERSION: u32 = 1;
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     format_iso8601_millis(millis)
+}
+
+/// The one `service.lifecycle` payload shape, published once per transition by
+/// `HearthManager::set_service_state` and by the queued-start bookkeeping below.
+fn lifecycle_event(state: &ServiceLifecycleState) -> Map<String, Value> {
+    let mut data = Map::new();
+    data.insert("serviceId".to_string(), json!(state.service_id));
+    data.insert("actualState".to_string(), json!(state.actual_state.as_wire_str()));
+    data.insert("readiness".to_string(), json!(state.readiness));
+    data.insert("generation".to_string(), json!(state.generation));
+    data.insert("operationId".to_string(), json!(state.current_operation_id));
+    data
 }
 
 fn default_daemon_owned(catalog: &ServiceCatalog, service_id: &str) -> bool {
@@ -67,6 +80,11 @@ impl IntoResponse for ManagerHttpError {
     fn into_response(self) -> Response {
         let body = json!({ "error": { "code": self.code, "message": self.message } });
         (self.status, [("cache-control", "no-store")], Json(body)).into_response()
+    }
+}
+impl From<RequestIdConflict> for ManagerHttpError {
+    fn from(_: RequestIdConflict) -> Self {
+        Self::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation")
     }
 }
 pub(crate) type HttpResult<T> = Result<T, ManagerHttpError>;
@@ -109,6 +127,14 @@ pub struct HearthManager {
     pub(crate) closing: AtomicBool,
     lifecycle: tokio::sync::Mutex<()>,
     catalog_reload_serial: tokio::sync::Mutex<()>,
+    /// Serializes the snapshot→write→fsync sequence so saves stay ordered while the file I/O runs
+    /// AFTER `state`'s lock is released — an F_FULLFSYNC can cost tens of ms and must not block
+    /// `service_states()` or the supervisor.
+    persist_lock: Mutex<()>,
+    /// `requestId` → (catalog, response) for recent `/v1/manager/reload` calls, so a retried reload
+    /// replays its original answer instead of re-applying (and reporting nothing changed).
+    reload_requests: Mutex<VecDeque<(String, Value, Value)>>,
+    reload_requests_serial: tokio::sync::Mutex<()>,
     supervisor: OnceLock<Arc<ProcessSupervisor>>,
     external_sync_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_done: watch::Sender<bool>,
@@ -118,6 +144,41 @@ pub struct HearthManager {
 pub struct ReloadOutcome {
     pub stopped: Vec<ServiceId>,
     pub changed: Vec<ServiceId>,
+}
+
+/// Why a catalog reload was refused. On every variant the previous catalog stays in place.
+#[derive(Debug)]
+pub enum ReloadError {
+    Closing,
+    Invalid(Vec<String>),
+    /// Removed services that were active and failed to stop — `(service id, stop error)` — plus
+    /// the ones that DID stop before the failure. Swapping the catalog anyway would drop a
+    /// still-running service from every UI.
+    StopFailed { failures: Vec<(ServiceId, String)>, stopped: Vec<ServiceId> },
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closing => f.write_str("manager is shutting down"),
+            Self::Invalid(errors) => f.write_str(&errors.join("; ")),
+            Self::StopFailed { failures, stopped } => {
+                let detail = failures.iter().map(|(id, error)| format!("{id}: {error}")).collect::<Vec<_>>().join("; ");
+                let stopped_note = if stopped.is_empty() { String::new() } else { format!("; stopped before the failure: {}", stopped.join(", ")) };
+                write!(f, "catalog not reloaded; removed services failed to stop ({detail}){stopped_note}")
+            }
+        }
+    }
+}
+
+impl From<ReloadError> for ManagerHttpError {
+    fn from(error: ReloadError) -> Self {
+        match &error {
+            ReloadError::Closing => Self::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"),
+            ReloadError::Invalid(_) => Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_catalog", error.to_string()),
+            ReloadError::StopFailed { .. } => Self::new(StatusCode::CONFLICT, "stop_failed", error.to_string()),
+        }
+    }
 }
 
 impl HearthManager {
@@ -161,16 +222,18 @@ impl HearthManager {
     /// stopping service is never briefly invisible from `service_states()`/`/v1/services` while its
     /// process is still alive. `external`-owned removed services are left alone. A service that
     /// stays present but whose definition changed is left running as-is and reported in `changed`.
+    /// A removed service that fails to stop aborts the whole reload (`StopFailed`) and the old
+    /// catalog stays — a stop must never be reported without stopping something.
     /// Serialized against itself (not `self.lifecycle`, which `supervisor.stop`'s own state writes
     /// run through — nesting into that from here would deadlock).
-    pub async fn reload_catalog(&self, next_catalog: ServiceCatalog) -> Result<ReloadOutcome, Vec<String>> {
+    pub async fn reload_catalog(&self, next_catalog: ServiceCatalog) -> Result<ReloadOutcome, ReloadError> {
         let _guard = self.catalog_reload_serial.lock().await;
         if self.closing.load(Ordering::SeqCst) {
-            return Err(vec!["manager is shutting down".to_string()]);
+            return Err(ReloadError::Closing);
         }
         let validation = validate_catalog(&next_catalog);
         if !validation.errors.is_empty() {
-            return Err(validation.errors);
+            return Err(ReloadError::Invalid(validation.errors));
         }
         let previous = self.catalog.read().unwrap().clone();
         let next_ids: std::collections::HashSet<&ServiceId> = next_catalog.services.iter().map(|s| &s.id).collect();
@@ -183,6 +246,7 @@ impl HearthManager {
             .collect();
 
         let mut stopped = Vec::new();
+        let mut failed = Vec::new();
         for service_id in &removed_ids {
             if !default_daemon_owned(&previous, service_id) {
                 continue;
@@ -191,16 +255,44 @@ impl HearthManager {
             if !is_active {
                 continue;
             }
-            let _ = self.supervisor().stop(service_id, None).await;
-            stopped.push(service_id.clone());
+            match self.supervisor().stop(service_id, None).await {
+                Ok(()) => stopped.push(service_id.clone()),
+                Err(error) => failed.push((service_id.clone(), error.0)),
+            }
         }
+        if !failed.is_empty() {
+            return Err(ReloadError::StopFailed { failures: failed, stopped });
+        }
+        let has_external = next_catalog.services.iter().any(|s| matches!(s.ownership, Some(ServiceOwnership::External)));
         *self.catalog.write().unwrap() = Arc::new(next_catalog);
         let mut data = Map::new();
         data.insert("removed".to_string(), json!(removed_ids));
         data.insert("changed".to_string(), json!(changed));
         data.insert("stopped".to_string(), json!(stopped));
         self.events.publish("manager.catalog-reloaded", data);
+        if has_external {
+            // The first `ownership: external` service can arrive by reload (a new `shared:` entry)
+            // — adopt it now rather than on the next 2s tick. Spawned, not awaited: the pass takes
+            // each per-service lock in turn, and a slow probe or an in-flight attach would
+            // otherwise stall the reload response past the client's manager timeout.
+            let sup = self.supervisor().clone();
+            tokio::spawn(async move {
+                sup.sync_external_services().await;
+            });
+        }
         Ok(ReloadOutcome { stopped, changed })
+    }
+
+    /// Persists the current `state` after the caller has mutated and RELEASED its lock — the
+    /// snapshot is taken and written under `persist_lock` so consecutive saves stay ordered, and
+    /// the write+fsync never runs inside `state`'s lock. A failed save surfaces through
+    /// `manager.error` instead of stopping persistence silently.
+    fn persist(&self) {
+        let _ordered = self.persist_lock.lock().unwrap();
+        let snapshot = self.state.lock().unwrap().clone();
+        if let Err(error) = self.state_store.save(&snapshot) {
+            <Self as Host>::record_background_error(self, "state-store", &error);
+        }
     }
 
     pub fn shutdown_completion(&self) -> watch::Receiver<bool> {
@@ -269,17 +361,14 @@ impl Host for HearthManager {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
+        let event = lifecycle_event(&next);
         let mut state = self.state.lock().unwrap();
-        state.services.insert(next.service_id.clone(), next.clone());
-        let snapshot = PersistedManagerState { version: STATE_VERSION, services: state.services.clone() };
+        state.services.insert(next.service_id.clone(), next);
         drop(state);
-        let _ = self.state_store.save(&snapshot);
-        let mut data = Map::new();
-        data.insert("serviceId".to_string(), json!(next.service_id));
-        data.insert("actualState".to_string(), serde_json::to_value(next.actual_state).unwrap());
-        data.insert("generation".to_string(), json!(next.generation));
-        data.insert("operationId".to_string(), next.current_operation_id.map(Value::String).unwrap_or(Value::Null));
-        self.events.publish("service.lifecycle", data);
+        self.persist();
+        // The only `service.lifecycle` publish for a supervisor transition — the engine does not
+        // publish its own copy.
+        self.events.publish("service.lifecycle", event);
     }
     async fn append_log(&self, service_id: &str, data: &str) {
         if self.closed.load(Ordering::SeqCst) {
@@ -309,7 +398,7 @@ fn default_state_or(existing: Option<&ServiceLifecycleState>, service_id: &str, 
     existing.cloned().unwrap_or_else(|| ServiceLifecycleState {
         service_id: service_id.to_string(),
         desired_state: crate::state::DesiredServiceState::Stopped,
-        actual_state: crate::state::ActualServiceState::Stopped,
+        actual_state: ActualServiceState::Stopped,
         readiness: crate::state::ServiceReadiness::Unknown,
         generation: 0,
         identity: None,
@@ -341,7 +430,10 @@ pub async fn bootstrap(options: HearthManagerOptions) -> Result<Arc<HearthManage
     if !validation.errors.is_empty() {
         return Err(BootstrapError::Message(format!("Invalid service catalog: {}", validation.errors.join("; "))));
     }
-    let root = options.root.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let root = match options.root.clone() {
+        Some(root) => root,
+        None => std::env::current_dir().map_err(|e| BootstrapError::Message(format!("cannot resolve the current directory: {e}")))?,
+    };
     let runtime_directory = options.runtime_directory.clone().unwrap_or_else(|| crate::paths::resolve_runtime_directory(&root, options.catalog.runtime_directory.as_deref()));
     let io: Arc<dyn FileIo> = Arc::from(create_file_io(options.catalog.private_file_guard != Some(false)));
     let token = super::lock::random_token();
@@ -359,7 +451,15 @@ pub async fn bootstrap(options: HearthManagerOptions) -> Result<Arc<HearthManage
     let events = ManagerEventStore::new(options.event_capacity, Some(bootstrap_metadata.instance_id.clone()));
     let operations = OperationScheduler::new(events.clone());
     let logs = CursorLogStore::new(io.clone(), runtime_directory.join("logs"), options.log_tail_bytes, options.log_max_bytes, options.log_rotation_count);
-    let state_store = AtomicStateStore::new(io.clone(), &runtime_directory);
+    let state_store = AtomicStateStore::new(io.clone(), &runtime_directory).with_error_reporter({
+        let events = events.clone();
+        Arc::new(move |message: &str| {
+            let mut data = Map::new();
+            data.insert("scope".to_string(), json!("state-store"));
+            data.insert("message".to_string(), json!(message));
+            events.publish("manager.error", data);
+        })
+    });
     let (shutdown_done, _rx) = watch::channel(false);
 
     let manager = Arc::new(HearthManager {
@@ -378,26 +478,19 @@ pub async fn bootstrap(options: HearthManagerOptions) -> Result<Arc<HearthManage
         closed: AtomicBool::new(false),
         closing: AtomicBool::new(false),
         lifecycle: tokio::sync::Mutex::new(()),
+        persist_lock: Mutex::new(()),
         catalog_reload_serial: tokio::sync::Mutex::new(()),
+        reload_requests: Mutex::new(VecDeque::new()),
+        reload_requests_serial: tokio::sync::Mutex::new(()),
         supervisor: OnceLock::new(),
         external_sync_task: Mutex::new(None),
         shutdown_done,
         shared: options.shared.clone(),
     });
 
-    let supervisor_options = match options.supervisor {
-        Some(mut opts) => {
-            let manager_for_closing = manager.clone();
-            opts.is_closing = Arc::new(move || manager_for_closing.closing.load(Ordering::SeqCst));
-            opts
-        }
-        None => {
-            let mut opts = crate::supervisor::default_adapters::default_supervisor_options(root.clone(), Some(runtime_directory.clone()), None);
-            let manager_for_closing = manager.clone();
-            opts.is_closing = Arc::new(move || manager_for_closing.closing.load(Ordering::SeqCst));
-            opts
-        }
-    };
+    let mut supervisor_options = options.supervisor.unwrap_or_else(|| crate::supervisor::default_adapters::default_supervisor_options(root.clone(), Some(runtime_directory.clone()), None));
+    let manager_for_closing = manager.clone();
+    supervisor_options.is_closing = Arc::new(move || manager_for_closing.closing.load(Ordering::SeqCst));
     let supervisor = ProcessSupervisor::new(manager.clone(), supervisor_options);
     let _ = manager.supervisor.set(supervisor);
 
@@ -420,17 +513,17 @@ pub async fn bootstrap(options: HearthManagerOptions) -> Result<Arc<HearthManage
         io.write_file(&lock.proof_path, &serde_json::to_string(&proof).unwrap()).map_err(|e| BootstrapError::Message(e.to_string()))?;
         manager.events.publish("manager.started", json!({ "instanceId": manager.instance_id }).as_object().unwrap().clone());
 
-        if manager.catalog().services.iter().any(|s| matches!(s.ownership, Some(ServiceOwnership::External))) {
-            manager.supervisor().sync_external_services().await;
-            let sup = manager.supervisor().clone();
-            let handle = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    sup.sync_external_services().await;
-                }
-            });
-            *manager.external_sync_task.lock().unwrap() = Some(handle);
-        }
+        // The adoption loop runs unconditionally: a catalog with no `ownership: external` service
+        // makes each tick a no-op, and the first such service may only arrive later by reload.
+        manager.supervisor().sync_external_services().await;
+        let sup = manager.supervisor().clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                sup.sync_external_services().await;
+            }
+        });
+        *manager.external_sync_task.lock().unwrap() = Some(handle);
         Ok(())
     }
     .await;
@@ -539,27 +632,42 @@ pub(crate) fn strict_body(bytes: &Bytes, allowed: &[&str], required: &[&str]) ->
     Ok(obj.clone())
 }
 
+/// Every mutation refuses once shutdown has begun.
+pub(crate) fn ensure_not_closing(manager: &HearthManager) -> HttpResult<()> {
+    if manager.closing.load(Ordering::SeqCst) {
+        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
+    }
+    Ok(())
+}
+
+/// `requestId`: a non-empty string of at most 128 bytes, the same bound on every endpoint.
+pub(crate) fn require_request_id(body: &Map<String, Value>) -> HttpResult<String> {
+    body.get("requestId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(str::to_string)
+        .ok_or_else(|| ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string of at most 128 bytes"))
+}
+
+/// An optional boolean flag (`killUnowned`, `force`): absent means `false`, anything but a bool is
+/// a 400.
+pub(crate) fn parse_bool_flag(body: &Map<String, Value>, key: &str) -> HttpResult<bool> {
+    match body.get(key) {
+        None | Some(Value::Bool(false)) => Ok(false),
+        Some(Value::Bool(true)) => Ok(true),
+        _ => Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", format!("{key} must be a boolean"))),
+    }
+}
+
 fn is_service_id(catalog: &ServiceCatalog, value: &Value) -> Option<ServiceId> {
     let s = value.as_str()?;
     catalog.services.iter().any(|svc| svc.id == s).then(|| s.to_string())
 }
 
-async fn post_operation(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> Response {
-    match post_operation_inner(manager, bytes).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
-}
-
-async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpResult<Response> {
-    if manager.closing.load(Ordering::SeqCst) {
-        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
-    }
+async fn post_operation(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
+    ensure_not_closing(&manager)?;
     let body = strict_body(&bytes, &["requestId", "serviceId", "action", "killUnowned"], &["requestId", "serviceId", "action"])?;
-    let request_id = body.get("requestId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128);
-    let Some(request_id) = request_id else {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string"));
-    };
+    let request_id = require_request_id(&body)?;
     let catalog = manager.catalog();
     let Some(service_id) = body.get("serviceId").and_then(|v| is_service_id(&catalog, v)) else {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_service", "serviceId must be a catalog service"));
@@ -576,18 +684,14 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
     if action != ServiceOperationKind::Status && catalog.services.iter().find(|s| s.id == service_id).map(|s| s.disabled).unwrap_or(false) {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "service_disabled", "service is disabled"));
     }
-    let kill_unowned = match body.get("killUnowned") {
-        None | Some(Value::Bool(false)) => false,
-        Some(Value::Bool(true)) => true,
-        _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "killUnowned must be a boolean")),
-    };
+    let kill_unowned = parse_bool_flag(&body, "killUnowned")?;
     if kill_unowned && action != ServiceOperationKind::Start {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "killUnowned only applies to a start action"));
     }
     let start_services: Vec<ServiceId> = if action == ServiceOperationKind::Start { vec![service_id.clone()] } else { Vec::new() };
 
-    let input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::Service, service_id: Some(service_id.clone()), target_service_ids: None, action: Some(action) };
-    if let Some(existing) = manager.operations.resolve_request(&input).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))? {
+    let input = OperationInput { request_id, kind: OperationKind::Service, service_id: Some(service_id.clone()), target_service_ids: None, action: Some(action) };
+    if let Some(existing) = manager.operations.resolve_request(&input)? {
         return Ok(json_response(json!({ "operation": existing }), StatusCode::ACCEPTED));
     }
 
@@ -609,7 +713,7 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
         }
         .boxed()
     });
-    let operation = manager.operations.schedule(input, execute, Some(rejected)).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))?;
+    let operation = manager.operations.schedule(input, execute, Some(rejected))?;
     if action == ServiceOperationKind::Start {
         queue_stopped_services_for_start(&manager, &start_services, &operation.id).await;
     }
@@ -649,7 +753,7 @@ async fn queue_stopped_services_for_start(manager: &Arc<HearthManager>, service_
     let mut changed = false;
     for service_id in service_ids {
         let previous = state.services.get(service_id).cloned().unwrap_or_else(|| default_state_or(None, service_id, &timestamp));
-        if previous.actual_state != crate::state::ActualServiceState::Stopped {
+        if previous.actual_state != ActualServiceState::Stopped {
             // Already up, or mid-flight. Its actual state must not be disturbed — but the INTENT
             // still has to be recorded, because `start_selected_dag` skips any node whose
             // `desired_state` is not `running` ("start cancelled") before it ever checks whether
@@ -670,23 +774,19 @@ async fn queue_stopped_services_for_start(manager: &Arc<HearthManager>, service_
         }
         let next = ServiceLifecycleState {
             desired_state: crate::state::DesiredServiceState::Running,
-            actual_state: crate::state::ActualServiceState::QueuedStart,
+            actual_state: ActualServiceState::QueuedStart,
             readiness: crate::state::ServiceReadiness::Unknown,
             updated_at: timestamp.clone(),
             current_operation_id: Some(operation_id.to_string()),
             ..previous
         };
-        manager.events.publish(
-            "service.lifecycle",
-            json!({"serviceId": service_id, "actualState": "queued-start", "generation": next.generation, "operationId": operation_id}).as_object().unwrap().clone(),
-        );
+        manager.events.publish("service.lifecycle", lifecycle_event(&next));
         state.services.insert(service_id.clone(), next);
         changed = true;
     }
     if changed {
-        let snapshot = PersistedManagerState { version: STATE_VERSION, services: state.services.clone() };
         drop(state);
-        let _ = manager.state_store.save(&snapshot);
+        manager.persist();
     }
 }
 
@@ -700,7 +800,7 @@ async fn clear_queued_starts(manager: &Arc<HearthManager>, service_ids: &[Servic
     let mut changed = false;
     for service_id in service_ids {
         let Some(previous) = state.services.get(service_id).cloned() else { continue };
-        if previous.actual_state != crate::state::ActualServiceState::QueuedStart {
+        if previous.actual_state != ActualServiceState::QueuedStart {
             continue;
         }
         // Always ownership-checked: only the operation that queued a service may un-queue it.
@@ -711,40 +811,27 @@ async fn clear_queued_starts(manager: &Arc<HearthManager>, service_ids: &[Servic
         }
         let next = ServiceLifecycleState {
             desired_state: crate::state::DesiredServiceState::Stopped,
-            actual_state: crate::state::ActualServiceState::Stopped,
+            actual_state: ActualServiceState::Stopped,
             readiness: crate::state::ServiceReadiness::Unknown,
             updated_at: timestamp.clone(),
             exited_at: Some(timestamp.clone()),
             current_operation_id: None,
             ..previous
         };
-        manager.events.publish("service.lifecycle", json!({"serviceId": service_id, "actualState": "stopped", "generation": next.generation}).as_object().unwrap().clone());
+        manager.events.publish("service.lifecycle", lifecycle_event(&next));
         state.services.insert(service_id.clone(), next);
         changed = true;
     }
     if changed {
-        let snapshot = PersistedManagerState { version: STATE_VERSION, services: state.services.clone() };
         drop(state);
-        let _ = manager.state_store.save(&snapshot);
+        manager.persist();
     }
 }
 
-async fn post_bulk_start(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> Response {
-    match post_bulk_start_inner(manager, bytes).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
-}
-
-async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpResult<Response> {
-    if manager.closing.load(Ordering::SeqCst) {
-        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
-    }
+async fn post_bulk_start(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
+    ensure_not_closing(&manager)?;
     let body = strict_body(&bytes, &["requestId", "targets", "killUnowned"], &["requestId", "targets"])?;
-    let request_id = body.get("requestId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 128);
-    let Some(request_id) = request_id else {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string"));
-    };
+    let request_id = require_request_id(&body)?;
     let catalog = manager.catalog();
     let targets_value = body.get("targets").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut targets = Vec::new();
@@ -768,18 +855,14 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
     if targets.is_empty() {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_targets", "targets must include at least one enabled catalog service"));
     }
-    let kill_unowned = match body.get("killUnowned") {
-        None | Some(Value::Bool(false)) => false,
-        Some(Value::Bool(true)) => true,
-        _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "killUnowned must be a boolean")),
-    };
+    let kill_unowned = parse_bool_flag(&body, "killUnowned")?;
     if targets.iter().any(|t| catalog.services.iter().find(|s| &s.id == t).map(|s| !s.profiles.run.is_verified()).unwrap_or(true)) {
         return Err(ManagerHttpError::new(StatusCode::CONFLICT, "unsupported_service", "The requested catalog service is not executable"));
     }
     let selected: Vec<ServiceId> = targets.clone();
 
-    let input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::BulkStart, service_id: None, target_service_ids: Some(targets.clone()), action: None };
-    if let Some(existing) = manager.operations.resolve_request(&input).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))? {
+    let input = OperationInput { request_id, kind: OperationKind::BulkStart, service_id: None, target_service_ids: Some(targets.clone()), action: None };
+    if let Some(existing) = manager.operations.resolve_request(&input)? {
         return Ok(json_response(json!({ "operation": existing }), StatusCode::ACCEPTED));
     }
     let manager_for_execute = manager.clone();
@@ -802,7 +885,7 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
         }
         .boxed()
     });
-    let operation = manager.operations.schedule(input, execute, Some(rejected)).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))?;
+    let operation = manager.operations.schedule(input, execute, Some(rejected))?;
     queue_stopped_services_for_start(&manager, &selected, &operation.id).await;
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
@@ -838,7 +921,7 @@ async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId]
             .unwrap()
             .services
             .get(&service_id_owned)
-            .map(|s| s.actual_state == crate::state::ActualServiceState::Ready && s.readiness == crate::state::ServiceReadiness::Ready)
+            .map(|s| s.actual_state == ActualServiceState::Ready && s.readiness == crate::state::ServiceReadiness::Ready)
             .unwrap_or(false);
         if already_ready {
             manager.operations.trace(&operation, &format!("Ready: {service_id_owned} (already ready)"));
@@ -849,7 +932,7 @@ async fn start_selected_dag(manager: &Arc<HearthManager>, selected: &[ServiceId]
         match manager.supervisor().start_with_options(&service_id_owned, Some(operation_id), crate::supervisor::types::StartOptions { kill_unowned }).await {
             Ok(()) => {
                 let settled = manager.state.lock().unwrap().services.get(&service_id_owned).map(|s| {
-                    s.actual_state == crate::state::ActualServiceState::Ready || (s.actual_state == crate::state::ActualServiceState::RunningUnready && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
+                    s.actual_state == ActualServiceState::Ready || (s.actual_state == ActualServiceState::RunningUnready && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
                 }).unwrap_or(false);
                 if settled {
                     manager.operations.trace(&operation, &format!("Ready: {service_id_owned}"));
@@ -1013,94 +1096,108 @@ async fn get_logs(State(manager): State<Arc<HearthManager>>, AxumPath(raw_servic
 /// per-service `CursorLogStore`, so it gets its own route. Returns a `LogSlice`-shaped tail:
 /// `reset` is always true (the whole tail is returned each poll — a diagnostic pane, not an
 /// incremental cursor) and `nextCursor` carries the byte length so callers can detect rotation.
-async fn get_daemon_log(State(manager): State<Arc<HearthManager>>, Query(params): Query<HashMap<String, String>>) -> Response {
+async fn get_daemon_log(State(manager): State<Arc<HearthManager>>, Query(params): Query<HashMap<String, String>>) -> HttpResult<Response> {
     let bytes = match params.get("bytes") {
         None => 131_072_u64,
         Some(v) => match v.parse::<u64>() {
             Ok(n) if (1..=1_048_576).contains(&n) => n,
-            _ => return ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_bytes", "bytes must be an integer between 1 and 1048576").into_response(),
+            _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_bytes", "bytes must be an integer between 1 and 1048576")),
         },
     };
     let path = manager.runtime_directory.join(crate::daemon::DAEMON_LOG_NAME);
-    let raw = match std::fs::read(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "daemon_log_unreadable", format!("could not read daemon.log: {e}")).into_response(),
-    };
-    let size = raw.len() as u64;
-    let mut start = raw.len().saturating_sub(bytes as usize);
-    // Snap the tail start to a UTF-8 boundary — same rule as the app's LogController trim.
-    while start < raw.len() && (raw[start] & 0b1100_0000) == 0b1000_0000 {
-        start += 1;
-    }
+    let read = tokio::task::spawn_blocking(move || read_log_tail(&path, bytes))
+        .await
+        .map_err(|e| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e.to_string()))?;
+    let (size, tail, truncated) = read.map_err(|e| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "daemon_log_unreadable", format!("could not read daemon.log: {e}")))?;
     let slice = LogSlice {
         service_id: "daemon".to_string(),
         generation: 0,
         cursor: 0,
         next_cursor: size,
-        data: String::from_utf8_lossy(&raw[start..]).into_owned(),
+        data: tail,
         reset: true,
-        truncated: start > 0,
+        truncated,
     };
-    json_response(slice, StatusCode::OK)
+    Ok(json_response(slice, StatusCode::OK))
 }
 
-async fn post_reload(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> Response {
-    match post_reload_inner(manager, bytes).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
+/// The last `bytes` of the file at `path` as `(file size, text, truncated)` — seeks to the tail
+/// instead of reading the whole file on every poll. A missing file reads as empty.
+fn read_log_tail(path: &std::path::Path, bytes: u64) -> std::io::Result<(u64, String, bool)> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, String::new(), false)),
+        Err(e) => return Err(e),
+    };
+    let size = file.metadata()?.len();
+    let start = size.saturating_sub(bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut raw = Vec::with_capacity((size - start) as usize);
+    file.take(bytes).read_to_end(&mut raw)?;
+    // Snap the tail start to a UTF-8 boundary — same rule as the app's LogController trim.
+    let skip = if start > 0 { raw.iter().take_while(|b| (**b & 0b1100_0000) == 0b1000_0000).count() } else { 0 };
+    Ok((size, String::from_utf8_lossy(&raw[skip..]).into_owned(), start > 0 || skip > 0))
 }
 
-async fn post_reload_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpResult<Response> {
-    if manager.closing.load(Ordering::SeqCst) {
-        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
-    }
+async fn post_reload(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
+    ensure_not_closing(&manager)?;
     let body = strict_body(&bytes, &["requestId", "catalog"], &["requestId", "catalog"])?;
-    let request_id = body.get("requestId").and_then(Value::as_str).filter(|s| !s.is_empty());
-    if request_id.is_none() {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string"));
-    }
+    let request_id = require_request_id(&body)?;
     let catalog_value = body.get("catalog").cloned().unwrap_or(Value::Null);
-    let valid_shape = catalog_value.get("services").map(Value::is_array).unwrap_or(false) && catalog_value.get("groups").map(Value::is_object).unwrap_or(false) && catalog_value.get("startFailurePolicy").map(Value::is_string).unwrap_or(false);
+    let valid_shape = catalog_value.get("services").map(Value::is_array).unwrap_or(false)
+        && catalog_value.get("groups").map(Value::is_object).unwrap_or(false)
+        && catalog_value.get("startFailurePolicy").map(Value::is_string).unwrap_or(true);
     if !valid_shape {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_catalog", "catalog must be a ServiceCatalog: { services: [...], groups: {...}, startFailurePolicy }"));
+        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_catalog", "catalog must be a ServiceCatalog: { services: [...], groups: {...}, startFailurePolicy? }"));
     }
-    let catalog: ServiceCatalog = serde_json::from_value(catalog_value).map_err(|e| ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_catalog", e.to_string()))?;
-    match manager.reload_catalog(catalog).await {
-        Ok(outcome) => Ok(json_response(json!({ "stopped": outcome.stopped, "changed": outcome.changed }), StatusCode::OK)),
-        Err(errors) => Err(ManagerHttpError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_catalog", errors.join("; "))),
+    let catalog: ServiceCatalog = serde_json::from_value(catalog_value.clone()).map_err(|e| ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_catalog", e.to_string()))?;
+    // Serialized with the reload itself so a retry arriving mid-reload waits for, then replays, the
+    // original answer.
+    let _serial = manager.reload_requests_serial.lock().await;
+    if let Some(replayed) = replay_reload(&manager, &request_id, &catalog_value)? {
+        return Ok(json_response(replayed, StatusCode::OK));
+    }
+    let outcome = manager.reload_catalog(catalog).await?;
+    let response = json!({ "stopped": outcome.stopped, "changed": outcome.changed });
+    let mut recent = manager.reload_requests.lock().unwrap();
+    if recent.len() >= RELOAD_REQUESTS_KEPT {
+        recent.pop_front();
+    }
+    recent.push_back((request_id, catalog_value, response.clone()));
+    Ok(json_response(response, StatusCode::OK))
+}
+
+/// How many recent reload `requestId`s are remembered for replay.
+const RELOAD_REQUESTS_KEPT: usize = 32;
+
+/// A reload `requestId` seen before: the same catalog replays the original response, a different
+/// one is a conflict.
+fn replay_reload(manager: &HearthManager, request_id: &str, catalog: &Value) -> HttpResult<Option<Value>> {
+    let recent = manager.reload_requests.lock().unwrap();
+    match recent.iter().find(|(id, _, _)| id == request_id) {
+        Some((_, seen, response)) if seen == catalog => Ok(Some(response.clone())),
+        Some(_) => Err(RequestIdConflict.into()),
+        None => Ok(None),
     }
 }
 
-async fn post_shutdown(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> Response {
-    match post_shutdown_inner(manager, bytes).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
-}
-
-async fn post_shutdown_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpResult<Response> {
+async fn post_shutdown(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
     let body = strict_body(&bytes, &["requestId", "mode"], &["requestId"])?;
-    let request_id = body.get("requestId").and_then(Value::as_str).filter(|s| !s.is_empty());
-    let Some(request_id) = request_id else {
-        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_request", "requestId must be a non-empty string"));
-    };
+    let request_id = require_request_id(&body)?;
     let mode = match body.get("mode") {
         None => "refuse-if-active",
         Some(Value::String(s)) if matches!(s.as_str(), "refuse-if-active" | "stop-services" | "leave-services") => s.as_str(),
         _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_shutdown_mode", "mode must be refuse-if-active, stop-services, or leave-services")),
     };
     let stop_services = mode == "stop-services";
-    let schedule_input = OperationInput { request_id: request_id.to_string(), kind: OperationKind::ManagerShutdown, service_id: None, target_service_ids: None, action: None };
-    if let Some(existing) = manager.operations.resolve_request(&schedule_input).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))? {
+    let schedule_input = OperationInput { request_id, kind: OperationKind::ManagerShutdown, service_id: None, target_service_ids: None, action: None };
+    if let Some(existing) = manager.operations.resolve_request(&schedule_input)? {
         return Ok(json_response(json!({ "operation": existing }), StatusCode::ACCEPTED));
     }
-    if manager.closing.load(Ordering::SeqCst) {
-        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "manager_closing", "Manager is shutting down"));
-    }
-    let non_terminal = ["stopped", "queued-start", "failed", "orphaned", "externally-owned"];
-    let active = manager.service_states().into_iter().any(|s| default_daemon_owned(&manager.catalog(), &s.service_id) && !non_terminal.contains(&s.actual_state.as_wire_str()));
+    ensure_not_closing(&manager)?;
+    let non_terminal = [ActualServiceState::Stopped, ActualServiceState::QueuedStart, ActualServiceState::Failed, ActualServiceState::Orphaned, ActualServiceState::ExternallyOwned];
+    let catalog = manager.catalog();
+    let active = manager.service_states().into_iter().any(|s| default_daemon_owned(&catalog, &s.service_id) && !non_terminal.contains(&s.actual_state));
     // Only `refuse-if-active` guards. `leave-services` is the deliberate "restart the daemon, keep
     // the services" path (`hearthd manager restart`): daemon-owned processes are detached and
     // outlive this daemon, and the next one re-adopts them from their persisted identities — the
@@ -1112,16 +1209,15 @@ async fn post_shutdown_inner(manager: Arc<HearthManager>, bytes: Bytes) -> HttpR
     tokio::spawn(async move {
         manager_for_shutdown.shutdown(stop_services).await;
     });
-    let operation = manager.operations.schedule(schedule_input, Box::new(|_h| async { Ok(()) }.boxed()), None).map_err(|_| ManagerHttpError::new(StatusCode::CONFLICT, "request_id_conflict", "requestId is already used by a different operation"))?;
+    let operation = manager.operations.schedule(schedule_input, Box::new(|_h| async { Ok(()) }.boxed()), None)?;
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
 
 // =============================================================================================
 // Real end-to-end test: a real bootstrap()'ed manager, a real spawned TCP-readiness service, real
-// HTTP calls via reqwest against the real bound port — the same category of test that closed out
-// Phase 2 for the supervisor + its real adapters. This is the capstone proof that every store
-// (lock, state, events, operations, logs) and the supervisor are correctly wired together behind
-// the actual HTTP+SSE surface a client (the macOS app, a future Rust CLI/TUI/MCP) would use.
+// HTTP calls via reqwest against the real bound port — proof that every store (lock, state,
+// events, operations, logs) and the supervisor are wired together behind the HTTP+SSE surface
+// the clients (macOS app, CLI, TUI, MCP) use.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,7 +1484,7 @@ mod tests {
         .expect("manager should finish shutting down");
 
         assert!(alive(), "leave-services must not stop the service's process");
-        assert_eq!(manager.service_states()[0].actual_state, crate::state::ActualServiceState::Ready, "the service must still be recorded as ready for the next daemon to re-adopt");
+        assert_eq!(manager.service_states()[0].actual_state, ActualServiceState::Ready, "the service must still be recorded as ready for the next daemon to re-adopt");
 
         // This test owns the process it spawned — nothing else will reap it.
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM);
@@ -1420,11 +1516,54 @@ mod tests {
         };
         let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         manager.supervisor().start(&"api".to_string(), None).await.unwrap();
-        assert_eq!(manager.service_states()[0].actual_state, crate::state::ActualServiceState::Ready);
+        assert_eq!(manager.service_states()[0].actual_state, ActualServiceState::Ready);
 
         let empty_catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let outcome = manager.reload_catalog(empty_catalog).await.unwrap();
         assert_eq!(outcome.stopped, vec!["api".to_string()]);
+        manager.close().await;
+    }
+
+    /// A removed service whose stop fails must not vanish from the catalog while it may still run.
+    #[tokio::test]
+    async fn reload_catalog_keeps_the_old_catalog_when_a_stop_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ServiceCatalog { services: vec![tcp_service("api", free_port())], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
+        // "Ready" with no process identity and no catalog `stop:` — there is nothing the daemon can
+        // stop, so the stop fails.
+        let timestamp = now();
+        let ready = ServiceLifecycleState { actual_state: ActualServiceState::Ready, desired_state: crate::state::DesiredServiceState::Running, readiness: crate::state::ServiceReadiness::Ready, generation: 1, ..default_state_or(None, "api", &timestamp) };
+        manager.set_service_state(ready).await;
+
+        let empty_catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        match manager.reload_catalog(empty_catalog).await {
+            Err(ReloadError::StopFailed { failures, .. }) => assert_eq!(failures.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["api"]),
+            Err(other) => panic!("expected StopFailed, got {other}"),
+            Ok(outcome) => panic!("reload must fail, stopped {:?}", outcome.stopped),
+        }
+        assert_eq!(manager.catalog().services.len(), 1, "the old catalog stays");
+        manager.close().await;
+    }
+
+    #[tokio::test]
+    async fn reload_request_ids_replay_and_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ServiceCatalog { services: vec![tcp_service("api", free_port())], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
+        let client = reqwest::Client::new();
+        let post = |body: Value| client.post(format!("{}/v1/manager/reload", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", "1").json(&body).send();
+
+        // `startFailurePolicy` is optional.
+        let next = json!({ "services": [], "groups": {} });
+        let first = post(json!({ "requestId": "r1", "catalog": next })).await.unwrap();
+        assert_eq!(first.status(), 200);
+        let first: Value = first.json().await.unwrap();
+        assert_eq!(first["stopped"], json!([]));
+        let replay: Value = post(json!({ "requestId": "r1", "catalog": next })).await.unwrap().json().await.unwrap();
+        assert_eq!(replay, first);
+        let conflict = post(json!({ "requestId": "r1", "catalog": { "services": [], "groups": { "g": [] } } })).await.unwrap();
+        assert_eq!(conflict.status(), 409);
         manager.close().await;
     }
 
@@ -1475,7 +1614,7 @@ mod tests {
         {
             let mut state = manager.state.lock().unwrap();
             let db = state.services.get_mut("db").expect("db present");
-            assert_eq!(db.actual_state, crate::state::ActualServiceState::Ready);
+            assert_eq!(db.actual_state, ActualServiceState::Ready);
             db.desired_state = crate::state::DesiredServiceState::Stopped;
         }
 
@@ -1498,7 +1637,7 @@ mod tests {
         let state_of = |id: &str| states.iter().find(|s| s.service_id == id).cloned().expect("service present");
         assert_eq!(
             state_of("db").actual_state,
-            crate::state::ActualServiceState::Ready,
+            ActualServiceState::Ready,
             "a ready service with a stale desired_state must not be skipped"
         );
 
@@ -1543,7 +1682,7 @@ mod tests {
         let operation_id = accepted.json::<Value>().await.unwrap()["operation"]["id"].as_str().unwrap().to_string();
         let settled = wait_for_operation(&client, &base, &token, &operation_id).await;
         assert_eq!(settled["operation"]["status"], "succeeded");
-        assert_eq!(manager.service_states().iter().find(|s| s.service_id == "api").unwrap().actual_state, crate::state::ActualServiceState::Ready);
+        assert_eq!(manager.service_states().iter().find(|s| s.service_id == "api").unwrap().actual_state, ActualServiceState::Ready);
 
         manager.close().await;
     }

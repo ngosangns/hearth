@@ -1,6 +1,0 @@
-#!/bin/bash
-set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="$1"
-export MONGOSH_NO_TELEMETRY=1
-exec "$ROOT/bin/mongosh" --quiet --norc --host 127.0.0.1 --port "$PORT" --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)'

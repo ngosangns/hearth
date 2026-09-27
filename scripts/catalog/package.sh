@@ -59,9 +59,7 @@ copy_payload() {
       continue
     fi
     cp "$file" "$dest/$base"
-    if [[ "$base" != *.xml ]]; then
-      chmod +x "$dest/$base"
-    fi
+    chmod +x "$dest/$base"
   done
 }
 
@@ -125,9 +123,11 @@ package_mongodb() {
 
 # Official darwin binaries live on dl.min.io, which is too slow to be a practical fetch from
 # some networks. Build the pinned release tags instead; the catalog sha256 is of our tarball.
+# The clone is kept across runs (it is large), but only while it is still checked out at $tag —
+# otherwise a bumped version in versions.env would rebuild the old source under the new name.
 build_go_tool() {
   local repo="$1" tag="$2" dest="$3" out="$4"
-  if [[ ! -d "$dest/.git" ]]; then
+  if [[ ! -d "$dest/.git" ]] || [[ "$(git -C "$dest" describe --tags --exact-match 2>/dev/null)" != "$tag" ]]; then
     rm -rf "$dest"
     git clone --depth 1 --branch "$tag" "$repo" "$dest"
   fi

@@ -16,7 +16,7 @@ final class WorkspaceControllerTests: XCTestCase {
 
     func testConnectReachesConnectedAndPublishesServices() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
 
         let sut = controller(api)
@@ -58,7 +58,7 @@ final class WorkspaceControllerTests: XCTestCase {
 
     func testRefreshRecoversFromATransientFailure() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         let sut = controller(api)
         await sut.connect()
@@ -82,7 +82,7 @@ final class WorkspaceControllerTests: XCTestCase {
     /// while the daemon was still doing the work.
     func testPerformStaysBusyUntilTheOperationSettles() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "stopped")] }
         let sut = controller(api)
         await sut.connect()
@@ -107,7 +107,7 @@ final class WorkspaceControllerTests: XCTestCase {
     /// meant the UI showed no error at all.
     func testPerformSurfacesAFailedOperationsReason() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "stopped")] }
         let sut = controller(api)
         await sut.connect()
@@ -130,10 +130,10 @@ final class WorkspaceControllerTests: XCTestCase {
     /// daemon, not the one it just replaced — without a manual reconnect.
     func testRestartDaemonReconnectsToTheNewClient() async {
         let old = FakeManagerAPI()
-        old.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        old.catalogHandler = { ServiceCatalogSummary(services: []) }
         old.servicesHandler = { [makeService("api", actualState: "ready")] }
         let new = FakeManagerAPI()
-        new.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        new.catalogHandler = { ServiceCatalogSummary(services: []) }
         new.servicesHandler = { [makeService("api", actualState: "stopped")] }
 
         let restarts = Counter()
@@ -164,7 +164,7 @@ final class WorkspaceControllerTests: XCTestCase {
             var errorDescription: String? { "hearthd exited 1: manager unavailable" }
         }
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         let sut = WorkspaceController(workspace: workspace(), watchesConfigFile: false, connector: { _ in api }, restarter: { _ in throw Boom() })
         await sut.connect()
@@ -183,7 +183,7 @@ final class WorkspaceControllerTests: XCTestCase {
     /// keep polling a daemon that no longer exists.
     func testStopDaemonDropsAllLiveStateAndReportsStopped() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         let stops = Counter()
         let sut = WorkspaceController(
@@ -209,7 +209,7 @@ final class WorkspaceControllerTests: XCTestCase {
             var errorDescription: String? { "hearthd exited 1: shutdown refused" }
         }
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         let sut = WorkspaceController(
             workspace: workspace(),
@@ -229,7 +229,7 @@ final class WorkspaceControllerTests: XCTestCase {
 
     func testLogControllerIsReusedForTheSameService() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         let sut = controller(api)
         await sut.connect()
@@ -245,7 +245,7 @@ final class WorkspaceControllerTests: XCTestCase {
     /// log controller is not pruned like a dead service's.
     func testDaemonLogRowIsNotPrunedByRefresh() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = { [makeService("api", actualState: "ready")] }
         api.daemonLogHandler = { makeLogSlice(data: "d\n", nextCursor: 0, generation: 0, reset: true) }
         api.logsHandler = { _, _ in throw FakeManagerAPI.Unimplemented(what: "logs") }
@@ -267,7 +267,7 @@ final class WorkspaceControllerTests: XCTestCase {
 
     func testRefreshKeepsThePublishedSnapshotWhenOnlyTimestampsChange() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         let stamp = Box(0)
         api.servicesHandler = {
             stamp.value += 1
@@ -302,7 +302,7 @@ final class WorkspaceControllerTests: XCTestCase {
 
     func testStopAllSkipsAlreadyStoppedServicesAndStopsQueuedStarts() async {
         let api = FakeManagerAPI()
-        api.catalogHandler = { ServiceCatalogSummary(services: [], groups: [:]) }
+        api.catalogHandler = { ServiceCatalogSummary(services: []) }
         api.servicesHandler = {
             [
                 makeService("ready-one", actualState: "ready"),

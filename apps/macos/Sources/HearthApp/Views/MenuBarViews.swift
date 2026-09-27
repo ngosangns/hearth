@@ -7,27 +7,19 @@ import SwiftUI
 /// truth, kept alive at the app level (see its doc comment) specifically so this stays accurate even
 /// when the main window is closed.
 struct MenuBarSummary {
-    let ready: Int
-    let failed: Int
-    let total: Int
+    let counts: ServiceCounts
+    var ready: Int { counts.ready }
+    var failed: Int { counts.failed }
+    var total: Int { counts.total }
 
     @MainActor
     static func compute(workspaces: [Workspace], registry: WorkspaceControllerRegistry) -> MenuBarSummary {
-        var ready = 0
-        var failed = 0
-        var total = 0
+        var counts = ServiceCounts()
         for workspace in workspaces where workspace.trusted {
             guard let controller = registry.controllers[workspace.id] else { continue }
-            for service in controller.services {
-                total += 1
-                switch service.displayState {
-                case "ready", "running": ready += 1
-                case "failed": failed += 1
-                default: break
-                }
-            }
+            for service in controller.services { counts.add(service) }
         }
-        return MenuBarSummary(ready: ready, failed: failed, total: total)
+        return MenuBarSummary(counts: counts)
     }
 
     var labelText: String {
@@ -63,9 +55,6 @@ struct MenuBarContentView: View {
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
     @EnvironmentObject private var menuBarPulse: MenuBarPulse
     @Environment(\.openWindow) private var openWindow
-    /// The workspace whose "Stop Daemon…" item armed the confirmation dialog — per-workspace, since
-    /// one content view lists them all.
-    @State private var stopDaemonTarget: Workspace?
 
     var body: some View {
         let _ = menuBarPulse.tick
@@ -77,17 +66,24 @@ struct MenuBarContentView: View {
                     Menu(menuTitle(for: workspace)) {
                         Button("Open") {
                             workspaceStore.selectedId = workspace.id
-                            openWindow(id: "main")
+                            openWindow(id: MainWindow.id)
                         }
                         if workspace.trusted, let controller = registry.controllers[workspace.id], controller.phase != .connecting {
                             Button("Restart Daemon") { Task { await controller.restartDaemon() } }
                                 .disabled(controller.daemonTransitionInFlight)
                         }
                         // Destructive like the toolbar button — daemon AND all its services go down,
-                        // so the menu item arms a confirmation rather than firing directly.
+                        // so the menu item confirms rather than firing directly. An `NSAlert`, not
+                        // a `confirmationDialog` (see `StopDaemonConfirmation.runModal`), shown
+                        // after the menu has finished closing.
                         if workspace.trusted, let controller = registry.controllers[workspace.id], controller.phase.mayHaveLiveDaemon {
-                            Button("Stop Daemon…") { stopDaemonTarget = workspace }
-                                .disabled(controller.daemonTransitionInFlight)
+                            Button("Stop Daemon…") {
+                                DispatchQueue.main.async {
+                                    guard StopDaemonConfirmation.runModal(workspaceName: workspace.displayName) else { return }
+                                    Task { await controller.stopDaemon() }
+                                }
+                            }
+                            .disabled(controller.daemonTransitionInFlight)
                         }
                         if let controller = registry.controllers[workspace.id], controller.phase == .connected {
                             Button("Stop All") { Task { await controller.stopAll() } }
@@ -98,28 +94,9 @@ struct MenuBarContentView: View {
             Divider()
             Button("Shared Services…") { openWindow(id: SharedWindow.id) }
             Divider()
-            Button("Open Hearth") { openWindow(id: "main") }
-            Button("Check for Updates…") {
-                if let url = URL(string: "https://github.com/gnasdev/hearth/releases") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
+            Button("Open Hearth") { openWindow(id: MainWindow.id) }
+            Button("Check for Updates…") { NSWorkspace.shared.open(AppLinks.releases) }
             Button("Quit") { NSApp.terminate(nil) }
-        }
-        .confirmationDialog(
-            "Stop this project's daemon?",
-            isPresented: Binding(
-                get: { stopDaemonTarget != nil },
-                set: { if !$0 { stopDaemonTarget = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            if let target = stopDaemonTarget, let controller = registry.controllers[target.id] {
-                Button("Stop Daemon", role: .destructive) { Task { await controller.stopDaemon() } }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The daemon and every service it manages will be stopped.")
         }
     }
 
@@ -136,9 +113,8 @@ struct MenuBarContentView: View {
         case .stopped: return "stopped"
         case .failed(let message): return message
         case .connected:
-            let ready = controller.services.filter { ["ready", "running"].contains($0.displayState) }.count
-            let failed = controller.services.filter { $0.displayState == "failed" }.count
-            return failed > 0 ? "\(ready)/\(controller.services.count) ready · \(failed) failed" : "\(ready)/\(controller.services.count) ready"
+            let counts = controller.counts
+            return counts.failed > 0 ? "\(counts.ready)/\(counts.total) ready · \(counts.failed) failed" : "\(counts.ready)/\(counts.total) ready"
         }
     }
 }

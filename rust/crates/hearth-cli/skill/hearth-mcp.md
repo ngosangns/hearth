@@ -8,7 +8,7 @@ description: Operate this project's local dev services (start/stop/status/logs) 
 
 This project's local dev services (per-container infra, docker/tailnet-adopted units, and host
 processes it runs directly) are managed by a single background daemon — the
-`@gnasdev/hearth` engine (compiled binary `hearthd`). Do not `kill`/`pkill`/`docker
+Hearth daemon, the `hearthd` binary. Do not `kill`/`pkill`/`docker
 restart`/run a dev task raw for a unit this daemon tracks: its state would drift from the real
 process, and every CLI/TUI/MCP surface reading that state would start reporting the wrong thing.
 
@@ -91,5 +91,5 @@ daemon-owned (started/stopped only through this daemon) or externally-owned (e.g
 compose`/`tailscale serve` unit whose lifecycle is managed elsewhere and merely observed/adopted
 by the daemon) — this project's own catalog decides which is which per service.
 
-This doc is generic to any project using `@gnasdev/hearth`; see this project's own docs
+This doc is generic to any project managed by `hearthd`; see this project's own docs
 for its specific service list, ports, and any additional operational rules.

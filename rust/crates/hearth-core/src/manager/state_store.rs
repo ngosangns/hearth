@@ -1,4 +1,4 @@
-//! Port of `AtomicStateStore` + its validation/legacy-migration helpers (`src/core/manager.ts`).
+//! `AtomicStateStore` + its validation/legacy-migration helpers.
 //! Corrupt or unrecognized `state.json` content is quarantined (renamed aside), never silently
 //! overwritten or trusted — and a state file written by either predecessor tool (`units`/`unitId`
 //! keyed) is rewritten in place rather than rejected, so a service that's still actually running
@@ -11,11 +11,25 @@ use serde_json::Value;
 
 use crate::catalog::ServiceId;
 use crate::file_io::FileIo;
-use crate::state::{PersistedManagerState, ServiceLifecycleState, STATE_VERSION};
+use crate::state::{ActualServiceState, PersistedManagerState, ReadinessKind, ServiceLifecycleState, ServiceReadiness, STATE_VERSION};
 
-const ACTUAL_STATES: [&str; 11] =
-    ["stopped", "queued-start", "preparing", "starting", "running", "running-unready", "ready", "stopping", "failed", "orphaned", "externally-owned"];
-const READINESS_STATES: [&str; 4] = ["unknown", "not-ready", "ready", "failed"];
+/// Built from the enums' own `ALL` lists (pinned to serde by `state.rs`'s tests), so a variant added
+/// there can never be quarantined here as unrecognized.
+fn is_actual_state(value: &str) -> bool {
+    ActualServiceState::ALL.iter().any(|state| state.as_wire_str() == value)
+}
+
+fn is_readiness_state(value: &str) -> bool {
+    ServiceReadiness::ALL.iter().any(|readiness| readiness.as_wire_str() == value)
+}
+
+fn is_readiness_kind(value: &str) -> bool {
+    ReadinessKind::ALL.iter().any(|kind| kind.as_wire_str() == value)
+}
+
+/// Reports a failure the store handles itself (a migration it could not persist, a file it could
+/// not quarantine) — `Host::record_background_error` in the daemon.
+pub type StateStoreErrorReporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn is_object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
     value.as_object()
@@ -70,8 +84,8 @@ fn is_lifecycle_state(value: &Value, service_key: &str) -> bool {
         return false;
     }
     let desired_state_ok = matches!(obj.get("desiredState").and_then(Value::as_str), Some("stopped") | Some("running"));
-    let actual_state_ok = obj.get("actualState").and_then(Value::as_str).map(|s| ACTUAL_STATES.contains(&s)).unwrap_or(false);
-    let readiness_ok = obj.get("readiness").and_then(Value::as_str).map(|s| READINESS_STATES.contains(&s)).unwrap_or(false);
+    let actual_state_ok = obj.get("actualState").and_then(Value::as_str).is_some_and(is_actual_state);
+    let readiness_ok = obj.get("readiness").and_then(Value::as_str).is_some_and(is_readiness_state);
     if !desired_state_ok || !actual_state_ok || !readiness_ok || !is_finite_integer(obj.get("generation"), 0) || !is_timestamp(obj.get("createdAt")) || !is_timestamp(obj.get("updatedAt")) {
         return false;
     }
@@ -86,7 +100,7 @@ fn is_lifecycle_state(value: &Value, service_key: &str) -> bool {
         }
     }
     if let Some(exit_code) = obj.get("exitCode") {
-        if !is_finite_integer(Some(exit_code), i64::MIN) {
+        if !exit_code.as_i64().is_some_and(|code| i32::try_from(code).is_ok()) {
             return false;
         }
     }
@@ -98,7 +112,7 @@ fn is_lifecycle_state(value: &Value, service_key: &str) -> bool {
         }
     }
     if let Some(kind) = obj.get("readinessKind") {
-        if !kind.is_string() {
+        if !kind.as_str().is_some_and(is_readiness_kind) {
             return false;
         }
     }
@@ -118,12 +132,10 @@ fn is_persisted_manager_state_value(value: &Value) -> bool {
 }
 
 /// Deliberately fallible rather than `.expect(...)`: `is_persisted_manager_state_value` is a
-/// shape check, not a type check, and it is weaker than these types in at least two places —
-/// `readinessKind` is validated as "any string" but deserializes into a closed enum, and
-/// `exitCode` is validated as any i64 but deserializes into an `i32`. A `state.json` containing
-/// `"readinessKind": "grpc"` passed validation and then panicked here, killing the daemon at
-/// bootstrap instead of quarantining the file and starting clean — which is the entire reason this
-/// module quarantines rather than trusts.
+/// shape check, not a type check. `readinessKind` and `exitCode` are now checked against the types
+/// they decode into, but any remaining gap must fall through to quarantine — a `state.json` with
+/// `"readinessKind": "grpc"` once passed validation and then panicked here, killing the daemon at
+/// bootstrap instead of quarantining the file and starting clean.
 fn value_to_persisted_state(value: &Value) -> Option<PersistedManagerState> {
     serde_json::from_value(value.clone()).ok()
 }
@@ -177,11 +189,24 @@ fn migrate_legacy_persisted_state(value: &Value) -> Option<PersistedManagerState
 pub struct AtomicStateStore {
     io: Arc<dyn FileIo>,
     pub path: std::path::PathBuf,
+    report_error: Option<StateStoreErrorReporter>,
 }
 
 impl AtomicStateStore {
     pub fn new(io: Arc<dyn FileIo>, runtime_directory: &std::path::Path) -> Self {
-        Self { io, path: runtime_directory.join("state.json") }
+        Self { io, path: runtime_directory.join("state.json"), report_error: None }
+    }
+
+    /// Where `load` reports what it cannot fix itself, instead of discarding it.
+    pub fn with_error_reporter(mut self, report_error: StateStoreErrorReporter) -> Self {
+        self.report_error = Some(report_error);
+        self
+    }
+
+    fn report(&self, message: &str) {
+        if let Some(report_error) = &self.report_error {
+            report_error(message);
+        }
     }
 
     pub fn load(&self) -> PersistedManagerState {
@@ -193,7 +218,10 @@ impl AtomicStateStore {
                 return value_to_persisted_state(&value);
             }
             if let Some(migrated) = migrate_legacy_persisted_state(&value) {
-                let _ = self.save(&migrated);
+                // Still usable in memory; the next successful save persists the migrated shape.
+                if let Err(error) = self.save(&migrated) {
+                    self.report(&format!("failed to persist migrated {}: {error}", self.path.display()));
+                }
                 return Some(migrated);
             }
             None
@@ -201,7 +229,9 @@ impl AtomicStateStore {
         match attempt() {
             Some(state) => state,
             None => {
-                let _ = self.io.quarantine(&self.path, "corrupt");
+                if let Err(error) = self.io.quarantine(&self.path, "corrupt") {
+                    self.report(&format!("failed to quarantine {}: {error}", self.path.display()));
+                }
                 PersistedManagerState { version: STATE_VERSION, services: HashMap::new() }
             }
         }
@@ -331,6 +361,27 @@ mod tests {
         let raw = std::fs::read_to_string(&store.path).unwrap();
         assert!(raw.contains("\"serviceId\":\"api\""));
         assert!(!raw.contains("unitId"));
+    }
+
+    #[test]
+    fn an_unknown_readiness_kind_is_quarantined_not_trusted() {
+        let mut value = serde_json::to_value(PersistedManagerState { version: STATE_VERSION, services: HashMap::from([("api".to_string(), sample_state())]) }).unwrap();
+        value["services"]["api"]["readinessKind"] = Value::String("grpc".to_string());
+        assert!(!is_persisted_manager_state_value(&value));
+        value["services"]["api"]["readinessKind"] = Value::String("tcp".to_string());
+        assert!(is_persisted_manager_state_value(&value));
+        value["services"]["api"]["exitCode"] = serde_json::json!(i64::from(i32::MAX) + 1);
+        assert!(!is_persisted_manager_state_value(&value), "an exit code outside i32 cannot deserialize");
+    }
+
+    #[test]
+    fn every_wire_state_is_accepted() {
+        for state in ActualServiceState::ALL {
+            assert!(is_actual_state(state.as_wire_str()), "{state:?}");
+        }
+        for readiness in ServiceReadiness::ALL {
+            assert!(is_readiness_state(readiness.as_wire_str()), "{readiness:?}");
+        }
     }
 
     #[test]

@@ -1,15 +1,19 @@
-//! Port of the `ManagerApiClient` half of `src/mcp/mcp-server.ts` — the default
-//! `HearthMcpClient` backed by the daemon's HTTP API, reusing `hearth-cli`'s own
-//! `require_client`/`request`/`runnable_targets` rather than re-implementing daemon HTTP plumbing a
-//! third time (`hearth-tui`'s `ManagerTuiClient` already reuses them the same way).
+//! The default `HearthMcpClient`, backed by the daemon's HTTP API through `hearth-cli`'s
+//! `ManagerClient` — the same typed client the CLI and TUI use.
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use hearth_cli::{require_client, request as cli_request, restart_manager, runnable_targets, stop_manager, Discovery, LocalctlOptions};
+use hearth_cli::{encode_path_segment, request as cli_request, restart_manager, runnable_targets, stop_manager, Discovery, LocalctlOptions, ManagerClient};
+use hearth_core::catalog::ServiceCatalog;
 use hearth_core::shared::{project_id, shared_root, RemoteCatalog};
+use hearth_core::state::{OperationStatus, ServiceOperationKind};
+
+/// How long `manage` waits for its operation before handing the agent the operation id to
+/// `trace` instead — an MCP tool call must not hang for a whole readiness timeout.
+const MANAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default)]
 pub struct StatusArguments {
@@ -35,27 +39,11 @@ pub struct EventsArguments {
     pub epoch: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManageAction {
-    Start,
-    Stop,
-    Restart,
-}
-
-impl ManageAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ManageAction::Start => "start",
-            ManageAction::Stop => "stop",
-            ManageAction::Restart => "restart",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ManageArguments {
     pub service: String,
-    pub action: ManageAction,
+    /// `start`, `stop` or `restart` — never `status`.
+    pub action: ServiceOperationKind,
     /// `action: start` only — the host-approved "kill the process holding my port" reclaim,
     /// forwarded verbatim to the daemon's `killUnowned` operation flag.
     pub kill_unowned: bool,
@@ -94,90 +82,107 @@ pub trait HearthMcpClient: Send + Sync {
     async fn shared_connection(&self, _service: String) -> Result<Value, String> {
         Err("shared services are not supported by this client".to_string())
     }
+
+    /// The service ids the daemon currently serves, when the client can tell — the server
+    /// refreshes its tool schemas and argument validation from this, so a `manager reload` that
+    /// adds a service doesn't need an MCP server restart. `None` keeps the ids it started with.
+    async fn service_ids(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Default `HearthMcpClient` backed by the daemon's HTTP API.
 pub struct ManagerApiClient {
     root: PathBuf,
     options: LocalctlOptions,
+    api: ManagerClient,
 }
 
 impl ManagerApiClient {
     pub fn new(root: PathBuf, options: LocalctlOptions) -> Self {
-        Self { root, options }
+        let api = ManagerClient::new(root.clone(), options.catalog.clone());
+        Self { root, options, api }
     }
 
-    async fn call(&self, path: &str, method: reqwest::Method, body: Option<&Value>) -> Result<Value, String> {
-        let client = require_client(&self.root, &self.options).await.map_err(|e| e.message)?;
-        cli_request(&client, path, method, body, None).await
+    async fn call(&self, path: &str) -> Result<Value, String> {
+        self.api.request(path, reqwest::Method::GET, None).await.map_err(|e| e.message)
+    }
+
+    /// The catalog the daemon serves now (it may have been reloaded since this process started),
+    /// falling back to the startup catalog when the daemon can't be asked.
+    async fn current_catalog(&self) -> ServiceCatalog {
+        self.api.catalog().await.unwrap_or_else(|_| self.options.catalog.clone())
     }
 }
 
 #[async_trait]
 impl HearthMcpClient for ManagerApiClient {
     async fn status(&self, arguments: StatusArguments) -> Result<Value, String> {
-        let client = require_client(&self.root, &self.options).await.map_err(|e| e.message)?;
-        let (manager, services) = tokio::try_join!(cli_request(&client, "/v1/manager", reqwest::Method::GET, None, None), cli_request(&client, "/v1/services", reqwest::Method::GET, None, None))?;
+        let (manager, services) = tokio::try_join!(self.call("/v1/manager"), self.call("/v1/services"))?;
         let mut result = json!({ "manager": manager, "services": filter_service_states(services, arguments.service.as_deref()) });
         // Additive, and best-effort: a daemon from before `/v1/urls` existed still answers
         // `status`, just without `urls`, rather than failing the whole call.
-        if let Ok(urls) = cli_request(&client, "/v1/urls", reqwest::Method::GET, None, None).await {
+        if let Ok(urls) = self.call("/v1/urls").await {
             result["urls"] = filter_service_urls(urls, arguments.service.as_deref());
         }
         Ok(result)
     }
 
     async fn logs(&self, arguments: LogsArguments) -> Result<Value, String> {
-        let query = query_string(&[("cursor", arguments.cursor.map(|v| v.to_string())), ("generation", arguments.generation.map(|v| v.to_string())), ("limit", arguments.limit.map(|v| v.to_string()))]);
-        self.call(&format!("/v1/logs/{}{query}", encode_path_segment(&arguments.service)), reqwest::Method::GET, None).await
+        let slice = self.api.log(&arguments.service, arguments.cursor, arguments.generation, arguments.limit).await.map_err(|e| e.message)?;
+        serde_json::to_value(slice).map_err(|e| e.to_string())
     }
 
     async fn trace(&self, arguments: TraceArguments) -> Result<Value, String> {
-        self.call(&format!("/v1/operations/{}", encode_path_segment(&arguments.operation_id)), reqwest::Method::GET, None).await
+        self.call(&format!("/v1/operations/{}", encode_path_segment(&arguments.operation_id))).await
     }
 
     async fn events(&self, arguments: EventsArguments) -> Result<Value, String> {
         let query = query_string(&[("after", arguments.after.map(|v| v.to_string())), ("epoch", arguments.epoch.clone())]);
-        self.call(&format!("/v1/events{query}"), reqwest::Method::GET, None).await
+        self.call(&format!("/v1/events{query}")).await
     }
 
+    /// Submits the operation and waits up to `MANAGE_WAIT_TIMEOUT`. Still running after that is not
+    /// an error: the reply carries the operation so the agent can `trace` it.
     async fn manage(&self, arguments: ManageArguments) -> Result<Value, String> {
-        runnable_targets(&self.options.catalog, Some(&arguments.service)).map_err(|e| e.message)?;
-        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": arguments.service, "action": arguments.action.as_str() });
-        if arguments.kill_unowned {
-            body["killUnowned"] = json!(true);
+        runnable_targets(&self.current_catalog().await, Some(&arguments.service)).map_err(|e| e.message)?;
+        let accepted = self.api.submit(arguments.action, &arguments.service, arguments.kill_unowned).await.map_err(|e| e.message)?;
+        let deadline = tokio::time::Instant::now() + MANAGE_WAIT_TIMEOUT;
+        let operation = match self.api.wait(&accepted.id, Some(deadline)).await {
+            Ok(operation) => operation,
+            // A lost poll doesn't lose the operation — hand its id back rather than an opaque error.
+            Err(error) => return Err(format!("{} (operation {} may still be running — trace it)", error.message, accepted.id)),
+        };
+        match operation.status {
+            OperationStatus::Failed => Err(operation.error.map(|e| e.message).unwrap_or_else(|| "operation failed".to_string())),
+            OperationStatus::Succeeded => self.status(StatusArguments { service: Some(arguments.service) }).await,
+            OperationStatus::Queued | OperationStatus::Running => Ok(json!({
+                "operation": operation,
+                "message": format!("still {} after {}s — call trace with operationId {} to follow it", operation.status.as_wire_str(), MANAGE_WAIT_TIMEOUT.as_secs(), operation.id),
+            })),
         }
-        let mut response = self.call("/v1/operations", reqwest::Method::POST, Some(&body)).await?;
-        let mut operation = response["operation"].take();
-        loop {
-            let status = operation["status"].as_str().unwrap_or_default();
-            if status != "queued" && status != "running" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let id = operation["id"].as_str().unwrap_or_default().to_string();
-            response = self.call(&format!("/v1/operations/{id}"), reqwest::Method::GET, None).await?;
-            operation = response["operation"].take();
-        }
-        if operation["status"].as_str() == Some("failed") {
-            let message = operation["error"]["message"].as_str().unwrap_or("operation failed").to_string();
-            return Err(message);
-        }
-        self.status(StatusArguments { service: Some(arguments.service) }).await
     }
 
     /// The same `hearthd manager restart` the CLI runs, in-process: shut the daemon down leaving its
-    /// services running, wait for it to exit, ensure a fresh one. Every later call re-discovers the
-    /// daemon through `require_client`, so this client needs no reconnection of its own.
+    /// services running, wait for it to exit, ensure a fresh one.
     async fn restart_daemon(&self) -> Result<Value, String> {
-        restart_manager(&self.root, &self.options).await.map_err(|e| e.message)
+        let result = restart_manager(&self.root, &self.options).await.map_err(|e| e.message);
+        self.api.invalidate();
+        result
     }
 
     /// The same `hearthd manager stop` the CLI runs, in-process: `stop-services` shutdown, then the
     /// wait for the daemon pid to exit — returning early would let the caller reconnect into a
     /// still-draining daemon that answers every request with `manager_closing`.
     async fn stop_daemon(&self) -> Result<Value, String> {
-        stop_manager(&self.root, &self.options).await.map_err(|e| e.message)
+        let result = stop_manager(&self.root, &self.options).await.map_err(|e| e.message);
+        self.api.invalidate();
+        result
+    }
+
+    async fn service_ids(&self) -> Option<Vec<String>> {
+        let catalog = self.api.catalog().await.ok()?;
+        Some(catalog.services.into_iter().map(|s| s.id).collect())
     }
 
     async fn shared_list(&self) -> Result<Value, String> {
@@ -202,7 +207,7 @@ impl HearthMcpClient for ManagerApiClient {
     }
 
     async fn shared_connection(&self, service: String) -> Result<Value, String> {
-        let instance_id = resolve_shared_instance_id(&self.options.catalog, &service)?;
+        let instance_id = resolve_shared_instance_id(&self.current_catalog().await, &service)?;
         let Discovery::Live { client } = hearth_cli::shared::discover_smp().await else {
             return Err("smp is not running".to_string());
         };
@@ -224,7 +229,8 @@ impl HearthMcpClient for ManagerApiClient {
 }
 
 /// `"postgres"` → `"postgres@16.4"` via this project catalog's generated `shared:` service (its run
-/// command is `hearthd shared attach <name@version>`); `"postgres@16.4"` passes through.
+/// command is `hearthd shared attach <name@version> [attach-args…]`); `"postgres@16.4"` passes
+/// through.
 fn resolve_shared_instance_id(catalog: &hearth_core::catalog::ServiceCatalog, service: &str) -> Result<String, String> {
     if service.contains('@') {
         return Ok(service.to_string());
@@ -236,10 +242,8 @@ fn resolve_shared_instance_id(catalog: &hearth_core::catalog::ServiceCatalog, se
     let hearth_core::catalog::CommandSpec::Argv { argv } = &command.command else {
         return Err(format!("{service} is not a shared service"));
     };
-    if argv.len() >= 4 && argv[argv.len() - 3] == "shared" && argv[argv.len() - 2] == "attach" {
-        return Ok(argv[argv.len() - 1].clone());
-    }
-    Err(format!("{service} is not a shared service"))
+    // The id follows the `shared attach` pair; `attachArgs` may follow the id.
+    argv.windows(3).find(|w| w[0] == "shared" && w[1] == "attach").map(|w| w[2].clone()).ok_or_else(|| format!("{service} is not a shared service"))
 }
 
 /// `/v1/urls`' body narrowed to one service's entries when `status` was asked about one service.
@@ -267,15 +271,40 @@ fn filter_service_states(value: Value, service: Option<&str>) -> Value {
     }
 }
 
-fn encode_path_segment(segment: &str) -> String {
-    percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
-
 fn query_string(pairs: &[(&str, Option<String>)]) -> String {
     let parts: Vec<String> = pairs.iter().filter_map(|(key, value)| value.as_ref().map(|value| format!("{}={}", encode_path_segment(key), encode_path_segment(value)))).collect();
     if parts.is_empty() {
         String::new()
     } else {
         format!("?{}", parts.join("&"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn catalog_with(definition: hearth_core::catalog::ServiceDefinition) -> ServiceCatalog {
+        ServiceCatalog {
+            services: vec![definition],
+            groups: Default::default(),
+            group_tree: Vec::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: hearth_core::catalog::StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: None,
+        }
+    }
+
+    /// viclass/infra's shared nginx passes `attachArgs`, which land after the instance id.
+    #[test]
+    fn resolves_the_instance_id_even_when_attach_args_follow_it() {
+        let exe = Path::new("/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd");
+        let with_args = hearth_core::shared::synthesize::project_service_entry("nginx".to_string(), "nginx@1.27", exe, None, vec!["--conf".to_string(), "/tmp/conf".to_string()], None);
+        assert_eq!(resolve_shared_instance_id(&catalog_with(with_args), "nginx").unwrap(), "nginx@1.27");
+        let bare = hearth_core::shared::synthesize::project_service_entry("postgres".to_string(), "postgres@16.4", exe, None, Vec::new(), None);
+        assert_eq!(resolve_shared_instance_id(&catalog_with(bare), "postgres").unwrap(), "postgres@16.4");
+        assert_eq!(resolve_shared_instance_id(&catalog_with(hearth_core::shared::synthesize::project_service_entry("x".to_string(), "x@1", exe, None, Vec::new(), None)), "x@2").unwrap(), "x@2");
     }
 }

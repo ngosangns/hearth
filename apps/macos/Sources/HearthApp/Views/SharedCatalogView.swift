@@ -49,11 +49,15 @@ struct SharedCatalogView: View {
             titleVisibility: .visible
         ) {
             if let id = removeTarget {
-                Button("Remove \(id)", role: .destructive) { controller.remove(id) }
+                let attachments = controller.instance(id)?.attachments.count ?? 0
+                Button("Remove \(id)", role: .destructive) { controller.remove(id, force: attachments > 0) }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The service is stopped and its install and data under ~/.hearth/shared are deleted. Projects attached to it lose their connection.")
+            let attachments = removeTarget.flatMap { controller.instance($0)?.attachments.count } ?? 0
+            Text(attachments > 0
+                ? "The service is stopped and its install and data under ~/.hearth/shared are deleted. \(attachments) attached project\(attachments == 1 ? "" : "s") will lose their connection."
+                : "The service is stopped and its install and data under ~/.hearth/shared are deleted.")
         }
     }
 
@@ -259,17 +263,7 @@ private struct SharedInstanceDetail: View {
             Spacer()
             if busy { ActionSpinner() }
             // Icon-only like the service rows — the tooltip carries the name.
-            switch instance.displayState {
-            case "stopped", "failed":
-                IconActionButton("Start", systemImage: "play.fill") { onAction(.start) }
-            case "ready", "running", "starting":
-                IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart) }
-                IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop) }
-            case "queued":
-                IconActionButton("Cancel start", systemImage: "xmark") { onAction(.stop) }
-            default:
-                EmptyView()
-            }
+            LifecycleButtons(state: instance.displayState, onAction: onAction)
             Button("Remove…", role: .destructive, action: onRemove)
                 .padding(.leading, 8)
         }
@@ -305,7 +299,7 @@ private struct AttachmentRow: View {
                 }
                 Spacer()
                 if let url = attachment.connection?.url {
-                    IconActionButton("Copy connection URL", systemImage: "doc.on.doc") { copy(url) }
+                    IconActionButton("Copy connection URL", systemImage: "doc.on.doc") { Pasteboard.copy(url) }
                         .font(.caption)
                 }
             }
@@ -315,16 +309,11 @@ private struct AttachmentRow: View {
                         Text(key).font(.caption.monospaced()).foregroundStyle(.secondary)
                         Text(env[key] ?? "").font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                         Spacer(minLength: 4)
-                        IconActionButton("Copy \(key)", systemImage: "doc.on.doc") { copy("\(key)=\(env[key] ?? "")") }
+                        IconActionButton("Copy \(key)", systemImage: "doc.on.doc") { Pasteboard.copy("\(key)=\(env[key] ?? "")") }
                             .font(.caption)
                     }
                 }
             }
         }
-    }
-
-    private func copy(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
     }
 }

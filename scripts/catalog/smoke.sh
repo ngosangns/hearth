@@ -1,10 +1,19 @@
 #!/bin/bash
-# Attach every shipped shared service against the local tarballs (no GitHub release needed).
+# Attach every shipped shared service against the tarballs package.sh left in dist/catalog,
+# rewriting each script artifact to a file:// url so the committed sha256 is actually verified.
 # Uses a throwaway HOME so it does not touch ~/.hearth/shared.
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck disable=SC1091
 source ./versions.env
+
+# A remote pack.sh only fetches what MANIFEST lists; a payload file missing from it would ship
+# locally but not to anyone installing from the served catalog.
+expected="$(printf '%s\n' pack.sh package.sh versions.env; find payload -type f ! -name .DS_Store | LC_ALL=C sort)"
+if [[ "$(grep -v '^#' MANIFEST)" != "$expected" ]]; then
+  echo "scripts/catalog/MANIFEST is stale; re-run write-catalog.py" >&2
+  exit 1
+fi
 
 REPO="$(cd ../.. && pwd)"
 HEARTHD="${HEARTHD:-$REPO/rust/target/debug/hearthd}"

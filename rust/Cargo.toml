@@ -10,9 +10,18 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
+base64 = "0.23"
+regex = "1"
+async-trait = "0.1"
+tokio-util = "0.7"
+tempfile = "3"
+# Per-crate extras (`stream`, rmcp's client/transport features) are added with `features = [...]`
+# next to `workspace = true`; features are additive.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rmcp = { version = "3", features = ["server", "transport-io"] }

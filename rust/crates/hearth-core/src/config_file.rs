@@ -83,7 +83,7 @@ pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog,
         })?
     };
 
-    let catalog = map_config_file(&raw, root, path).map_err(|errors| ConfigFileLoadError {
+    let catalog = map_config_file(&raw, root).map_err(|errors| ConfigFileLoadError {
         path: Some(path.to_path_buf()),
         errors,
     })?;
@@ -470,47 +470,34 @@ fn artifact_vars(root: &Path, runtime_directory: &Path, id: &str, version: &str,
     vars
 }
 
-/// An artifact var that survived rendering — always a bug (every non-port var is defined once an
-/// `artifact:` exists; `{port}`/`{portN}` is defined only when enough ports are declared).
-fn unrendered_artifact_var(text: &str) -> Option<String> {
-    for token in ["installDir", "dataDir", "serviceId", "projectRoot"] {
-        if text.contains(&format!("{{{token}}}")) {
-            return Some(token.to_string());
-        }
-    }
-    let mut rest = text;
-    while let Some(start) = rest.find("{port") {
-        let after = &rest[start + 5..];
-        match after.find('}') {
-            Some(end) if after[..end].chars().all(|c| c.is_ascii_digit()) => {
-                return Some(format!("port{}", &after[..end]));
-            }
-            _ => rest = after,
-        }
-    }
-    None
+/// Is `name` one of the vars an `artifact:` service can reference — `{installDir}`, `{dataDir}`,
+/// `{serviceId}`, `{projectRoot}`, `{port}`, `{portN}`? Any other `{…}` is left alone (`awk '{print}'`).
+fn is_artifact_var(name: &str) -> bool {
+    matches!(name, "installDir" | "dataDir" | "serviceId" | "projectRoot")
+        || name.strip_prefix("port").is_some_and(|digits| digits.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn check_rendered(text: &str, path: &str, errors: &mut Vec<String>) {
-    if let Some(var) = unrendered_artifact_var(text) {
+/// Flags an artifact var the template references but `vars` does not define — always a bug (every
+/// non-port var is defined once an `artifact:` exists; `{port}`/`{portN}` only when enough ports
+/// are declared). Checked on the template, before rendering.
+fn check_template(text: &str, vars: &HashMap<String, String>, path: &str, errors: &mut Vec<String>) {
+    if let Some(var) = crate::catalog::unknown_template_var(text, |name| !is_artifact_var(name) || vars.contains_key(name)) {
         errors.push(format!("{path}: template var {{{var}}} has no value — declare it in ports (or a tcp readiness port for {{port}})"));
     }
 }
 
-fn render_artifact_command(spec: CommandSpec, vars: &HashMap<String, String>, path: &str, errors: &mut Vec<String>) -> CommandSpec {
-    let rendered = crate::shared::render::render_command(&spec, vars);
-    match &rendered {
-        CommandSpec::Argv { argv } => argv.iter().for_each(|a| check_rendered(a, path, errors)),
-        CommandSpec::Shell { shell, .. } => check_rendered(shell, path, errors),
+fn render_artifact_command(spec: &CommandSpec, vars: &HashMap<String, String>, path: &str, errors: &mut Vec<String>) -> CommandSpec {
+    for text in crate::shared::render::command_strings(spec) {
+        check_template(text, vars, path, errors);
     }
-    rendered
+    crate::shared::render::render_command(spec, vars)
 }
 
 /// Substitutes an artifact service's `{installDir}`/`{dataDir}`/`{port}`/`{portN}`/`{serviceId}`/
 /// `{projectRoot}` vars everywhere they can appear, in place on the finished definition. `urls`
 /// render but are not strict-checked — `{tailnetHost}` is a legal placeholder there.
 fn render_service_artifact(root: &Path, runtime_directory: &Path, def: &mut crate::catalog::ServiceDefinition, artifact: &mut crate::catalog::ServiceArtifact, path: &str, errors: &mut Vec<String>) {
-    use crate::shared::render::{render_env, render_readiness, render_str};
+    use crate::shared::render::{render_env, render_str};
     let ports: &[ServicePort] = def.ports.as_deref().unwrap_or(&[]);
     let readiness_for_port = def.profiles.run.readiness().clone();
     let vars = artifact_vars(root, runtime_directory, &def.id, &artifact.version, ports, Some(&readiness_for_port));
@@ -518,25 +505,32 @@ fn render_service_artifact(root: &Path, runtime_directory: &Path, def: &mut crat
     artifact.data_dir = Some(vars["dataDir"].clone());
     match &mut def.profiles.run {
         ServiceRunProfile::Verified { command, readiness, preparation_command, .. } => {
-            command.command = render_artifact_command(command.command.clone(), &vars, &format!("{path}.run"), errors);
+            command.command = render_artifact_command(&command.command, &vars, &format!("{path}.run"), errors);
+            check_template(&command.cwd, &vars, &format!("{path}.cwd"), errors);
             command.cwd = render_str(&command.cwd, &vars);
-            check_rendered(&command.cwd, &format!("{path}.cwd"), errors);
             if let Some(env) = &mut command.environment {
-                *env = render_env(env, &vars);
                 for value in env.values() {
-                    check_rendered(value, &format!("{path}.env"), errors);
+                    check_template(value, &vars, &format!("{path}.env"), errors);
                 }
+                *env = render_env(env, &vars);
             }
             if let Some(stop) = &mut command.docker_stop_command {
-                *stop = render_artifact_command(stop.clone(), &vars, &format!("{path}.stop"), errors);
+                *stop = render_artifact_command(stop, &vars, &format!("{path}.stop"), errors);
             }
-            let rendered_readiness = render_readiness(readiness, &vars);
-            match rendered_readiness {
-                Ok(r) => *readiness = r,
-                Err(e) => errors.push(format!("{path}.readiness: {}", e.0)),
+            // Artifact-var rules, not the recipe renderer's strict check: a readiness command may
+            // legitimately carry `${HOME}` or `awk '{print}'`.
+            match readiness {
+                ReadinessSpec::Http { url } => {
+                    check_template(url, &vars, &format!("{path}.readiness.url"), errors);
+                    *url = render_str(url, &vars);
+                }
+                ReadinessSpec::Command { command, .. } => {
+                    *command = render_artifact_command(command, &vars, &format!("{path}.readiness.command"), errors);
+                }
+                ReadinessSpec::Process | ReadinessSpec::Tcp { .. } | ReadinessSpec::Container | ReadinessSpec::Tailnet => {}
             }
             if let Some(prep) = preparation_command {
-                prep.command = render_artifact_command(prep.command.clone(), &vars, &format!("{path}.preparationCommand"), errors);
+                prep.command = render_artifact_command(&prep.command, &vars, &format!("{path}.preparationCommand"), errors);
                 if let Some(cwd) = &mut prep.cwd {
                     *cwd = render_str(cwd, &vars);
                 }
@@ -545,7 +539,7 @@ fn render_service_artifact(root: &Path, runtime_directory: &Path, def: &mut crat
         ServiceRunProfile::Unresolved { .. } => {}
     }
     if let Some(build) = &mut def.profiles.build {
-        build.command.command = render_artifact_command(build.command.command.clone(), &vars, &format!("{path}.build"), errors);
+        build.command.command = render_artifact_command(&build.command.command, &vars, &format!("{path}.build"), errors);
         build.command.cwd = render_str(&build.command.cwd, &vars);
         if let Some(env) = &mut build.command.environment {
             *env = render_env(env, &vars);
@@ -587,7 +581,7 @@ fn is_valid_shared_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCatalog, Vec<String>> {
+fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
     let Some(top) = raw.as_object() else {
         return Err(vec!["config file must contain a YAML/JSON object".to_string()]);
@@ -877,15 +871,7 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
                     .get("preparationCommand")
                     .and_then(|v| read_preparation_command(v, &format!("{svc_path}.preparationCommand"), &mut errors))
                     .map(|mut prep| {
-                        prep.command = match prep.command {
-                            crate::catalog::CommandSpec::Argv { argv } => crate::catalog::CommandSpec::Argv {
-                                argv: argv.iter().map(|a| crate::shared::render::render_str(a, &shared_vars)).collect(),
-                            },
-                            crate::catalog::CommandSpec::Shell { shell, exec } => crate::catalog::CommandSpec::Shell {
-                                shell: crate::shared::render::render_str(&shell, &shared_vars),
-                                exec,
-                            },
-                        };
+                        prep.command = crate::shared::render::render_command(&prep.command, &shared_vars);
                         if let Some(cwd) = &mut prep.cwd {
                             *cwd = crate::shared::render::render_str(cwd, &shared_vars);
                         }
@@ -1579,5 +1565,26 @@ services:
             "version: 1\nservices:\n  db:\n    artifact: { version: '1', script: pack.sh }\n    run: { shell: \"echo awk '{print $1}' && sleep 1\" }\n    readiness: { kind: process }\n",
         );
         load_catalog(dir.path()).expect("braces that aren't artifact vars must pass");
+    }
+
+    #[test]
+    fn artifact_readiness_commands_keep_shell_expansions() {
+        // `${HOME}` and `awk '{print}'` in a readiness command used to fail the load as an unknown
+        // template var; a real missing var after an unrelated brace pair must still be caught.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  db:\n    artifact: { version: '1', script: pack.sh }\n    run: { argv: [x] }\n    readiness: { kind: command, command: { shell: \"test -d ${HOME} && awk '{print}' {dataDir}/ok\" } }\n",
+        );
+        load_catalog(dir.path()).expect("shell expansions are not template vars");
+
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  db:\n    artifact: { version: '1', script: pack.sh }\n    run: { argv: [x] }\n    readiness: { kind: command, command: { shell: \"awk '{print}' {port2}\" } }\n",
+        );
+        let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+        assert!(errors.iter().any(|e| e.contains("{port2}") && e.contains("readiness")), "{errors:?}");
     }
 }

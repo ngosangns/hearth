@@ -1,4 +1,4 @@
-//! Port of `src/core/platform.ts`.
+//! Platform checks and the few raw process primitives the manager needs outside the supervisor.
 
 pub fn is_supported_hearth_platform(platform: &str) -> bool {
     platform == "darwin" || platform == "linux"
@@ -15,18 +15,6 @@ pub fn current_platform() -> &'static str {
         "linux"
     } else {
         "unknown"
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct UnsupportedPlatformError(String);
-
-pub fn require_supported_hearth_platform(platform: &str) -> Result<(), UnsupportedPlatformError> {
-    if is_supported_hearth_platform(platform) {
-        Ok(())
-    } else {
-        Err(UnsupportedPlatformError(unsupported_platform_message(platform)))
     }
 }
 

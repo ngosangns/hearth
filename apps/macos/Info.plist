@@ -46,9 +46,5 @@
 			</array>
 		</dict>
 	</array>
-	<key>SUFeedURL</key>
-	<string>https://github.com/ngosangns/hearth/releases.atom</string>
-	<key>SUEnableAutomaticChecks</key>
-	<false/>
 </dict>
 </plist>

@@ -5,21 +5,19 @@
 //! atomically rename the payload into the install dir. A `.hearth-installed` marker file is the
 //! source of truth for "done" — a partial install is never mistaken for a complete one because the
 //! marker is written last.
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::Digest;
+use tokio::io::AsyncWriteExt;
 
 use super::registry::SharedInstance;
 use super::remote::{SharedArtifact, SharedRecipe};
-use super::{SharedContext, SharedError, SHARED_ARTIFACT_PLATFORM};
+use super::{blocking, hex, output_with_timeout, SharedContext, SharedError, SHARED_ARTIFACT_PLATFORM};
 
 const INSTALLED_MARKER: &str = ".hearth-installed";
 const EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-fn hex_digest(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+const PACK_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45 * 60);
 
 /// The normalized artifact both callers lower into: the shared catalog's per-platform
 /// `SharedArtifact`, and a `hearth.yaml` service's `artifact:` block.
@@ -94,59 +92,64 @@ impl TarballInstaller {
             return Ok(install_dir.to_path_buf());
         }
 
-        std::fs::create_dir_all(&self.downloads_dir)
-            .map_err(|e| SharedError(format!("cannot create downloads dir: {e}")))?;
+        let downloads_dir = self.downloads_dir.clone();
+        blocking(move || {
+            std::fs::create_dir_all(&downloads_dir)
+                .map_err(|e| SharedError(format!("cannot create downloads dir: {e}")))
+        })
+        .await?;
         let archive_path = self.downloads_dir.join(format!("{name}.tar.gz"));
-        self.materialize_archive(name, artifact, &archive_path, on_progress).await?;
+        let digest = self.materialize_archive(name, artifact, &archive_path, on_progress).await?;
         if artifact.url.is_some() {
-            let sha = artifact.sha256.as_deref().unwrap_or_default();
-            verify_sha256(&archive_path, sha)?;
+            // The digest was computed while the bytes were written — no second read of the file.
+            let expected = artifact.sha256.as_deref().unwrap_or_default();
+            if !digest.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(expected)) {
+                let _ = std::fs::remove_file(&archive_path);
+                return Err(SharedError(format!(
+                    "sha256 mismatch: expected {expected}, got {}",
+                    digest.unwrap_or_default()
+                )));
+            }
         }
 
         let staging = self.downloads_dir.join(format!("{name}.extract"));
-        let _ = std::fs::remove_dir_all(&staging);
-        std::fs::create_dir_all(&staging)
-            .map_err(|e| SharedError(format!("cannot create extract dir: {e}")))?;
+        {
+            let staging = staging.clone();
+            blocking(move || {
+                let _ = std::fs::remove_dir_all(&staging);
+                std::fs::create_dir_all(&staging)
+                    .map_err(|e| SharedError(format!("cannot create extract dir: {e}")))
+            })
+            .await?;
+        }
         extract(&archive_path, &staging).await?;
-        let payload = payload_dir(&staging)?;
-
-        // Rename into place only once the payload is complete; a leftover target from a previous
-        // failed attempt is quarantined aside first, never deleted.
-        if install_dir.exists() {
-            let quarantined =
-                install_dir.with_extension(format!("quarantine-{}", uuid::Uuid::new_v4()));
-            std::fs::rename(install_dir, &quarantined)
-                .map_err(|e| SharedError(format!("cannot quarantine previous install: {e}")))?;
-        }
-        if let Some(parent) = install_dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SharedError(e.to_string()))?;
-        }
-        std::fs::rename(&payload, install_dir)
-            .map_err(|e| SharedError(format!("cannot move install into place: {e}")))?;
-        std::fs::write(install_dir.join(INSTALLED_MARKER), "ok\n")
-            .map_err(|e| SharedError(e.to_string()))?;
-        let _ = std::fs::remove_file(&archive_path);
-        let _ = std::fs::remove_dir_all(&staging);
+        let installed = {
+            let install_dir = install_dir.to_path_buf();
+            blocking(move || finish_install(&staging, &archive_path, &install_dir)).await?
+        };
         on_progress(&format!("installed {name}"));
-        Ok(install_dir.to_path_buf())
+        Ok(installed)
     }
 
-    /// Download a published tarball, or run the packaging script into `dest`.
+    /// Download a published tarball, or run the packaging script into `dest`. Returns the
+    /// download's sha256 (hex) for a `url` artifact; script output is never hashed.
     async fn materialize_archive(
         &self,
         name: &str,
         artifact: &ArtifactSpec,
         dest: &Path,
         on_progress: &impl Fn(&str),
-    ) -> Result<(), SharedError> {
+    ) -> Result<Option<String>, SharedError> {
         if let Some(url) = artifact.url.as_deref() {
-            return self.download(url, dest, on_progress).await;
+            return self.download(url, dest, on_progress).await.map(Some);
         }
         let script = artifact
             .script
             .as_deref()
             .ok_or_else(|| SharedError(format!("{name}: artifact needs a url or a script")))?;
-        self.run_pack_script(name, script, &artifact.script_args, dest, on_progress).await
+        self.run_pack_script(name, script, &artifact.script_args, dest, on_progress)
+            .await
+            .map(|()| None)
     }
 
     async fn run_pack_script(
@@ -169,14 +172,18 @@ impl TarballInstaller {
         if let Some(dir) = script_path.parent() {
             command.current_dir(dir);
         }
-        let output = tokio::time::timeout(std::time::Duration::from_secs(45 * 60), command.output())
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = output_with_timeout(command, PACK_SCRIPT_TIMEOUT)
             .await
-            .map_err(|_| SharedError(format!("{name}: packaging script timed out")))?
             .map_err(|e| {
                 SharedError(format!(
                     "{name}: failed to run packaging script: {e}"
                 ))
-            })?;
+            })?
+            .ok_or_else(|| SharedError(format!("{name}: packaging script timed out")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -226,19 +233,24 @@ impl TarballInstaller {
         }
     }
 
+    /// Streams `url` into `dest`, hashing in the same pass — a 300 MB tarball is never held in
+    /// memory or read back. Returns the lowercase-hex sha256 of what was written.
     async fn download(
         &self,
         url: &str,
         dest: &Path,
         on_progress: &impl Fn(&str),
-    ) -> Result<(), SharedError> {
+    ) -> Result<String, SharedError> {
         on_progress(&format!("downloading {url}"));
         if let Some(rest) = url.strip_prefix("file://") {
-            // file:// artifacts exist for tests and local fixtures — the sha256 check below still runs.
-            std::fs::copy(rest, dest).map_err(|e| SharedError(format!("failed to copy {url}: {e}")))?;
-            return Ok(());
+            // file:// artifacts exist for tests and local fixtures — still hashed for the sha check.
+            let (src, dest, url) = (PathBuf::from(rest), dest.to_path_buf(), url.to_string());
+            return blocking(move || {
+                copy_hashing(&src, &dest).map_err(|e| SharedError(format!("failed to copy {url}: {e}")))
+            })
+            .await;
         }
-        let response = self
+        let mut response = self
             .http
             .get(url)
             .timeout(std::time::Duration::from_secs(600))
@@ -251,16 +263,65 @@ impl TarballInstaller {
                 response.status()
             )));
         }
-        let bytes = response
-            .bytes()
+        let mut file = tokio::fs::File::create(dest)
             .await
-            .map_err(|e| SharedError(format!("download failed for {url}: {e}")))?;
-        let mut file = std::fs::File::create(dest)
             .map_err(|e| SharedError(format!("cannot create {}: {e}", dest.display())))?;
-        file.write_all(&bytes)
+        let mut hasher = sha2::Sha256::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| SharedError(format!("download failed for {url}: {e}")))?
+        {
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| SharedError(format!("cannot write {}: {e}", dest.display())))?;
+        }
+        file.flush()
+            .await
             .map_err(|e| SharedError(format!("cannot write {}: {e}", dest.display())))?;
-        Ok(())
+        Ok(hex(&hasher.finalize()))
     }
+}
+
+/// `std::fs::copy` that also hashes what it copies.
+fn copy_hashing(src: &Path, dest: &Path) -> std::io::Result<String> {
+    let mut input = std::fs::File::open(src)?;
+    let mut output = std::fs::File::create(dest)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Moves the extracted payload into `install_dir` and writes the marker. Rename into place only
+/// once the payload is complete; a leftover target from a previous failed attempt is quarantined
+/// aside first, never deleted.
+fn finish_install(staging: &Path, archive_path: &Path, install_dir: &Path) -> Result<PathBuf, SharedError> {
+    let payload = payload_dir(staging)?;
+    if install_dir.exists() {
+        let quarantined =
+            install_dir.with_extension(format!("quarantine-{}", uuid::Uuid::new_v4()));
+        std::fs::rename(install_dir, &quarantined)
+            .map_err(|e| SharedError(format!("cannot quarantine previous install: {e}")))?;
+    }
+    if let Some(parent) = install_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| SharedError(e.to_string()))?;
+    }
+    std::fs::rename(&payload, install_dir)
+        .map_err(|e| SharedError(format!("cannot move install into place: {e}")))?;
+    std::fs::write(install_dir.join(INSTALLED_MARKER), "ok\n")
+        .map_err(|e| SharedError(e.to_string()))?;
+    let _ = std::fs::remove_file(archive_path);
+    let _ = std::fs::remove_dir_all(staging);
+    Ok(install_dir.to_path_buf())
 }
 
 fn artifact_for<'a>(
@@ -346,32 +407,21 @@ fn local_catalog_script(catalog_url: &str, script: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn verify_sha256(path: &Path, expected: &str) -> Result<(), SharedError> {
-    let bytes = std::fs::read(path).map_err(|e| SharedError(e.to_string()))?;
-    let digest = hex_digest(&sha2::Sha256::digest(&bytes));
-    if !digest.eq_ignore_ascii_case(expected) {
-        let _ = std::fs::remove_file(path);
-        return Err(SharedError(format!(
-            "sha256 mismatch: expected {expected}, got {digest}"
-        )));
-    }
-    Ok(())
-}
-
 /// `tar -xzf` via the system tar — present on every supported macOS, no crate needed.
 async fn extract(archive: &Path, dest: &Path) -> Result<(), SharedError> {
-    let output = tokio::time::timeout(
-        EXTRACT_TIMEOUT,
-        tokio::process::Command::new("tar")
-            .arg("-xzf")
-            .arg(archive)
-            .arg("-C")
-            .arg(dest)
-            .output(),
-    )
-    .await
-    .map_err(|_| SharedError("tar extract timed out".to_string()))?
-    .map_err(|e| SharedError(format!("failed to spawn tar: {e}")))?;
+    let mut command = tokio::process::Command::new("tar");
+    command
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let output = output_with_timeout(command, EXTRACT_TIMEOUT)
+        .await
+        .map_err(|e| SharedError(format!("failed to spawn tar: {e}")))?
+        .ok_or_else(|| SharedError("tar extract timed out".to_string()))?;
     if !output.status.success() {
         return Err(SharedError(format!(
             "tar extract failed: {}",
@@ -421,7 +471,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let sha = hex_digest(&sha2::Sha256::digest(std::fs::read(&archive).unwrap()));
+        let sha = hex(&sha2::Sha256::digest(std::fs::read(&archive).unwrap()));
         (archive, sha)
     }
 

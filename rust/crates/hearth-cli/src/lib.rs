@@ -1,5 +1,5 @@
-//! Port of `src/cli/localctl.ts` — a thin HTTP client for one daemon's loopback API, plain-text or
-//! JSON output, hand-rolled flag parsing. Phase 4 of the Rust-rewrite plan.
+//! The `hearthd` CLI: a thin HTTP client for one daemon's loopback API, plain-text or JSON output,
+//! hand-rolled flag parsing. The typed per-endpoint client lives in `client.rs`.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -8,21 +8,22 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{json, Value};
 
+pub mod client;
 pub mod shared;
 
+pub use client::ManagerClient;
+
 use hearth_core::catalog::{ServiceCatalog, ServiceId};
-use hearth_core::doctor::{run_doctor, DefaultDoctorAdapter, DoctorChecks};
+use hearth_core::doctor::{run_doctor, DefaultDoctorAdapter, DoctorChecks, DoctorCommandCheck};
 use hearth_core::file_io::{create_file_io, remove_directory};
 use hearth_core::manager::{is_stale_lock_marker, read_lock_ownership_key, read_owned_lock_artifacts, verify_lock_ownership_proof};
 use hearth_core::paths::resolve_runtime_directory;
-use hearth_core::state::{ActualServiceState, ManagerMetadata, Operation, OperationStatus, ServiceLifecycleState, StaleLockMarker, PROTOCOL_VERSION};
+use hearth_core::state::{ActualServiceState, ManagerMetadata, Operation, OperationStatus, ServiceLifecycleState, ServiceOperationKind, StaleLockMarker, PROTOCOL_VERSION};
 
 pub const EXIT_USAGE: i32 = 2;
 pub const EXIT_UNAVAILABLE: i32 = 3;
 pub const EXIT_PROTOCOL: i32 = 4;
 pub const EXIT_FAILED: i32 = 5;
-#[allow(dead_code)]
-pub const EXIT_TIMEOUT: i32 = 6;
 pub const EXIT_UNAUTHORIZED: i32 = 7;
 
 /// Bulk operations may occupy the manager's single request path briefly; this bounds only
@@ -76,7 +77,24 @@ pub type SpawnDaemon = Box<dyn Fn(&Path) + Send + Sync>;
 pub struct LocalctlOptions {
     pub catalog: ServiceCatalog,
     pub spawn_daemon: SpawnDaemon,
-    pub doctor_checks: Option<DoctorChecks>,
+}
+
+/// The host tools the daemon and the test suite shell out to (AGENTS.md "Build, test, release").
+fn default_doctor_checks() -> DoctorChecks {
+    fn on_path(name: &str) -> DoctorCommandCheck {
+        DoctorCommandCheck {
+            name: name.to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), format!("command -v {name}")],
+            ok: None,
+            detail: None,
+        }
+    }
+    DoctorChecks {
+        commands: ["docker", "tailscale", "nc", "ps", "sh"].iter().map(|name| on_path(name)).collect(),
+        paths: vec![],
+        ports: vec![],
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -93,6 +111,7 @@ pub enum FlagName {
     Dest,
     Key,
     KillUnowned,
+    Force,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -106,6 +125,7 @@ pub struct Flags {
     pub dest: Option<String>,
     pub key: Option<String>,
     pub kill_unowned: bool,
+    pub force: bool,
 }
 
 pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> LocalctlResult<Flags> {
@@ -129,6 +149,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
             "dest" => (FlagName::Dest, "dest"),
             "key" => (FlagName::Key, "key"),
             "kill-unowned" => (FlagName::KillUnowned, "kill-unowned"),
+            "force" => (FlagName::Force, "force"),
             _ => return usage_err(format!("unknown flag: {argument}")),
         };
         if !allowed.contains(&flag) {
@@ -164,6 +185,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
                 }
             }
             FlagName::KillUnowned => result.kill_unowned = true,
+            FlagName::Force => result.force = true,
             FlagName::Key => {
                 index += 1;
                 match arguments.get(index).filter(|v| !v.is_empty()) {
@@ -185,9 +207,31 @@ fn valid_metadata(metadata: &ManagerMetadata) -> bool {
     metadata.version == 1 && !metadata.instance_id.is_empty() && metadata.port > 0 && metadata.pid > 0 && !metadata.started_at.is_empty()
 }
 
-/// Sends one request to the daemon at `client`, with the standard auth + protocol headers. Maps
-/// transport failures to the same plain-text error shapes the TS source uses (`"manager unavailable"`
-/// / a timeout message), since callers pattern-match on the string containing `"unauthorized"`.
+/// The one HTTP client every daemon request shares, so polls reuse pooled connections instead of
+/// building a TLS-capable client per request. Timeouts are set per request, never here: the SSE
+/// stream must stay open indefinitely.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Percent-encodes one URL path segment (anything outside RFC 3986's unreserved set), so a service
+/// or operation id can never change the request path or add a query.
+pub fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Sends one request to the daemon at `client`, with the standard auth + protocol headers. A
+/// transport failure is `"manager unavailable"` (or a timeout message); an HTTP error is
+/// `"<code>:<message>"` — callers match on the `unauthorized` code.
 pub async fn request(client: &Client, path: &str, method: reqwest::Method, body: Option<&Value>, protocol_version: Option<u32>) -> Result<Value, String> {
     request_with_timeout(client, path, method, body, protocol_version, Some(MANAGER_REQUEST_TIMEOUT)).await
 }
@@ -198,8 +242,7 @@ pub async fn request(client: &Client, path: &str, method: reqwest::Method, body:
 pub async fn request_with_timeout(client: &Client, path: &str, method: reqwest::Method, body: Option<&Value>, protocol_version: Option<u32>, timeout: Option<Duration>) -> Result<Value, String> {
     let url = format!("http://127.0.0.1:{}{}", client.metadata.port, path);
     let protocol = protocol_version.unwrap_or(PROTOCOL_VERSION);
-    let http_client = reqwest::Client::new();
-    let mut builder = http_client.request(method, &url).bearer_auth(&client.token).header("x-hearth-protocol", protocol.to_string());
+    let mut builder = http_client().request(method, &url).bearer_auth(&client.token).header("x-hearth-protocol", protocol.to_string());
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
     }
@@ -222,33 +265,40 @@ pub async fn request_with_timeout(client: &Client, path: &str, method: reqwest::
 }
 
 pub async fn discover(root: &Path, catalog: &ServiceCatalog) -> Discovery {
+    discover_probed(root, catalog).await.0
+}
+
+/// `discover`, plus whether the liveness probe was answered `unauthorized` — `Live` covers both, and
+/// `require_client_for` needs the difference without probing the daemon a second time.
+async fn discover_probed(root: &Path, catalog: &ServiceCatalog) -> (Discovery, bool) {
+    let discovery = |d: Discovery| (d, false);
     let io = create_file_io(catalog.private_file_guard != Some(false));
     let runtime_directory = resolve_runtime_directory(root, catalog.runtime_directory.as_deref());
     let lock_directory = runtime_directory.join("manager.lock");
     if !io.is_private_directory(&runtime_directory) || !io.is_private_directory(&lock_directory) {
-        return Discovery::Absent;
+        return discovery(Discovery::Absent);
     }
     let raw_metadata = io.read_file(&lock_directory.join("metadata.json")).ok().flatten();
     let raw_token = io.read_file(&lock_directory.join("token")).ok().flatten();
-    let (Some(raw_metadata), Some(raw_token)) = (raw_metadata, raw_token) else { return Discovery::Absent };
-    let Ok(metadata) = serde_json::from_str::<ManagerMetadata>(&raw_metadata) else { return Discovery::Malformed };
+    let (Some(raw_metadata), Some(raw_token)) = (raw_metadata, raw_token) else { return discovery(Discovery::Absent) };
+    let Ok(metadata) = serde_json::from_str::<ManagerMetadata>(&raw_metadata) else { return discovery(Discovery::Malformed) };
     let token = raw_token.trim().to_string();
     if !valid_metadata(&metadata) || token.is_empty() {
-        return Discovery::Malformed;
+        return discovery(Discovery::Malformed);
     }
-    let Some(artifacts) = read_owned_lock_artifacts(io.as_ref(), &lock_directory) else { return Discovery::Malformed };
-    let Some(ownership_key) = read_lock_ownership_key(io.as_ref(), &runtime_directory) else { return Discovery::Malformed };
+    let Some(artifacts) = read_owned_lock_artifacts(io.as_ref(), &lock_directory) else { return discovery(Discovery::Malformed) };
+    let Some(ownership_key) = read_lock_ownership_key(io.as_ref(), &runtime_directory) else { return discovery(Discovery::Malformed) };
     if !verify_lock_ownership_proof(Some(&ownership_key), &artifacts.metadata, &artifacts.token, &artifacts.proof) {
-        return Discovery::Malformed;
+        return discovery(Discovery::Malformed);
     }
     let client = Client { root: root.to_path_buf(), runtime_directory, metadata: metadata.clone(), token };
     if metadata.protocol_version != PROTOCOL_VERSION {
-        return Discovery::Incompatible { client };
+        return discovery(Discovery::Incompatible { client });
     }
     match request(&client, "/v1/manager", reqwest::Method::GET, None, None).await {
-        Ok(_) => Discovery::Live { client },
-        Err(e) if e.contains("unauthorized") => Discovery::Live { client },
-        Err(_) => Discovery::Stale { client },
+        Ok(_) => (Discovery::Live { client }, false),
+        Err(e) if e.contains("unauthorized") => (Discovery::Live { client }, true),
+        Err(_) => discovery(Discovery::Stale { client }),
     }
 }
 
@@ -274,18 +324,17 @@ pub async fn ensure(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Cl
 }
 
 pub async fn require_client(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Client> {
-    let discovered = discover(root, &options.catalog).await;
-    if let Discovery::Incompatible { .. } = discovered {
-        return fail_err(EXIT_PROTOCOL, "hearth manager protocol is incompatible");
-    }
-    let client = match discovered {
-        Discovery::Live { client } => client,
-        _ => return fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable"),
-    };
-    match request(&client, "/v1/manager", reqwest::Method::GET, None, None).await {
-        Ok(_) => Ok(client),
-        Err(e) if e.contains("unauthorized") => fail_err(EXIT_UNAUTHORIZED, "hearth manager authentication failed"),
-        Err(_) => fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable"),
+    require_client_for(root, &options.catalog).await
+}
+
+/// A live, authorized daemon for `root` — never spawns one. `discover` already probed
+/// `/v1/manager`, so its answer decides liveness and auth without a second round trip.
+pub async fn require_client_for(root: &Path, catalog: &ServiceCatalog) -> LocalctlResult<Client> {
+    match discover_probed(root, catalog).await {
+        (Discovery::Incompatible { .. }, _) => fail_err(EXIT_PROTOCOL, "hearth manager protocol is incompatible"),
+        (Discovery::Live { .. }, true) => fail_err(EXIT_UNAUTHORIZED, "hearth manager authentication failed"),
+        (Discovery::Live { client }, false) => Ok(client),
+        _ => fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable"),
     }
 }
 
@@ -391,10 +440,7 @@ fn operation_id_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9._~-]{1,128}$").unwrap())
 }
 
-/// The TS source URL-encodes this after validating it — a no-op in practice, since the validating
-/// regex only accepts characters already in RFC 3986's "unreserved" set, which never need encoding.
-/// Skipped here rather than pulling in a URL-encoding crate for a call that can never change its
-/// input.
+/// Validates an operation id: only RFC 3986 unreserved characters, 1–128 of them.
 pub fn operation_id(value: &str) -> LocalctlResult<String> {
     if operation_id_re().is_match(value) {
         Ok(value.to_string())
@@ -403,16 +449,9 @@ pub fn operation_id(value: &str) -> LocalctlResult<String> {
     }
 }
 
+/// Polls an operation until it succeeds or fails, with no deadline.
 pub async fn wait_operation(client: &Client, id: &str) -> LocalctlResult<Operation> {
-    let encoded = operation_id(id)?;
-    loop {
-        let body = request(client, &format!("/v1/operations/{encoded}"), reqwest::Method::GET, None, None).await.or_else(unavailable_err)?;
-        let operation: Operation = serde_json::from_value(body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
-        if matches!(operation.status, OperationStatus::Succeeded | OperationStatus::Failed) {
-            return Ok(operation);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    client.wait(id, None).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -420,16 +459,12 @@ pub async fn wait_operation(client: &Client, id: &str) -> LocalctlResult<Operati
 // ---------------------------------------------------------------------------------------------
 
 async fn service_rows(client: &Client) -> LocalctlResult<Vec<ServiceLifecycleState>> {
-    let body = request(client, "/v1/services", reqwest::Method::GET, None, None).await.or_else(unavailable_err)?;
-    serde_json::from_value(body["services"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })
+    client.services().await
 }
 
 /// The state `hearthd status` prints. In-flight states collapse into "running", but a state that
-/// means something went wrong or is out of this daemon's hands is NEVER collapsed into "stopped".
-/// It used to be: a crashed service (`failed`, still `desiredState: running`) printed as "stopped",
-/// indistinguishable from one that was simply never started, while the TUI, the macOS app and the
-/// MCP tools all reported it as failed. Four viclass services sat in that state for two days with
-/// `hearthd status` calling them stopped.
+/// means something went wrong or is out of this daemon's hands is NEVER collapsed into "stopped" —
+/// a crashed service must not read as one nobody started.
 fn text_state(state: Option<&ServiceLifecycleState>) -> &'static str {
     match state.map(|s| s.actual_state) {
         Some(ActualServiceState::Ready) => "ready",
@@ -479,48 +514,32 @@ pub async fn cleanup(root: &Path, options: &LocalctlOptions) -> LocalctlResult<(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors the TS function's own parameter list 1:1
+#[allow(clippy::too_many_arguments)]
 pub async fn logs(mut client: Client, service_id: &str, tail: u64, follow: bool, json_output: bool, options: &LocalctlOptions, mut write: impl FnMut(&str), mut write_err: impl FnMut(&str)) -> LocalctlResult<()> {
     let mut cursor: Option<u64> = None;
     let mut generation: Option<u64> = None;
     let mut reconnects = 0u32;
     loop {
-        let mut query = "limit=16384".to_string();
-        if let Some(c) = cursor {
-            query.push_str(&format!("&cursor={c}"));
-        }
-        if let Some(g) = generation {
-            query.push_str(&format!("&generation={g}"));
-        }
-        match request(&client, &format!("/v1/logs/{service_id}?{query}"), reqwest::Method::GET, None, None).await {
-            Ok(body) => {
-                let data = body["data"].as_str().unwrap_or("").to_string();
-                let next_cursor = body["nextCursor"].as_u64().unwrap_or(0);
-                let response_generation = body["generation"].as_u64().unwrap_or(0);
-                let reset = body["reset"].as_bool().unwrap_or(false);
-                let lines: Vec<&str> = data.lines().filter(|l| !l.is_empty()).collect();
+        match client.log(service_id, cursor, generation, Some(16_384)).await {
+            Ok(slice) => {
+                let lines: Vec<&str> = slice.data.lines().filter(|l| !l.is_empty()).collect();
                 let tail_lines: &[&str] = if lines.len() as u64 > tail { &lines[lines.len() - tail as usize..] } else { &lines };
                 let joined = if lines.is_empty() { String::new() } else { format!("{}\n", tail_lines.join("\n")) };
                 if json_output {
-                    // `cursor` is the server's echoed cursor, not the client's previous one (which
-                    // is null on a first poll), and `truncated` is carried through. The TS CLI
-                    // prints the server's whole `LogSlice`, so both fields were simply missing or
-                    // wrong here.
-                    let mut slice = json!({"serviceId": service_id, "generation": response_generation, "cursor": body.get("cursor").cloned().unwrap_or(Value::Null), "nextCursor": next_cursor, "data": joined, "reset": reset});
-                    if let Some(truncated) = body.get("truncated") {
-                        slice["truncated"] = truncated.clone();
-                    }
-                    write(&slice.to_string());
+                    // The server's whole `LogSlice` (its echoed `cursor`, `truncated`), with `data`
+                    // narrowed to the requested tail.
+                    let printed = json!({"serviceId": service_id, "generation": slice.generation, "cursor": slice.cursor, "nextCursor": slice.next_cursor, "data": joined, "reset": slice.reset, "truncated": slice.truncated});
+                    write(&printed.to_string());
                 } else {
-                    if reset {
-                        write_err(&format!("log reset {service_id} generation {response_generation}"));
+                    if slice.reset {
+                        write_err(&format!("log reset {service_id} generation {}", slice.generation));
                     }
                     if !joined.is_empty() {
                         write(&joined);
                     }
                 }
-                cursor = Some(next_cursor);
-                generation = Some(response_generation);
+                cursor = Some(slice.next_cursor);
+                generation = Some(slice.generation);
                 reconnects = 0;
                 if !follow {
                     return Ok(());
@@ -562,8 +581,20 @@ pub struct Io<'a> {
     pub confirm: Option<&'a mut dyn FnMut(&str) -> bool>,
 }
 
-pub async fn main(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>) -> i32 {
-    match main_inner(options, argv, io).await {
+/// Splits a leading `--root <path>` off `argv`; the root defaults to the current directory. The
+/// binary calls this once and hands the result to `main`, so every subcommand agrees on the root.
+pub fn parse_root(argv: &[String]) -> LocalctlResult<(PathBuf, Vec<String>)> {
+    if argv.first().map(String::as_str) == Some("--root") {
+        let Some(path) = argv.get(1) else { return usage_err("--root requires a path") };
+        return Ok((PathBuf::from(path), argv[2..].to_vec()));
+    }
+    let cwd = std::env::current_dir().map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("cannot resolve the current directory: {e}") })?;
+    Ok((cwd, argv.to_vec()))
+}
+
+/// Runs one CLI command for the project at `root` (already split off by `parse_root`).
+pub async fn main(options: &LocalctlOptions, root: &Path, argv: &[String], io: &mut Io<'_>) -> i32 {
+    match main_inner(options, root, argv, io).await {
         Ok(code) => code,
         Err(error) => {
             (io.err)(&error.message);
@@ -572,18 +603,9 @@ pub async fn main(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>) -
     }
 }
 
-async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
-    let mut argv = argv;
-    let mut root = std::env::current_dir().unwrap();
-    let owned_argv;
-    if argv.first().map(String::as_str) == Some("--root") {
-        let path = argv.get(1).cloned();
-        let Some(path) = path else { return usage_err("--root requires a path") };
-        root = PathBuf::from(path);
-        owned_argv = argv[2..].to_vec();
-        argv = &owned_argv;
-    }
-    let Some(command) = argv.first() else { return usage_err("usage: hearth <command>") };
+async fn main_inner(options: &LocalctlOptions, root: &Path, argv: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
+    let root = root.to_path_buf();
+    let Some(command) = argv.first() else { return usage_err("usage: hearthd <command>") };
     let rest = &argv[1..];
 
     match command.as_str() {
@@ -593,9 +615,7 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
                 return usage_err("doctor takes no positional arguments");
             }
             let adapter = DefaultDoctorAdapter;
-            let default_checks = DoctorChecks::default();
-            let checks = options.doctor_checks.as_ref().unwrap_or(&default_checks);
-            let report = run_doctor(&options.catalog, checks, &adapter);
+            let report = run_doctor(&options.catalog, &default_doctor_checks(), &adapter);
             if flags.json {
                 (io.out)(&print_value(&json!(report_to_json(&report)), true));
             } else {
@@ -623,7 +643,7 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
         "status" => {
             let flags = parse_command_flags(rest, &[FlagName::Json])?;
             if flags.positionals.len() > 1 {
-                return usage_err("usage: hearth status [target] [--json]");
+                return usage_err("usage: hearthd status [target] [--json]");
             }
             let client = require_client(&root, options).await?;
             let rows = service_rows(&client).await?;
@@ -636,9 +656,8 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
                         hearth_core::state::ProcessIdentity::Posix(p) => Some(p.pid),
                         hearth_core::state::ProcessIdentity::Docker(_) => None,
                     });
-                    // `pid` is OMITTED when there isn't one, rather than emitted as null — the
-                    // TS CLI builds the object the same way, and a consumer doing
-                    // `"pid" in service` sees a different answer between the two otherwise.
+                    // `pid` is omitted, never null, when there isn't one — consumers test for
+                    // the key's presence.
                     let mut entry = json!({ "serviceId": service_id, "state": text_state(row) });
                     if let Some(pid) = pid {
                         entry["pid"] = json!(pid);
@@ -661,16 +680,10 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
         "operation" => {
             let flags = parse_command_flags(rest, &[FlagName::Json])?;
             if flags.positionals.len() != 2 || !matches!(flags.positionals[0].as_str(), "get" | "watch") {
-                return usage_err("usage: hearth operation get|watch <operationId> [--json]");
+                return usage_err("usage: hearthd operation get|watch <operationId> [--json]");
             }
             let client = require_client(&root, options).await?;
-            let operation = if flags.positionals[0] == "watch" {
-                wait_operation(&client, &flags.positionals[1]).await?
-            } else {
-                let encoded = operation_id(&flags.positionals[1])?;
-                let body = request(&client, &format!("/v1/operations/{encoded}"), reqwest::Method::GET, None, None).await.or_else(unavailable_err)?;
-                serde_json::from_value(body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?
-            };
+            let operation = if flags.positionals[0] == "watch" { wait_operation(&client, &flags.positionals[1]).await? } else { client.operation(&flags.positionals[1]).await? };
             (io.out)(&print_value(&serde_json::to_value(&operation).unwrap(), flags.json));
             Ok(0)
         }
@@ -678,19 +691,11 @@ async fn main_inner(options: &LocalctlOptions, argv: &[String], io: &mut Io<'_>)
             let flags = parse_command_flags(rest, &[FlagName::Tail, FlagName::Follow, FlagName::Json])?;
             let service_ok = flags.positionals.len() == 1 && options.catalog.services.iter().any(|s| Some(&s.id) == flags.positionals.first());
             if !service_ok {
-                return usage_err("usage: hearth logs <service> [--tail N] [--follow] [--json]");
+                return usage_err("usage: hearthd logs <service> [--tail N] [--follow] [--json]");
             }
             let client = require_client(&root, options).await?;
             logs(client, &flags.positionals[0], flags.tail.unwrap_or(200), flags.follow, flags.json, options, |s| (io.out)(s), |s| (io.err)(s)).await?;
             Ok(0)
-        }
-        "tui" => {
-            let flags = parse_command_flags(rest, &[])?;
-            if !flags.positionals.is_empty() {
-                return usage_err("tui takes no positional arguments");
-            }
-            ensure(&root, options).await?;
-            usage_err("tui is not available: this build did not wire a `tui` runtime handler (see the /tui subpath)")
         }
         "mcp" => mcp_command(&root, rest, io).await,
         "skill" => skill_command(&root, rest, io).await,
@@ -710,7 +715,7 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
     let flags = parse_command_flags(rest, &[FlagName::Json])?;
     let subcommand = flags.positionals.first().cloned();
     if flags.positionals.len() != 1 || !matches!(subcommand.as_deref(), Some("ensure") | Some("status") | Some("stop") | Some("restart") | Some("reload")) {
-        return usage_err("usage: hearth manager ensure|status|stop|restart|reload [--json]");
+        return usage_err("usage: hearthd manager ensure|status|stop|restart|reload [--json]");
     }
     match subcommand.as_deref().unwrap() {
         "reload" => {
@@ -736,7 +741,7 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
                 return fail_err(EXIT_PROTOCOL, "hearth manager protocol is incompatible");
             }
             let client = require_client(root, options).await?;
-            let result = request(&client, "/v1/manager", reqwest::Method::GET, None, None).await.or_else(unavailable_err)?;
+            let result = client.manager_info().await?;
             (io.out)(&print_value(&result, flags.json));
             Ok(0)
         }
@@ -797,7 +802,7 @@ async fn wait_for_daemon_exit(pid: i64, timeout: Duration, alive: impl Fn(i64) -
 async fn urls_command(root: &Path, options: &LocalctlOptions, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Json])?;
     if flags.positionals.len() > 1 {
-        return usage_err("usage: hearth urls [target] [--json]");
+        return usage_err("usage: hearthd urls [target] [--json]");
     }
     let selected = targets(&options.catalog, flags.positionals.first().map(String::as_str))?;
     let client = require_client(root, options).await?;
@@ -861,11 +866,11 @@ fn prompt_kill_unowned(service_id: &str, row: Option<&ServiceLifecycleState>, fl
 async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, command: &str, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Wait, FlagName::Json, FlagName::KillUnowned])?;
     if flags.kill_unowned && command != "start" {
-        return usage_err("--kill-unowned only applies to `hearth start`");
+        return usage_err("--kill-unowned only applies to `hearthd start`");
     }
     if flags.positionals.len() != 1 {
         let flag_hint = if command == "start" { " [--kill-unowned]" } else { "" };
-        return usage_err(format!("usage: hearth {command} <service|group> [--wait] [--json]{flag_hint}"));
+        return usage_err(format!("usage: hearthd {command} <service|group> [--wait] [--json]{flag_hint}"));
     }
     let target = &flags.positionals[0];
     let selected = runnable_targets(&options.catalog, Some(target))?;
@@ -876,17 +881,14 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
     let client = ensure(root, options).await?;
 
     if command == "start" && !is_single_service {
-        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "targets": selected });
-        if flags.kill_unowned {
-            body["killUnowned"] = json!(true);
-        }
-        let accepted_body = request(&client, "/v1/operations/bulk-start", reqwest::Method::POST, Some(&body), None).await.or_else(unavailable_err)?;
-        let accepted: Operation = serde_json::from_value(accepted_body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
+        // An explicit `--kill-unowned` is the confirmation for every member of the group; there is
+        // no per-service prompt on a bulk start.
+        let accepted = client.bulk_start(&selected, flags.kill_unowned).await?;
         let operation = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
         if flags.json {
             (io.out)(&print_value(&json!({ "operation": operation }), true));
         } else {
-            (io.out)(&format!("{} bulk-start {}", operation_status_str(operation.status), operation.id));
+            (io.out)(&format!("{} bulk-start {}", operation.status.as_wire_str(), operation.id));
         }
         if operation.status == OperationStatus::Failed {
             return fail_err(EXIT_FAILED, "service operation failed");
@@ -896,38 +898,36 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
 
     let mut operations: Vec<Operation> = Vec::new();
     let mut state_rows: Option<Vec<ServiceLifecycleState>> = None;
+    let action = match command {
+        "start" => ServiceOperationKind::Start,
+        "stop" => ServiceOperationKind::Stop,
+        _ => ServiceOperationKind::Restart,
+    };
     for service_id in &selected {
-        let action = match command {
-            "start" => "start",
-            "stop" => "stop",
-            _ => "restart",
-        };
         let mut kill_unowned = flags.kill_unowned;
+        let mut declined = false;
         // Pre-submit prompt: a prior attempt already persisted `externally-owned`, so the conflict
-        // is known before this start even runs — works without --wait.
-        if command == "start" {
+        // is known before this start even runs — works without --wait. A declined prompt still
+        // submits a plain start: `externally-owned` is only re-evaluated by a start, and the daemon
+        // fails it on its own if the port is still held.
+        if action == ServiceOperationKind::Start {
             if state_rows.is_none() {
                 state_rows = service_rows(&client).await.ok();
             }
             match prompt_kill_unowned(service_id, state_rows.as_ref().and_then(|rows| rows.iter().find(|r| &r.service_id == service_id)), &flags, io) {
                 Some(true) => kill_unowned = true,
-                Some(false) => return fail_err(EXIT_FAILED, format!("start declined: {service_id} left externally owned")),
+                Some(false) => declined = true,
                 None => {}
             }
         }
         let mut completed;
         loop {
-            let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action });
-            if kill_unowned {
-                body["killUnowned"] = json!(true);
-            }
-            let accepted_body = request(&client, "/v1/operations", reqwest::Method::POST, Some(&body), None).await.or_else(unavailable_err)?;
-            let accepted: Operation = serde_json::from_value(accepted_body["operation"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })?;
+            let accepted = client.submit(action, service_id, kill_unowned).await?;
             completed = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
             // Post-failure prompt: a FRESH conflict only surfaces once the operation completes,
             // which needs --wait. Re-read the row — the daemon just persisted `externally-owned`
-            // with the holder's pid/command in `error`.
-            if command != "start" || !flags.wait || kill_unowned || completed.status != OperationStatus::Failed {
+            // with the holder's pid/command in `error`. Never re-asks a question already declined.
+            if action != ServiceOperationKind::Start || !flags.wait || kill_unowned || declined || completed.status != OperationStatus::Failed {
                 break;
             }
             let fresh_row = service_rows(&client).await.ok().and_then(|rows| rows.into_iter().find(|r| &r.service_id == service_id));
@@ -951,7 +951,7 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
         (io.out)(&print_value(&json!({ "operations": operations }), true));
     } else {
         for operation in &operations {
-            (io.out)(&format!("{} {} {}", operation_status_str(operation.status), operation.service_id.clone().unwrap_or_default(), operation.id));
+            (io.out)(&format!("{} {} {}", operation.status.as_wire_str(), operation.service_id.clone().unwrap_or_default(), operation.id));
         }
     }
     if operations.iter().any(|o| o.status == OperationStatus::Failed) {
@@ -960,29 +960,16 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
     Ok(0)
 }
 
-pub(crate) fn operation_status_str(status: OperationStatus) -> &'static str {
-    match status {
-        OperationStatus::Queued => "queued",
-        OperationStatus::Running => "running",
-        OperationStatus::Succeeded => "succeeded",
-        OperationStatus::Failed => "failed",
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // mcp install / skill install
 //
-// Every real consumer of this package (infra, viclass) used to hand-author its own ~20-line
-// Node/Bun wrapper spawning `hearthd mcp`, plus hand-edit its MCP host's JSON config to point at that
-// wrapper — duplicated per repo for no reason once `hearthd` itself is a single binary any MCP host
-// can spawn directly. `mcp install` replaces both: it resolves the *running* `hearthd` binary's own
-// absolute path (no wrapper script needed) and merges a `{command, args}` entry directly into
-// whatever JSON file the caller points it at.
+// `mcp install` registers the *running* `hearthd` binary's absolute path directly in an MCP host's
+// JSON config — no wrapper script — merging only `{command, args}`.
 // ---------------------------------------------------------------------------------------------
 
 async fn mcp_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let Some(subcommand) = rest.first() else {
-        return usage_err("usage: hearth mcp install [--name <name>] [--json] <config-file>...");
+        return usage_err("usage: hearthd mcp install [--name <name>] [--json] <config-file>...");
     };
     match subcommand.as_str() {
         "install" => mcp_install_command(root, &rest[1..], io).await,
@@ -998,7 +985,7 @@ async fn mcp_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlR
 async fn mcp_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Name, FlagName::Key, FlagName::Json])?;
     if flags.positionals.is_empty() {
-        return usage_err("usage: hearth mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>...");
+        return usage_err("usage: hearthd mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>...");
     }
     let name = flags.name.clone().unwrap_or_else(|| "hearth".to_string());
     let key = flags.key.clone().unwrap_or_else(|| "mcpServers".to_string());
@@ -1024,8 +1011,7 @@ async fn mcp_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> L
 /// shares — Claude Code's `.mcp.json`, Kiro's `.kiro/settings/mcp.json`) into `path`, touching
 /// only `command`/`args` on that entry. `serde_json`'s `preserve_order` feature is load-bearing
 /// here: without it, `Value`'s object type is a `BTreeMap` and silently alphabetizes every key in
-/// the *entire* document on write, turning a one-entry change into a huge, unreviewable diff of a
-/// human-maintained file (caught the hard way against a real file mid-development — see AGENTS.md).
+/// the *entire* document on write (see AGENTS.md).
 fn install_mcp_entry(path: &Path, key: &str, name: &str, command: &str, args: &[String]) -> LocalctlResult<()> {
     let io_err = |context: String| move |e: std::io::Error| LocalctlError { exit_code: EXIT_FAILED, message: format!("{context}: {e}") };
     let mut document: Value = if path.exists() {
@@ -1059,7 +1045,7 @@ const SKILL_MARKDOWN: &str = include_str!("../skill/hearth-mcp.md");
 
 async fn skill_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let Some(subcommand) = rest.first() else {
-        return usage_err("usage: hearth skill install --dest <path>");
+        return usage_err("usage: hearthd skill install --dest <path>");
     };
     match subcommand.as_str() {
         "install" => skill_install_command(root, &rest[1..], io).await,
@@ -1073,7 +1059,7 @@ async fn skill_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) ->
         return usage_err("skill install takes no positional arguments");
     }
     let Some(dest) = flags.dest.clone() else {
-        return usage_err("usage: hearth skill install --dest <path>");
+        return usage_err("usage: hearthd skill install --dest <path>");
     };
     let dest_path = Path::new(&dest);
     let resolved = if dest_path.is_absolute() { dest_path.to_path_buf() } else { root.join(dest_path) };
@@ -1097,7 +1083,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     // -----------------------------------------------------------------------------------------
-    // parse_command_flags — a 1:1-ish port of localctl.test.ts's own flag-parsing coverage.
+    // parse_command_flags
     // -----------------------------------------------------------------------------------------
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -1140,6 +1126,24 @@ mod tests {
         assert!(err.message.contains("--tail must be a positive integer"));
         let flags = parse_command_flags(&args(&["--tail", "50"]), &[FlagName::Tail]).unwrap();
         assert_eq!(flags.tail, Some(50));
+    }
+
+    #[test]
+    fn parse_root_splits_a_leading_root_flag_and_rejects_a_missing_path() {
+        let (root, rest) = parse_root(&args(&["--root", "/tmp/project", "status"])).unwrap();
+        assert_eq!(root, PathBuf::from("/tmp/project"));
+        assert_eq!(rest, vec!["status".to_string()]);
+        let (root, rest) = parse_root(&args(&["status"])).unwrap();
+        assert_eq!(root, std::env::current_dir().unwrap());
+        assert_eq!(rest, vec!["status".to_string()]);
+        assert_eq!(parse_root(&args(&["--root"])).unwrap_err().exit_code, EXIT_USAGE);
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_everything_outside_the_unreserved_set() {
+        assert_eq!(encode_path_segment("api-1_.~"), "api-1_.~");
+        assert_eq!(encode_path_segment("a/b?c#d e"), "a%2Fb%3Fc%23d%20e");
+        assert_eq!(encode_path_segment("é"), "%C3%A9");
     }
 
     #[test]
@@ -1227,9 +1231,9 @@ mod tests {
         let out2 = out.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "status", "--json"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["status", "--json"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(&out.lock().unwrap()[0]).unwrap();
         assert_eq!(printed["services"][0]["state"], "stopped");
@@ -1247,9 +1251,9 @@ mod tests {
         let out2 = out.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait", "--json"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["start", "api", "--wait", "--json"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(out.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(printed["operations"][0]["status"], "succeeded");
@@ -1299,15 +1303,15 @@ mod tests {
         let out2 = out.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait", "--json"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["start", "api", "--wait", "--json"]), &mut io).await;
         assert_ne!(code, 0, "a held port must refuse a plain start");
         assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::ExternallyOwned);
         assert!(squatter.child.try_wait().unwrap().is_none(), "the squatter must still be alive");
 
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait", "--json", "--kill-unowned"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["start", "api", "--wait", "--json", "--kill-unowned"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(out.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(printed["operations"][0]["status"], "succeeded");
@@ -1340,9 +1344,9 @@ mod tests {
         };
         let mut out_fn = move |_: &str| {};
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: Some(&mut confirm) };
-        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["start", "api", "--wait"]), &mut io).await;
         assert_eq!(code, 0);
         assert_eq!(prompts.lock().unwrap().len(), 1, "the fresh conflict must prompt exactly once, after the failed submit");
         assert!(prompts.lock().unwrap()[0].contains(&format!("api: Port {port} is held by pid")), "{:?}", prompts.lock().unwrap());
@@ -1361,14 +1365,29 @@ mod tests {
         let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
         let manager = bootstrap_manager(catalog.clone()).await;
 
-        let mut confirm = |_: &str| false;
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prompts2 = prompts.clone();
+        let mut confirm = move |_: &str| {
+            prompts2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        };
         let mut out_fn = move |_: &str| {};
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: Some(&mut confirm) };
-        let code = main(&options, &args(&["--root", "/tmp", "start", "api", "--wait"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["start", "api", "--wait"]), &mut io).await;
         assert_ne!(code, 0, "a declined reclaim is still a failed start");
         assert_eq!(manager.service_states()[0].actual_state, hearth_core::state::ActualServiceState::ExternallyOwned);
+        assert!(squatter.child.try_wait().unwrap().is_none(), "declining must never signal the squatter");
+
+        // The row is now persisted `externally-owned`: the pre-submit prompt asks once, and a "no"
+        // still submits a plain start (the daemon re-checks the port) rather than failing unsent.
+        let before = manager.service_states()[0].updated_at.clone();
+        prompts.store(0, std::sync::atomic::Ordering::SeqCst);
+        let code = main(&options, Path::new("/tmp"), &args(&["start", "api", "--wait"]), &mut io).await;
+        assert_ne!(code, 0);
+        assert_eq!(prompts.load(std::sync::atomic::Ordering::SeqCst), 1, "a declined question is never asked twice");
+        assert_ne!(manager.service_states()[0].updated_at, before, "the declined prompt must still submit a plain start");
         assert!(squatter.child.try_wait().unwrap().is_none(), "declining must never signal the squatter");
         manager.close().await;
     }
@@ -1382,9 +1401,9 @@ mod tests {
         let err2 = err.clone();
         let mut out_fn = move |_: &str| {};
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "stop", "api", "--kill-unowned"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["stop", "api", "--kill-unowned"]), &mut io).await;
         assert_eq!(code, EXIT_USAGE);
         assert!(err.lock().unwrap()[0].contains("--kill-unowned only applies"), "{:?}", err.lock().unwrap());
     }
@@ -1399,9 +1418,9 @@ mod tests {
         let out2 = out.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "manager", "ensure", "--json"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["manager", "ensure", "--json"]), &mut io).await;
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(&out.lock().unwrap()[0]).unwrap();
         assert_eq!(printed["instanceId"], json!(manager.instance_id));
@@ -1422,7 +1441,7 @@ mod tests {
                 hearth_core::daemon::run_daemon(HearthManagerOptions { runtime_directory: None, root: Some(root), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }, false).await;
             });
         });
-        let options = LocalctlOptions { catalog, spawn_daemon, doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon };
         let client = ensure(&root, &options).await.unwrap();
         assert!(client.metadata.port > 0);
         // Clean up: ask the real daemon we just spawned to stop.
@@ -1498,9 +1517,9 @@ mod tests {
         let out2 = out.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |_: &str| {};
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "doctor"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["doctor"]), &mut io).await;
         assert_eq!(code, 0);
         assert!(out.lock().unwrap().iter().any(|line| line.contains("platform")));
     }
@@ -1515,9 +1534,9 @@ mod tests {
         let err2 = err.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "bogus"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["bogus"]), &mut io).await;
         assert_eq!(code, EXIT_USAGE);
         assert!(err.lock().unwrap()[0].contains("unknown command"));
     }
@@ -1532,9 +1551,9 @@ mod tests {
         let err2 = err.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let code = main(&options, &args(&["--root", "/tmp", "status"]), &mut io).await;
+        let code = main(&options, Path::new("/tmp"), &args(&["status"]), &mut io).await;
         assert_eq!(code, EXIT_UNAVAILABLE);
         assert!(err.lock().unwrap()[0].contains("unavailable"));
     }
@@ -1545,7 +1564,7 @@ mod tests {
 
     async fn run_cli(dir: &Path, extra_args: &[&str]) -> (i32, Vec<String>, Vec<String>) {
         let catalog = test_catalog(dir, vec![]);
-        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+        let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
         let out = Arc::new(Mutex::new(Vec::new()));
         let err = Arc::new(Mutex::new(Vec::new()));
         let out2 = out.clone();
@@ -1553,9 +1572,7 @@ mod tests {
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
         let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
         let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-        let mut full_args: Vec<&str> = vec!["--root", dir.to_str().unwrap()];
-        full_args.extend_from_slice(extra_args);
-        let code = main(&options, &args(&full_args), &mut io).await;
+        let code = main(&options, dir, &args(extra_args), &mut io).await;
         let out = out.lock().unwrap().clone();
         let err = err.lock().unwrap().clone();
         (code, out, err)
@@ -1681,7 +1698,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (code, _out, err) = run_cli(dir.path(), &["mcp", "install"]).await;
         assert_eq!(code, EXIT_USAGE);
-        assert!(err[0].contains("usage: hearth mcp install"));
+        assert!(err[0].contains("usage: hearthd mcp install"));
     }
 
     #[tokio::test]
@@ -1708,7 +1725,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (code, _out, err) = run_cli(dir.path(), &["skill", "install"]).await;
         assert_eq!(code, EXIT_USAGE);
-        assert!(err[0].contains("usage: hearth skill install"));
+        assert!(err[0].contains("usage: hearthd skill install"));
     }
 
     /// A failed service must not print as "stopped" — that made a crash indistinguishable from a
@@ -1772,11 +1789,11 @@ mod tests {
                 let out2 = out.clone();
                 let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
                 let mut err_fn = move |_: &str| {};
-                let options = LocalctlOptions { catalog, spawn_daemon: never_spawn(), doctor_checks: None };
+                let options = LocalctlOptions { catalog, spawn_daemon: never_spawn() };
                 let mut io = Io { out: &mut out_fn, err: &mut err_fn, confirm: None };
-                let mut argv = vec!["--root", "/tmp", "urls"];
+                let mut argv = vec!["urls"];
                 argv.extend_from_slice(extra);
-                let code = main(&options, &args(&argv), &mut io).await;
+                let code = main(&options, Path::new("/tmp"), &args(&argv), &mut io).await;
                 let lines = out.lock().unwrap().clone();
                 (code, lines)
             }

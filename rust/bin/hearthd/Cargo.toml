@@ -14,10 +14,9 @@ hearth-cli = { path = "../../crates/hearth-cli" }
 hearth-tui = { path = "../../crates/hearth-tui" }
 hearth-mcp = { path = "../../crates/hearth-mcp" }
 tokio = { workspace = true }
-serde_json = { workspace = true }
-rmcp = { version = "3", features = ["server", "transport-io"] }
+rmcp = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rmcp = { version = "3", features = ["server", "client", "transport-io", "transport-child-process"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }

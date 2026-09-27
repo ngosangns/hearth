@@ -25,27 +25,13 @@ struct ContentView: View {
                     )
                 }
             }
-            .safeAreaInset(edge: .bottom) {
-                // Xcode-style status strip: the same glanceable summary the menu bar shows, so the
-                // number stays visible even while the sidebar is scrolled.
-                let summary = MenuBarSummary.compute(workspaces: workspaceStore.workspaces, registry: registry)
-                if summary.total > 0 {
-                    HStack(spacing: 6) {
-                        Image(systemName: "server.rack")
-                        if summary.failed > 0 {
-                            Text("\(summary.ready)/\(summary.total) ready · \(summary.failed) failed")
-                                .foregroundStyle(.red)
-                        } else {
-                            Text("\(summary.ready)/\(summary.total) services ready")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.bar)
+            .safeAreaInset(edge: .top) {
+                if let error = workspaceStore.loadError {
+                    ErrorBanner(text: error) { workspaceStore.dismissLoadError() }
                 }
+            }
+            .safeAreaInset(edge: .bottom) {
+                SummaryStrip(workspaces: workspaceStore.workspaces, registry: registry, pulse: registry.menuBarPulse)
             }
         } detail: {
             if let selection = workspaceStore.selectedId, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }),
@@ -85,15 +71,47 @@ struct ContentView: View {
     }
 }
 
+/// Xcode-style status strip: the same glanceable summary the menu bar shows, so the number stays
+/// visible even while the sidebar is scrolled. Its own view observing `menuBarPulse`: `ContentView`
+/// deliberately does not observe the controllers (see `WorkspaceControllerRegistry`), so computed
+/// inline there it only redrew when something unrelated invalidated the window.
+private struct SummaryStrip: View {
+    let workspaces: [Workspace]
+    let registry: WorkspaceControllerRegistry
+    @ObservedObject var pulse: MenuBarPulse
+
+    var body: some View {
+        let summary = MenuBarSummary.compute(workspaces: workspaces, registry: registry)
+        if summary.total > 0 {
+            HStack(spacing: 6) {
+                Image(systemName: "server.rack")
+                if summary.failed > 0 {
+                    Text("\(summary.ready)/\(summary.total) ready · \(summary.failed) failed")
+                        .foregroundStyle(.red)
+                } else {
+                    Text("\(summary.ready)/\(summary.total) services ready")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.caption)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.bar)
+        }
+    }
+}
+
 private struct WorkspaceRow: View {
     let workspace: Workspace
     /// The live controller, if the registry has made one — drives the trailing status.
     let controller: WorkspaceController?
 
     var body: some View {
+        let exists = workspace.existsOnDisk
         HStack(spacing: 8) {
-            Image(systemName: workspace.existsOnDisk ? "folder.fill" : "folder.badge.questionmark")
-                .foregroundStyle(workspace.existsOnDisk ? Color.accentColor : .secondary)
+            Image(systemName: exists ? "folder.fill" : "folder.badge.questionmark")
+                .foregroundStyle(exists ? Color.accentColor : .secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(workspace.displayName)
                     .fontWeight(.medium)
@@ -104,40 +122,43 @@ private struct WorkspaceRow: View {
                     .truncationMode(.middle)
             }
             Spacer()
-            status
+            if let controller {
+                WorkspaceRowStatus(controller: controller)
+            } else if !workspace.trusted {
+                Image(systemName: "lock").foregroundStyle(.secondary)
+            }
         }
         .padding(.vertical, 2)
     }
+}
 
-    /// A compact trailing status: a ready/total count while connected, a glyph for anything else.
-    /// Untrusted workspaces show nothing — the trust prompt explains itself in the detail pane.
-    @ViewBuilder
-    private var status: some View {
-        if let controller {
-            switch controller.phase {
-            case .connected:
-                let ready = controller.services.filter { ["ready", "running"].contains($0.displayState) }.count
-                let failed = controller.services.filter { $0.displayState == "failed" }.count
-                if failed > 0 {
-                    Text("\(ready)/\(controller.services.count) · \(failed) failed")
-                        .font(.caption).monospacedDigit().foregroundStyle(.red)
-                } else {
-                    Text("\(ready)/\(controller.services.count)")
-                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
-                }
-            case .connecting:
-                ActionSpinner()
-            case .idle:
-                // Resting state — the daemon has never been started for this workspace in this
-                // session. Showing a spinner here made every untouched row look stuck loading.
-                EmptyView()
-            case .failed:
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            case .stopped:
-                Image(systemName: "stop.circle").foregroundStyle(.secondary)
+/// A compact trailing status: a ready/total count while connected, a glyph for anything else.
+/// A separate view so it can observe the controller — `WorkspaceRow` gets it as a plain value from
+/// `ContentView`, which does not observe controllers, so the count went stale there.
+private struct WorkspaceRowStatus: View {
+    @ObservedObject var controller: WorkspaceController
+
+    var body: some View {
+        switch controller.phase {
+        case .connected:
+            let counts = controller.counts
+            if counts.failed > 0 {
+                Text("\(counts.ready)/\(counts.total) · \(counts.failed) failed")
+                    .font(.caption).monospacedDigit().foregroundStyle(.red)
+            } else {
+                Text("\(counts.ready)/\(counts.total)")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
-        } else if !workspace.trusted {
-            Image(systemName: "lock").foregroundStyle(.secondary)
+        case .connecting:
+            ActionSpinner()
+        case .idle:
+            // Resting state — the daemon has never been started for this workspace in this
+            // session. Showing a spinner here made every untouched row look stuck loading.
+            EmptyView()
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .stopped:
+            Image(systemName: "stop.circle").foregroundStyle(.secondary)
         }
     }
 }

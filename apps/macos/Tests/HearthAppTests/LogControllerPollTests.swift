@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 
 @testable import HearthApp
@@ -119,5 +120,90 @@ final class LogControllerPollTests: XCTestCase {
         await sut.fetchOnce()
         XCTAssertNil(sut.lastError)
         XCTAssertEqual(sut.text, "back\n")
+    }
+
+    // MARK: - Deltas (what `LogTextView` applies in place)
+
+    /// Replays `deltas` onto a mirror the way the text view does — it must always equal `text`.
+    private func mirror(_ sut: LogController) -> (Box<NSMutableString>, AnyCancellable) {
+        let mirror = Box(NSMutableString(string: sut.text))
+        let subscription = sut.deltas.sink { delta in
+            switch delta {
+            case .reset(let text):
+                mirror.value.setString(text)
+            case .append(let text, let trimmedUTF16):
+                mirror.value.deleteCharacters(in: NSRange(location: 0, length: trimmedUTF16))
+                mirror.value.append(text)
+            }
+        }
+        return (mirror, subscription)
+    }
+
+    func testAppendsAndResetsArePublishedAsDeltas() async {
+        let api = FakeManagerAPI()
+        let slices = Box<[LogSlice]>([
+            makeLogSlice(data: "one\n", nextCursor: 4, generation: 1),
+            makeLogSlice(data: "", nextCursor: 4, generation: 1),
+            makeLogSlice(data: "fresh\n", nextCursor: 6, generation: 2, reset: true),
+        ])
+        api.logsHandler = { _, _ in slices.value.removeFirst() }
+        let sut = LogController(client: api, serviceId: "api")
+        var deltas: [LogDelta] = []
+        let subscription = sut.deltas.sink { deltas.append($0) }
+        defer { subscription.cancel() }
+
+        await sut.fetchOnce()
+        await sut.fetchOnce()
+        await sut.fetchOnce()
+
+        XCTAssertEqual(deltas, [.append("one\n", trimmedUTF16: 0), .reset("fresh\n")], "an empty slice publishes nothing")
+        XCTAssertTrue(sut.hasText)
+    }
+
+    /// Past the byte cap the head is trimmed — as a head-delete delta, so the text view trims its
+    /// storage in place instead of replacing 256KB. Multi-byte text keeps UTF-16 and UTF-8 apart.
+    func testTrimmingPublishesAHeadDeleteThatKeepsTheMirrorInSync() async {
+        let api = FakeManagerAPI()
+        let chunk = String(repeating: "→ log line with multi-byte text\n", count: 1_500) // ~51KB
+        api.logsHandler = { _, _ in makeLogSlice(data: chunk, nextCursor: 1, generation: 1) }
+        let sut = LogController(client: api, serviceId: "api")
+        let (mirror, subscription) = mirror(sut)
+        defer { subscription.cancel() }
+
+        for _ in 0..<12 {
+            await sut.fetchOnce()
+            XCTAssertEqual(mirror.value as String, sut.text)
+        }
+        XCTAssertLessThanOrEqual(sut.text.utf8.count, 262_144)
+    }
+
+    /// A single slice bigger than the cap cannot be expressed as "trim, then append the slice".
+    func testASliceLargerThanTheCapIsAReset() async {
+        let api = FakeManagerAPI()
+        api.logsHandler = { _, _ in makeLogSlice(data: String(repeating: "x", count: 300_000), nextCursor: 1, generation: 1) }
+        let sut = LogController(client: api, serviceId: "api")
+        let (mirror, subscription) = mirror(sut)
+        defer { subscription.cancel() }
+
+        await sut.fetchOnce()
+
+        XCTAssertEqual(mirror.value as String, sut.text)
+        XCTAssertLessThanOrEqual(sut.text.utf8.count, 262_144)
+    }
+
+    /// Every daemon-log answer is a whole 128KB tail — an unchanged one must not repaint.
+    func testAnUnchangedDaemonLogTailPublishesNothing() async {
+        let api = FakeManagerAPI()
+        api.daemonLogHandler = { makeLogSlice(data: "same tail\n", nextCursor: 0, generation: 0, reset: true) }
+        let sut = LogController(client: api, daemonLog: ())
+        var deltas: [LogDelta] = []
+        let subscription = sut.deltas.sink { deltas.append($0) }
+        defer { subscription.cancel() }
+
+        await sut.fetchOnce()
+        await sut.fetchOnce()
+
+        XCTAssertEqual(deltas, [.reset("same tail\n")])
+        XCTAssertEqual(sut.pollInterval, .seconds(2), "the daemon log polls slower than a service log")
     }
 }

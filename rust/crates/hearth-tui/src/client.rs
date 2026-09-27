@@ -1,25 +1,20 @@
-//! Port of `src/tui/tui-client.ts` — a daemon HTTP+SSE client. The TUI has no direct access to
-//! processes; it is just another client of the manager, same as the CLI (whose `hearth_cli::{discover,
-//! request, require_client, wait_operation}` this reuses directly rather than re-implementing).
-//!
-//! **Deliberate deviation from the TS source**: the TS `ManagerTuiClient` takes an injectable
-//! `runtime` (discover/request/sleep/now/eventStream) purely for test doubles. This port has no such
-//! injection point — every test drives a real bootstrapped `HearthManager` over real HTTP,
-//! the same methodology `hearth-core`'s and `hearth-cli`'s own test suites already use, so a fake transport
-//! layer would be redundant rather than a capability gap.
+//! The TUI's daemon client: typed calls through `hearth_cli::ManagerClient` (the same client the
+//! CLI and MCP use) plus the SSE reconnect loop. The TUI has no direct access to processes. Tests
+//! drive a real bootstrapped `HearthManager` over real HTTP rather than a fake transport.
 use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use hearth_cli::{operation_id, require_client, request as cli_request, wait_operation as cli_wait_operation, Client, LocalctlError, LocalctlOptions, EXIT_FAILED, EXIT_UNAVAILABLE};
-use hearth_core::state::{ManagerEvent, Operation, ServiceLifecycleState};
+use hearth_cli::{LocalctlError, ManagerClient, EXIT_FAILED};
+use hearth_core::catalog::ServiceCatalog;
+use hearth_core::state::{ManagerEvent, Operation, ServiceLifecycleState, ServiceOperationKind};
 
-use crate::state::{ActionKind, LogSlice};
+use crate::state::LogSlice;
 
 pub const LOG_TAIL_BYTES: u64 = 16 * 1024;
 pub const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
@@ -45,98 +40,59 @@ pub enum WatchEvent {
     Replay(EventReplay),
     ManagerEvent(ManagerEvent),
     Unavailable(String),
+    /// A background "start all" wait finished — sent by the task `run_all` spawns, not by
+    /// `watch()`, and not fenced: it reports an operation, not connection state.
+    BulkStartFinished(Result<Operation, String>),
 }
 
-fn unavailable_error(message: String) -> LocalctlError {
-    LocalctlError { exit_code: EXIT_UNAVAILABLE, message }
-}
-
-fn malformed_error(error: serde_json::Error) -> LocalctlError {
-    LocalctlError { exit_code: EXIT_FAILED, message: error.to_string() }
-}
-
-fn safe_message(message: &str) -> String {
+/// Replaces control characters so a daemon-supplied message can't move the cursor or break a row.
+pub(crate) fn safe_message(message: &str) -> String {
     message.chars().map(|c| if c == '\r' || c == '\n' || (c as u32) < 0x20 || c as u32 == 0x7f { ' ' } else { c }).collect()
 }
 
-pub struct ManagerTuiClient<'a> {
-    root: PathBuf,
-    options: &'a LocalctlOptions,
+pub struct ManagerTuiClient {
+    api: ManagerClient,
 }
 
-impl<'a> ManagerTuiClient<'a> {
-    pub fn new(root: PathBuf, options: &'a LocalctlOptions) -> Self {
-        Self { root, options }
-    }
-
-    async fn client(&self) -> Result<Client, LocalctlError> {
-        require_client(&self.root, self.options).await
+impl ManagerTuiClient {
+    pub fn new(root: PathBuf, catalog: ServiceCatalog) -> Self {
+        Self { api: ManagerClient::new(root, catalog) }
     }
 
     pub async fn snapshot(&self) -> Result<Vec<ServiceLifecycleState>, LocalctlError> {
-        let client = self.client().await?;
-        let body = cli_request(&client, "/v1/services", reqwest::Method::GET, None, None).await.map_err(unavailable_error)?;
-        serde_json::from_value(body["services"].clone()).map_err(malformed_error)
+        self.api.services().await
     }
 
     /// Every resolved service URL (`GET /v1/urls`).
     pub async fn urls(&self) -> Result<Vec<hearth_core::catalog::ResolvedServiceUrl>, LocalctlError> {
-        let client = self.client().await?;
-        let body = cli_request(&client, "/v1/urls", reqwest::Method::GET, None, None).await.map_err(unavailable_error)?;
-        serde_json::from_value(body["urls"].clone()).map_err(malformed_error)
+        let body = self.api.urls().await?;
+        serde_json::from_value(body["urls"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })
     }
 
     pub async fn log(&self, service_id: &str, cursor: Option<u64>, generation: Option<u64>) -> Result<LogSlice, LocalctlError> {
-        let client = self.client().await?;
-        let mut query = format!("limit={LOG_TAIL_BYTES}");
-        if let Some(c) = cursor {
-            query.push_str(&format!("&cursor={c}"));
-        }
-        if let Some(g) = generation {
-            query.push_str(&format!("&generation={g}"));
-        }
-        let path = format!("/v1/logs/{}?{query}", encode_path_segment(service_id));
-        let body = cli_request(&client, &path, reqwest::Method::GET, None, None).await.map_err(unavailable_error)?;
-        Ok(LogSlice {
-            data: body["data"].as_str().unwrap_or_default().to_string(),
-            next_cursor: body["nextCursor"].as_u64().unwrap_or(0),
-            generation: body["generation"].as_u64().unwrap_or(0),
-            reset: body["reset"].as_bool().unwrap_or(false),
-        })
+        let slice = self.api.log(service_id, cursor, generation, Some(LOG_TAIL_BYTES)).await?;
+        Ok(LogSlice { data: slice.data, next_cursor: slice.next_cursor, generation: slice.generation, reset: slice.reset })
     }
 
     pub async fn operation(&self, id: &str) -> Result<Operation, LocalctlError> {
-        let client = self.client().await?;
-        let encoded = operation_id(id)?;
-        let body = cli_request(&client, &format!("/v1/operations/{encoded}"), reqwest::Method::GET, None, None).await.map_err(unavailable_error)?;
-        serde_json::from_value(body["operation"].clone()).map_err(malformed_error)
+        self.api.operation(id).await
     }
 
-    pub async fn action(&self, service_id: &str, action: ActionKind, kill_unowned: bool) -> Result<Operation, LocalctlError> {
-        let client = self.client().await?;
-        let action_str = match action {
-            ActionKind::Start => "start",
-            ActionKind::Stop => "stop",
-            ActionKind::Restart => "restart",
-        };
-        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action_str });
-        if kill_unowned {
-            body["killUnowned"] = json!(true);
-        }
-        let response = cli_request(&client, "/v1/operations", reqwest::Method::POST, Some(&body), None).await.map_err(unavailable_error)?;
-        serde_json::from_value(response["operation"].clone()).map_err(malformed_error)
+    pub async fn action(&self, service_id: &str, action: ServiceOperationKind, kill_unowned: bool) -> Result<Operation, LocalctlError> {
+        self.api.submit(action, service_id, kill_unowned).await
     }
 
     pub async fn bulk_start(&self, targets: &[String]) -> Result<Operation, LocalctlError> {
-        let client = self.client().await?;
-        let body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "targets": targets });
-        let response = cli_request(&client, "/v1/operations/bulk-start", reqwest::Method::POST, Some(&body), None).await.map_err(unavailable_error)?;
-        serde_json::from_value(response["operation"].clone()).map_err(malformed_error)
+        self.api.bulk_start(targets, false).await
     }
 
     pub async fn wait_operation(&self, id: &str) -> Result<Operation, LocalctlError> {
-        let client = self.client().await?;
-        cli_wait_operation(&client, id).await
+        self.api.wait(id, None).await
+    }
+
+    /// The current connection, for work that must outlive a borrow of this client (a spawned wait).
+    pub async fn connection(&self) -> Result<hearth_cli::Client, LocalctlError> {
+        self.api.connection().await
     }
 
     /// Runs the reconnect loop until `cancel` fires: on each attempt, fetches a fresh `/v1/services`
@@ -164,36 +120,17 @@ impl<'a> ManagerTuiClient<'a> {
     }
 
     async fn watch_once(&self, after: &mut Option<u64>, epoch: &mut Option<String>, tx: &mpsc::Sender<WatchEvent>, cancel: &CancellationToken) -> Result<(), String> {
-        let client = self.client().await.map_err(|e| e.message)?;
-        let body = cli_request(&client, "/v1/services", reqwest::Method::GET, None, None).await?;
-        let services: Vec<ServiceLifecycleState> = serde_json::from_value(body["services"].clone()).map_err(|_| "manager returned malformed service state".to_string())?;
+        let services = self.api.services().await.map_err(|e| e.message)?;
         let _ = tx.send(WatchEvent::Snapshot(services)).await;
-        self.stream_events(&client, after, epoch, tx, cancel).await
+        self.stream_events(after, epoch, tx, cancel).await
     }
 
-    async fn stream_events(&self, client: &Client, after: &mut Option<u64>, epoch: &mut Option<String>, tx: &mpsc::Sender<WatchEvent>, cancel: &CancellationToken) -> Result<(), String> {
-        let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(a) = after {
-            query.push(("after", a.to_string()));
-        }
-        if let Some(e) = epoch.as_ref() {
-            query.push(("epoch", e.clone()));
-        }
-        let url = format!("http://127.0.0.1:{}/v1/events/stream", client.metadata.port);
-        let response = reqwest::Client::new()
-            .get(&url)
-            .query(&query)
-            .bearer_auth(&client.token)
-            .header("x-hearth-protocol", hearth_core::state::PROTOCOL_VERSION.to_string())
-            .header("accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("event stream failed: {}", response.status()));
-        }
+    async fn stream_events(&self, after: &mut Option<u64>, epoch: &mut Option<String>, tx: &mpsc::Sender<WatchEvent>, cancel: &CancellationToken) -> Result<(), String> {
+        let response = self.api.event_stream(*after, epoch.as_deref()).await.map_err(|e| e.message)?;
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        // Raw bytes, decoded per complete frame: a multi-byte character split across two TCP
+        // chunks must not turn into U+FFFD.
+        let mut buffer: Vec<u8> = Vec::new();
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
@@ -204,10 +141,11 @@ impl<'a> ManagerTuiClient<'a> {
                 Some(Err(error)) => return Err(error.to_string()),
                 Some(Ok(bytes)) => bytes,
             };
-            buffer = append_sse_chunk(&buffer, &String::from_utf8_lossy(&bytes))?;
-            while let Some(boundary) = buffer.find("\n\n") {
-                let frame = buffer[..boundary].to_string();
-                buffer = buffer[boundary + 2..].to_string();
+            append_sse_chunk(&mut buffer, &bytes)?;
+            while let Some(frame) = next_sse_frame(&mut buffer) {
+                if is_sse_comment(&frame) {
+                    continue;
+                }
                 let parsed = parse_sse(&frame).ok_or_else(|| "event stream frame is malformed".to_string())?;
                 if parsed.event_type == "replay" {
                     let replay: EventReplay = serde_json::from_value(parsed.data).map_err(|_| "event stream payload is malformed".to_string())?;
@@ -226,16 +164,27 @@ impl<'a> ManagerTuiClient<'a> {
     }
 }
 
-fn encode_path_segment(segment: &str) -> String {
-    percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
-
-pub fn append_sse_chunk(buffer: &str, chunk: &str) -> Result<String, String> {
-    let next = format!("{buffer}{chunk}");
-    if next.len() > MAX_SSE_FRAME_BYTES {
+/// Appends one network chunk to the pending-frame buffer, failing once a single frame would exceed
+/// `MAX_SSE_FRAME_BYTES`.
+pub fn append_sse_chunk(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    if buffer.len() + chunk.len() > MAX_SSE_FRAME_BYTES {
         return Err("event stream frame exceeds limit".to_string());
     }
-    Ok(next)
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// Removes and decodes the next complete (blank-line-terminated) frame from `buffer`, if any.
+pub fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
+    let boundary = buffer.windows(2).position(|pair| pair == b"\n\n")?;
+    let frame = String::from_utf8_lossy(&buffer[..boundary]).into_owned();
+    buffer.drain(..boundary + 2);
+    Some(frame)
+}
+
+/// A frame of only comment (`:`) or blank lines — the server's keep-alive. Carries no event.
+pub fn is_sse_comment(frame: &str) -> bool {
+    frame.lines().all(|line| line.is_empty() || line.starts_with(':'))
 }
 
 pub struct SseFrame {
@@ -255,10 +204,10 @@ pub fn parse_sse(frame: &str) -> Option<SseFrame> {
     serde_json::from_str(&raw).ok().map(|data| SseFrame { event_type, data })
 }
 
-/// Port of `refreshSelectedLog` — re-fetches the selected service's log tail at its current cursor,
-/// falling back to a from-scratch fetch (and a `replace_log` rather than an incremental append) when
-/// the incremental fetch came back truncated at exactly the tail-byte cap.
-pub async fn refresh_selected_log(client: &ManagerTuiClient<'_>, state: &mut crate::state::TuiState, fence: crate::state::TuiFence) -> Result<bool, String> {
+/// Re-fetches the selected service's log tail at its current cursor, falling back to a
+/// from-scratch fetch (and a `replace_log` rather than an incremental append) when the incremental
+/// fetch came back truncated at exactly the tail-byte cap.
+pub async fn refresh_selected_log(client: &ManagerTuiClient, state: &mut crate::state::TuiState, fence: crate::state::TuiFence) -> Result<bool, String> {
     let service = state.selection.selected_name.clone();
     if service.is_empty() {
         return Ok(false);
@@ -312,8 +261,38 @@ mod tests {
 
     #[test]
     fn rejects_an_oversized_chunk_append() {
-        let huge = "x".repeat(MAX_SSE_FRAME_BYTES + 1);
-        assert!(append_sse_chunk("", &huge).is_err());
+        let huge = vec![b'x'; MAX_SSE_FRAME_BYTES + 1];
+        assert!(append_sse_chunk(&mut Vec::new(), &huge).is_err());
+    }
+
+    /// axum's keep-alive is a bare `:` comment frame; it must be skipped, not treated as a
+    /// malformed frame that tears the stream down.
+    #[test]
+    fn keep_alive_comment_frames_are_skipped() {
+        assert!(is_sse_comment(":"));
+        assert!(is_sse_comment(": ping"));
+        assert!(is_sse_comment(""));
+        assert!(!is_sse_comment("event: replay\ndata: {}"));
+        let mut buffer = Vec::new();
+        append_sse_chunk(&mut buffer, b":\n\nevent: replay\ndata: {\"epoch\":\"e\",\"reset\":false,\"latestSequence\":1}\n\n").unwrap();
+        let frames: Vec<String> = std::iter::from_fn(|| next_sse_frame(&mut buffer)).filter(|f| !is_sse_comment(f)).collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(parse_sse(&frames[0]).unwrap().event_type, "replay");
+        assert!(buffer.is_empty());
+    }
+
+    /// A multi-byte character split across two network chunks decodes intact once the frame
+    /// completes.
+    #[test]
+    fn a_character_split_across_chunks_decodes_intact() {
+        let frame = "data: {\"message\":\"héllo\"}\n\n".as_bytes();
+        let split = frame.iter().position(|b| *b == 0xC3).unwrap() + 1;
+        let mut buffer = Vec::new();
+        append_sse_chunk(&mut buffer, &frame[..split]).unwrap();
+        assert!(next_sse_frame(&mut buffer).is_none());
+        append_sse_chunk(&mut buffer, &frame[split..]).unwrap();
+        let parsed = parse_sse(&next_sse_frame(&mut buffer).unwrap()).unwrap();
+        assert_eq!(parsed.data["message"], "héllo");
     }
 
     /// End-to-end through a real daemon: `action(..., kill_unowned: true)` is the TUI's version of
@@ -379,15 +358,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let options = LocalctlOptions { catalog, spawn_daemon: Box::new(|_| panic!("must not spawn a daemon in a test")), doctor_checks: None };
-        let client = ManagerTuiClient::new(PathBuf::from("/tmp"), &options);
+        let client = ManagerTuiClient::new(PathBuf::from("/tmp"), catalog);
 
         // Without the flag the start refuses — and the squatter is left alone.
-        let refused = client.action("api", ActionKind::Start, false).await.unwrap();
+        let refused = client.action("api", ServiceOperationKind::Start, false).await.unwrap();
         assert_eq!(client.wait_operation(&refused.id).await.unwrap().status, OperationStatus::Failed);
         assert!(squatter.try_wait().unwrap().is_none());
 
-        let accepted = client.action("api", ActionKind::Start, true).await.unwrap();
+        let accepted = client.action("api", ServiceOperationKind::Start, true).await.unwrap();
         assert_eq!(client.wait_operation(&accepted.id).await.unwrap().status, OperationStatus::Succeeded);
         for _ in 0..50 {
             if squatter.try_wait().unwrap().is_some() {

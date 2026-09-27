@@ -9,7 +9,6 @@ import Foundation
 protocol ManagerAPI: Sendable {
     func services() async throws -> [ServiceLifecycleState]
     func catalog() async throws -> ServiceCatalogSummary
-    func managerInfo() async throws -> ManagerInfo
     func logs(serviceId: String, cursor: Int?, generation: Int?, limit: Int) async throws -> LogSlice
     /// `GET /v1/daemon/log` — the daemon's own `daemon.log`, returned as a `LogSlice` tail
     /// (`reset` is always true; the endpoint sends the whole tail, not an incremental cursor).
@@ -37,8 +36,9 @@ protocol SharedAPI: ManagerAPI {
     func sharedCatalog() async throws -> SharedCatalogDocument
     /// Downloads+verifies+installs `name@version` — can take minutes on first use.
     func sharedInstall(service: String) async throws -> SharedMutationResponse
-    /// Stops the instance and deletes its install + data — the only removal path.
-    func sharedRemove(service: String) async throws -> SharedMutationResponse
+    /// Stops the instance and deletes its install + data — the only removal path. The server
+    /// refuses an instance that still has project attachments unless `force` confirms the wipe.
+    func sharedRemove(service: String, force: Bool) async throws -> SharedMutationResponse
 }
 
 extension ManagerAPI {

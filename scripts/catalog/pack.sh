@@ -11,23 +11,16 @@ here="$(cd "$(dirname "$0")" && pwd)"
 if [[ ! -f "$here/package.sh" ]]; then
   origin="${HEARTH_CATALOG_ORIGIN:?HEARTH_CATALOG_ORIGIN is not set}"
   work="$(mktemp -d)"
-  files=(
-    scripts/catalog/pack.sh
-    scripts/catalog/package.sh
-    scripts/catalog/versions.env
-    scripts/catalog/payload/redis/hearth-prepare
-    scripts/catalog/payload/redis/hearth-ready
-    scripts/catalog/payload/mongodb/hearth-provision
-    scripts/catalog/payload/mongodb/hearth-ready
-    scripts/catalog/payload/minio/hearth-provision
-    scripts/catalog/payload/nginx/hearth-prepare
-    scripts/catalog/payload/nginx/hearth-provision
-    scripts/catalog/payload/nginx/hearth-deprovision
-    scripts/catalog/payload/kafka/hearth-prepare
-    scripts/catalog/payload/kafka/hearth-provision
-    scripts/catalog/payload/kafka/hearth-ready
-    scripts/catalog/payload/kafka/hearth-log4j2.xml
-  )
+  # MANIFEST (written by write-catalog.py) lists every file the build needs, relative to
+  # scripts/catalog, so a new payload script can't be missing from a remote install's tarball.
+  mkdir -p "$work/scripts/catalog"
+  curl -fsSL "$origin/scripts/catalog/MANIFEST" -o "$work/scripts/catalog/MANIFEST"
+  files=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    files+=("scripts/catalog/$line")
+  done < "$work/scripts/catalog/MANIFEST"
+  [[ "${#files[@]}" -gt 0 ]] || { echo "empty MANIFEST at $origin" >&2; exit 1; }
   for rel in "${files[@]}"; do
     mkdir -p "$work/$(dirname "$rel")"
     curl -fsSL "$origin/$rel" -o "$work/$rel"

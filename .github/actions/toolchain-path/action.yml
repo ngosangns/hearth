@@ -1,0 +1,42 @@
+name: Put the toolchain on PATH
+description: >
+  A self-hosted runner executes `run:` steps from its service environment, which is not a login
+  shell, so a toolchain under ~/.cargo/bin (rustup) or Homebrew is absent from PATH even though it
+  works in a terminal on that machine. Appends every known tool directory, then checks the tools.
+
+inputs:
+  tools:
+    description: Space-separated commands that must resolve on the resulting PATH.
+    required: false
+    default: cargo
+
+runs:
+  using: composite
+  steps:
+    - name: Append tool directories to PATH
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Each $GITHUB_PATH line is prepended, so the last one wins: rustup's ~/.cargo/bin is
+        # written last to take precedence over a Homebrew rust on the same machine.
+        printf '%s\n' /usr/local/bin /opt/homebrew/bin "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+    # A separate step: $GITHUB_PATH only takes effect for the steps after the one that wrote it.
+    - name: Check required tools
+      shell: bash
+      env:
+        TOOLS: ${{ inputs.tools }}
+      run: |
+        set -euo pipefail
+        missing=0
+        for tool in $TOOLS; do
+          if path="$(command -v "$tool")"; then
+            echo "using $tool at $path"
+          else
+            echo "$tool not found in: $PATH" >&2
+            missing=1
+          fi
+        done
+        if [ "$missing" -ne 0 ]; then
+          echo "install the missing tools on this runner, or add their directory to .github/actions/toolchain-path" >&2
+          exit 1
+        fi

@@ -53,7 +53,7 @@ async fn full_tool_lifecycle_over_a_real_bootstrapped_manager() {
     let catalog = ServiceCatalog { services: vec![tcp_service("api", port)], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: Some(dir.path().to_string_lossy().to_string()), start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
     let manager = bootstrap(HearthManagerOptions { runtime_directory: None, root: Some(PathBuf::from("/tmp")), catalog: catalog.clone(), event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
 
-    let options = LocalctlOptions { catalog, spawn_daemon: Box::new(|_| panic!("a running manager should never need spawning")), doctor_checks: None };
+    let options = LocalctlOptions { catalog, spawn_daemon: Box::new(|_| panic!("a running manager should never need spawning")) };
     let client = ManagerApiClient::new(PathBuf::from("/tmp"), options);
     let server = create_hearth_mcp_server(Arc::new(client), CreateHearthMcpServerOptions { name: "hearth".to_string(), tool_prefix: String::new(), known_service_ids: vec!["api".to_string()], ..Default::default() });
 

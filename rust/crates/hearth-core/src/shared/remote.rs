@@ -180,6 +180,21 @@ fn parse_document(text: &str) -> Result<SharedCatalogDocument, SharedError> {
     Ok(doc)
 }
 
+/// Adds every `name@version` from `other` that `doc` doesn't already have.
+fn merge_missing_recipes(doc: &mut SharedCatalogDocument, other: SharedCatalogDocument) {
+    for (name, family) in other.services {
+        let target = doc
+            .services
+            .entry(name)
+            .or_insert_with(|| SharedServiceFamily {
+                versions: HashMap::new(),
+            });
+        for (version, recipe) in family.versions {
+            target.versions.entry(version).or_insert(recipe);
+        }
+    }
+}
+
 /// Fetches `catalog.json` with a write-through file cache. The in-process memo is deliberate: the
 /// remote registry should change rarely, and every `attach` would otherwise pay a fetch.
 pub struct RemoteCatalog {
@@ -224,16 +239,27 @@ impl RemoteCatalog {
                     return Ok(doc);
                 }
                 if let Ok(doc) = parse_document(EMBEDDED_CATALOG) {
-                    return Ok(Arc::new(doc));
+                    let doc = Arc::new(doc);
+                    // Memoized like any other answer — otherwise every `load(false)` on a machine
+                    // with no cache re-attempts the (failing) fetch.
+                    *self.memo.lock().await = Some(doc.clone());
+                    return Ok(doc);
                 }
                 Err(remote_error)
             }
         }
     }
 
+    /// The disk cache, topped up with any recipe the embedded catalog has that the cache lacks.
+    /// A cache written once (env / `catalog-url` / `file://` use) would otherwise hide every recipe
+    /// added in a newer `hearthd` build forever, because the private-repo fetch always fails.
+    /// A recipe present in both keeps the cached (actually fetched) version.
     fn load_cached(&self) -> Option<Arc<SharedCatalogDocument>> {
         let text = std::fs::read_to_string(&self.cache_path).ok()?;
-        let doc = parse_document(&text).ok()?;
+        let mut doc = parse_document(&text).ok()?;
+        if let Ok(embedded) = parse_document(EMBEDDED_CATALOG) {
+            merge_missing_recipes(&mut doc, embedded);
+        }
         let doc = Arc::new(doc);
         // Populate the memo without blocking — callers here are sync on the fallback path.
         if let Ok(mut memo) = self.memo.try_lock() {
@@ -447,7 +473,13 @@ mod tests {
             Some("http://127.0.0.1:1/unreachable".to_string()),
         );
         let doc = remote.load(true).await.unwrap();
-        assert!(doc.recipe("postgres", "16.4").is_some());
+        assert_eq!(
+            doc.recipe("postgres", "16.4").unwrap().artifacts["darwin-arm64"].sha256,
+            "abc",
+            "a cached recipe wins over nothing"
+        );
+        // A stale cache doesn't hide recipes this build ships.
+        assert!(doc.services.contains_key("redis"));
     }
 
     #[tokio::test]
@@ -464,18 +496,7 @@ mod tests {
     }
 
     fn brace_names(text: &str) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut rest = text;
-        while let Some(open) = rest.find('{') {
-            let after = &rest[open + 1..];
-            let Some(close) = after.find('}') else { break };
-            let name = &after[..close];
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                names.push(name.to_string());
-            }
-            rest = &after[close + 1..];
-        }
-        names
+        crate::catalog::template_vars(text).into_iter().map(str::to_string).collect()
     }
 
     fn walk_strings(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {

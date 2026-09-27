@@ -1,5 +1,6 @@
-//! Traits and shared types for `ProcessSupervisor` — port of the top of `src/core/supervisor.ts`
-//! (everything above the `ProcessSupervisor` class itself).
+//! Traits and shared types for `ProcessSupervisor`: the adapter seams every OS interaction goes
+//! through (so the engine runs against fakes in its unit tests), and the records they exchange.
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -8,6 +9,8 @@ use tokio::sync::oneshot;
 
 use crate::catalog::{CommandSpec, ServiceCatalog, ServiceCommand, ServiceId};
 use crate::state::{ProcessIdentity, ServiceLifecycleState};
+
+use super::process_tree::ProcessTreeEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSignal {
@@ -56,6 +59,21 @@ pub struct ObservedProcess {
     pub alive: bool,
 }
 
+/// What an `inspect` call could determine about an identity. The probe (`ps`, `docker inspect`)
+/// can itself fail — a timeout or spawn error must never be read as "the process is gone", or a
+/// wedged Docker/`ps` makes Stop record `Stopped` over a still-running container and `reconcile`
+/// marks a live service `Failed`.
+pub enum Inspection {
+    /// The probe ran; this is what it saw.
+    Observed(ObservedProcess),
+    /// The probe ran and the process/container is gone, or a different instance occupies the
+    /// pid/container name.
+    Gone,
+    /// The probe itself could not answer. Callers decide nothing: keep the state, fail the
+    /// operation, or skip — never conclude "dead".
+    Unknown,
+}
+
 /// A spawned, live process/container — the `exited` channel is consumed exactly once (mirrors the
 /// TS `Promise<number>` being `.then()`-ed exactly once in `spawnAndWait`).
 pub struct ManagedProcess {
@@ -101,7 +119,10 @@ pub struct StartOptions {
 /// backlog — without either, the container's whole retained log would be re-forwarded on every
 /// re-attach.
 pub enum OutputSource<'a> {
-    Process,
+    /// `skip_backlog` starts the tail at the file's current size — used when adopting a process
+    /// whose raw capture file the previous daemon already forwarded, so a daemon restart does not
+    /// replay it all into the log store.
+    Process { skip_backlog: bool },
     Container { container_name: &'a str, since: Option<&'a str>, tail: Option<u64> },
 }
 
@@ -132,7 +153,7 @@ impl OutputTail {
 #[async_trait]
 pub trait ProcessAdapter: Send + Sync {
     async fn spawn(&self, input: SpawnInput, on_output: OnOutput) -> Result<ManagedProcess, SupervisorError>;
-    async fn inspect(&self, identity: &ProcessIdentity) -> Option<ObservedProcess>;
+    async fn inspect(&self, identity: &ProcessIdentity) -> Inspection;
     async fn signal_group(&self, pgid: i64, signal: ProcessSignal);
     /// Signals exactly one pid, and only if the pid still presents `expected_start_identity` —
     /// the pid-reuse guard lives here so the signal can never land on a recycled process.
@@ -140,6 +161,13 @@ pub trait ProcessAdapter: Send + Sync {
     /// membership is untrusted (a shared job can hold innocent siblings; pgid 1 must never be
     /// signalled), so only the resolved holder pids are signalled, one at a time.
     async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal);
+    /// Snapshot of the whole process tree under `leader_pid`, taken before the first signal of a
+    /// stop. Empty unless the OS table still shows `leader_start_identity` for the leader — a
+    /// reused pid must never pull an unrelated live tree into a signal (see `build_process_tree`).
+    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry>;
+    /// One `pid -> start identity` snapshot of every live process, or `None` when the table could
+    /// not be read. What tree members are checked against, so a recycled pid never counts as ours.
+    async fn live_start_identities(&self) -> Option<HashMap<i64, String>>;
     /// `None` if unsupported by this adapter (the TS "optional" `stopContainer`/`attachOutput`).
     async fn stop_container(&self, _command: &ServiceCommand, _on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
         None
@@ -156,7 +184,8 @@ pub trait PreparationAdapter: Send + Sync {
 }
 
 /// One process holding a TCP listen socket on a catalog port — what `port_in_use` reports only as
-/// a bool. `pgid`/`command` describe it for the "held by pid N (`cmd`)" refusal/prompt text;
+/// a bool. `command` is the raw command line (not a fingerprint hash) for the "held by pid N
+/// (`cmd`)" refusal/prompt text the user decides whether to kill on;
 /// `start_identity` is the `ps lstart` value the pid-reuse guard compares before signalling, so a
 /// holder whose pid was recycled between resolve and kill can never pull an unrelated tree in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +228,7 @@ pub trait SupervisorClock: Send + Sync {
     async fn sleep(&self, millis: i64);
 }
 
-pub struct SystemClock;
+pub(crate) struct SystemClock;
 #[async_trait]
 impl SupervisorClock for SystemClock {
     fn now_millis(&self) -> i64 {

@@ -1,5 +1,4 @@
-//! Whole-process-tree signalling — port of `ProcessSupervisor.processTree`/`processTreeAlive`/
-//! `signalProcessTree` from `src/core/supervisor.ts`.
+//! Whole-process-tree signalling logic.
 //!
 //! **Sharp edge (AGENTS.md)**: stopping a service must signal its *whole process tree*, snapshotted
 //! from `ps` *before* the first signal: a wrapper (e.g. `air`) can run the real long-lived server in
@@ -7,7 +6,8 @@
 //! its port. The snapshot is only walked when the OS table still shows the recorded `start_identity`
 //! for the leader pid, so a stale/reused pid can never pull an unrelated live tree into a signal or
 //! into the wait-for-death loop. This module is pure parsing/graph logic — no process spawning or
-//! signalling happens here; see `default_adapters.rs` for the `ps`/`kill` shell-outs that feed it.
+//! signalling happens here: `ProcessAdapter::process_tree`/`live_start_identities` feed it (the `ps`
+//! shell-outs live in `default_adapters.rs`), and the engine's `signal_process_tree` acts on it.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
@@ -218,7 +218,7 @@ mod tests {
     }
 }
 
-// Real OS-level regression test — port of `test/core/terminate-tree-regression.test.ts`. Spawns a
+// Real OS-level regression test. Spawns a
 // shell that backgrounds a job into its own process group (mirroring `air` handing its built server
 // its own pgid), then proves the tree-walk-and-signal logic actually kills it. This is the live
 // oracle for the whole-process-tree sharp edge; it exercises real `ps`/real signals, not a stub.

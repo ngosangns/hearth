@@ -7,12 +7,8 @@ import XCTest
 @testable import HearthApp
 
 final class ManagerClientTests: XCTestCase {
-    private func makeClient() -> ManagerClient {
-        let connection = ManagerConnection(
-            instanceId: "test", port: 50101, token: "tok3n", protocolVersion: 1,
-            runtimeDirectory: "/tmp/x/.hearth/runtime-v1", root: "/tmp/x"
-        )
-        return ManagerClient(connection: connection)
+    private func makeClient(protocolVersion: Int = ManagerClient.supportedProtocolVersion) -> ManagerClient {
+        ManagerClient(connection: ManagerConnection(port: 50101, token: "tok3n", protocolVersion: protocolVersion))
     }
 
     func testRequestPutsQueryStringInTheURLQueryNotThePath() {
@@ -32,6 +28,13 @@ final class ManagerClientTests: XCTestCase {
         let request = makeClient().request("/v1/services")
         XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Bearer tok3n")
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-hearth-protocol"), "1")
+    }
+
+    /// The header states what THIS build speaks — echoing the daemon's value back would let the
+    /// daemon's own compatibility check pass against a client that cannot decode it.
+    func testProtocolHeaderIsTheCompiledInVersionNotTheDaemons() {
+        let request = makeClient(protocolVersion: 99).request("/v1/services")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-hearth-protocol"), String(ManagerClient.supportedProtocolVersion))
     }
 
     func testEventStreamPathKeepsQueryInTheURLQuery() {

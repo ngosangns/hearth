@@ -3,7 +3,8 @@ import SwiftUI
 
 /// An inline (not modal) live log tail for whichever service is selected in `ServiceListView`'s
 /// split view. The `LogController` is owned by `WorkspaceController` and reused when the same
-/// service is focused again — this view only starts/stops its poll loop.
+/// service is focused again — this view only starts/stops its poll loop (at the controller's own
+/// cadence: the daemon log polls slower than a service log).
 struct ServiceLogPanel: View {
     let serviceLabel: String
     /// Optional live state for the badge in the header (nil for the daemon log row).
@@ -27,16 +28,15 @@ struct ServiceLogPanel: View {
                         .lineLimit(1)
                 }
                 IconActionButton("Copy the visible log buffer", systemImage: "doc.on.doc") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(log.text, forType: .string)
+                    Pasteboard.copy(log.text)
                 }
-                .disabled(log.text.isEmpty)
+                .disabled(!log.hasText)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(.bar)
             Divider()
-            LogTextView(text: log.text)
+            LogTextView(log: log)
                 .background(Color(nsColor: .underPageBackgroundColor))
         }
         .onAppear { log.start() }

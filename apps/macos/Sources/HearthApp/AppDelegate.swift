@@ -15,6 +15,28 @@ enum SharedWindow {
     static let id = "shared"
 }
 
+/// Where "Check for Updates…" goes. Derived from a GitHub `SUFeedURL` (`…/owner/repo/releases.atom`)
+/// if the bundle ever declares one again (Sparkle is not linked today, so Info.plist carries none),
+/// else this repo's releases page — one constant, so the toolbar and menu bar cannot disagree.
+enum AppLinks {
+    static let fallbackReleases = URL(string: "https://github.com/ngosangns/hearth/releases")!
+
+    static let releases: URL = {
+        guard let feed = (Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String).flatMap(URL.init(string:)) else {
+            return fallbackReleases
+        }
+        return releasesPage(forFeed: feed) ?? fallbackReleases
+    }()
+
+    /// `https://github.com/<owner>/<repo>/…` → `https://github.com/<owner>/<repo>/releases`; `nil`
+    /// for anything that is not a GitHub repo URL.
+    static func releasesPage(forFeed feed: URL) -> URL? {
+        let parts = feed.pathComponents.filter { $0 != "/" }
+        guard feed.host == "github.com", parts.count >= 2 else { return nil }
+        return URL(string: "https://github.com/\(parts[0])/\(parts[1])/releases")
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// A second instance posts this to ask the already-running one to show a window.
     private static let showWindowNotification = Notification.Name("dev.ngosangns.hearth.show-main-window")

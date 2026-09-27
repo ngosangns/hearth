@@ -16,9 +16,10 @@ pub mod platform;
 pub mod shared;
 pub mod state;
 pub mod supervisor;
+pub mod sync;
 
 pub use catalog::{
-    is_container_command, validate_catalog, CatalogValidation, CommandSpec, ReadinessProbeContext,
+    is_container_command, validate_catalog, CatalogValidation, CommandSpec,
     ReadinessSpec, ServiceBuildProfile, ServiceCatalog, ServiceCommand, ServiceDefinition,
     ServiceId, ServiceKind, ServiceOwnership, ServicePort, ServiceProfiles, ServiceRunProfile,
     StartFailurePolicy,

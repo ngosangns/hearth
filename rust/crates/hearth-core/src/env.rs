@@ -1,5 +1,4 @@
-//! Port of `src/core/env.ts` — resolves the environment a daemon should hand to every process it
-//! spawns. A daemon started from a GUI (Finder/Dock/LaunchAgent, as a desktop app's sidecar would)
+//! Resolves the environment a daemon should hand to every process it spawns. A daemon started from a GUI (Finder/Dock/LaunchAgent, as a desktop app's sidecar would)
 //! inherits a bare `PATH` — none of the login-shell customization (`nvm`, `asdf`, Homebrew, a
 //! project's own `.env`) that a daemon started from an interactive terminal gets for free. A daemon
 //! spawned from a terminal and one spawned from an app should end up running the exact same
@@ -22,21 +21,11 @@ fn login_shell_env_cache() -> &'static Mutex<HashMap<String, HashMap<String, Str
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Parses `env -0` output: NUL-terminated `KEY=VALUE` entries. NUL (unlike newline) cannot occur
+/// inside a value, so multi-line values need no continuation heuristics and the final entry gets no
+/// stray trailing newline.
 fn parse_env_block(text: &str) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    let mut key: Option<String> = None;
-    for raw_line in text.split('\n') {
-        if let Some((k, v)) = split_key_value(raw_line) {
-            env.insert(k.clone(), v);
-            key = Some(k);
-        } else if let Some(k) = &key {
-            // A value containing a literal newline continues on the following line(s).
-            let entry = env.get_mut(k).unwrap();
-            entry.push('\n');
-            entry.push_str(raw_line);
-        }
-    }
-    env
+    text.split('\0').filter_map(split_key_value).collect()
 }
 
 fn split_key_value(line: &str) -> Option<(String, String)> {
@@ -57,26 +46,27 @@ fn split_key_value(line: &str) -> Option<(String, String)> {
 /// sandboxed shell) resolve to `{}` — never panics/errors — so a caller can always fall back to the
 /// process's own environment.
 fn run_login_shell_env(shell: &str, timeout: Duration) -> HashMap<String, String> {
-    let script = format!("printf '%s' '{START_MARKER}'; env; printf '%s' '{END_MARKER}'");
+    let script = format!("printf '%s' '{START_MARKER}'; env -0; printf '%s' '{END_MARKER}'");
     let attempt = (|| -> std::io::Result<HashMap<String, String>> {
-        let child = Command::new(shell)
-            .arg("-ilc")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut command = Command::new(shell);
+        command.arg("-ilc").arg(&script).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        // Its own process group, so the timeout can kill everything the rc files started — a
+        // grandchild (an agent, an `nvm` helper) that inherits stdout would otherwise keep
+        // `wait_with_output` blocked long past the timeout, stalling daemon startup.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn()?;
         let pid = child.id();
         // A channel-based watchdog (not a fixed sleep-then-check-a-flag) so a child that exits well
-        // before `timeout` doesn't force this call to still block for the full timeout duration —
-        // `recv_timeout` returns as soon as the main thread signals completion, mirroring
-        // `clearTimeout(timer)` cancelling a pending JS timer immediately.
+        // before `timeout` doesn't force this call to still block for the full timeout duration.
+        // The shell is only reaped after its stdout closes, so its pid — the group id — cannot have
+        // been recycled while `wait_with_output` is still blocked.
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let watchdog = thread::spawn(move || {
             if done_rx.recv_timeout(timeout).is_err() {
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                 }
             }
         });
@@ -144,9 +134,10 @@ pub fn resolve_login_shell_env(shell: Option<&str>, timeout: Option<Duration>) -
     resolved
 }
 
-/// Test-only escape hatch: `resolve_login_shell_env` memoizes per shell path, which would otherwise
-/// leak a stubbed result across unrelated tests.
-pub fn clear_login_shell_env_cache_for_tests() {
+/// `resolve_login_shell_env` memoizes per shell path, which would otherwise leak a stubbed result
+/// across unrelated tests.
+#[cfg(test)]
+fn clear_login_shell_env_cache_for_tests() {
     login_shell_env_cache().lock().unwrap().clear();
 }
 
@@ -242,24 +233,26 @@ mod tests {
 
     #[test]
     fn parses_a_simple_env_block() {
-        // A trailing newline in the source text produces one trailing empty element from `split('\n')`,
-        // which — faithfully matching the TS port — gets appended as a continuation line onto the last
-        // key's value (`env[key] += "\n" + rawLine`). Real usage never notices this because it's an
-        // internal implementation quirk of splitting on a trailing terminator, not something a caller
-        // observes differently from omitting the trailing newline in the first place.
-        let parsed = parse_env_block("FOO=bar\nBAZ=qux\n");
+        // `env -0` terminates every entry, including the last, with NUL — the last value must not
+        // pick up a stray terminator.
+        let parsed = parse_env_block("FOO=bar\0BAZ=qux\0");
         assert_eq!(parsed.get("FOO"), Some(&"bar".to_string()));
-        assert_eq!(parsed.get("BAZ"), Some(&"qux\n".to_string()));
-
-        let parsed_no_trailing_newline = parse_env_block("FOO=bar\nBAZ=qux");
-        assert_eq!(parsed_no_trailing_newline.get("BAZ"), Some(&"qux".to_string()));
+        assert_eq!(parsed.get("BAZ"), Some(&"qux".to_string()));
+        assert_eq!(parsed.len(), 2);
     }
 
     #[test]
     fn parses_a_value_with_embedded_newlines() {
-        let parsed = parse_env_block("MULTI=line one\nline two\nOTHER=x");
+        let parsed = parse_env_block("MULTI=line one\nline two\0OTHER=x\0");
         assert_eq!(parsed.get("MULTI"), Some(&"line one\nline two".to_string()));
         assert_eq!(parsed.get("OTHER"), Some(&"x".to_string()));
+    }
+
+    #[test]
+    fn a_value_line_that_looks_like_an_assignment_stays_inside_its_value() {
+        let parsed = parse_env_block("SCRIPT=a\nFAKE=b\0");
+        assert_eq!(parsed.get("SCRIPT"), Some(&"a\nFAKE=b".to_string()));
+        assert!(!parsed.contains_key("FAKE"));
     }
 
     #[test]

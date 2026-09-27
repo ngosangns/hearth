@@ -1,7 +1,8 @@
 import Foundation
 
 /// One workspace's live connection state: ensures a daemon, holds the resulting `ManagerClient`, and
-/// watches `/v1/events/stream` (falling back to polling `GET /v1/services`). Owned by
+/// watches `/v1/events/stream` through `EventWatchLoop` (falling back to polling
+/// `GET /v1/services`). Owned by
 /// `WorkspaceControllerRegistry` at the app
 /// level — one per workspace, created and torn down only by its `sync(_:)`, so a connection outlives
 /// the detail view and the menu bar can read live status with no window open.
@@ -28,12 +29,23 @@ final class WorkspaceController: ObservableObject {
 
     let workspace: Workspace
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var services: [ServiceLifecycleState] = []
-    @Published private(set) var catalog: ServiceCatalogSummary?
+    @Published private(set) var services: [ServiceLifecycleState] = [] {
+        didSet { servicesById = Dictionary(services.map { ($0.serviceId, $0) }, uniquingKeysWith: { first, _ in first }) }
+    }
+    @Published private(set) var catalog: ServiceCatalogSummary? {
+        didSet { catalogServices = Dictionary(catalog?.services.map { ($0.id, $0) } ?? [], uniquingKeysWith: { first, _ in first }) }
+    }
     /// Every registered service URL, placeholders resolved by the daemon. Fetched on connect and
     /// after each catalog reload — URLs only change when the catalog does (or the tailnet host does,
     /// which the daemon re-resolves on each request).
-    @Published private(set) var urls: [ResolvedServiceUrl] = []
+    @Published private(set) var urls: [ResolvedServiceUrl] = [] {
+        didSet { urlsByService = Dictionary(grouping: urls, by: \.serviceId) }
+    }
+    /// Lookups the service list renders per row, rebuilt when their source changes rather than
+    /// rescanned for every row on every render.
+    private var catalogServices: [String: CatalogService] = [:]
+    private var urlsByService: [String: [ResolvedServiceUrl]] = [:]
+    private var servicesById: [String: ServiceLifecycleState] = [:]
     /// Hoisted out of the detail view so switching workspaces (which recreates `ServiceListView`)
     /// restores the last focused row and its cached log tail instead of refetching from byte 0.
     @Published var selectedServiceId: String?
@@ -44,7 +56,15 @@ final class WorkspaceController: ObservableObject {
     @Published var lastActionError: String?
 
     private var client: (any ManagerAPI)?
-    private var pollTask: Task<Void, Never>?
+    private lazy var watchLoop = EventWatchLoop(pollInterval: pollInterval, handlers: .init(
+        client: { [weak self] in self?.client },
+        sync: { [weak self] batch in await self?.sync(batch) },
+        isFailed: { [weak self] in
+            if case .failed = self?.phase { return true }
+            return false
+        },
+        reconnect: { [weak self] in await self?.reconnect() }
+    ))
     private let pollInterval: Duration
     private var configWatcher: ConfigFileWatcher?
     /// How `connect()` obtains a client for a project root. Injectable so the connection state
@@ -85,7 +105,6 @@ final class WorkspaceController: ObservableObject {
     }
 
     deinit {
-        pollTask?.cancel()
         configWatcher?.stop()
     }
 
@@ -98,6 +117,9 @@ final class WorkspaceController: ObservableObject {
     /// persisted identities) — so this is the recovery path for a wedged daemon or one still running
     /// an older `hearthd` binary, not a way to restart a service.
     func restartDaemon() async {
+        // Stop the watch loop FIRST: while the old daemon exits its stream errors, and an
+        // in-flight reconnect would otherwise race `establish` into a second, competing `ensure`.
+        watchLoop.stop()
         await establish(using: restarter)
     }
 
@@ -110,8 +132,7 @@ final class WorkspaceController: ObservableObject {
         defer { daemonTransitionInFlight = false }
         do {
             try await stopper(workspace.path)
-            pollTask?.cancel()
-            pollTask = nil
+            watchLoop.stop()
             configWatcher?.stop()
             configWatcher = nil
             dropLogControllers()
@@ -133,6 +154,8 @@ final class WorkspaceController: ObservableObject {
     /// restart clicked twice cannot stack two daemon swaps.
     private func establish(using obtain: @Sendable (String) async throws -> any ManagerAPI) async {
         guard phase != .connecting, !daemonTransitionInFlight else { return }
+        daemonTransitionInFlight = true
+        defer { daemonTransitionInFlight = false }
         phase = .connecting
         do {
             let client = try await obtain(workspace.path)
@@ -142,7 +165,7 @@ final class WorkspaceController: ObservableObject {
             await refreshUrls()
             applyServices(try await client.services())
             phase = .connected
-            startWatching()
+            watchLoop.start()
             if watchesConfigFile {
                 startConfigWatcher()
             }
@@ -151,9 +174,17 @@ final class WorkspaceController: ObservableObject {
         }
     }
 
+    /// The watch loop's recovery path: a daemon that stopped answering was usually replaced
+    /// (CLI `manager restart`, a crash then `ensure`) and now listens on a new port with a new
+    /// token, so the dead client is dropped and `ensure` finds — or starts — the live one.
+    private func reconnect() async {
+        guard phase != .connecting, !daemonTransitionInFlight else { return }
+        client = nil
+        await establish(using: connector)
+    }
+
     func stop() {
-        pollTask?.cancel()
-        pollTask = nil
+        watchLoop.stop()
         configWatcher?.stop()
         configWatcher = nil
         dropLogControllers()
@@ -192,64 +223,27 @@ final class WorkspaceController: ObservableObject {
 
     /// The registered URLs for one service, in catalog order.
     func urls(for serviceId: String) -> [ResolvedServiceUrl] {
-        urls.filter { $0.serviceId == serviceId }
+        urlsByService[serviceId] ?? []
     }
 
-    /// Prefer the daemon's SSE stream (same path as the TUI). If the client cannot stream
-    /// (`watchUnsupported` on fakes / older daemons), fall back to polling `GET /v1/services`.
-    private func startWatching() {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            await self?.runWatchLoop()
-        }
+    func service(_ serviceId: String) -> ServiceLifecycleState? {
+        servicesById[serviceId]
     }
 
-    private func runWatchLoop() async {
-        var after: UInt64?
-        var epoch: String?
-        while !Task.isCancelled {
-            guard let client else { return }
-            do {
-                for try await event in client.watchEvents(after: after, epoch: epoch) {
-                    if Task.isCancelled { return }
-                    switch event {
-                    case .replay(let nextEpoch, let reset, let latest):
-                        epoch = nextEpoch
-                        if reset {
-                            after = latest
-                            await refresh()
-                            await refreshUrls()
-                        }
-                    case .manager(let sequence, let type):
-                        after = sequence
-                        if type == "service.log" { continue }
-                        await refresh()
-                        if type == "manager.catalog-reloaded" {
-                            catalog = try? await client.catalog()
-                            await refreshUrls()
-                        }
-                    }
-                }
-                if Task.isCancelled { return }
-                try await Task.sleep(for: .seconds(1))
-            } catch is CancellationError {
-                return
-            } catch ManagerClientError.watchUnsupported {
-                await pollFallback()
-                return
-            } catch {
-                await refresh()
-                try? await Task.sleep(for: pollInterval)
-            }
-        }
+    /// The catalog's label for a service, else its id.
+    func displayName(for serviceId: String) -> String {
+        catalogServices[serviceId]?.displayName ?? serviceId
     }
 
-    private func pollFallback() async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: pollInterval)
-            if Task.isCancelled { return }
-            await refresh()
-        }
+    var counts: ServiceCounts { ServiceCounts(services) }
+
+    /// What `EventWatchLoop` calls per (coalesced) batch of stream events. The catalog and URLs
+    /// only move on a catalog reload — or on a resync, which may have skipped one.
+    private func sync(_ batch: EventBatch) async {
+        await refresh()
+        guard batch.resync || batch.types.contains("manager.catalog-reloaded"), let client else { return }
+        if let fresh = try? await client.catalog() { catalog = fresh }
+        await refreshUrls()
     }
 
     /// `internal` rather than `private` so a test can step one poll deterministically instead of
@@ -261,7 +255,9 @@ final class WorkspaceController: ObservableObject {
             if case .failed = phase { phase = .connected } // recovered from a transient blip
             applyServices(fresh)
         } catch {
-            phase = .failed(error.localizedDescription)
+            // `.connecting` belongs to `establish` — a late refresh failure must not overwrite it,
+            // or the reconnect guard would fire a second `ensure` mid-transition.
+            if phase != .connecting { phase = .failed(error.localizedDescription) }
         }
     }
 
@@ -321,10 +317,10 @@ final class WorkspaceController: ObservableObject {
     /// Whether the catalog marks this service `disabled: true` — disabled services take no
     /// lifecycle action (start/stop/restart are rejected daemon-side too).
     func isDisabled(_ serviceId: String) -> Bool {
-        catalog?.services.first { $0.id == serviceId }?.isDisabled ?? false
+        catalogServices[serviceId]?.isDisabled ?? false
     }
 
-    /// No bulk-stop endpoint on the daemon (see AGENTS.md's sharp edges) — stops every currently
+    /// No bulk-stop endpoint on the daemon (see `ManagerClient.bulkStart`) — stops every currently
     /// non-stopped service concurrently, client-side, the same way the TUI's `s` "stop all" key does.
     func stopAll() async {
         guard client != nil else { return }

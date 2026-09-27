@@ -1,20 +1,11 @@
-//! Port of `src/tui/index.ts` — boots a terminal app that is just another HTTP+SSE client of the
-//! daemon; it has no direct access to processes.
+//! Boots a terminal app that is just another HTTP+SSE client of the daemon; it has no direct access
+//! to processes. This module owns the real terminal and has no automated coverage.
 //!
-//! **Deliberate deviations from the TS source** (this module cannot be meaningfully unit-tested —
-//! it owns the real terminal and a real reconnect loop — so these are judgment calls made while
-//! porting, not something a test caught):
-//! - No diffing renderer. `pi-tui`'s `TUI`/`ProcessTerminal` do incremental terminal diffing; this
-//!   port does a full clear + redraw every frame via plain ANSI. More flicker-prone under a very
-//!   fast event stream, functionally equivalent otherwise.
-//! - Action dispatch (`start`/`stop`/`restart`/`start all`) runs to completion inline in the same
-//!   event loop that also reads input, instead of the TS source's fire-and-forget
-//!   (`void runAction(...)`) that lets input keep being processed while the request is in flight.
-//!   Rust's single-owner `TuiApp` makes true concurrent mutation awkward without message-passing
-//!   the entire action back in, which isn't worth the complexity for what is already a `busy`-gated,
-//!   typically sub-second HTTP round trip.
-//! - Input comes from `crossterm`'s structured `KeyEvent`/`MouseEvent`, not raw terminal bytes (see
-//!   `actions.rs`'s module doc for why).
+//! - Every frame is a full redraw via plain ANSI — no diffing renderer.
+//! - Action requests (a single POST each) run inline in the event loop, `busy`-gated. Anything
+//!   that can take minutes must not: "start all" only POSTs inline and waits for the bulk
+//!   operation in a spawned task that reports back over the watch channel, so input (`q`,
+//!   Ctrl-C — raw mode disables ISIG) is never blocked behind a build or a readiness timeout.
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,13 +15,14 @@ use crossterm::event::{Event, EventStream, KeyEventKind, MouseButton, MouseEvent
 use futures_util::StreamExt;
 use hearth_cli::{ensure, LocalctlOptions, SpawnDaemon};
 use hearth_core::catalog::ServiceCatalog;
+use hearth_core::state::{ActualServiceState, OperationStatus, ServiceOperationKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::actions::{keyboard_action, TuiAction};
-use crate::client::{refresh_selected_log, ManagerTuiClient, WatchEvent};
+use crate::client::{refresh_selected_log, safe_message, ManagerTuiClient, WatchEvent};
 use crate::screen::{ServiceScreen, ScreenUpdate, Viewport};
-use crate::state::{ActionKind, ServiceKindLookup, TuiFence, TuiState};
+use crate::state::{ServiceKindLookup, TuiFence, TuiState};
 
 const MOUSE_TRACKING_ON: &str = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_TRACKING_OFF: &str = "\x1b[?1006l\x1b[?1000l";
@@ -43,44 +35,48 @@ pub struct RunTuiOptions {
     pub spawn_daemon: SpawnDaemon,
     /// Background reconciliation poll interval; the SSE event stream is the primary update path.
     pub refresh_interval: Duration,
-    /// Looks up a service's `kind` for display. Defaults to a catalog lookup.
-    pub service_kind: Option<ServiceKindLookup>,
-}
-
-fn message(error: &dyn std::error::Error) -> String {
-    error.to_string().chars().map(|c| if c == '\r' || c == '\n' || (c as u32) < 0x20 || c as u32 == 0x7f { ' ' } else { c }).collect()
 }
 
 /// Boots a terminal app that is just another HTTP+SSE client of the daemon. Resolves with an exit
 /// code once the user quits (`q`/Ctrl-C).
 pub async fn run_tui(options: RunTuiOptions) -> i32 {
-    let RunTuiOptions { root, catalog, spawn_daemon, refresh_interval, service_kind } = options;
-    let localctl_options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon, doctor_checks: None };
+    let RunTuiOptions { root, catalog, spawn_daemon, refresh_interval } = options;
+    let localctl_options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon };
     if let Err(error) = ensure(&root, &localctl_options).await {
         eprintln!("{}", error.message);
         return error.exit_code;
     }
 
-    let service_kind_lookup: ServiceKindLookup = service_kind.unwrap_or_else(|| {
-        let lookup_catalog = catalog.clone();
-        Arc::new(move |id: &str| lookup_catalog.services.iter().find(|s| s.id == id).and_then(|s| s.kind))
-    });
+    let lookup_catalog = catalog.clone();
+    let service_kind_lookup: ServiceKindLookup = Arc::new(move |id: &str| lookup_catalog.services.iter().find(|s| s.id == id).and_then(|s| s.kind));
     // Fallback "all" = every service the catalog knows — minus disabled ones, matching how a
     // declared `all` group expands past them at load.
     let all_targets: Vec<String> = catalog.groups.get("all").cloned().unwrap_or_else(|| catalog.services.iter().filter(|s| !s.disabled).map(|s| s.id.clone()).collect());
 
-    let client = ManagerTuiClient::new(root, &localctl_options);
+    let client = ManagerTuiClient::new(root, catalog);
     let (columns, rows) = crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24));
 
-    let mut app = TuiApp { state: TuiState::new(service_kind_lookup), screen: ServiceScreen::new(Viewport { columns, rows }), all_targets, busy: false, disposed: false, columns, rows, urls: Vec::new(), pending_reclaim: None };
+    let cancel = CancellationToken::new();
+    let (tx, rx) = mpsc::channel::<WatchEvent>(256);
+
+    let mut app = TuiApp {
+        state: TuiState::new(service_kind_lookup),
+        screen: ServiceScreen::new(Viewport { columns, rows }),
+        all_targets,
+        busy: false,
+        start_all_pending: false,
+        disposed: false,
+        columns,
+        rows,
+        urls: Vec::new(),
+        pending_reclaim: None,
+        events: tx.clone(),
+    };
 
     let _ = crossterm::terminal::enable_raw_mode();
     let mut stdout = std::io::stdout();
     let _ = write!(stdout, "{MOUSE_TRACKING_ON}");
     let _ = stdout.flush();
-
-    let cancel = CancellationToken::new();
-    let (tx, rx) = mpsc::channel::<WatchEvent>(256);
 
     let watch_future = client.watch(tx, cancel.clone());
     let loop_future = app.event_loop(&client, rx, refresh_interval, cancel.clone());
@@ -97,6 +93,8 @@ struct TuiApp {
     screen: ServiceScreen,
     all_targets: Vec<String>,
     busy: bool,
+    /// A "start all" is waiting in its background task; a second one is refused until it reports.
+    start_all_pending: bool,
     disposed: bool,
     columns: usize,
     rows: usize,
@@ -106,10 +104,12 @@ struct TuiApp {
     /// the user's confirmation to kill the port-holder. Any other key or a selection move clears
     /// it, so a stray Enter can never turn into a kill.
     pending_reclaim: Option<String>,
+    /// The watch channel's sender, for background work (the "start all" wait) to report back on.
+    events: mpsc::Sender<WatchEvent>,
 }
 
 impl TuiApp {
-    async fn event_loop(&mut self, client: &ManagerTuiClient<'_>, mut rx: mpsc::Receiver<WatchEvent>, refresh_interval: Duration, cancel: CancellationToken) -> i32 {
+    async fn event_loop(&mut self, client: &ManagerTuiClient, mut rx: mpsc::Receiver<WatchEvent>, refresh_interval: Duration, cancel: CancellationToken) -> i32 {
         let mut current_fence = TuiFence::default();
         let mut events = EventStream::new();
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + refresh_interval, refresh_interval);
@@ -138,7 +138,7 @@ impl TuiApp {
         0
     }
 
-    async fn handle_watch_event(&mut self, message: WatchEvent, client: &ManagerTuiClient<'_>, current_fence: &mut TuiFence) {
+    async fn handle_watch_event(&mut self, message: WatchEvent, client: &ManagerTuiClient, current_fence: &mut TuiFence) {
         match message {
             WatchEvent::BeginConnection => {
                 *current_fence = self.state.begin_connection();
@@ -183,15 +183,25 @@ impl TuiApp {
                 self.state.notice = format!("Manager unavailable: {msg}");
                 self.draw();
             }
+            WatchEvent::BulkStartFinished(outcome) => {
+                self.start_all_pending = false;
+                self.state.notice = match outcome {
+                    Ok(operation) if operation.status == OperationStatus::Failed => format!("start all failed: {}", safe_message(&operation.error.map(|e| e.message).unwrap_or_else(|| "start all failed".to_string()))),
+                    Ok(_) => "start all: succeeded".to_string(),
+                    Err(error) => format!("start all failed: {}", safe_message(&error)),
+                };
+                self.draw();
+                self.reconcile(client).await;
+            }
         }
     }
 
-    async fn handle_terminal_event(&mut self, event: Event, client: &ManagerTuiClient<'_>) {
+    async fn handle_terminal_event(&mut self, event: Event, client: &ManagerTuiClient) {
         match event {
             Event::Resize(columns, rows) => {
                 self.columns = columns as usize;
                 self.rows = rows as usize;
-                self.screen.invalidate();
+                self.screen.resize(Viewport { columns: self.columns, rows: self.rows });
                 self.draw();
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -214,11 +224,11 @@ impl TuiApp {
                     TuiAction::Quit => self.shutdown(),
                     TuiAction::Up => self.move_selection(-1, client).await,
                     TuiAction::Down => self.move_selection(1, client).await,
-                    TuiAction::StartAll => self.run_all(ActionKind::Start, client).await,
-                    TuiAction::StopAll => self.run_all(ActionKind::Stop, client).await,
-                    TuiAction::Start => self.run_action(ActionKind::Start, self.state.selection.selected_name.clone(), client, false).await,
-                    TuiAction::Stop => self.run_action(ActionKind::Stop, self.state.selection.selected_name.clone(), client, false).await,
-                    TuiAction::Restart => self.run_action(ActionKind::Restart, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::StartAll => self.start_all(client).await,
+                    TuiAction::StopAll => self.stop_all(client).await,
+                    TuiAction::Start => self.run_action(ServiceOperationKind::Start, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::Stop => self.run_action(ServiceOperationKind::Stop, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::Restart => self.run_action(ServiceOperationKind::Restart, self.state.selection.selected_name.clone(), client, false).await,
                     TuiAction::Reclaim => self.reclaim(selected.as_ref(), client).await,
                 }
             }
@@ -229,12 +239,15 @@ impl TuiApp {
     fn handle_wheel(&mut self, row: usize, delta: i64) {
         let rows = self.rows;
         if let Some(service) = self.screen.handle_wheel(row, delta, Some(rows)) {
-            self.state.selection.select(&service);
+            // A selection move disarms a pending reclaim, wheel included.
+            if self.state.selection.select(&service) {
+                self.pending_reclaim = None;
+            }
             self.draw();
         }
     }
 
-    async fn select_service(&mut self, name: &str, client: &ManagerTuiClient<'_>) {
+    async fn select_service(&mut self, name: &str, client: &ManagerTuiClient) {
         self.pending_reclaim = None;
         if !self.state.selection.select(name) {
             return;
@@ -244,7 +257,7 @@ impl TuiApp {
         self.refresh_selected(client, fence).await;
     }
 
-    async fn move_selection(&mut self, delta: i64, client: &ManagerTuiClient<'_>) {
+    async fn move_selection(&mut self, delta: i64, client: &ManagerTuiClient) {
         if !self.state.selection.move_by(delta) {
             return;
         }
@@ -253,7 +266,7 @@ impl TuiApp {
         self.refresh_selected(client, fence).await;
     }
 
-    async fn reconcile(&mut self, client: &ManagerTuiClient<'_>) {
+    async fn reconcile(&mut self, client: &ManagerTuiClient) {
         if self.disposed || self.busy {
             return;
         }
@@ -276,13 +289,13 @@ impl TuiApp {
                 if !self.state.current(fence) {
                     return;
                 }
-                self.state.notice = format!("Manager unavailable: {}", message(&error));
+                self.state.notice = format!("Manager unavailable: {}", safe_message(&error.message));
                 self.draw();
             }
         }
     }
 
-    async fn refresh_selected(&mut self, client: &ManagerTuiClient<'_>, fence: TuiFence) {
+    async fn refresh_selected(&mut self, client: &ManagerTuiClient, fence: TuiFence) {
         if self.state.selection.selected_name.is_empty() {
             if self.state.current(fence) {
                 self.state.log = "No services.".to_string();
@@ -306,7 +319,7 @@ impl TuiApp {
         }
     }
 
-    async fn refresh_operation(&mut self, client: &ManagerTuiClient<'_>, fence: TuiFence) {
+    async fn refresh_operation(&mut self, client: &ManagerTuiClient, fence: TuiFence) {
         let Some(operation_id) = self.state.selection.selected().and_then(|s| s.current_operation_id.clone()) else { return };
         match client.operation(&operation_id).await {
             Ok(operation) => {
@@ -323,71 +336,83 @@ impl TuiApp {
         }
     }
 
-    async fn run_all(&mut self, action: ActionKind, client: &ManagerTuiClient<'_>) {
-        if action == ActionKind::Start {
-            if self.busy {
-                return;
-            }
-            self.busy = true;
-            self.state.notice = "start all…".to_string();
-            self.draw();
-            let outcome: Result<(), String> = async {
-                let operation = client.bulk_start(&self.all_targets).await.map_err(|e| e.message)?;
-                let completed = client.wait_operation(&operation.id).await.map_err(|e| e.message)?;
-                if completed.status == hearth_core::state::OperationStatus::Failed {
-                    return Err(completed.error.map(|e| e.message).unwrap_or_else(|| "start all failed".to_string()));
-                }
-                Ok(())
-            }
-            .await;
-            match outcome {
-                Ok(()) => {
-                    self.state.notice = "start all: succeeded".to_string();
-                    self.draw();
-                    self.reconcile(client).await;
-                }
-                Err(error) => {
-                    self.state.notice = format!("start all failed: {error}");
-                    self.draw();
-                }
-            }
-            self.busy = false;
+    /// POSTs the bulk start inline, then waits for it in a spawned task that reports back as
+    /// `WatchEvent::BulkStartFinished` — the wait can take minutes and must never block input.
+    async fn start_all(&mut self, client: &ManagerTuiClient) {
+        if self.busy || self.start_all_pending {
             return;
         }
+        self.busy = true;
+        self.state.notice = "start all…".to_string();
+        self.draw();
+        let accepted = match client.bulk_start(&self.all_targets).await {
+            Ok(operation) => client.connection().await.map(|connection| (operation, connection)),
+            Err(error) => Err(error),
+        };
+        self.busy = false;
+        match accepted {
+            Ok((operation, connection)) => {
+                self.start_all_pending = true;
+                self.state.notice = format!("start all: {}", operation.id);
+                self.draw();
+                let events = self.events.clone();
+                tokio::spawn(async move {
+                    let outcome = connection.wait(&operation.id, None).await.map_err(|e| e.message);
+                    let _ = events.send(WatchEvent::BulkStartFinished(outcome)).await;
+                });
+            }
+            Err(error) => {
+                self.state.notice = format!("start all failed: {}", safe_message(&error.message));
+                self.draw();
+            }
+        }
+    }
+
+    async fn stop_all(&mut self, client: &ManagerTuiClient) {
         let services: Vec<String> = self.state.selection.services.iter().map(|s| s.name.clone()).collect();
         for service in services {
             if self.disposed {
                 return;
             }
-            self.run_action(action, service, client, false).await;
+            self.run_action(ServiceOperationKind::Stop, service, client, false).await;
         }
     }
 
     /// First press arms the reclaim (the notice names the holder); a second press on the same
     /// service sends `killUnowned`. Arming is per-service — switching rows re-asks.
-    async fn reclaim(&mut self, selected: Option<&crate::state::Service>, client: &ManagerTuiClient<'_>) {
+    async fn reclaim(&mut self, selected: Option<&crate::state::Service>, client: &ManagerTuiClient) {
         let Some(selected) = selected else { return };
         let service = selected.name.clone();
         if self.pending_reclaim.as_deref() != Some(service.as_str()) {
+            // Lifecycle events don't carry `error`, so refresh the row before naming the holder.
+            self.reconcile(client).await;
+            let Some(refreshed) = self.state.selection.services.iter().find(|s| s.name == service && s.state == ActualServiceState::ExternallyOwned) else {
+                self.state.notice = format!("{service} is no longer externally owned");
+                self.draw();
+                return;
+            };
+            let holder = refreshed.error.clone().unwrap_or_else(|| format!("{service} is externally owned"));
             self.pending_reclaim = Some(service.clone());
-            let holder = selected.error.clone().unwrap_or_else(|| format!("{service} is externally owned"));
             self.state.notice = format!("{holder} — press again to kill it and start {service}");
             self.draw();
             return;
         }
         self.pending_reclaim = None;
-        self.run_action(ActionKind::Start, service, client, true).await;
+        self.run_action(ServiceOperationKind::Start, service, client, true).await;
     }
 
-    async fn run_action(&mut self, action: ActionKind, service: String, client: &ManagerTuiClient<'_>, kill_unowned: bool) {
+    async fn run_action(&mut self, action: ServiceOperationKind, service: String, client: &ManagerTuiClient, kill_unowned: bool) {
         if self.busy || service.is_empty() {
             return;
         }
         let fence = self.state.begin_action(&service, action);
         self.busy = true;
-        self.state.notice = format!("{} {service}…", action_verb(action));
+        self.state.notice = format!("{} {service}…", action.as_wire_str());
         self.draw();
-        match client.action(&service, action, kill_unowned).await {
+        let result = client.action(&service, action, kill_unowned).await;
+        // Cleared before the reconcile below, which is a no-op while `busy` is set.
+        self.busy = false;
+        match result {
             Ok(operation) => {
                 if self.state.apply_action(&fence, operation) {
                     self.draw();
@@ -395,12 +420,11 @@ impl TuiApp {
                 }
             }
             Err(error) => {
-                if self.state.apply_action_failure(&fence, &error.message) {
+                if self.state.apply_action_failure(&fence, &safe_message(&error.message)) {
                     self.draw();
                 }
             }
         }
-        self.busy = false;
     }
 
     fn shutdown(&mut self) {
@@ -415,7 +439,9 @@ impl TuiApp {
     /// while it is not — the same rule as `hearthd urls`.
     fn focused_urls(&self) -> Vec<String> {
         let selected = &self.state.selection.selected_name;
-        let running = self.state.selection.services.iter().find(|s| &s.name == selected).is_some_and(|s| matches!(s.state.as_str(), "ready" | "running" | "degraded" | "starting" | "preparing"));
+        let running = self.state.selection.services.iter().find(|s| &s.name == selected).is_some_and(|s| {
+            matches!(s.state, ActualServiceState::Ready | ActualServiceState::Running | ActualServiceState::RunningUnready | ActualServiceState::Starting | ActualServiceState::Preparing)
+        });
         self.urls
             .iter()
             .filter(|u| &u.service_id == selected)
@@ -439,13 +465,5 @@ impl TuiApp {
             let _ = write!(stdout, "{line}\x1b[K\r\n");
         }
         let _ = stdout.flush();
-    }
-}
-
-fn action_verb(action: ActionKind) -> &'static str {
-    match action {
-        ActionKind::Start => "start",
-        ActionKind::Stop => "stop",
-        ActionKind::Restart => "restart",
     }
 }

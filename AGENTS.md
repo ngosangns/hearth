@@ -42,10 +42,12 @@ the fswatch rebuild loop).
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags.
 There is no npm publish. The binary is installed by hand or bundled into the macOS app.
-Pushing a `v*.*.*` tag also runs `.github/workflows/release.yml` on the self-hosted runner:
-`build-app.sh release` → `ditto` zip → `gh release create --generate-notes` (idempotent — a re-run
-uploads `--clobber` over the existing release). The zip is the asset `SUFeedURL`'s releases page
-serves; the app is still ad-hoc signed, so first launch elsewhere needs right-click > Open.
+Pushing a `v*.*.*` tag runs CI, and a successful tag CI run triggers `.github/workflows/release.yml`
+(`workflow_run`, so a red tag never publishes; tag/sha come from `github.event.workflow_run`, not
+`github.ref`) on the self-hosted runner: `build-app.sh release` → `ditto` zip →
+`gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
+release). The zip is served from the repo's GitHub Releases page (`AppLinks.releases` in the app);
+the app is still ad-hoc signed, so first launch elsewhere needs right-click > Open.
 `apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`)
 and runs `swift build` only — its tests need XCTest, which the self-hosted runner lacks.
 
@@ -59,8 +61,10 @@ instances under `~/actions-runner-<repo>` on the Mac mini) is a different physic
 from any dev box here, with the same username.
 
 - **It executes `run:` steps from the runner service's environment, not a login shell**, so a
-  toolchain under `~/.cargo/bin` or Homebrew is not on PATH by default. `ci.yml` resolves cargo's
-  directory into `$GITHUB_PATH` itself — keep that in the workflow.
+  toolchain under `~/.cargo/bin` or Homebrew is not on PATH by default. Both workflows add it via
+  the composite action `.github/actions/toolchain-path` — keep using it.
+- `ci.yml` and `macos-app.yml` skip fork pull requests: the runner shares a user account with
+  other repos' runners.
 - **Its Rust is managed by rustup, whose stable toolchain does not include clippy**, while dev
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
@@ -82,6 +86,11 @@ from any dev box here, with the same username.
 - An adopted identity is kept only while it still answers its readiness probe; an alive-but-
   unresponsive one (air survives its child) is terminated and replaced, rather than re-adopted on
   every start into a permanent `Readiness timed out`.
+- `ProcessAdapter::inspect` is tri-state (`Inspection::Observed|Gone|Unknown`) — a probe that fails
+  to spawn or times out is `Unknown`, and callers must never read it as "gone": a wedged `docker`
+  or `ps` would otherwise let `stop` record `stopped` over a running container and `reconcile` mark
+  a live service `Failed` (spawning a duplicate). Unknown ⇒ stop/terminate fail loudly, `status`
+  and `reconcile` skip, the readiness loop keeps waiting.
 - `ProcessSupervisor.shutdown()` does two passes: an "active state" stop pass, then a reap pass for
   daemon-owned services holding a stale POSIX identity in a non-active state (e.g. `externally-owned`
   after a port conflict). Don't collapse these into one.
@@ -208,15 +217,23 @@ from any dev box here, with the same username.
   `SHARED_CATALOG_URL` serves; `HEARTH_SHARED_CATALOG_URL` overrides it for dev/tests (`file://`
   works for both the catalog and artifact URLs). Catalog URL order: env →
   `~/.hearth/shared/catalog-url` → pinned URL — the file exists because a GUI-launched `smp` daemon
-  doesn't inherit shell env. The repo is private, so the pinned raw URL
-  answers 404 without auth — `remote.rs` embeds the same `catalog.json` (`include_str!`) as the
-  final fallback after the disk cache, which is what actually answers on a fresh install.
+  doesn't inherit shell env. `remote.rs` also embeds the same `catalog.json` (`include_str!`) as the
+  final fallback — a stale disk cache is topped up with any recipe the embedded catalog has that the
+  cache lacks, so recipes added in newer `hearthd` builds still reach machines that cached an old
+  `catalog-url`/`file://` document.
 - Shared MongoDB runs `--replSet rs0` (consumers use transactions — e.g. engreel's
   `WithTransaction`) and `--wiredTigerCacheSizeGB 0.25`; its `provision` payload initiates rs0
   idempotently then writes the project-db marker, which is why the recipe needs the repacked
   mongod+mongosh tarball rather than the bare upstream archive.
 - `POST /v1/shared/attach` blocks through install+start+provision — clients must not use the 10s
   manager timeout for it (`request_with_timeout` with `None`).
+- `POST /v1/shared/remove` refuses (409) an instance that still has project attachments unless
+  `force: true` — it deletes every attached project's data. `hearthd shared remove --force` and the
+  app's attachment-counting confirmation dialog are the sanctioned confirmations, same contract as
+  `killUnowned`. `POST /v1/manager/reload` likewise fails with 409 `stop_failed` and keeps the old
+  catalog when a removed-but-active service can't be stopped. `hearthd shared stop`/`start` exit
+  non-zero when the operation fails. `hearthd doctor` checks the suite's host tools (docker,
+  tailscale, nc, ps, sh) on top of platform + catalog validation.
 
 **Consumers and the `hearthd` binary**
 

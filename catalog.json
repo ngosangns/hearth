@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "Shared-services registry served to smp daemons over HTTPS (see docs/shared-services.md). darwin-arm64 only. Tarballs are built by scripts/catalog/package.sh and published on the catalog-v1 release.",
+  "_comment": "Shared-services registry served to smp daemons over HTTPS (see docs/shared-services.md). darwin-arm64 only. Every artifact is a script: the daemon runs scripts/catalog/pack.sh to build the tarball on demand (nothing is published as a release asset).",
   "services": {
     "redis": {
       "versions": {

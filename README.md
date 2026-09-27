@@ -99,9 +99,13 @@ The shared `nginx` pins `127.0.0.1:18080` + `:18443`; a pf rdr anchor exposes th
 `:80`/`:443` (macOS keeps <1024 privileged for everyone — the redirect is the way around it):
 
 ```bash
-printf 'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80  -> 127.0.0.1 port 18080\n'
-'$(printf 'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 18443\n')' | sudo pfctl -a com.apple/hearth -f - && sudo pfctl -e
-``` A plain attach gets a
+printf '%s\n' \
+  'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80  -> 127.0.0.1 port 18080' \
+  'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 18443' \
+  | sudo pfctl -a com.apple/hearth -f - && sudo pfctl -e
+```
+
+A plain attach gets a
 `/<projectId>/` location + `www/` docroot; an attach with a conf source (dir →
 `conf.d/servers/<projectId>/`, file → `conf.d/servers/<projectId>.conf`) mounts whole server
 blocks into the shared instance — `nginx -t` validates before reload, so a bad drop fails the

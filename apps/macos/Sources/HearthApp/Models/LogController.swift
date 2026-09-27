@@ -1,4 +1,14 @@
+import Combine
 import Foundation
+
+/// One change to a `LogController`'s buffer, in the order it happened — what `LogTextView` applies
+/// to its `NSTextStorage` in place instead of diffing a 256KB string on every poll.
+enum LogDelta: Equatable {
+    /// Replace the whole buffer (log rotated, stale cursor, or a `daemon.log` tail that moved).
+    case reset(String)
+    /// Drop `trimmedUTF16` UTF-16 code units from the head, then append `text`.
+    case append(String, trimmedUTF16: Int)
+}
 
 /// One service's live log tail: polls `GET /v1/logs/:serviceId` on a timer, following the
 /// cursor/generation protocol `hearthd logs` uses (see `ManagerClient.logs`'s doc
@@ -6,7 +16,13 @@ import Foundation
 /// existing cursor instead of refetching the whole buffer.
 @MainActor
 final class LogController: ObservableObject {
-    @Published private(set) var text: String = ""
+    /// The whole displayed buffer — for Copy and tests. Deliberately not `@Published`: views
+    /// follow `deltas`, and republishing the buffer re-rendered the panel on every poll.
+    private(set) var text: String = ""
+    /// Every buffer change, in order. Subscribers seed themselves from `text` first.
+    let deltas = PassthroughSubject<LogDelta, Never>()
+    /// Flips only when the buffer goes empty ↔ non-empty (the Copy button's enabled state).
+    @Published private(set) var hasText = false
     @Published var lastError: String?
     /// Set once the daemon reports `service_not_found` (`GET /v1/logs/:id`) —
     /// the service was removed from the catalog (e.g. a config-file edit + hot-reload) while this
@@ -17,17 +33,23 @@ final class LogController: ObservableObject {
     @Published private(set) var isGone = false
 
     /// Keeps the displayed buffer bounded — this is a live tail view, not a full-log archive.
+    /// Over the cap the head is cut down to `trimTargetBytes`, not to the cap itself, so the next
+    /// few polls append without trimming again.
     private static let maxDisplayedBytes = 262_144
+    private static let trimTargetBytes = 196_608
 
     private let fetch: (Int?, Int?) async throws -> LogSlice
     private var cursor: Int?
     private var generation: Int?
     private var pollTask: Task<Void, Never>?
+    /// `start()`'s default cadence.
+    let pollInterval: Duration
 
     init(client: any ManagerAPI, serviceId: String) {
         self.fetch = { cursor, generation in
             try await client.logs(serviceId: serviceId, cursor: cursor, generation: generation)
         }
+        self.pollInterval = .milliseconds(700)
     }
 
     /// The daemon's own log — the same panel, sourced from `GET /v1/daemon/log` instead of
@@ -35,19 +57,25 @@ final class LogController: ObservableObject {
     /// service because `$` is outside the service-id charset.
     static let daemonServiceId = "$daemon"
 
+    /// Polled less often than a service log: every answer is a fresh 128KB tail, not a cursor delta.
     convenience init(client: any ManagerAPI, daemonLog: Void) {
-        self.init(fetch: { _, _ in try await client.daemonLog() })
+        self.init(fetch: { _, _ in try await client.daemonLog() }, pollInterval: .seconds(2))
     }
 
-    private init(fetch: @escaping (Int?, Int?) async throws -> LogSlice) {
+    private init(fetch: @escaping (Int?, Int?) async throws -> LogSlice, pollInterval: Duration) {
         self.fetch = fetch
+        self.pollInterval = pollInterval
     }
 
-    func start(interval: Duration = .milliseconds(700)) {
+    func start(interval: Duration? = nil) {
         stop()
         isGone = false
+        let interval = interval ?? pollInterval
+        // `self` is re-resolved weakly on every pass — though the strong binding then lasts the
+        // whole pass (sleep included), so a dropped controller ends one interval later at worst.
         pollTask = Task { [weak self] in
-            while let self, !Task.isCancelled, !self.isGone {
+            while !Task.isCancelled {
+                guard let self, !self.isGone else { return }
                 await self.fetchOnce()
                 if self.isGone { return }
                 try? await Task.sleep(for: interval)
@@ -69,7 +97,7 @@ final class LogController: ObservableObject {
     /// Both sides have to be measured in bytes: the cap test counts `utf8.count` while `suffix(n)`
     /// counts Characters, so with multi-byte output the "trimmed" string could still be over the
     /// cap — the condition stayed true on every poll and re-copied the whole string on the main
-    /// actor every 700ms without ever converging. A raw byte suffix can land mid-scalar, so the
+    /// actor on every poll without ever converging. A raw byte suffix can land mid-scalar, so the
     /// leading continuation bytes (`0b10xxxxxx`) are dropped rather than decoded into U+FFFD.
     /// `nonisolated` because it is pure — no reason to hop to the main actor to trim a string.
     nonisolated static func trimmingToByteCount(_ value: String, maxBytes: Int) -> String {
@@ -82,21 +110,40 @@ final class LogController: ObservableObject {
         return String(decoding: bytes[start...], as: UTF8.self)
     }
 
+    private static func bounded(_ value: String) -> String {
+        value.utf8.count > maxDisplayedBytes ? trimmingToByteCount(value, maxBytes: trimTargetBytes) : value
+    }
+
     /// `internal` rather than `private` so a test can step one poll deterministically instead of
     /// waiting on the real timer.
     func fetchOnce() async {
         do {
             let slice = try await fetch(cursor, generation)
-            let next = slice.reset ? slice.data : (slice.data.isEmpty ? text : text + slice.data)
-            // Trim by BYTES on both sides of the comparison. `suffix(n)` counts Characters, so with
-            // any multi-byte log output the trimmed string could still exceed the byte cap — the
-            // condition then stayed true on every poll and re-copied a 256KB+ string on the main
-            // actor every 700ms, forever, without ever converging.
-            let trimmed = next.utf8.count > Self.maxDisplayedBytes ? Self.trimmingToByteCount(next, maxBytes: Self.maxDisplayedBytes) : next
-            if trimmed != text { text = trimmed }
+            if slice.reset {
+                let fresh = Self.bounded(slice.data)
+                if fresh != text {
+                    text = fresh
+                    deltas.send(.reset(fresh))
+                }
+            } else if !slice.data.isEmpty {
+                text.append(slice.data)
+                if text.utf8.count > Self.maxDisplayedBytes {
+                    // `kept` is a suffix of `text` cut on a scalar boundary, so the UTF-16 length
+                    // difference is exactly the head the text view has to delete — unless the cut
+                    // reaches into the slice just appended, which only a full replace can express.
+                    let kept = Self.trimmingToByteCount(text, maxBytes: Self.trimTargetBytes)
+                    let dropped = text.utf16.count - kept.utf16.count
+                    let cutIntoSlice = kept.utf16.count < slice.data.utf16.count
+                    text = kept
+                    deltas.send(cutIntoSlice ? .reset(kept) : .append(slice.data, trimmedUTF16: dropped))
+                } else {
+                    deltas.send(.append(slice.data, trimmedUTF16: 0))
+                }
+            }
+            if hasText == text.isEmpty { hasText = !text.isEmpty }
             cursor = slice.nextCursor
             generation = slice.generation
-            lastError = nil
+            if lastError != nil { lastError = nil }
         } catch ManagerClientError.http(_, "service_not_found", _) {
             isGone = true
             lastError = "This service is no longer in the catalog."

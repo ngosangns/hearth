@@ -1,6 +1,5 @@
-//! Port of `src/core/daemon.ts` — the daemon-*process* glue around a `HearthManager`:
-//! diagnostics logging, the losing-side lock-takeover watch, and `run_daemon`'s signal wiring.
-//! Sibling to `manager.rs` in the TS source; kept as its own top-level module here too.
+//! The daemon-*process* glue around a `HearthManager`: diagnostics logging, the losing-side
+//! lock-takeover watch, and `run_daemon`'s signal and panic wiring.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -167,28 +166,36 @@ impl<M: ShutdownManager + 'static> DaemonLifecycle<M> {
     }
 }
 
-pub async fn terminate_after_manager_shutdown<M: ShutdownManager + 'static>(lifecycle: &DaemonLifecycle<M>, terminate: impl FnOnce(i32)) {
-    lifecycle.wait_for_manager_shutdown().await;
-    terminate(0);
+/// Routes every panic's message and location into `daemon.log` before the default hook runs.
+///
+/// A panic in a spawned task only unwinds that task, and almost every `JoinHandle` here is dropped
+/// (readiness exit watchers, log forwarders, the `axum::serve` task) — so without this, a detached
+/// daemon (stdio ignored) loses the panic entirely, and the daemon keeps running with whatever that
+/// task was responsible for silently gone. Installed once per process.
+pub fn install_panic_log(log: DaemonLog) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            log(&format!("panic in thread '{}': {info}", thread.name().unwrap_or("<unnamed>")));
+            previous(info);
+        }));
+    });
 }
 
 /// Boots a `HearthManager`, wires SIGINT/SIGTERM to a graceful `DaemonLifecycle` shutdown,
 /// and resolves once the manager has fully closed. A raced `ClaimLockError::AlreadyRunning`
 /// (another daemon won the lock claim first) is treated as a clean, silent exit.
 ///
-/// Not a full port of every TS behavior: Node/Bun's global `unhandledRejection`/`uncaughtException`
-/// hooks (logged to `daemon.log` instead of crashing the process) have no direct Rust equivalent —
-/// a panicking spawned task is caught at that task's own `JoinHandle`, not globally. Fire-and-forget
-/// work in this codebase already routes its own errors through `Host::record_background_error`
-/// rather than panicking, so this gap is narrower than it looks; documented here rather than papered
-/// over with a global panic hook that would itself be a divergence from the TS design.
-#[cfg(unix)]
 /// Returns `false` when bootstrap failed, so the caller can exit non-zero. Losing a race to another
 /// daemon is a normal, successful outcome (`true`) — that daemon is now serving this root.
+#[cfg(unix)]
 pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> bool {
     let root = options.root.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
     let runtime_directory = options.runtime_directory.clone().unwrap_or_else(|| crate::paths::resolve_runtime_directory(&root, options.catalog.runtime_directory.as_deref()));
     let log = create_daemon_log(&runtime_directory);
+    install_panic_log(log.clone());
 
     let manager = match bootstrap(options).await {
         Ok(manager) => manager,
@@ -250,7 +257,7 @@ pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> b
         }
     });
 
-    terminate_after_manager_shutdown(&lifecycle, |_code| {}).await;
+    lifecycle.wait_for_manager_shutdown().await;
     true
 }
 

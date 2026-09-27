@@ -27,6 +27,14 @@ enum ManagerClientError: Error, LocalizedError {
 }
 
 final class ManagerClient: ManagerAPI, SharedAPI {
+    /// The daemon wire protocol this build speaks — `PROTOCOL_VERSION` in
+    /// `rust/crates/hearth-core/src/state.rs`. Sent as `x-hearth-protocol` on every request (the
+    /// daemon answers `426 incompatible_protocol` on a mismatch) and checked against the
+    /// `protocolVersion` a `hearthd ... ensure --json` reports before any request is made — see
+    /// `DaemonConnection.decodeConnection`. Echoing the daemon's own value back would make the
+    /// header check pass against a daemon this client cannot actually decode.
+    static let supportedProtocolVersion = 1
+
     private let connection: ManagerConnection
     private let session: URLSession
 
@@ -45,10 +53,6 @@ final class ManagerClient: ManagerAPI, SharedAPI {
 
     func catalog() async throws -> ServiceCatalogSummary {
         try await get("/v1/catalog", as: CatalogResponse.self).catalog
-    }
-
-    func managerInfo() async throws -> ManagerInfo {
-        try await get("/v1/manager", as: ManagerInfo.self)
     }
 
     /// `cursor`/`generation` mirror what `GET /v1/logs/:serviceId` expects — pass
@@ -121,17 +125,18 @@ final class ManagerClient: ManagerAPI, SharedAPI {
         guard (200..<300).contains(http.statusCode) else {
             throw ManagerClientError.http(status: http.statusCode, code: "request_failed", message: "HTTP \(http.statusCode)")
         }
-        var buffer = ""
-        for try await line in bytes.lines {
-            try Task.checkCancellation()
-            buffer += line + "\n"
-            if buffer.utf8.count > SSEParser.maxFrameBytes {
+        // Raw bytes, not `bytes.lines` — see `SSEFrameSplitter` for why lines lose every frame.
+        var splitter = SSEFrameSplitter()
+        for try await byte in bytes {
+            let frame: String?
+            do {
+                frame = try splitter.push(byte)
+            } catch {
                 throw ManagerClientError.decoding(URLError(.dataLengthExceedsMaximum))
             }
-            for frame in SSEParser.takeFrames(from: &buffer) {
-                let trimmed = frame.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.isEmpty || trimmed.hasPrefix(":") { continue }
-                guard let event = SSEParser.parseFrame(frame) else { continue }
+            guard let frame else { continue }
+            try Task.checkCancellation()
+            if let event = SSEParser.parseFrame(frame) {
                 continuation.yield(event)
             }
         }
@@ -167,8 +172,8 @@ final class ManagerClient: ManagerAPI, SharedAPI {
         try await post("/v1/shared/install", body: ["service": service], timeout: 900, as: SharedMutationResponse.self)
     }
 
-    func sharedRemove(service: String) async throws -> SharedMutationResponse {
-        try await post("/v1/shared/remove", body: ["service": service], timeout: 120, as: SharedMutationResponse.self)
+    func sharedRemove(service: String, force: Bool) async throws -> SharedMutationResponse {
+        try await post("/v1/shared/remove", body: ["service": service, "force": force], timeout: 120, as: SharedMutationResponse.self)
     }
 
     // MARK: - Transport
@@ -176,7 +181,7 @@ final class ManagerClient: ManagerAPI, SharedAPI {
     // `appendingPathComponent` percent-encodes `?`/`&` as literal path characters instead of treating
     // them as a query delimiter — a `path` like `/v1/logs/kafka?limit=…` (see `logs()` above) would
     // turn into a request for the path `/v1/logs/kafka%3Flimit=…`, which the daemon's router (matching
-    // on `url.pathname`) 404s as `service_not_found`. Splitting off the query and assigning it via
+    // on the request path) 404s as `service_not_found`. Splitting off the query and assigning it via
     // `percentEncodedQuery` (its values here are already query-safe — numbers and a percent-encoded
     // serviceId) keeps `path` callers passing a plain `"/foo?a=b"` string without needing URLComponents
     // at each call site.
@@ -193,7 +198,7 @@ final class ManagerClient: ManagerAPI, SharedAPI {
         components.percentEncodedQuery = query
         var request = URLRequest(url: components.url!)
         request.setValue("Bearer \(connection.token)", forHTTPHeaderField: "authorization")
-        request.setValue(String(connection.protocolVersion), forHTTPHeaderField: "x-hearth-protocol")
+        request.setValue(String(Self.supportedProtocolVersion), forHTTPHeaderField: "x-hearth-protocol")
         return request
     }
 

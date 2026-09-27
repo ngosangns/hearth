@@ -2,7 +2,7 @@
 //!
 //! `PROTOCOL_VERSION` is bumped on any breaking change to the daemon/TUI/MCP wire protocol or
 //! persisted-state shape; a daemon and a client built against different `PROTOCOL_VERSION`s must
-//! refuse to talk to each other (`x-hearth-protocol` header check in `manager.rs`) rather
+//! refuse to talk to each other (`x-hearth-protocol` header check in `manager/http.rs`) rather
 //! than silently misbehaving.
 use std::collections::HashMap;
 
@@ -32,6 +32,10 @@ pub enum ActualServiceState {
     QueuedStart,
     Preparing,
     Starting,
+    /// Reserved: never produced by this daemon (`kind: process` readiness settles in
+    /// `RunningUnready`). Kept because the wire and `state.json` encodings still accept it — a state
+    /// file written by a predecessor tool may carry it — so removing it is a `PROTOCOL_VERSION` bump.
+    #[doc = "reserved: never produced"]
     Running,
     RunningUnready,
     Ready,
@@ -93,6 +97,20 @@ pub enum ServiceReadiness {
     Failed,
 }
 
+impl ServiceReadiness {
+    /// The kebab-case wire encoding, matching this enum's serde representation.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::NotReady => "not-ready",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [Self::Unknown, Self::NotReady, Self::Ready, Self::Failed];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServiceOperationKind {
@@ -100,6 +118,21 @@ pub enum ServiceOperationKind {
     Stop,
     Restart,
     Status,
+}
+
+impl ServiceOperationKind {
+    /// The kebab-case wire encoding, matching this enum's serde representation — same rule as
+    /// `ActualServiceState::as_wire_str`: never build a client-facing string from `Debug`.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Status => "status",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [Self::Start, Self::Stop, Self::Restart, Self::Status];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +144,20 @@ pub enum OperationStatus {
     Failed,
 }
 
+impl OperationStatus {
+    /// The lowercase wire encoding, matching this enum's serde representation.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [Self::Queued, Self::Running, Self::Succeeded, Self::Failed];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReadinessKind {
@@ -120,6 +167,10 @@ pub enum ReadinessKind {
     Container,
     Tailnet,
     Command,
+    /// Reserved: never produced. There is no custom readiness probe (a closure can't cross the
+    /// YAML/JSON boundary — `command` is the stand-in); the variant stays only so a persisted or
+    /// wire value that carries it still decodes. Removing it is a `PROTOCOL_VERSION` bump.
+    #[doc = "reserved: never produced"]
     Custom,
 }
 
@@ -175,6 +226,36 @@ pub struct DockerContainerIdentity {
 pub enum ProcessIdentity {
     Posix(PosixProcessIdentity),
     Docker(DockerContainerIdentity),
+}
+
+impl ProcessIdentity {
+    pub fn manager_instance_id(&self) -> &str {
+        match self {
+            Self::Posix(p) => &p.manager_instance_id,
+            Self::Docker(d) => &d.manager_instance_id,
+        }
+    }
+
+    pub fn service_id(&self) -> &ServiceId {
+        match self {
+            Self::Posix(p) => &p.service_id,
+            Self::Docker(d) => &d.service_id,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Posix(p) => p.generation,
+            Self::Docker(d) => d.generation,
+        }
+    }
+
+    pub fn command_fingerprint(&self) -> &str {
+        match self {
+            Self::Posix(p) => &p.command_fingerprint,
+            Self::Docker(d) => &d.command_fingerprint,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -412,6 +493,30 @@ mod tests {
         for kind in ReadinessKind::ALL {
             let serde_form = serde_json::to_value(kind).expect("serializable");
             assert_eq!(serde_form.as_str().expect("a string"), kind.as_wire_str(), "as_wire_str drifted from serde for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn wire_encoding_matches_serde_for_every_service_readiness() {
+        for readiness in ServiceReadiness::ALL {
+            let serde_form = serde_json::to_value(readiness).expect("serializable");
+            assert_eq!(serde_form.as_str().expect("a string"), readiness.as_wire_str(), "as_wire_str drifted from serde for {readiness:?}");
+        }
+    }
+
+    #[test]
+    fn wire_encoding_matches_serde_for_every_service_operation_kind() {
+        for kind in ServiceOperationKind::ALL {
+            let serde_form = serde_json::to_value(kind).expect("serializable");
+            assert_eq!(serde_form.as_str().expect("a string"), kind.as_wire_str(), "as_wire_str drifted from serde for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn wire_encoding_matches_serde_for_every_operation_status() {
+        for status in OperationStatus::ALL {
+            let serde_form = serde_json::to_value(status).expect("serializable");
+            assert_eq!(serde_form.as_str().expect("a string"), status.as_wire_str(), "as_wire_str drifted from serde for {status:?}");
         }
     }
 

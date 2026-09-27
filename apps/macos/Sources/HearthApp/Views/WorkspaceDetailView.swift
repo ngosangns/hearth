@@ -50,9 +50,7 @@ struct WorkspaceDetailView: View {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: workspace.path)])
         })
         actions.append(TopBarAction(id: "updates", title: "Check for Updates…", systemImage: "arrow.down.circle") {
-            if let url = URL(string: "https://github.com/gnasdev/hearth/releases") {
-                NSWorkspace.shared.open(url)
-            }
+            NSWorkspace.shared.open(AppLinks.releases)
         })
         return actions
     }
@@ -130,15 +128,8 @@ struct WorkspaceDetailView: View {
                         .labelStyle(.iconOnly)
                 }
                 .help("Workspace actions")
-                .confirmationDialog(
-                    "Stop this project's daemon?",
-                    isPresented: $confirmStopDaemon,
-                    titleVisibility: .visible
-                ) {
-                    Button("Stop Daemon", role: .destructive) { Task { await controller.stopDaemon() } }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text("The daemon and every service it manages will be stopped.")
+                .stopDaemonConfirmation(isPresented: $confirmStopDaemon) {
+                    Task { await controller.stopDaemon() }
                 }
             }
         }
@@ -233,10 +224,10 @@ private struct ServiceListView: View {
                     } else {
                         ForEach(Array(sections.enumerated()), id: \.offset) { _, section in
                             Section {
-                                ForEach(controller.services.filter { section.serviceIds.contains($0.serviceId) }) { service in
+                                ForEach(section.serviceIds.compactMap { controller.service($0) }) { service in
                                     ServiceRow(
                                         service: service,
-                                        label: controller.catalog?.services.first(where: { $0.id == service.serviceId })?.displayName ?? service.serviceId,
+                                        label: controller.displayName(for: service.serviceId),
                                         busy: controller.actionsInFlight.contains(service.serviceId),
                                         disabled: controller.isDisabled(service.serviceId),
                                         urls: controller.urls(for: service.serviceId),
@@ -251,9 +242,7 @@ private struct ServiceListView: View {
                                     // Group actions expand past `disabled: true` members — the
                                     // daemon would skip them in a bulk start anyway.
                                     let enabledIds = section.serviceIds.filter { !controller.isDisabled($0) }
-                                    let allStarted = !enabledIds.isEmpty && enabledIds.allSatisfy { id in
-                                        ["ready", "running"].contains(controller.services.first { $0.serviceId == id }?.displayState ?? "")
-                                    }
+                                    let allStarted = !enabledIds.isEmpty && enabledIds.allSatisfy { controller.service($0)?.isUp ?? false }
                                     if enabledIds.isEmpty {
                                         Text(name)
                                     } else {
@@ -285,10 +274,10 @@ private struct ServiceListView: View {
     @ViewBuilder
     private var logPanel: some View {
         if let selectedServiceId = controller.selectedServiceId, let logController = controller.logController(for: selectedServiceId) {
-            let service = controller.services.first(where: { $0.serviceId == selectedServiceId })
+            let service = controller.service(selectedServiceId)
             let label = selectedServiceId == LogController.daemonServiceId
                 ? "daemon log"
-                : controller.catalog?.services.first(where: { $0.id == selectedServiceId })?.displayName ?? selectedServiceId
+                : controller.displayName(for: selectedServiceId)
             ServiceLogPanel(serviceLabel: label, state: service?.displayState, log: logController)
                 .id(selectedServiceId)
         } else {
@@ -432,8 +421,6 @@ private struct ServiceRow: View {
                 }
             } else {
                 switch service.displayState {
-                case "stopped", "failed":
-                    IconActionButton("Start", systemImage: "play.fill") { onAction(.start, false) }
                 // `orphaned`: the daemon no longer owns the process it recorded (a reused pid, or a
                 // program that replaced it). Start re-runs the catalog's run command; Stop runs its
                 // `stop:` command — or reports why it cannot, which is the only honest answer for a
@@ -441,13 +428,6 @@ private struct ServiceRow: View {
                 case "orphaned":
                     IconActionButton("Start", systemImage: "play.fill") { onAction(.start, false) }
                     IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
-                case "ready", "running", "starting":
-                    IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart, false) }
-                    IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
-                // A service queued behind another operation on the same target stays `queued-start`
-                // until something clears it — without this the row offered no way out of it at all.
-                case "queued":
-                    IconActionButton("Cancel start", systemImage: "xmark") { onAction(.stop, false) }
                 // `externally-owned`: a process this daemon does not own holds the service's port, so
                 // it has no process to kill. "Kill & Start" asks the daemon to terminate that
                 // process (SIGTERM, then SIGKILL) and continue the start — destructive, so it is
@@ -471,9 +451,8 @@ private struct ServiceRow: View {
                         Text(service.error ?? "A process this manager does not own holds the port.")
                     }
                     IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
-                // `stopping` is genuinely in-flight — no extra action, the poll will move it.
                 default:
-                    EmptyView()
+                    LifecycleButtons(state: service.displayState) { onAction($0, false) }
                 }
             }
         }

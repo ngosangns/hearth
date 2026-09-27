@@ -1,5 +1,5 @@
-//! Port of `src/core/doctor.ts` — a thin generic engine (tcp probe / command-exec probe /
-//! path-exists probe) driving a caller-supplied check list. Nothing project-specific belongs here.
+//! A thin generic engine (tcp probe / command-exec probe / path-exists probe) driving a
+//! caller-supplied check list. Nothing project-specific belongs here.
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
@@ -46,7 +46,10 @@ pub struct DefaultDoctorAdapter;
 
 impl DoctorAdapter for DefaultDoctorAdapter {
     fn command(&self, command: &str, args: &[String]) -> CommandResult {
-        match Command::new(command).args(args).output() {
+        // `command -v`-style checks must see the daemon's own PATH — the caller's bare launchd
+        // PATH lacks the tool dirs `env::with_known_tool_directories` appends.
+        let path = crate::env::with_known_tool_directories(std::env::var_os("PATH").as_deref(), std::env::var_os("HOME").as_deref());
+        match Command::new(command).args(args).env("PATH", path).output() {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);

@@ -1,4 +1,4 @@
-//! Port of `src/core/file-io.ts` — two interchangeable strategies for every lock/state/log file
+//! Two interchangeable strategies for every lock/state/log file
 //! operation the manager performs, selected by `ServiceCatalog.private_file_guard` (default on):
 //!
 //!  - `guarded`: O_NOFOLLOW + dev/ino identity-tracking, defending against a symlink swapped in
@@ -57,6 +57,17 @@ fn quarantine_suffix_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Writes `content` and flushes it to disk before the caller renames the temp file into place.
+/// Without the `sync_all`, a crash or power loss can leave the rename durable but the data not —
+/// a zero-length `state.json` that is then quarantined, dropping every persisted identity and so
+/// orphaning every running service.
+fn write_durably(file: &mut fs::File, content: &str) -> Result<()> {
+    use std::io::Write;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
@@ -110,18 +121,21 @@ impl FileIo for PlainFileIo {
             plain_ensure_directory(parent)?;
         }
         let temp = temp_path(path);
-        {
-            use std::io::Write;
+        let result = (|| -> Result<()> {
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
                 .open(&temp)?;
-            file.write_all(content.as_bytes())?;
+            write_durably(&mut file, content)?;
+            fs::rename(&temp, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
         }
-        fs::rename(&temp, path)?;
-        Ok(())
+        result
     }
 
     fn create_exclusive(&self, path: &Path, content: &str) -> Result<bool> {
@@ -296,10 +310,10 @@ impl FileIo for GuardedFileIo {
             guarded_ensure_directory(parent)?;
         }
         let temp = temp_path(path);
-        {
-            use std::io::Write;
-            let mut file = open_regular(&temp, true, true)?;
-            file.write_all(content.as_bytes())?;
+        let written = open_regular(&temp, true, true).and_then(|mut file| write_durably(&mut file, content));
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
         }
         let result = fs::rename(&temp, path).map_err(FileIoError::from).and_then(|()| {
             if identity(path)?.is_none() {

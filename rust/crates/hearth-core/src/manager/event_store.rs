@@ -1,9 +1,8 @@
-//! Port of `ManagerEventStore` (`src/core/manager.ts`) — a fixed-capacity ring buffer of manager
-//! events with sequence/epoch-based replay semantics. Deliberately simple and HTTP-agnostic (per
-//! the Rust-rewrite plan's risk mitigation for the SSE-backpressure sharp edge): the bounded
-//! per-client queue / drop-and-reset-on-overflow logic lives in the HTTP/SSE layer, built as a thin
-//! adapter on top of this store's plain `subscribe`/`publish`/`replay`.
-use std::collections::HashMap;
+//! `ManagerEventStore` — a fixed-capacity ring buffer of manager events with sequence/epoch-based
+//! replay semantics. Deliberately simple and HTTP-agnostic: the bounded per-client queue /
+//! drop-and-reset-on-overflow logic lives in the HTTP/SSE layer, built as a thin adapter on top of
+//! this store's plain `subscribe`/`publish`/`replay`.
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -29,7 +28,7 @@ pub struct Replay {
 
 struct Inner {
     next_sequence: u64,
-    events: Vec<ManagerEvent>,
+    events: VecDeque<ManagerEvent>,
     listeners: HashMap<u64, EventListener>,
     next_listener_id: u64,
 }
@@ -45,7 +44,7 @@ impl ManagerEventStore {
         Arc::new(Self {
             capacity: capacity.unwrap_or(DEFAULT_EVENT_CAPACITY),
             epoch: epoch.unwrap_or_else(|| Uuid::new_v4().to_string()),
-            inner: Mutex::new(Inner { next_sequence: 1, events: Vec::new(), listeners: HashMap::new(), next_listener_id: 0 }),
+            inner: Mutex::new(Inner { next_sequence: 1, events: VecDeque::new(), listeners: HashMap::new(), next_listener_id: 0 }),
         })
     }
 
@@ -54,10 +53,11 @@ impl ManagerEventStore {
             let mut inner = self.inner.lock().unwrap();
             let event = ManagerEvent { sequence: inner.next_sequence, at: now(), event_type: event_type.to_string(), data };
             inner.next_sequence += 1;
-            inner.events.push(event.clone());
-            if inner.events.len() > self.capacity {
-                let excess = inner.events.len() - self.capacity;
-                inner.events.drain(0..excess);
+            // A `VecDeque` so evicting the oldest event is O(1), not a shift of the whole buffer on
+            // every publish once it is full.
+            inner.events.push_back(event.clone());
+            while inner.events.len() > self.capacity {
+                inner.events.pop_front();
             }
             let listeners: Vec<_> = inner.listeners.values().cloned().collect();
             (event, listeners)
@@ -85,13 +85,14 @@ impl ManagerEventStore {
         })
     }
 
-    pub fn subscriber_count(&self) -> usize {
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
         self.inner.lock().unwrap().listeners.len()
     }
 
     pub fn replay(&self, after_sequence: Option<u64>, epoch: Option<&str>) -> Replay {
         let inner = self.inner.lock().unwrap();
-        let oldest_sequence = inner.events.first().map(|e| e.sequence).unwrap_or(inner.next_sequence);
+        let oldest_sequence = inner.events.front().map(|e| e.sequence).unwrap_or(inner.next_sequence);
         let latest_sequence = inner.next_sequence.saturating_sub(1);
         let epoch_mismatch = epoch.is_some_and(|e| e != self.epoch);
         let out_of_range = after_sequence.is_some_and(|after| {
@@ -104,7 +105,7 @@ impl ManagerEventStore {
         // client with a stale cursor no way to recover — it saw `reset: true` and no events.
         let events = match after_sequence {
             Some(after) if !reset => inner.events.iter().filter(|e| e.sequence > after).cloned().collect(),
-            _ => inner.events.clone(),
+            _ => inner.events.iter().cloned().collect(),
         };
         Replay { epoch: self.epoch.clone(), reset, events, latest_sequence }
     }

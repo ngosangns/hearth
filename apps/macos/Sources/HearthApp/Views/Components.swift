@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The one place that maps a service/instance state string to a color — service rows, sidebar
@@ -105,5 +106,73 @@ struct ErrorBanner: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.red.opacity(0.12))
+    }
+}
+
+/// The general pasteboard, as every Copy button uses it.
+enum Pasteboard {
+    static func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+/// The lifecycle buttons for a (display-collapsed) state that both a service row and a shared
+/// instance share: Start from rest, Restart+Stop while up, Cancel for a queued start. States with
+/// their own affordances (`orphaned`, `external`) are handled by the caller before this.
+struct LifecycleButtons: View {
+    let state: String
+    let onAction: (ManagerAction) -> Void
+
+    var body: some View {
+        switch state {
+        case "stopped", "failed":
+            IconActionButton("Start", systemImage: "play.fill") { onAction(.start) }
+        case "ready", "running", "starting":
+            IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart) }
+            IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop) }
+        // A service queued behind another operation on the same target stays `queued-start`
+        // until something clears it — without this the row offered no way out of it at all.
+        case "queued":
+            IconActionButton("Cancel start", systemImage: "xmark") { onAction(.stop) }
+        // `stopping` is genuinely in-flight — no extra action, the poll will move it.
+        default:
+            EmptyView()
+        }
+    }
+}
+
+/// "Stop Daemon…" takes the daemon AND every service it manages down, so every surface confirms it
+/// with the same words.
+enum StopDaemonConfirmation {
+    static let title = "Stop this project's daemon?"
+    static let message = "The daemon and every service it manages will be stopped."
+    static let confirmLabel = "Stop Daemon"
+
+    /// A modal alert, for the menu bar: `.menuBarExtraStyle(.menu)` renders its content as
+    /// `NSMenu` items, which have no window to host a `confirmationDialog` — one attached there
+    /// never appears, and the stop it guards could never be confirmed.
+    @MainActor
+    static func runModal(workspaceName: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = "\(workspaceName): \(message)"
+        alert.addButton(withTitle: confirmLabel).hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+}
+
+extension View {
+    /// The in-window form of `StopDaemonConfirmation`.
+    func stopDaemonConfirmation(isPresented: Binding<Bool>, onConfirm: @escaping () -> Void) -> some View {
+        confirmationDialog(StopDaemonConfirmation.title, isPresented: isPresented, titleVisibility: .visible) {
+            Button(StopDaemonConfirmation.confirmLabel, role: .destructive, action: onConfirm)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(StopDaemonConfirmation.message)
+        }
     }
 }

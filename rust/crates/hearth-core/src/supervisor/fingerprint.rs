@@ -1,5 +1,4 @@
-//! Command fingerprinting — port of `normalizeCommandFingerprint`/`normalizeObservedCommandFingerprint`
-//! from `src/core/supervisor.ts`.
+//! Command fingerprinting — the identity hash a managed process is re-recognized by across restarts.
 //!
 //! **Sharp edge (AGENTS.md)**: `normalize_command_fingerprint` must hash the *logical* command text
 //! (argv joined, or the bare `shell` string) — never the physical `sh -c` spawn wrapper — so it
@@ -58,7 +57,6 @@ pub fn normalize_observed_command_fingerprint(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn argv_command(argv: &[&str]) -> ServiceCommand {
         ServiceCommand {
@@ -137,20 +135,14 @@ mod tests {
         assert!(!exec);
     }
 
-    // Exercises the exact stable-exec-fingerprint scenario `supervisor.test.ts` names: a shell
-    // wrapper's own fingerprint (the `sh -c ...` line as `ps` shows it *before* exec) differs from
-    // the execed program's fingerprint, and only the post-exec one should ever match the logical one.
+    // A shell wrapper observed before exec completes (`/bin/sh -c exec sleep 30` in `ps`) normalizes
+    // to the same fingerprint as the logical command: the `sh -c` prefix-stripping applies to the
+    // wrapper line itself, so it is not mistaken for a foreign process.
     #[test]
-    fn pre_exec_wrapper_fingerprint_does_not_match_the_logical_fingerprint() {
+    fn pre_exec_wrapper_fingerprint_matches_the_logical_fingerprint() {
         let command = shell_command("exec sleep 30", Some(true));
         let logical = normalize_command_fingerprint(&command);
-        // Before exec completes, `ps` would show the literal wrapper invocation, unstripped by our
-        // prefix regex because "exec sleep 30" itself starts the shell's argument, not another sh -c.
         let pre_exec_observed = normalize_observed_command_fingerprint("/bin/sh -c exec sleep 30");
-        assert_eq!(logical, pre_exec_observed); // stripping still applies to the sh -c wrapper itself
-        let mut seen = HashMap::new();
-        seen.insert("logical", logical);
-        seen.insert("pre_exec", pre_exec_observed);
-        assert_eq!(seen["logical"], seen["pre_exec"]);
+        assert_eq!(logical, pre_exec_observed);
     }
 }

@@ -10,6 +10,8 @@ final class WorkspaceStore: ObservableObject {
     @Published var selectedId: UUID? {
         didSet { UserDefaults.standard.set(selectedId?.uuidString, forKey: Self.selectionKey) }
     }
+    /// Why `workspaces.json` could not be read. The sidebar shows it until dismissed.
+    @Published private(set) var loadError: String?
 
     private static let selectionKey = "selectedWorkspaceId"
 
@@ -33,7 +35,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     /// ISO8601, not `JSONDecoder`'s default (seconds since the 2001 reference date) — matches the
-    /// ISO8601 timestamps this package's daemon itself uses everywhere (`state.ts`), and keeps
+    /// ISO8601 timestamps the daemon itself uses everywhere (`rust/crates/hearth-core/src/state.rs`), and keeps
     /// `workspaces.json` actually readable by hand, per this type's own doc comment above.
     private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -47,9 +49,31 @@ final class WorkspaceStore: ObservableObject {
         return encoder
     }()
 
+    /// A file that exists but does not decode is moved aside, not read as `[]`: the next `save()`
+    /// would otherwise overwrite the user's list with the empty one.
     private func load() {
         guard let data = try? Data(contentsOf: fileURL) else { return }
-        workspaces = (try? Self.decoder.decode([Workspace].self, from: data)) ?? []
+        do {
+            workspaces = try Self.decoder.decode([Workspace].self, from: data)
+        } catch {
+            let stamp = Int(Date().timeIntervalSince1970)
+            let aside = fileURL.deletingLastPathComponent().appendingPathComponent("\(fileURL.lastPathComponent).corrupt-\(stamp)")
+            if (try? FileManager.default.moveItem(at: fileURL, to: aside)) != nil {
+                loadError = "\(fileURL.lastPathComponent) could not be read and was moved to \(aside.path). Starting with an empty workspace list."
+            } else {
+                loadError = "\(fileURL.lastPathComponent) could not be read: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func dismissLoadError() {
+        loadError = nil
+    }
+
+    /// One spelling per folder: a trailing `/`, `.`/`..` segments or a symlinked path must not
+    /// register the same daemon twice.
+    static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     private func save() {
@@ -58,10 +82,12 @@ final class WorkspaceStore: ObservableObject {
     }
 
     /// No-op (returns the existing entry) if `path` is already a workspace — adding the same folder
-    /// twice should never produce two independent connections to the same daemon.
+    /// twice should never produce two independent connections to the same daemon. `path` must be
+    /// absolute (see `handleOpenURL`); it is stored normalized.
     @discardableResult
     func add(path: String) -> Workspace {
-        if let existing = workspaces.first(where: { $0.path == path }) {
+        let path = Self.normalizedPath(path)
+        if let existing = workspaces.first(where: { Self.normalizedPath($0.path) == path }) {
             selectedId = existing.id
             return existing
         }
@@ -79,13 +105,14 @@ final class WorkspaceStore: ObservableObject {
     }
 
     /// `hearth://open?path=/abs/folder` — adds the folder if needed and selects it.
-    /// Does not auto-trust; the trust prompt still gates the first daemon spawn.
+    /// Does not auto-trust; the trust prompt still gates the first daemon spawn. A relative path is
+    /// rejected: it would resolve against whatever this process's cwd happens to be.
     func handleOpenURL(_ url: URL) {
         guard url.scheme == "hearth" else { return }
         guard url.host == "open" else { return }
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let path = components.queryItems?.first(where: { $0.name == "path" })?.value,
-              !path.isEmpty else { return }
+              (path as NSString).expandingTildeInPath.hasPrefix("/") else { return }
         _ = add(path: path)
     }
 

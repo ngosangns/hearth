@@ -1,11 +1,11 @@
-//! Port of `src/tui/state.ts` — pure TUI state (no terminal, no network), driven entirely through
+//! Pure TUI state (no terminal, no network), driven entirely through
 //! the connection/request/selection fence counters so a stale async response can never overwrite
 //! state a newer request/selection has already superseded.
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use hearth_core::catalog::ServiceKind;
-use hearth_core::state::{ActualServiceState, Operation, OperationStatus, ServiceLifecycleState};
+use hearth_core::state::{ActualServiceState, Operation, ServiceLifecycleState, ServiceOperationKind};
 
 /// Looks up a service's `kind` for display — pass the consumer's `ServiceCatalog` lookup, or a
 /// closure returning `None` for no kind badges.
@@ -19,7 +19,7 @@ pub fn no_service_kind() -> ServiceKindLookup {
 pub struct Service {
     pub name: String,
     pub kind: Option<ServiceKind>,
-    pub state: String,
+    pub state: ActualServiceState,
     pub generation: Option<u64>,
     pub current_operation_id: Option<String>,
     /// The daemon's last error for the row — for `externally-owned` it names the port-holder
@@ -34,42 +34,27 @@ pub struct TuiFence {
     pub selection: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionKind {
-    Start,
-    Stop,
-    Restart,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionFence {
     pub fence: TuiFence,
     pub service: String,
-    pub action: ActionKind,
+    pub action: ServiceOperationKind,
 }
 
-fn actual_state_str(state: ActualServiceState) -> &'static str {
+/// The label the TUI shows for a state: the wire string, except `running-unready` reads as
+/// `degraded`.
+pub fn display_state(state: ActualServiceState) -> &'static str {
     match state {
-        ActualServiceState::Stopped => "stopped",
-        ActualServiceState::QueuedStart => "queued-start",
-        ActualServiceState::Preparing => "preparing",
-        ActualServiceState::Starting => "starting",
-        ActualServiceState::Running => "running",
-        ActualServiceState::RunningUnready => "running-unready",
-        ActualServiceState::Ready => "ready",
-        ActualServiceState::Stopping => "stopping",
-        ActualServiceState::Failed => "failed",
-        ActualServiceState::Orphaned => "orphaned",
-        ActualServiceState::ExternallyOwned => "externally-owned",
+        ActualServiceState::RunningUnready => "degraded",
+        other => other.as_wire_str(),
     }
 }
 
 pub fn service_from_lifecycle(service: &ServiceLifecycleState, service_kind: &ServiceKindLookup) -> Service {
-    let state = if service.actual_state == ActualServiceState::RunningUnready { "degraded".to_string() } else { actual_state_str(service.actual_state).to_string() };
     Service {
         name: service.service_id.clone(),
         kind: service_kind(&service.service_id),
-        state,
+        state: service.actual_state,
         generation: Some(service.generation),
         current_operation_id: service.current_operation_id.clone(),
         error: service.error.clone(),
@@ -78,9 +63,7 @@ pub fn service_from_lifecycle(service: &ServiceLifecycleState, service_kind: &Se
 
 pub const DEFAULT_LOG_TAIL_LIMIT: usize = 16 * 1024;
 
-/// Keeps only the last `limit` *characters* (Unicode scalar values) of `current` + `next` — the TS
-/// source measures UTF-16 code units instead, so this diverges only for text containing characters
-/// outside the Basic Multilingual Plane, which real process log output essentially never contains.
+/// Keeps only the last `limit` *characters* (Unicode scalar values) of `current` + `next`.
 pub fn bounded_tail(current: &str, next: &str, limit: usize) -> String {
     let combined = format!("{current}{next}");
     let char_count = combined.chars().count();
@@ -187,7 +170,7 @@ impl TuiState {
         self.fence()
     }
 
-    pub fn begin_action(&mut self, service: &str, action: ActionKind) -> ActionFence {
+    pub fn begin_action(&mut self, service: &str, action: ServiceOperationKind) -> ActionFence {
         ActionFence { fence: self.begin_request(), service: service.to_string(), action }
     }
 
@@ -258,19 +241,14 @@ impl TuiState {
     }
 
     pub fn apply_action(&mut self, fence: &ActionFence, operation: Operation) -> bool {
-        let expected_action = match fence.action {
-            ActionKind::Start => hearth_core::state::ServiceOperationKind::Start,
-            ActionKind::Stop => hearth_core::state::ServiceOperationKind::Stop,
-            ActionKind::Restart => hearth_core::state::ServiceOperationKind::Restart,
-        };
-        if !self.current_action(fence) || operation.service_id.as_deref() != Some(fence.service.as_str()) || operation.action != Some(expected_action) {
+        if !self.current_action(fence) || operation.service_id.as_deref() != Some(fence.service.as_str()) || operation.action != Some(fence.action) {
             return false;
         }
         self.operation = Some(operation);
-        if fence.action == ActionKind::Start {
+        if fence.action == ServiceOperationKind::Start {
             self.clear_log(&fence.service);
         }
-        self.notice = format!("{} {}: {}", action_str(fence.action), fence.service, self.operation.as_ref().unwrap().id);
+        self.notice = format!("{} {}: {}", fence.action.as_wire_str(), fence.service, self.operation.as_ref().unwrap().id);
         true
     }
 
@@ -278,7 +256,7 @@ impl TuiState {
         if !self.current_action(fence) {
             return false;
         }
-        self.notice = format!("{} {} failed: {error}", action_str(fence.action), fence.service);
+        self.notice = format!("{} {} failed: {error}", fence.action.as_wire_str(), fence.service);
         true
     }
 
@@ -290,8 +268,13 @@ impl TuiState {
         if let Some(service_id) = service_id {
             if event_type == "service.lifecycle" {
                 if let Some(service) = self.selection.services.iter_mut().find(|s| s.name == service_id) {
-                    if let Some(actual_state) = data.get("actualState").and_then(|v| v.as_str()) {
-                        service.state = if actual_state == "running-unready" { "degraded".to_string() } else { actual_state.to_string() };
+                    if let Some(actual_state) = data.get("actualState").and_then(|v| serde_json::from_value::<ActualServiceState>(v.clone()).ok()) {
+                        service.state = actual_state;
+                    }
+                    // Lifecycle events carry no `error` today; honour one if a daemon sends it,
+                    // otherwise the next snapshot refreshes it.
+                    if let Some(error) = data.get("error") {
+                        service.error = error.as_str().map(str::to_string);
                     }
                     if let Some(generation) = data.get("generation").and_then(|v| v.as_u64()) {
                         service.generation = Some(generation);
@@ -305,10 +288,10 @@ impl TuiState {
 
     pub fn detail(&self) -> String {
         let Some(service) = self.selection.selected() else { return "No services.".to_string() };
-        let mut parts = vec![format!("state={}", service.state), format!("generation={}", service.generation.unwrap_or(0))];
+        let mut parts = vec![format!("state={}", display_state(service.state)), format!("generation={}", service.generation.unwrap_or(0))];
         if let Some(operation) = &self.operation {
             if operation.service_id.as_deref() == Some(service.name.as_str()) {
-                parts.push(format!("operation={} {}", operation.id, operation_status_str(operation.status)));
+                parts.push(format!("operation={} {}", operation.id, operation.status.as_wire_str()));
                 parts.extend(operation.trace.iter().map(|entry| format!("{} {}", entry.at, entry.message)));
                 if let Some(error) = &operation.error {
                     parts.push(format!("operation error={}", error.message));
@@ -332,27 +315,10 @@ impl TuiState {
     }
 }
 
-fn action_str(action: ActionKind) -> &'static str {
-    match action {
-        ActionKind::Start => "start",
-        ActionKind::Stop => "stop",
-        ActionKind::Restart => "restart",
-    }
-}
-
-fn operation_status_str(status: OperationStatus) -> &'static str {
-    match status {
-        OperationStatus::Queued => "queued",
-        OperationStatus::Running => "running",
-        OperationStatus::Succeeded => "succeeded",
-        OperationStatus::Failed => "failed",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hearth_core::state::{DesiredServiceState, ServiceReadiness};
+    use hearth_core::state::{DesiredServiceState, OperationStatus, ServiceReadiness};
 
     fn service() -> ServiceLifecycleState {
         ServiceLifecycleState {
@@ -409,7 +375,7 @@ mod tests {
         s.generation = 0;
         assert!(state.apply_snapshot(fence, &[s]));
         let selected = state.selection.selected().unwrap();
-        assert_eq!(selected.state, "queued-start");
+        assert_eq!(selected.state, ActualServiceState::QueuedStart);
         assert_eq!(selected.generation, Some(0));
         assert!(state.detail().contains("state=queued-start"));
     }
@@ -420,12 +386,27 @@ mod tests {
         let fence = state.begin_connection();
         state.apply_snapshot(fence, &[service()]);
         state.apply_log(fence, "metadata", &LogSlice { data: "old output\n".to_string(), generation: 1, next_cursor: 11, reset: false });
-        let action = state.begin_action("metadata", ActionKind::Start);
+        let action = state.begin_action("metadata", ServiceOperationKind::Start);
         assert!(state.apply_action(&action, operation()));
         assert_eq!(state.log, "No log yet.");
         let cursor = state.log_cursor("metadata");
         assert_eq!(cursor.cursor, Some(11));
         assert_eq!(cursor.generation, Some(1));
+    }
+
+    #[test]
+    fn shows_running_unready_as_degraded_and_follows_lifecycle_events() {
+        let mut state = TuiState::new(no_service_kind());
+        let fence = state.begin_connection();
+        let mut s = service();
+        s.actual_state = ActualServiceState::RunningUnready;
+        state.apply_snapshot(fence, &[s]);
+        assert!(state.detail().contains("state=degraded"));
+        let event = serde_json::json!({ "serviceId": "metadata", "actualState": "externally-owned", "error": "Port 1 is held by pid 2 (nc)" });
+        assert!(state.apply_event(fence, "service.lifecycle", event.as_object().unwrap()));
+        let selected = state.selection.selected().unwrap();
+        assert_eq!(selected.state, ActualServiceState::ExternallyOwned);
+        assert_eq!(selected.error.as_deref(), Some("Port 1 is held by pid 2 (nc)"));
     }
 
     #[test]

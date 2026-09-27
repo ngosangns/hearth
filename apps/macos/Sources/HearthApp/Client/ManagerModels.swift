@@ -1,22 +1,20 @@
 // Swift mirrors of the wire shapes `hearth-core` (rust/crates/hearth-core/src/state.rs,
 // rust/crates/hearth-core/src/manager/) sends over HTTP+SSE. Kept intentionally permissive (lots of
 // optional fields, no strict enums for `identity`'s POSIX/Docker union) rather than a byte-for-byte
-// port of the TS types — this client only needs enough to render status and drive start/stop/restart,
-// and a permissive decode degrades gracefully instead of breaking the whole app on a field this
-// client doesn't know about yet.
+// port of the Rust types — this client only needs enough to render status and drive
+// start/stop/restart, and a permissive decode degrades gracefully instead of breaking the whole app
+// on a field this client doesn't know about yet. Fields nothing reads are deliberately not declared:
+// a non-optional field the daemon stops sending would fail the whole decode for no benefit.
 
 import Foundation
 
 /// What `hearthd manager ensure --json` prints (and `manager restart --json`, which prints the same
-/// shape for the daemon it just started) — see src/cli/localctl.ts's `manager ensure` handler.
-/// This is the entire connection contract a generic (non-Bun) client needs.
+/// shape for the daemon it just started) — see `rust/crates/hearth-cli/src/lib.rs`. The subset of
+/// that output this client uses; `instanceId`/`runtimeDirectory`/`root` are printed too but unread.
 struct ManagerConnection: Codable, Equatable {
-    let instanceId: String
     let port: Int
     let token: String
     let protocolVersion: Int
-    let runtimeDirectory: String
-    let root: String
 
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
 }
@@ -60,12 +58,19 @@ struct ServiceLifecycleState: Codable, Equatable, Identifiable {
             && exitCode == other.exitCode
     }
 
+    var displayState: String { Self.displayState(for: actualState) }
+
+    /// Counted as "up" in every ready/total summary — `ready`, plus `running` (a `kind: process`
+    /// service sits in `running` forever and must not read as a stuck boot).
+    var isUp: Bool { ["ready", "running"].contains(displayState) }
+
     /// A small, display-oriented collapse of `actualState` — the app's analogue of the CLI's
     /// `text_state` (which collapses every in-flight state into `running`).
     /// `running` covers both `running` and `running-unready`: the process is alive but readiness
     /// either isn't probed yet or isn't probeable at all (`kind: process` services sit here
-    /// permanently — showing them as "starting" forever read as a stuck boot).
-    var displayState: String {
+    /// permanently — showing them as "starting" forever read as a stuck boot). Shared instances
+    /// carry the same supervisor states, so `SharedInstance.displayState` goes through here too.
+    static func displayState(for actualState: String?) -> String {
         switch actualState {
         case "ready": return "ready"
         case "queued-start": return "queued"
@@ -76,6 +81,28 @@ struct ServiceLifecycleState: Codable, Equatable, Identifiable {
         case "orphaned": return "orphaned"
         case "externally-owned": return "external"
         default: return "stopped"
+        }
+    }
+}
+
+/// The "ready/total · failed" numbers every summary shows (sidebar row, status strip, menu bar).
+struct ServiceCounts: Equatable {
+    var ready = 0
+    var failed = 0
+    var total = 0
+
+    init() {}
+
+    init(_ services: [ServiceLifecycleState]) {
+        for service in services { add(service) }
+    }
+
+    mutating func add(_ service: ServiceLifecycleState) {
+        total += 1
+        if service.isUp {
+            ready += 1
+        } else if service.displayState == "failed" {
+            failed += 1
         }
     }
 }
@@ -107,7 +134,6 @@ struct CatalogGroupDecl: Codable, Equatable, Identifiable {
 
 struct ServiceCatalogSummary: Codable, Equatable {
     let services: [CatalogService]
-    let groups: [String: [String]]
     var groupTree: [CatalogGroupDecl]? = nil
 
     /// Ordered sections for the service list: each service lands in the first group that lists it
@@ -165,11 +191,6 @@ struct CatalogResponse: Codable {
     let catalog: ServiceCatalogSummary
 }
 
-struct OperationTraceEntry: Codable, Equatable {
-    let at: String
-    let message: String
-}
-
 struct OperationError: Codable, Equatable {
     let code: String
     let message: String
@@ -184,7 +205,6 @@ struct ManagerOperation: Codable, Equatable, Identifiable {
     let status: String
     let createdAt: String
     let updatedAt: String
-    let trace: [OperationTraceEntry]
     let error: OperationError?
 }
 
@@ -192,23 +212,12 @@ struct OperationResponse: Codable {
     let operation: ManagerOperation
 }
 
-struct ManagerInfo: Codable {
-    let protocolVersion: Int
-    let instanceId: String
-    let pid: Int
-    let port: Int
-    let startedAt: String
-    let runtimeDirectory: String
-}
-
 struct LogSlice: Codable {
     let serviceId: String
     let generation: Int
-    let cursor: Int
     let nextCursor: Int
     let data: String
     let reset: Bool
-    let truncated: Bool
 }
 
 struct ManagerErrorEnvelope: Codable {
@@ -254,19 +263,7 @@ struct SharedInstance: Codable, Equatable, Identifiable {
 
     /// Same display collapse as `ServiceLifecycleState.displayState` — the wire states are the
     /// same supervisor states, just nested under `state` here.
-    var displayState: String {
-        switch state?.actualState {
-        case "ready": return "ready"
-        case "queued-start": return "queued"
-        case "running", "running-unready": return "running"
-        case "starting", "preparing": return "starting"
-        case "stopping": return "stopping"
-        case "failed": return "failed"
-        case "orphaned": return "orphaned"
-        case "externally-owned": return "external"
-        default: return "stopped"
-        }
-    }
+    var displayState: String { ServiceLifecycleState.displayState(for: state?.actualState) }
 }
 
 struct SharedInstancesResponse: Codable {

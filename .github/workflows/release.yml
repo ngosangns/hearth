@@ -1,32 +1,42 @@
 name: Release
 
-# Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. CI's rust-test
-# job already runs on the same tag (ci.yml); this workflow builds the ad-hoc-signed Hearth.app and
-# attaches a zip to the GitHub Release that SUFeedURL in Info.plist points at.
+# Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. The tag push
+# runs CI (ci.yml) first; this workflow starts when that CI run completes and only publishes if it
+# succeeded, so a tag whose tests or clippy fail never gets a release asset. It builds the
+# ad-hoc-signed Hearth.app and attaches a zip to the GitHub Release the app's "Check for Updates…"
+# link points at.
+#
+# `workflow_run` always runs this file from the default branch, and `github.ref*` there describe
+# that branch — the tag and commit come from `github.event.workflow_run` instead.
 on:
-  push:
-    tags: ["v*.*.*"]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
   contents: write
 
 jobs:
   macos-app:
+    # For a tag push, `head_branch` is the tag name. CI's other push trigger is `main`, and PR runs
+    # are excluded by the event check.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: [self-hosted, macmini]
     env:
-      APP_ZIP: Hearth-${{ github.ref_name }}-macos.zip
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+      APP_ZIP: Hearth-${{ github.event.workflow_run.head_branch }}-macos.zip
     steps:
       - uses: actions/checkout@v7
-      # Same PATH problem as ci.yml: the runner service doesn't have a login-shell PATH, so cargo
-      # (rustup under ~/.cargo/bin here, Homebrew on dev machines) is absent unless added. Homebrew
-      # bin dirs are added unconditionally because `gh` (used in the publish step) lives there and
-      # the cargo candidate loop exits before appending it.
-      - name: Put toolchain on PATH
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$HOME/.cargo/bin" /opt/homebrew/bin /usr/local/bin >> "$GITHUB_PATH"
-      - name: Check toolchain
-        run: cargo --version && swift --version && gh --version
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      # `gh` (used in the publish step) lives in Homebrew's bin dir, which the runner service's
+      # PATH lacks as well as cargo's.
+      - uses: ./.github/actions/toolchain-path
+        with:
+          tools: cargo swift gh
       - name: Package Hearth.app
         run: apps/macos/scripts/build-app.sh release
       # ditto, not zip(1): preserves the resource forks/quarantine metadata a signed .app needs when
@@ -45,9 +55,9 @@ jobs:
         run: |
           set -euo pipefail
           # Idempotent so a re-run of a failed/partial release job still lands the asset.
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$APP_ZIP" --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APP_ZIP" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "$APP_ZIP" \
-              --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$RELEASE_TAG" "$APP_ZIP" \
+              --title "$RELEASE_TAG" --generate-notes --verify-tag
           fi

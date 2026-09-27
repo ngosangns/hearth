@@ -64,6 +64,21 @@ final class SharedServicesControllerTests: XCTestCase {
         XCTAssertTrue(message.contains("no sidecar"))
     }
 
+    /// `connect()` must not report `.connected` when the first instance fetch failed — a daemon whose
+    /// `/v1/shared` errors showed as connected with an empty list.
+    @MainActor
+    func testConnectFailsWhenTheInstanceFetchFails() async {
+        let api = FakeManagerAPI()
+        api.sharedInstancesHandler = { throw ManagerClientError.http(status: 500, code: "internal", message: "registry unreadable") }
+        api.sharedCatalogHandler = { SharedCatalogDocument(version: 1, services: [:]) }
+        let sut = SharedServicesController(connector: { api })
+
+        await sut.connect()
+
+        guard case .failed(let message) = sut.phase else { return XCTFail("expected failed, got \(sut.phase)") }
+        XCTAssertTrue(message.contains("registry unreadable"))
+    }
+
     /// A `.failed` refresh drops the stale client: a restarted smp listens on a different port with
     /// a new token, so `connect()` must run `ensure` again rather than reuse it.
     @MainActor
