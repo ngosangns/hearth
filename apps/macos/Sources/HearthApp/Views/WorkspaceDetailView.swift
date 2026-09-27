@@ -63,7 +63,7 @@ struct WorkspaceDetailView: View {
     private var visibleTopBarCount: Int {
         let items = topBarActions
         let budget = detailWidth - 300
-        func width(_ item: TopBarAction) -> CGFloat { CGFloat(item.title.count) * 7.5 + 44 }
+        func width(_ item: TopBarAction) -> CGFloat { CGFloat(item.title.count) * 7.5 + 56 }
         if items.reduce(0, { $0 + width($1) }) <= budget { return items.count }
         var used: CGFloat = 44
         var count = 0
@@ -98,6 +98,7 @@ struct WorkspaceDetailView: View {
                         Label(action.title, systemImage: action.systemImage)
                             .labelStyle(.titleAndIcon)
                     }
+                    .padding(.horizontal, 6)
                     .disabled(action.disabled)
                     .help(action.title)
                 }
