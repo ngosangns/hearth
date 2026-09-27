@@ -318,15 +318,53 @@ final class WorkspaceController: ObservableObject {
         }
     }
 
+    /// Whether the catalog marks this service `disabled: true` — disabled services take no
+    /// lifecycle action (start/stop/restart are rejected daemon-side too).
+    func isDisabled(_ serviceId: String) -> Bool {
+        catalog?.services.first { $0.id == serviceId }?.isDisabled ?? false
+    }
+
     /// No bulk-stop endpoint on the daemon (see AGENTS.md's sharp edges) — stops every currently
     /// non-stopped service concurrently, client-side, the same way the TUI's `s` "stop all" key does.
     func stopAll() async {
         guard client != nil else { return }
-        let targets = services.filter { $0.actualState != "stopped" }.map(\.serviceId)
+        let targets = services.filter { $0.actualState != "stopped" && !isDisabled($0.serviceId) }.map(\.serviceId)
         guard !targets.isEmpty else { return }
+        await stopGroup(targets)
+    }
+
+    /// Group section actions. Start goes through `bulk-start` so the daemon's stop-on-first-failure
+    /// ordering applies; stop mirrors `stopAll` — a client-side loop over the group's members.
+    func startGroup(_ serviceIds: [String]) async {
+        guard let client else { return }
+        for id in serviceIds { beginFlight(id) }
+        defer { for id in serviceIds { endFlight(id) } }
+        do {
+            let accepted = try await client.bulkStart(targets: serviceIds)
+            await refresh()
+            _ = try await client.waitForOperation(id: accepted.id)
+            await refresh()
+        } catch {
+            lastActionError = error.localizedDescription
+            await refresh()
+        }
+    }
+
+    func stopGroup(_ serviceIds: [String]) async {
+        guard client != nil else { return }
         await withTaskGroup(of: Void.self) { group in
-            for serviceId in targets {
+            for serviceId in serviceIds {
                 group.addTask { [weak self] in await self?.perform(.stop, serviceId: serviceId) }
+            }
+        }
+    }
+
+    /// No bulk-restart endpoint either — same client-side loop as `stopGroup`.
+    func restartGroup(_ serviceIds: [String]) async {
+        guard client != nil else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for serviceId in serviceIds {
+                group.addTask { [weak self] in await self?.perform(.restart, serviceId: serviceId) }
             }
         }
     }

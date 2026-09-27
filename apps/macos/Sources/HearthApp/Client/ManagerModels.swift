@@ -84,13 +84,55 @@ struct CatalogService: Codable, Equatable, Identifiable {
     let label: String?
     let kind: String?
     let ownership: String?
+    var disabled: Bool? = nil
 
     var displayName: String { label ?? id }
+    var isDisabled: Bool { disabled ?? false }
+}
+
+/// One `groups:` entry as declared — `members` may name services or other groups. The flattened
+/// view (`groups`) is for resolving targets; this one is for grouped display, in declaration
+/// order.
+struct CatalogGroupDecl: Codable, Equatable, Identifiable {
+    let name: String
+    let members: [String]
+
+    var id: String { name }
 }
 
 struct ServiceCatalogSummary: Codable, Equatable {
     let services: [CatalogService]
     let groups: [String: [String]]
+    var groupTree: [CatalogGroupDecl]? = nil
+
+    /// Ordered sections for the service list: each service lands in the first group that lists it
+    /// directly (in `groups:` declaration order); the rest fall into a trailing `nil` section.
+    /// Group names that list other groups only contribute members transitively, so they never
+    /// become display sections themselves (e.g. `all`).
+    func serviceSections(serviceOrder: [String]) -> [(name: String?, serviceIds: [String])] {
+        let tree = groupTree ?? []
+        guard !tree.isEmpty else { return [(nil, serviceOrder)] }
+        var firstGroup: [String: String] = [:]
+        for group in tree {
+            for member in group.members where firstGroup[member] == nil {
+                firstGroup[member] = group.name
+            }
+        }
+        var sections: [(name: String?, serviceIds: [String])] = tree.map { ($0.name as String?, []) }
+        var rest: [String] = []
+        for id in serviceOrder {
+            if let group = firstGroup[id], let index = sections.firstIndex(where: { $0.name == group }) {
+                sections[index].serviceIds.append(id)
+            } else {
+                rest.append(id)
+            }
+        }
+        sections = sections.filter { !$0.serviceIds.isEmpty }
+        if !rest.isEmpty {
+            sections.append((nil, rest))
+        }
+        return sections
+    }
 }
 
 /// One registered service URL with its placeholders already resolved by the daemon

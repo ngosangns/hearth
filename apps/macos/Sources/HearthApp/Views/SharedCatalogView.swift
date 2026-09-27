@@ -33,7 +33,11 @@ struct SharedCatalogView: View {
         .navigationTitle("Shared Services")
         .toolbar {
             if controller.phase == .connected {
-                ToolbarItem { Button("Refresh") { Task { await controller.refresh(); await controller.refreshCatalog() } } }
+                ToolbarItem {
+                    IconActionButton("Refresh", systemImage: "arrow.clockwise") {
+                        Task { await controller.refresh(); await controller.refreshCatalog() }
+                    }
+                }
             }
         }
         .task {
@@ -127,6 +131,7 @@ struct SharedCatalogView: View {
                 Text("Not installed — the first project that needs it will install it, or install it now.")
                     .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 380)
                 Button("Install \(entry.name)@\(entry.version)") { controller.install("\(entry.name)@\(entry.version)") }
+                    .buttonStyle(.borderedProminent)
                     .disabled(controller.actionsInFlight.contains("\(entry.name)@\(entry.version)"))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -152,12 +157,14 @@ private struct SharedInstanceRow: View {
     let busy: Bool
 
     var body: some View {
-        HStack {
-            Circle().fill(stateColor).frame(width: 8, height: 8)
+        HStack(spacing: 8) {
+            StatusDot(state: instance.displayState)
             VStack(alignment: .leading, spacing: 2) {
-                Text(instance.id)
+                Text(instance.id).fontWeight(.medium)
                 HStack(spacing: 6) {
-                    Text(instance.displayState).font(.caption).foregroundStyle(.secondary)
+                    Text(instance.displayState)
+                        .font(.caption)
+                        .foregroundStyle(StatusStyle.color(for: instance.displayState))
                     Text("port \(instance.port)").font(.caption).foregroundStyle(.secondary)
                     if instance.installState == "installing" {
                         Text("installing").font(.caption).foregroundStyle(.orange)
@@ -172,20 +179,10 @@ private struct SharedInstanceRow: View {
                 }
             }
             Spacer()
-            if busy { ProgressView().controlSize(.small) }
+            if busy { ActionSpinner() }
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-    }
-
-    private var stateColor: Color {
-        switch instance.displayState {
-        case "ready": return .green
-        case "starting", "queued": return .yellow
-        case "failed": return .red
-        case "stopping": return .orange
-        default: return .gray
-        }
     }
 }
 
@@ -197,17 +194,25 @@ private struct SharedCatalogRow: View {
     let onInstall: () -> Void
 
     var body: some View {
-        HStack {
-            Image(systemName: "shippingbox").foregroundStyle(.secondary)
-            Text(name)
-            Text(version).font(.caption).foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            Image(systemName: "shippingbox").foregroundStyle(Color.accentColor)
+            Text(name).fontWeight(.medium)
+            Text(version)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(.quaternary, in: Capsule())
             Spacer()
             if busy {
-                ProgressView().controlSize(.small)
+                ActionSpinner()
             } else if installed {
-                Text("installed").font(.caption).foregroundStyle(.secondary)
+                Label("Installed", systemImage: "checkmark.circle.fill")
+                    .labelStyle(.iconOnly)
+                    .foregroundStyle(.green)
+                    .help("Already installed on this machine")
             } else {
-                Button("Install", action: onInstall)
+                IconActionButton("Install \(name)@\(version)", systemImage: "square.and.arrow.down", action: onInstall)
             }
         }
         .contentShape(Rectangle())
@@ -231,7 +236,7 @@ private struct SharedInstanceDetail: View {
             attachments
             Divider()
             if let log {
-                ServiceLogPanel(serviceLabel: instance.id, log: log)
+                ServiceLogPanel(serviceLabel: instance.id, state: instance.displayState, log: log)
                     .frame(minHeight: 160)
             }
         }
@@ -252,19 +257,21 @@ private struct SharedInstanceDetail: View {
                 }
             }
             Spacer()
-            if busy { ProgressView().controlSize(.small) }
+            if busy { ActionSpinner() }
+            // Icon-only like the service rows — the tooltip carries the name.
             switch instance.displayState {
             case "stopped", "failed":
-                Button("Start") { onAction(.start) }
+                IconActionButton("Start", systemImage: "play.fill") { onAction(.start) }
             case "ready", "starting":
-                Button("Restart") { onAction(.restart) }
-                Button("Stop") { onAction(.stop) }
+                IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart) }
+                IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop) }
             case "queued":
-                Button("Cancel") { onAction(.stop) }
+                IconActionButton("Cancel start", systemImage: "xmark") { onAction(.stop) }
             default:
                 EmptyView()
             }
             Button("Remove…", role: .destructive, action: onRemove)
+                .padding(.leading, 8)
         }
         .padding(12)
     }
@@ -298,7 +305,8 @@ private struct AttachmentRow: View {
                 }
                 Spacer()
                 if let url = attachment.connection?.url {
-                    Button("Copy URL") { copy(url) }.font(.caption)
+                    IconActionButton("Copy connection URL", systemImage: "doc.on.doc") { copy(url) }
+                        .font(.caption)
                 }
             }
             if let env = attachment.connection?.env, !env.isEmpty {
@@ -306,7 +314,9 @@ private struct AttachmentRow: View {
                     HStack {
                         Text(key).font(.caption.monospaced()).foregroundStyle(.secondary)
                         Text(env[key] ?? "").font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                        Button("Copy") { copy("\(key)=\(env[key] ?? "")") }.font(.caption)
+                        Spacer(minLength: 4)
+                        IconActionButton("Copy \(key)", systemImage: "doc.on.doc") { copy("\(key)=\(env[key] ?? "")") }
+                            .font(.caption)
                     }
                 }
             }

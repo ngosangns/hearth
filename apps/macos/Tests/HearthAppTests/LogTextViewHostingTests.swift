@@ -136,8 +136,18 @@ final class LogTextViewHostingTests: XCTestCase {
             return
         }
 
-        // Row 0 is the pinned "daemon log" row — the first service is row 1.
-        let rowRect = table.rect(ofRow: 1)
+        // Row layout: section headers and the pinned "daemon log" row occupy the first rows, so
+        // locate the service row by content — it is the only row carrying action buttons.
+        var serviceRow = -1
+        for row in 0 ..< table.numberOfRows {
+            guard let rowView = table.rowView(atRow: row, makeIfNecessary: true) else { continue }
+            if containsButton(rowView) { serviceRow = row; break }
+        }
+        guard serviceRow >= 0 else {
+            XCTFail("no row rendering a service (no row has action buttons)")
+            return
+        }
+        let rowRect = table.rect(ofRow: serviceRow)
         let pointInWindow = table.convert(NSPoint(x: rowRect.midX, y: rowRect.midY), to: nil)
         let pointOnScreen = window.convertPoint(toScreen: pointInWindow)
         guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: pointOnScreen, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
@@ -156,11 +166,20 @@ final class LogTextViewHostingTests: XCTestCase {
         if controller.selectedServiceId != "api" {
             // Isolate whether the failure is click delivery or the binding itself: drive the same
             // delegate path programmatically.
-            table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            table.selectRowIndexes(IndexSet(integer: serviceRow), byExtendingSelection: false)
             try await Task.sleep(for: .milliseconds(100))
             XCTAssertEqual(controller.selectedServiceId, "api", "neither click nor programmatic selection reached the binding")
         }
         XCTAssertEqual(controller.selectedServiceId, "api")
+    }
+
+    /// True when `view`'s subtree contains a text field/label displaying `text` — used to locate a
+    /// row by what it shows instead of a fragile fixed index.
+    /// True when `view`'s subtree contains a button — service rows carry Start/Stop action
+    /// buttons; the pinned daemon row and section headers do not.
+    private func containsButton(_ view: NSView) -> Bool {
+        if view is NSButton { return true }
+        return view.subviews.contains { containsButton($0) }
     }
 
     /// The real app embeds `WorkspaceDetailView` in a `NavigationSplitView`'s `detail` slot —

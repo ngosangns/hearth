@@ -9,18 +9,12 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             List(workspaceStore.workspaces, selection: $workspaceStore.selectedId) { workspace in
-                WorkspaceRow(workspace: workspace).tag(workspace.id)
+                WorkspaceRow(workspace: workspace, controller: registry.controllers[workspace.id])
+                    .tag(workspace.id)
             }
             .navigationTitle("Workspaces")
             .toolbar {
                 ToolbarItem { Button(action: addWorkspace) { Label("Add Folder", systemImage: "plus") } }
-                // The catalog window is otherwise only reachable from the menu bar extra.
-                ToolbarItem {
-                    Button { openWindow(id: SharedWindow.id) } label: {
-                        Label("Shared Services", systemImage: "shippingbox")
-                    }
-                    .help("Open the shared services catalog")
-                }
             }
             .overlay {
                 if workspaceStore.workspaces.isEmpty {
@@ -29,6 +23,28 @@ struct ContentView: View {
                         message: "Add a folder that has a hearth.yaml to manage its services here.",
                         systemImage: "folder.badge.plus"
                     )
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                // Xcode-style status strip: the same glanceable summary the menu bar shows, so the
+                // number stays visible even while the sidebar is scrolled.
+                let summary = MenuBarSummary.compute(workspaces: workspaceStore.workspaces, registry: registry)
+                if summary.total > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "server.rack")
+                        if summary.failed > 0 {
+                            Text("\(summary.ready)/\(summary.total) ready · \(summary.failed) failed")
+                                .foregroundStyle(.red)
+                        } else {
+                            Text("\(summary.ready)/\(summary.total) services ready")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.bar)
                 }
             }
         } detail: {
@@ -71,15 +87,57 @@ struct ContentView: View {
 
 private struct WorkspaceRow: View {
     let workspace: Workspace
+    /// The live controller, if the registry has made one — drives the trailing status.
+    let controller: WorkspaceController?
 
     var body: some View {
-        HStack {
-            Image(systemName: workspace.existsOnDisk ? "folder" : "folder.badge.questionmark")
-                .foregroundStyle(workspace.existsOnDisk ? .primary : .secondary)
-            VStack(alignment: .leading) {
+        HStack(spacing: 8) {
+            Image(systemName: workspace.existsOnDisk ? "folder.fill" : "folder.badge.questionmark")
+                .foregroundStyle(workspace.existsOnDisk ? Color.accentColor : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
                 Text(workspace.displayName)
-                Text(workspace.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .fontWeight(.medium)
+                Text(workspace.path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
+            Spacer()
+            status
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// A compact trailing status: a ready/total count while connected, a glyph for anything else.
+    /// Untrusted workspaces show nothing — the trust prompt explains itself in the detail pane.
+    @ViewBuilder
+    private var status: some View {
+        if let controller {
+            switch controller.phase {
+            case .connected:
+                let ready = controller.services.filter { $0.displayState == "ready" }.count
+                let failed = controller.services.filter { $0.displayState == "failed" }.count
+                if failed > 0 {
+                    Text("\(ready)/\(controller.services.count) · \(failed) failed")
+                        .font(.caption).monospacedDigit().foregroundStyle(.red)
+                } else {
+                    Text("\(ready)/\(controller.services.count)")
+                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                }
+            case .connecting:
+                ActionSpinner()
+            case .idle:
+                // Resting state — the daemon has never been started for this workspace in this
+                // session. Showing a spinner here made every untouched row look stuck loading.
+                EmptyView()
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            case .stopped:
+                Image(systemName: "stop.circle").foregroundStyle(.secondary)
+            }
+        } else if !workspace.trusted {
+            Image(systemName: "lock").foregroundStyle(.secondary)
         }
     }
 }
