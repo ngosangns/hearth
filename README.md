@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" alt="Hearth" width="128"></p>
+
 # hearth
 
 Local dev services manager: one long-lived daemon per project folder, plus a CLI, TUI, MCP server,

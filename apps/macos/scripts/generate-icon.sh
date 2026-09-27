@@ -24,4 +24,7 @@ done
 
 echo "==> iconutil -c icns"
 iconutil -c icns "$iconset" -o "$app_root/AppIcon.icns"
-echo "==> done: $app_root/AppIcon.icns"
+
+# docs/icon.png is the README's copy of the same icon — regenerate it here so the two never drift.
+sips -z 256 256 "$work_dir/icon-1024.png" --out "$app_root/../../docs/icon.png" >/dev/null
+echo "==> done: $app_root/AppIcon.icns (+ docs/icon.png)"
