@@ -28,7 +28,7 @@ final class ManagerModelsTests: XCTestCase {
         XCTAssertEqual(service.serviceId, "sleeper")
         XCTAssertEqual(service.actualState, "running-unready")
         XCTAssertEqual(service.identity?.pid, 94901)
-        XCTAssertEqual(service.displayState, "starting") // running-unready collapses to "starting"
+        XCTAssertEqual(service.displayState, "running") // running-unready collapses to "running"
     }
 
     func testDecodesServicesResponseWithNoIdentityOrOptionalFields() throws {
@@ -96,8 +96,8 @@ final class ManagerModelsTests: XCTestCase {
         let cases: [(String, String)] = [
             ("ready", "ready"),
             ("queued-start", "queued"),
-            ("running", "starting"),
-            ("running-unready", "starting"),
+            ("running", "running"),
+            ("running-unready", "running"),
             ("starting", "starting"),
             ("preparing", "starting"),
             ("stopping", "stopping"),

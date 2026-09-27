@@ -262,7 +262,7 @@ private struct SharedInstanceDetail: View {
             switch instance.displayState {
             case "stopped", "failed":
                 IconActionButton("Start", systemImage: "play.fill") { onAction(.start) }
-            case "ready", "starting":
+            case "ready", "running", "starting":
                 IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart) }
                 IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop) }
             case "queued":

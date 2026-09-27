@@ -251,7 +251,7 @@ private struct ServiceListView: View {
                                     // daemon would skip them in a bulk start anyway.
                                     let enabledIds = section.serviceIds.filter { !controller.isDisabled($0) }
                                     let allStarted = !enabledIds.isEmpty && enabledIds.allSatisfy { id in
-                                        controller.services.first { $0.serviceId == id }?.displayState == "ready"
+                                        ["ready", "running"].contains(controller.services.first { $0.serviceId == id }?.displayState ?? "")
                                     }
                                     if enabledIds.isEmpty {
                                         Text(name)
@@ -342,7 +342,7 @@ private struct ServiceRow: View {
     @State private var confirmReclaim = false
 
     /// Same rule as `hearthd urls` and both TUIs: in-flight states count as running.
-    private var isRunning: Bool { ["ready", "starting"].contains(service.displayState) }
+    private var isRunning: Bool { ["ready", "running", "starting"].contains(service.displayState) }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -440,7 +440,7 @@ private struct ServiceRow: View {
                 case "orphaned":
                     IconActionButton("Start", systemImage: "play.fill") { onAction(.start, false) }
                     IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
-                case "ready", "starting":
+                case "ready", "running", "starting":
                     IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart, false) }
                     IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
                 // A service queued behind another operation on the same target stays `queued-start`

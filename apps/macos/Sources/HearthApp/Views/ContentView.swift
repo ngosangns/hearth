@@ -116,7 +116,7 @@ private struct WorkspaceRow: View {
         if let controller {
             switch controller.phase {
             case .connected:
-                let ready = controller.services.filter { $0.displayState == "ready" }.count
+                let ready = controller.services.filter { ["ready", "running"].contains($0.displayState) }.count
                 let failed = controller.services.filter { $0.displayState == "failed" }.count
                 if failed > 0 {
                     Text("\(ready)/\(controller.services.count) · \(failed) failed")

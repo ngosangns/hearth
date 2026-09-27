@@ -60,12 +60,17 @@ struct ServiceLifecycleState: Codable, Equatable, Identifiable {
             && exitCode == other.exitCode
     }
 
-    /// A small, display-oriented collapse of `actualState` — mirrors `localctl.ts`'s own `textState`.
+    /// A small, display-oriented collapse of `actualState` — the app's analogue of the CLI's
+    /// `text_state` (which collapses every in-flight state into `running`).
+    /// `running` covers both `running` and `running-unready`: the process is alive but readiness
+    /// either isn't probed yet or isn't probeable at all (`kind: process` services sit here
+    /// permanently — showing them as "starting" forever read as a stuck boot).
     var displayState: String {
         switch actualState {
         case "ready": return "ready"
         case "queued-start": return "queued"
-        case "running", "running-unready", "starting", "preparing": return "starting"
+        case "running", "running-unready": return "running"
+        case "starting", "preparing": return "starting"
         case "stopping": return "stopping"
         case "failed": return "failed"
         case "orphaned": return "orphaned"
@@ -253,7 +258,8 @@ struct SharedInstance: Codable, Equatable, Identifiable {
         switch state?.actualState {
         case "ready": return "ready"
         case "queued-start": return "queued"
-        case "running", "running-unready", "starting", "preparing": return "starting"
+        case "running", "running-unready": return "running"
+        case "starting", "preparing": return "starting"
         case "stopping": return "stopping"
         case "failed": return "failed"
         case "orphaned": return "orphaned"

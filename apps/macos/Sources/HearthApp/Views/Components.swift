@@ -7,6 +7,7 @@ enum StatusStyle {
     static func color(for state: String) -> Color {
         switch state {
         case "ready": return .green
+        case "running": return .mint
         case "starting", "queued": return .yellow
         case "failed": return .red
         case "stopping": return .orange

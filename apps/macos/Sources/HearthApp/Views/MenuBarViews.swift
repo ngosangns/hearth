@@ -21,7 +21,7 @@ struct MenuBarSummary {
             for service in controller.services {
                 total += 1
                 switch service.displayState {
-                case "ready": ready += 1
+                case "ready", "running": ready += 1
                 case "failed": failed += 1
                 default: break
                 }
@@ -136,7 +136,7 @@ struct MenuBarContentView: View {
         case .stopped: return "stopped"
         case .failed(let message): return message
         case .connected:
-            let ready = controller.services.filter { $0.displayState == "ready" }.count
+            let ready = controller.services.filter { ["ready", "running"].contains($0.displayState) }.count
             let failed = controller.services.filter { $0.displayState == "failed" }.count
             return failed > 0 ? "\(ready)/\(controller.services.count) ready · \(failed) failed" : "\(ready)/\(controller.services.count) ready"
         }
