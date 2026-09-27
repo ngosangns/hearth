@@ -65,7 +65,9 @@ pub async fn run_tui(options: RunTuiOptions) -> i32 {
         let lookup_catalog = catalog.clone();
         Arc::new(move |id: &str| lookup_catalog.services.iter().find(|s| s.id == id).and_then(|s| s.kind))
     });
-    let all_targets: Vec<String> = catalog.groups.get("all").cloned().unwrap_or_else(|| catalog.services.iter().map(|s| s.id.clone()).collect());
+    // Fallback "all" = every service the catalog knows — minus disabled ones, matching how a
+    // declared `all` group expands past them at load.
+    let all_targets: Vec<String> = catalog.groups.get("all").cloned().unwrap_or_else(|| catalog.services.iter().filter(|s| !s.disabled).map(|s| s.id.clone()).collect());
 
     let client = ManagerTuiClient::new(root, &localctl_options);
     let (columns, rows) = crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24));

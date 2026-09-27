@@ -58,6 +58,12 @@ pub async fn allocate_ports(
     None
 }
 
+/// Bind-check only — for recipes with pinned ports (outside the shared range) there is nothing
+/// to probe, just the question of whether the requested set is free.
+pub async fn ports_free(ports: &[u16]) -> bool {
+    bind_all(ports).await
+}
+
 /// Holds listeners for the whole block until every bind has succeeded, then drops them together.
 async fn bind_all(ports: &[u16]) -> bool {
     let mut listeners = Vec::with_capacity(ports.len());

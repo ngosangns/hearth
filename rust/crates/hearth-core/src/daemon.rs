@@ -13,7 +13,7 @@ use crate::manager::{bootstrap, BootstrapError, ClaimLockError, HearthManager, H
 use crate::paths::metadata_path;
 
 const DAEMON_LOG_MAX_BYTES: u64 = 512 * 1024;
-const DAEMON_LOG_NAME: &str = "daemon.log";
+pub(crate) const DAEMON_LOG_NAME: &str = "daemon.log";
 const LOCK_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 pub type DaemonLog = Arc<dyn Fn(&str) + Send + Sync>;

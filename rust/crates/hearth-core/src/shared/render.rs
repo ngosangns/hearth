@@ -184,6 +184,7 @@ mod tests {
                 env: None,
                 prepare: None,
                 additional_ports: 0,
+                ports: Vec::new(),
                 extra_port_labels: Vec::new(),
             },
             attachments: BTreeMap::new(),

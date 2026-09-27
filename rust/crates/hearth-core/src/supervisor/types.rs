@@ -273,11 +273,23 @@ pub struct SupervisorOptions {
     pub run_build: Arc<dyn RunBuild>,
     pub probes: Arc<dyn ProbeAdapter>,
     pub preparation: Option<Arc<dyn PreparationAdapter>>,
+    /// Installs a service's `artifact:` tarball before its first start. `None` on hosts that never
+    /// load file-based catalogs — a service declaring `artifact:` then fails its start with a
+    /// clear error rather than silently skipping the install.
+    pub artifact_installer: Option<Arc<dyn ArtifactInstaller>>,
     pub clock: Arc<dyn SupervisorClock>,
     pub readiness_timeout_ms: i64,
     pub readiness_backoff_ms: i64,
     pub termination_grace_ms: i64,
     pub is_closing: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// Runs the idempotent `artifact:` install (marker-checked, streams progress through
+/// `on_output`) and keeps the service's data dir alive. Invoked on every start, before
+/// preparation and build.
+#[async_trait]
+pub trait ArtifactInstaller: Send + Sync {
+    async fn install(&self, service: &crate::catalog::ServiceDefinition, on_output: OnOutput) -> Result<(), SupervisorError>;
 }
 
 #[async_trait]

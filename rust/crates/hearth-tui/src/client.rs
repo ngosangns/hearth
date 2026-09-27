@@ -342,6 +342,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
@@ -354,10 +355,12 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         };
         let catalog = ServiceCatalog {
             services: vec![service],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: Some(dir.path().to_string_lossy().to_string()),
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,

@@ -362,6 +362,21 @@ pub fn targets(catalog: &ServiceCatalog, target: Option<&str>) -> LocalctlResult
 
 pub fn runnable_targets(catalog: &ServiceCatalog, target: Option<&str>) -> LocalctlResult<Vec<ServiceId>> {
     let selected = targets(catalog, target)?;
+    // `disabled: true` is a hard stop for a direct target ("start x is disabled"), and a silent
+    // skip inside a group — `config_file` already strips disabled members from `catalog.groups`,
+    // this only covers the no-group fallback that expands to every service.
+    if let Some(t) = target {
+        if catalog.services.iter().any(|s| s.id == *t && s.disabled) {
+            return usage_err(format!("service {t} is disabled"));
+        }
+    }
+    let selected: Vec<ServiceId> = selected
+        .into_iter()
+        .filter(|id| !catalog.services.iter().find(|s| &s.id == id).map(|s| s.disabled).unwrap_or(false))
+        .collect();
+    if selected.is_empty() {
+        return usage_err("nothing to run: every selected service is disabled".to_string());
+    }
     for service_id in &selected {
         let verified = catalog.services.iter().find(|s| &s.id == service_id).map(|s| s.profiles.run.is_verified()).unwrap_or(false);
         if !verified {
@@ -1152,6 +1167,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
@@ -1164,6 +1180,7 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         }
     }
 
@@ -1171,6 +1188,7 @@ mod tests {
         ServiceCatalog {
             services,
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: Some(runtime_directory.to_string_lossy().to_string()),
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,

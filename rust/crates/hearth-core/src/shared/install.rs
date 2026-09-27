@@ -1,15 +1,17 @@
-//! Tarball installer for shared services. Downloads a recipe's artifact, verifies its sha256,
-//! extracts under `downloads/` (a staging/quarantine area), then atomically renames the payload
-//! into `installs/<name>/<version>`. A `.hearth-installed` marker file is the source of truth for
-//! "done" — a partial install is never mistaken for a complete one because the marker is written
-//! last.
+//! Tarball installer — used by shared services (`hearth.yaml shared:` → smp instances under
+//! `~/.hearth/shared`) and by per-service `artifact:` blocks (`<runtimeDir>/installs/…`). The flow
+//! is identical for both: materialize the archive (`url` download or `script` packager), verify
+//! sha256 for `url` artifacts only, extract under `downloads/` (a staging/quarantine area), then
+//! atomically rename the payload into the install dir. A `.hearth-installed` marker file is the
+//! source of truth for "done" — a partial install is never mistaken for a complete one because the
+//! marker is written last.
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::Digest;
 
 use super::registry::SharedInstance;
-use super::remote::SharedRecipe;
+use super::remote::{SharedArtifact, SharedRecipe};
 use super::{SharedContext, SharedError, SHARED_ARTIFACT_PLATFORM};
 
 const INSTALLED_MARKER: &str = ".hearth-installed";
@@ -17,6 +19,248 @@ const EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The normalized artifact both callers lower into: the shared catalog's per-platform
+/// `SharedArtifact`, and a `hearth.yaml` service's `artifact:` block.
+pub struct ArtifactSpec {
+    pub url: Option<String>,
+    pub script: Option<String>,
+    pub script_args: Vec<String>,
+    /// sha256 is enforced only for downloaded `url` artifacts — the one place a hash can actually
+    /// pin anything. `script` artifacts are built locally from the recipe's own packaging script:
+    /// the output is never byte-reproducible (tar mtimes, compile variance), the catalog hash just
+    /// records what the producer's build happened to yield, and the script — already executed — is
+    /// the real trust boundary.
+    pub sha256: Option<String>,
+}
+
+impl From<&SharedArtifact> for ArtifactSpec {
+    fn from(a: &SharedArtifact) -> Self {
+        Self {
+            url: a.url.clone().filter(|s| !s.is_empty()),
+            script: a.script.clone().filter(|s| !s.is_empty()),
+            script_args: a.script_args.clone(),
+            sha256: Some(a.sha256.clone()).filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+impl From<&crate::catalog::ServiceArtifact> for ArtifactSpec {
+    fn from(a: &crate::catalog::ServiceArtifact) -> Self {
+        Self { url: a.url.clone(), script: a.script.clone(), script_args: a.script_args.clone(), sha256: a.sha256.clone() }
+    }
+}
+
+/// How a relative `script` source resolves — next to a catalog URL for shared recipes, or under
+/// the project root for a service `artifact:`.
+#[derive(Debug, Clone)]
+pub enum ScriptOrigin {
+    CatalogUrl(String),
+    ProjectDir(PathBuf),
+}
+
+/// Everything a tarball install needs besides the artifact itself.
+pub struct TarballInstaller {
+    pub http: reqwest::Client,
+    pub downloads_dir: PathBuf,
+    pub script_origin: ScriptOrigin,
+}
+
+impl TarballInstaller {
+    pub fn shared(ctx: &SharedContext) -> Self {
+        Self {
+            http: ctx.http.clone(),
+            downloads_dir: ctx.downloads_dir(),
+            script_origin: ScriptOrigin::CatalogUrl(ctx.remote.url().to_string()),
+        }
+    }
+
+    /// Project-scoped installs: relative `script` paths resolve under `project_root`, and
+    /// `HEARTH_CATALOG_ORIGIN` handed to the script is the root as a `file://` URL.
+    pub fn project(project_root: &Path, downloads_dir: PathBuf) -> Self {
+        Self { http: reqwest::Client::new(), downloads_dir, script_origin: ScriptOrigin::ProjectDir(project_root.to_path_buf()) }
+    }
+
+    /// Idempotent install into `install_dir` — early-returns when the marker is already present.
+    pub async fn install(
+        &self,
+        name: &str,
+        install_dir: &Path,
+        artifact: &ArtifactSpec,
+        on_progress: &impl Fn(&str),
+    ) -> Result<PathBuf, SharedError> {
+        if install_dir.join(INSTALLED_MARKER).is_file() {
+            return Ok(install_dir.to_path_buf());
+        }
+
+        std::fs::create_dir_all(&self.downloads_dir)
+            .map_err(|e| SharedError(format!("cannot create downloads dir: {e}")))?;
+        let archive_path = self.downloads_dir.join(format!("{name}.tar.gz"));
+        self.materialize_archive(name, artifact, &archive_path, on_progress).await?;
+        if artifact.url.is_some() {
+            let sha = artifact.sha256.as_deref().unwrap_or_default();
+            verify_sha256(&archive_path, sha)?;
+        }
+
+        let staging = self.downloads_dir.join(format!("{name}.extract"));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| SharedError(format!("cannot create extract dir: {e}")))?;
+        extract(&archive_path, &staging).await?;
+        let payload = payload_dir(&staging)?;
+
+        // Rename into place only once the payload is complete; a leftover target from a previous
+        // failed attempt is quarantined aside first, never deleted.
+        if install_dir.exists() {
+            let quarantined =
+                install_dir.with_extension(format!("quarantine-{}", uuid::Uuid::new_v4()));
+            std::fs::rename(install_dir, &quarantined)
+                .map_err(|e| SharedError(format!("cannot quarantine previous install: {e}")))?;
+        }
+        if let Some(parent) = install_dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| SharedError(e.to_string()))?;
+        }
+        std::fs::rename(&payload, install_dir)
+            .map_err(|e| SharedError(format!("cannot move install into place: {e}")))?;
+        std::fs::write(install_dir.join(INSTALLED_MARKER), "ok\n")
+            .map_err(|e| SharedError(e.to_string()))?;
+        let _ = std::fs::remove_file(&archive_path);
+        let _ = std::fs::remove_dir_all(&staging);
+        on_progress(&format!("installed {name}"));
+        Ok(install_dir.to_path_buf())
+    }
+
+    /// Download a published tarball, or run the packaging script into `dest`.
+    async fn materialize_archive(
+        &self,
+        name: &str,
+        artifact: &ArtifactSpec,
+        dest: &Path,
+        on_progress: &impl Fn(&str),
+    ) -> Result<(), SharedError> {
+        if let Some(url) = artifact.url.as_deref() {
+            return self.download(url, dest, on_progress).await;
+        }
+        let script = artifact
+            .script
+            .as_deref()
+            .ok_or_else(|| SharedError(format!("{name}: artifact needs a url or a script")))?;
+        self.run_pack_script(name, script, &artifact.script_args, dest, on_progress).await
+    }
+
+    async fn run_pack_script(
+        &self,
+        name: &str,
+        script: &str,
+        args: &[String],
+        dest: &Path,
+        on_progress: &impl Fn(&str),
+    ) -> Result<(), SharedError> {
+        let script_path = self.stage_script(name, script).await?;
+        let origin = match &self.script_origin {
+            ScriptOrigin::CatalogUrl(url) => catalog_origin(url),
+            ScriptOrigin::ProjectDir(root) => format!("file://{}", root.display()),
+        };
+        on_progress(&format!("packaging {name} with {script}"));
+        let mut command = tokio::process::Command::new("bash");
+        command.arg(&script_path).args(args).arg(dest);
+        command.env("HEARTH_CATALOG_ORIGIN", &origin);
+        if let Some(dir) = script_path.parent() {
+            command.current_dir(dir);
+        }
+        let output = tokio::time::timeout(std::time::Duration::from_secs(45 * 60), command.output())
+            .await
+            .map_err(|_| SharedError(format!("{name}: packaging script timed out")))?
+            .map_err(|e| {
+                SharedError(format!(
+                    "{name}: failed to run packaging script: {e}"
+                ))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(SharedError(format!(
+                "{name}: packaging script failed: {stderr}{stdout}"
+            )));
+        }
+        if !dest.is_file() {
+            return Err(SharedError(format!(
+                "{name}: packaging script did not write {}",
+                dest.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Shared: a `file://` catalog runs the script that sits next to it, an `https://` catalog
+    /// downloads the script from the same directory as `catalog.json`. Project: relative paths are
+    /// project files; `https://`/`file://` scripts download into the staging area.
+    async fn stage_script(&self, name: &str, script: &str) -> Result<PathBuf, SharedError> {
+        match &self.script_origin {
+            ScriptOrigin::CatalogUrl(catalog_url) => {
+                if let Some(path) = local_catalog_script(catalog_url, script) {
+                    return Ok(path);
+                }
+                let url = if script.contains("://") {
+                    script.to_string()
+                } else {
+                    format!("{}/{}", catalog_origin(catalog_url), script)
+                };
+                let dest = self.downloads_dir.join(format!("{name}.pack.sh"));
+                self.download(&url, &dest, &|_| {}).await?;
+                Ok(dest)
+            }
+            ScriptOrigin::ProjectDir(root) => {
+                if script.contains("://") {
+                    let dest = self.downloads_dir.join(format!("{name}.pack.sh"));
+                    self.download(script, &dest, &|_| {}).await?;
+                    return Ok(dest);
+                }
+                let path = root.join(script);
+                if path.is_file() {
+                    return Ok(path);
+                }
+                Err(SharedError(format!("{name}: packaging script not found: {}", path.display())))
+            }
+        }
+    }
+
+    async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        on_progress: &impl Fn(&str),
+    ) -> Result<(), SharedError> {
+        on_progress(&format!("downloading {url}"));
+        if let Some(rest) = url.strip_prefix("file://") {
+            // file:// artifacts exist for tests and local fixtures — the sha256 check below still runs.
+            std::fs::copy(rest, dest).map_err(|e| SharedError(format!("failed to copy {url}: {e}")))?;
+            return Ok(());
+        }
+        let response = self
+            .http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(600))
+            .send()
+            .await
+            .map_err(|e| SharedError(format!("download failed for {url}: {e}")))?;
+        if !response.status().is_success() {
+            return Err(SharedError(format!(
+                "download failed for {url}: HTTP {}",
+                response.status()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| SharedError(format!("download failed for {url}: {e}")))?;
+        let mut file = std::fs::File::create(dest)
+            .map_err(|e| SharedError(format!("cannot create {}: {e}", dest.display())))?;
+        file.write_all(&bytes)
+            .map_err(|e| SharedError(format!("cannot write {}: {e}", dest.display())))?;
+        Ok(())
+    }
 }
 
 fn artifact_for<'a>(
@@ -54,131 +298,38 @@ pub async fn ensure_installed(
         return Ok(install_dir);
     }
     let artifact = artifact_for(&instance.id(), &instance.recipe)?;
-
-    std::fs::create_dir_all(ctx.downloads_dir())
-        .map_err(|e| SharedError(format!("cannot create downloads dir: {e}")))?;
-    let archive_path = ctx
-        .downloads_dir()
-        .join(format!("{}.tar.gz", instance.id()));
-    materialize_archive(ctx, &instance.id(), artifact, &archive_path, &on_progress).await?;
-    verify_sha256(&archive_path, &artifact.sha256)?;
-
-    let staging = ctx
-        .downloads_dir()
-        .join(format!("{}.extract", instance.id()));
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)
-        .map_err(|e| SharedError(format!("cannot create extract dir: {e}")))?;
-    extract(&archive_path, &staging).await?;
-    let payload = payload_dir(&staging)?;
-
-    // Rename into place only once the payload is complete; a leftover target from a previous
-    // failed attempt is quarantined aside first, never deleted.
-    if install_dir.exists() {
-        let quarantined =
-            install_dir.with_extension(format!("quarantine-{}", uuid::Uuid::new_v4()));
-        std::fs::rename(&install_dir, &quarantined)
-            .map_err(|e| SharedError(format!("cannot quarantine previous install: {e}")))?;
-    }
-    if let Some(parent) = install_dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SharedError(e.to_string()))?;
-    }
-    std::fs::rename(&payload, &install_dir)
-        .map_err(|e| SharedError(format!("cannot move install into place: {e}")))?;
-    std::fs::write(install_dir.join(INSTALLED_MARKER), "ok\n")
-        .map_err(|e| SharedError(e.to_string()))?;
-    let _ = std::fs::remove_file(&archive_path);
-    let _ = std::fs::remove_dir_all(&staging);
-    on_progress(&format!("installed {}", instance.id()));
-    Ok(install_dir)
-}
-
-/// Download a published tarball, or run the catalog's packaging script into `dest`.
-async fn materialize_archive(
-    ctx: &SharedContext,
-    instance_id: &str,
-    artifact: &super::remote::SharedArtifact,
-    dest: &Path,
-    on_progress: &impl Fn(&str),
-) -> Result<(), SharedError> {
-    if let Some(url) = artifact.url.as_deref().filter(|url| !url.is_empty()) {
-        return download(ctx, url, dest, on_progress).await;
-    }
-    let script = artifact
-        .script
-        .as_deref()
-        .filter(|script| !script.is_empty())
-        .ok_or_else(|| SharedError(format!("{instance_id}: artifact needs a url or a script")))?;
-    run_pack_script(
-        ctx,
-        instance_id,
-        script,
-        &artifact.script_args,
-        dest,
-        on_progress,
-    )
-    .await
-}
-
-async fn run_pack_script(
-    ctx: &SharedContext,
-    instance_id: &str,
-    script: &str,
-    args: &[String],
-    dest: &Path,
-    on_progress: &impl Fn(&str),
-) -> Result<(), SharedError> {
-    let script_path = stage_script(ctx, instance_id, script).await?;
-    let origin = catalog_origin(ctx.remote.url());
-    on_progress(&format!("packaging {instance_id} with {script}"));
-    let mut command = tokio::process::Command::new("bash");
-    command.arg(&script_path).args(args).arg(dest);
-    command.env("HEARTH_CATALOG_ORIGIN", &origin);
-    if let Some(dir) = script_path.parent() {
-        command.current_dir(dir);
-    }
-    let output = tokio::time::timeout(std::time::Duration::from_secs(45 * 60), command.output())
+    TarballInstaller::shared(ctx)
+        .install(&instance.id(), &install_dir, &ArtifactSpec::from(artifact), &on_progress)
         .await
-        .map_err(|_| SharedError(format!("{instance_id}: packaging script timed out")))?
-        .map_err(|e| {
-            SharedError(format!(
-                "{instance_id}: failed to run packaging script: {e}"
-            ))
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(SharedError(format!(
-            "{instance_id}: packaging script failed: {stderr}{stdout}"
-        )));
-    }
-    if !dest.is_file() {
-        return Err(SharedError(format!(
-            "{instance_id}: packaging script did not write {}",
-            dest.display()
-        )));
-    }
-    Ok(())
 }
 
-/// A `file://` catalog runs the script that sits next to it. An `https://` catalog downloads the
-/// script from the same directory as `catalog.json`.
-async fn stage_script(
-    ctx: &SharedContext,
-    instance_id: &str,
-    script: &str,
+/// Install for a per-service `artifact:` block: `<installDir>`/`<dataDir>` come from the resolved
+/// definition (or fall back to the runtime-dir convention for programmatically built catalogs),
+/// and the data dir is created on every start — wiping it manually must not wedge the service.
+pub async fn install_service_artifact(
+    project_root: &Path,
+    runtime_directory: &Path,
+    service: &crate::catalog::ServiceDefinition,
+    artifact: &crate::catalog::ServiceArtifact,
+    on_progress: &impl Fn(&str),
 ) -> Result<PathBuf, SharedError> {
-    if let Some(path) = local_catalog_script(ctx.remote.url(), script) {
-        return Ok(path);
-    }
-    let url = if script.contains("://") {
-        script.to_string()
-    } else {
-        format!("{}/{}", catalog_origin(ctx.remote.url()), script)
-    };
-    let dest = ctx.downloads_dir().join(format!("{instance_id}.pack.sh"));
-    download(ctx, &url, &dest, &|_| {}).await?;
-    Ok(dest)
+    let install_dir = artifact
+        .install_dir
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::paths::install_dir(runtime_directory, &service.id, &artifact.version));
+    let data_dir = artifact
+        .data_dir
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::paths::service_data_dir(runtime_directory, &service.id));
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| SharedError(format!("cannot create data dir {}: {e}", data_dir.display())))?;
+    TarballInstaller::project(project_root, crate::paths::downloads_dir(runtime_directory))
+        .install(&service.id, &install_dir, &ArtifactSpec::from(artifact), on_progress)
+        .await
 }
 
 fn catalog_origin(catalog_url: &str) -> String {
@@ -193,42 +344,6 @@ fn local_catalog_script(catalog_url: &str, script: &str) -> Option<PathBuf> {
     let catalog = Path::new(rest);
     let path = catalog.parent()?.join(script);
     path.is_file().then_some(path)
-}
-
-async fn download(
-    ctx: &SharedContext,
-    url: &str,
-    dest: &Path,
-    on_progress: &impl Fn(&str),
-) -> Result<(), SharedError> {
-    on_progress(&format!("downloading {url}"));
-    if let Some(rest) = url.strip_prefix("file://") {
-        // file:// artifacts exist for tests and local fixtures — the sha256 check below still runs.
-        std::fs::copy(rest, dest).map_err(|e| SharedError(format!("failed to copy {url}: {e}")))?;
-        return Ok(());
-    }
-    let response = ctx
-        .http
-        .get(url)
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .await
-        .map_err(|e| SharedError(format!("download failed for {url}: {e}")))?;
-    if !response.status().is_success() {
-        return Err(SharedError(format!(
-            "download failed for {url}: HTTP {}",
-            response.status()
-        )));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| SharedError(format!("download failed for {url}: {e}")))?;
-    let mut file = std::fs::File::create(dest)
-        .map_err(|e| SharedError(format!("cannot create {}: {e}", dest.display())))?;
-    file.write_all(&bytes)
-        .map_err(|e| SharedError(format!("cannot write {}: {e}", dest.display())))?;
-    Ok(())
 }
 
 fn verify_sha256(path: &Path, expected: &str) -> Result<(), SharedError> {
@@ -266,8 +381,8 @@ async fn extract(archive: &Path, dest: &Path) -> Result<(), SharedError> {
     Ok(())
 }
 
-/// What inside the staging dir becomes `installs/<name>/<version>`: the single top-level directory
-/// if there is exactly one (the usual tarball shape), otherwise the staging dir itself.
+/// What inside the staging dir becomes the install dir: the single top-level directory if there is
+/// exactly one (the usual tarball shape), otherwise the staging dir itself.
 fn payload_dir(staging: &Path) -> Result<PathBuf, SharedError> {
     let entries: Vec<PathBuf> = std::fs::read_dir(staging)
         .map_err(|e| SharedError(e.to_string()))?
@@ -341,6 +456,7 @@ mod tests {
                 env: None,
                 prepare: None,
                 additional_ports: 0,
+                ports: Vec::new(),
                 extra_port_labels: Vec::new(),
             },
             attachments: BTreeMap::new(),
@@ -416,5 +532,47 @@ mod tests {
         let err = ensure_installed(&ctx, &instance, |_| {}).await.unwrap_err();
         assert!(err.0.contains("sha256 mismatch"), "{err}");
         assert!(!is_installed(&ctx, &instance));
+    }
+
+    #[tokio::test]
+    async fn installs_a_project_service_artifact_with_project_relative_script() {
+        let src = tempfile::tempdir().unwrap();
+        let (archive, _sha) = make_tarball(src.path());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("pack.sh"),
+            format!("#!/bin/bash\nset -euo pipefail\ncp '{}' \"$1\"\n", archive.display()),
+        )
+        .unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let service = crate::catalog::ServiceDefinition {
+            id: "db".to_string(),
+            label: None,
+            kind: None,
+            ownership: None,
+            disabled: false,
+            profiles: crate::catalog::ServiceProfiles {
+                run: crate::catalog::ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
+                build: None,
+            },
+            ports: None,
+            urls: None,
+            artifact: None,
+        };
+        let artifact = crate::catalog::ServiceArtifact {
+            version: "1.0".to_string(),
+            url: None,
+            script: Some("pack.sh".to_string()),
+            script_args: vec![],
+            sha256: None,
+            install_dir: None,
+            data_dir: None,
+        };
+        let install_dir = install_service_artifact(project.path(), runtime.path(), &service, &artifact, &|_| {}).await.unwrap();
+        assert_eq!(install_dir, crate::paths::install_dir(runtime.path(), "db", "1.0"));
+        assert!(install_dir.join("bin/hello").exists());
+        assert!(crate::paths::service_data_dir(runtime.path(), "db").is_dir());
+        // Idempotent.
+        install_service_artifact(project.path(), runtime.path(), &service, &artifact, &|_| {}).await.unwrap();
     }
 }

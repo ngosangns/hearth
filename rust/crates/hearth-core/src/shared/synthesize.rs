@@ -37,6 +37,7 @@ pub fn synthesize_catalog(
             "all".to_string(),
             instances.iter().map(|i| i.id()).collect::<Vec<ServiceId>>(),
         )]),
+        group_tree: Vec::new(),
         compose_file: None,
         runtime_directory: Some(SHARED_RUNTIME_DIRECTORY_NAME.to_string()),
         start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -91,6 +92,7 @@ pub fn synthesize_service(
         label: Some(format!("{}@{} (shared)", instance.name, instance.version)),
         kind: Some(ServiceKind::Infrastructure),
         ownership: Some(ServiceOwnership::Daemon),
+        disabled: false,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
                 command: ServiceCommand {
@@ -115,6 +117,7 @@ pub fn synthesize_service(
         },
         ports: Some(ports),
         urls: None,
+        artifact: None,
     })
 }
 
@@ -128,23 +131,36 @@ pub const SHARED_READINESS_TIMEOUT_MS: u64 = 600_000;
 /// ready AND this project is attached) the adoption signal `syncExternalServices` polls. `stop` is
 /// `hearthd shared detach` — released via the probe going false, never by killing the singleton.
 /// `exe` is the hearthd binary's own path so the commands never depend on PATH.
-pub fn project_service_entry(id: ServiceId, instance: &str, exe: &Path) -> ServiceDefinition {
+/// `attach_args` append to the attach argv (forwarded to the recipe's provision commands);
+/// `preparation` runs project-side before every attach — e.g. rendering the conf the provision
+/// step will publish.
+pub fn project_service_entry(
+    id: ServiceId,
+    instance: &str,
+    exe: &Path,
+    preparation: Option<crate::catalog::PreparationCommand>,
+    attach_args: Vec<String>,
+    urls: Option<Vec<crate::catalog::ServiceUrl>>,
+) -> ServiceDefinition {
     let exe = exe.display().to_string();
+    let mut attach_argv = vec![
+        exe.clone(),
+        "shared".to_string(),
+        "attach".to_string(),
+        instance.to_string(),
+    ];
+    attach_argv.extend(attach_args);
     ServiceDefinition {
         label: Some(format!("{instance} (shared)")),
         id,
         kind: Some(ServiceKind::Infrastructure),
         ownership: Some(ServiceOwnership::External),
+        disabled: false,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
                 command: ServiceCommand {
                     command: CommandSpec::Argv {
-                        argv: vec![
-                            exe.clone(),
-                            "shared".to_string(),
-                            "attach".to_string(),
-                            instance.to_string(),
-                        ],
+                        argv: attach_argv,
                     },
                     cwd: ".".to_string(),
                     environment: None,
@@ -171,12 +187,13 @@ pub fn project_service_entry(id: ServiceId, instance: &str, exe: &Path) -> Servi
                 },
                 readiness_timeout_ms: Some(SHARED_READINESS_TIMEOUT_MS),
                 preparation: None,
-                preparation_command: None,
+                preparation_command: preparation,
             },
             build: None,
         },
         ports: None,
-        urls: None,
+        urls,
+        artifact: None,
     }
 }
 
@@ -233,6 +250,7 @@ mod tests {
                     ],
                 }),
                 additional_ports: 1,
+                ports: Vec::new(),
                 extra_port_labels: vec!["console".to_string()],
             },
             attachments: BTreeMap::new(),

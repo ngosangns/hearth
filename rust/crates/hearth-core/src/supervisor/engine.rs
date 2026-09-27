@@ -598,6 +598,53 @@ impl ProcessSupervisor {
         )
         .await;
 
+        // `artifact:` install runs first — preparation commands and builds may reference
+        // `{installDir}`/`{dataDir}` contents, so the tarball has to be on disk before either.
+        let definition = definition_for(&self.host.catalog(), service_id).cloned();
+        if let Some(def) = definition.as_ref().filter(|def| def.artifact.is_some()) {
+            let installer = self.options.artifact_installer.clone();
+            match installer {
+                Some(installer) => {
+                    let sup = self.clone();
+                    let sid = service_id.clone();
+                    let on_output: OnOutput = Arc::new(move |data: &str| {
+                        if sup.valid(&sid, generation, token) {
+                            sup.append_output(&sid, data);
+                        }
+                    });
+                    if let Err(error) = installer.install(def, on_output).await {
+                        if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+                            return Ok(());
+                        }
+                        self.transition_if_current(
+                            service_id,
+                            generation,
+                            token,
+                            ActualServiceState::Failed,
+                            ServiceReadiness::Failed,
+                            Changes { error: Patch::Set(format!("Install failed: {}", error.0)), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+                None => {
+                    self.transition_if_current(
+                        service_id,
+                        generation,
+                        token,
+                        ActualServiceState::Failed,
+                        ServiceReadiness::Failed,
+                        Changes { error: Patch::Set("artifact installs are not supported by this host".to_string()), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+                    )
+                    .await;
+                    return Err(SupervisorError(format!("{service_id}: artifact installs are not supported by this host")));
+                }
+            }
+        }
+        if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+            return Ok(());
+        }
         let mut preparation_failed = false;
         if let Some(preparation) = &profile.preparation {
             if !preparation.is_empty() {
@@ -643,7 +690,6 @@ impl ProcessSupervisor {
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
             return Ok(());
         }
-        let definition = definition_for(&self.host.catalog(), service_id).cloned();
         if let Some(def) = &definition {
             if def.profiles.build.is_some() {
                 self.build(service_id, def, generation, token, operation_id.clone()).await?;
@@ -2116,6 +2162,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
@@ -2134,6 +2181,7 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         }
     }
 
@@ -2148,6 +2196,7 @@ mod tests {
         ServiceCatalog {
             services: vec![service],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -2179,7 +2228,7 @@ mod tests {
             process: process.clone(),
             run_build: run_build.clone(),
             probes: probes.clone(),
-            preparation: Some(Arc::new(NoPreparation)),
+            preparation: Some(Arc::new(NoPreparation)), artifact_installer: None,
             clock: clock.clone(),
             readiness_timeout_ms,
             readiness_backoff_ms: 5,
@@ -2623,6 +2672,7 @@ mod tests {
         let catalog = ServiceCatalog {
             services: vec![service_with_build("a", "shared"), service_with_build("b", "shared")],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -2673,7 +2723,7 @@ mod tests {
                 process,
                 run_build,
                 probes,
-                preparation: Some(Arc::new(NoPreparation)),
+                preparation: Some(Arc::new(NoPreparation)), artifact_installer: None,
                 clock,
                 readiness_timeout_ms: 200,
                 readiness_backoff_ms: 5,
@@ -2683,6 +2733,96 @@ mod tests {
         );
         supervisor.start(&"api".to_string(), None).await.unwrap();
         assert_eq!(host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+    }
+
+    // --- artifact installs ---
+
+    struct FakeArtifactInstaller {
+        calls: std::sync::Mutex<Vec<String>>,
+        result: std::sync::Mutex<Result<(), String>>,
+    }
+
+    impl FakeArtifactInstaller {
+        fn ok() -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()), result: std::sync::Mutex::new(Ok(())) }
+        }
+    }
+
+    #[async_trait]
+    impl crate::supervisor::types::ArtifactInstaller for FakeArtifactInstaller {
+        async fn install(&self, service: &ServiceDefinition, _on_output: OnOutput) -> Result<(), SupervisorError> {
+            self.calls.lock().unwrap().push(service.id.clone());
+            self.result.lock().unwrap().clone().map_err(SupervisorError)
+        }
+    }
+
+    fn artifact_service(id: &str) -> ServiceDefinition {
+        let mut service = argv_verified(id, ReadinessSpec::Process);
+        service.artifact = Some(crate::catalog::ServiceArtifact {
+            version: "1.0".to_string(),
+            url: Some("file:///tmp/x.tgz".to_string()),
+            script: None,
+            script_args: vec![],
+            sha256: Some("0".repeat(64)),
+            install_dir: Some("/tmp/x".to_string()),
+            data_dir: Some("/tmp/x-data".to_string()),
+        });
+        service
+    }
+
+    fn artifact_harness(service: ServiceDefinition, installer: Option<Arc<FakeArtifactInstaller>>) -> (Arc<ProcessSupervisor>, Arc<FakeHost>) {
+        let host = FakeHost::new(one_service_catalog(service));
+        let process = FakeProcessAdapter::new();
+        let probes = FakeProbeAdapter::new();
+        let run_build = FakeRunBuild::new();
+        let clock = FakeClock::new();
+        let supervisor = ProcessSupervisor::new(
+            host.clone(),
+            SupervisorOptions {
+                process,
+                run_build,
+                probes,
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: installer.map(|i| i as Arc<dyn crate::supervisor::types::ArtifactInstaller>),
+                clock,
+                readiness_timeout_ms: 200,
+                readiness_backoff_ms: 5,
+                termination_grace_ms: 50,
+                is_closing: Arc::new(|| false),
+            },
+        );
+        (supervisor, host)
+    }
+
+    #[tokio::test]
+    async fn artifact_service_installs_before_starting() {
+        let installer = Arc::new(FakeArtifactInstaller::ok());
+        let (supervisor, host) = artifact_harness(artifact_service("db"), Some(installer.clone()));
+        supervisor.start(&"db".to_string(), None).await.unwrap();
+        assert_eq!(installer.calls.lock().unwrap().as_slice(), &["db".to_string()]);
+        // `process` readiness ends the start at running-unready — the proof we want is that the
+        // install ran before spawn and nothing failed.
+        assert_eq!(host.state_of("db").unwrap().actual_state, ActualServiceState::RunningUnready);
+    }
+
+    #[tokio::test]
+    async fn artifact_install_failure_fails_the_start() {
+        let installer = Arc::new(FakeArtifactInstaller::ok());
+        *installer.result.lock().unwrap() = Err("sha256 mismatch".to_string());
+        let (supervisor, host) = artifact_harness(artifact_service("db"), Some(installer));
+        supervisor.start(&"db".to_string(), None).await.unwrap_err();
+        let state = host.state_of("db").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Failed);
+        assert_eq!(state.error.as_deref(), Some("Install failed: sha256 mismatch"));
+    }
+
+    #[tokio::test]
+    async fn artifact_without_an_installer_fails_clearly() {
+        let (supervisor, host) = artifact_harness(artifact_service("db"), None);
+        supervisor.start(&"db".to_string(), None).await.unwrap_err();
+        let state = host.state_of("db").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Failed);
+        assert!(state.error.as_deref().unwrap().contains("not supported"));
     }
 
     fn preparation_catalog() -> ServiceCatalog {
@@ -2704,7 +2844,7 @@ mod tests {
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
             host.clone(),
-            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), artifact_installer: None, clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
         );
         supervisor.start(&"api".to_string(), None).await.unwrap();
         assert_eq!(host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
@@ -2720,7 +2860,7 @@ mod tests {
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
             host.clone(),
-            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), artifact_installer: None, clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
         );
         let err = supervisor.start(&"api".to_string(), None).await.unwrap_err();
         assert_eq!(err.0, "Preparation failed for api");
@@ -2754,6 +2894,7 @@ mod tests {
         let catalog = ServiceCatalog {
             services: vec![service_with_prep("a", "shared"), service_with_prep("b", "shared")],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -2766,7 +2907,7 @@ mod tests {
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
             host.clone(),
-            SupervisorOptions { process, run_build, probes: probes.clone(), preparation: Some(Arc::new(NoPreparation)), clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+            SupervisorOptions { process, run_build, probes: probes.clone(), preparation: Some(Arc::new(NoPreparation)), artifact_installer: None, clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
         );
         let sup_a = supervisor.clone();
         let sup_b = supervisor.clone();
@@ -2916,7 +3057,7 @@ mod tests {
                 process: process.clone(),
                 run_build: FakeRunBuild::new(),
                 probes,
-                preparation: Some(Arc::new(NoPreparation)),
+                preparation: Some(Arc::new(NoPreparation)), artifact_installer: None,
                 clock: FakeClock::new(),
                 readiness_timeout_ms: 200,
                 readiness_backoff_ms: 5,

@@ -128,6 +128,42 @@ fn string_array(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Depth-first group member expansion. `visiting` is the chain of group names currently being
+/// expanded — re-entering one is a cycle and a load error, not silent truncation.
+fn expand_group_members<'a>(
+    group: &str,
+    members: &'a [String],
+    declared: &HashMap<&'a str, &'a [String]>,
+    service_ids: &std::collections::HashSet<&'a str>,
+    visiting: &mut Vec<&'a str>,
+    out: &mut Vec<String>,
+    errors: &mut Vec<String>,
+) {
+    for member in members {
+        // Service ids win over same-named groups, matching `targets()` resolution precedence.
+        if service_ids.contains(member.as_str()) {
+            if !out.contains(member) {
+                out.push(member.clone());
+            }
+            continue;
+        }
+        match declared.get(member.as_str()) {
+            Some(sub_members) => {
+                if visiting.contains(&member.as_str()) {
+                    let mut chain: Vec<&str> = visiting.clone();
+                    chain.push(member.as_str());
+                    errors.push(format!("group cycle: {}", chain.join(" -> ")));
+                    continue;
+                }
+                visiting.push(member.as_str());
+                expand_group_members(member, sub_members, declared, service_ids, visiting, out, errors);
+                visiting.pop();
+            }
+            None => errors.push(format!("group {group} references unknown service or group {member}")),
+        }
+    }
+}
+
 /// JS's `String(x)` for the scalar types the argv-coercion sharp edge accepts (string/number/bool).
 fn scalar_to_string(value: &Value) -> Option<String> {
     match value {
@@ -378,8 +414,149 @@ fn resolve_service_cwd(cwd: Option<&str>, path: &str, errors: &mut Vec<String>) 
 /// dropped and surface much later as an unrelated error. `x-`-prefixed keys stay free for YAML anchors.
 const TOP_LEVEL_KEYS: &[&str] = &["version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services", "shared"];
 const SERVICE_KEYS: &[&str] = &[
-    "label", "kind", "ownership", "env", "container", "cwd", "run", "stop", "build", "readiness", "readinessTimeoutMs", "preparationCommand", "ports", "urls",
+    "label", "kind", "ownership", "disabled", "env", "container", "cwd", "run", "stop", "build", "readiness", "readinessTimeoutMs", "preparationCommand", "ports", "urls", "artifact",
 ];
+
+const ARTIFACT_KEYS: &[&str] = &["version", "url", "script", "scriptArgs", "sha256"];
+
+fn read_artifact(value: &Value, path: &str, errors: &mut Vec<String>) -> Option<crate::catalog::ServiceArtifact> {
+    let Some(obj) = value.as_object() else {
+        errors.push(format!("{path} must be an object"));
+        return None;
+    };
+    check_known_keys(obj, ARTIFACT_KEYS, path, errors);
+    let version = obj.get("version").and_then(Value::as_str).unwrap_or_default().to_string();
+    if version.is_empty() {
+        errors.push(format!("{path}.version must be a non-empty string"));
+    }
+    let url = obj.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    let script = obj.get("script").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    if url.is_some() == script.is_some() {
+        errors.push(format!("{path} needs exactly one of url or script"));
+    }
+    let sha256 = obj.get("sha256").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    if url.is_some() && sha256.is_none() {
+        errors.push(format!("{path}.sha256 is required for a url artifact"));
+    }
+    let script_args = match obj.get("scriptArgs") {
+        None => Vec::new(),
+        Some(v) if is_string_array(v) => string_array(v),
+        Some(_) => {
+            errors.push(format!("{path}.scriptArgs must be an array of strings"));
+            Vec::new()
+        }
+    };
+    Some(crate::catalog::ServiceArtifact { version, url, script, script_args, sha256, install_dir: None, data_dir: None })
+}
+
+/// `{var}` values available to a service declaring `artifact:` — `{port}` is the first declared
+/// port (or the tcp readiness port when no `ports:` entries exist); `{port2}…` walk the rest.
+fn artifact_vars(root: &Path, runtime_directory: &Path, id: &str, version: &str, ports: &[ServicePort], readiness: Option<&ReadinessSpec>) -> HashMap<String, String> {
+    let mut vars = HashMap::from([
+        ("installDir".to_string(), crate::paths::install_dir(runtime_directory, id, version).display().to_string()),
+        ("dataDir".to_string(), crate::paths::service_data_dir(runtime_directory, id).display().to_string()),
+        ("serviceId".to_string(), id.to_string()),
+        ("projectRoot".to_string(), root.display().to_string()),
+    ]);
+    for (index, entry) in ports.iter().enumerate() {
+        let name = if index == 0 { "port".to_string() } else { format!("port{}", index + 1) };
+        vars.insert(name, entry.port.to_string());
+    }
+    if !vars.contains_key("port") {
+        if let Some(ReadinessSpec::Tcp { port }) = readiness {
+            vars.insert("port".to_string(), port.to_string());
+        }
+    }
+    vars
+}
+
+/// An artifact var that survived rendering — always a bug (every non-port var is defined once an
+/// `artifact:` exists; `{port}`/`{portN}` is defined only when enough ports are declared).
+fn unrendered_artifact_var(text: &str) -> Option<String> {
+    for token in ["installDir", "dataDir", "serviceId", "projectRoot"] {
+        if text.contains(&format!("{{{token}}}")) {
+            return Some(token.to_string());
+        }
+    }
+    let mut rest = text;
+    while let Some(start) = rest.find("{port") {
+        let after = &rest[start + 5..];
+        match after.find('}') {
+            Some(end) if after[..end].chars().all(|c| c.is_ascii_digit()) => {
+                return Some(format!("port{}", &after[..end]));
+            }
+            _ => rest = after,
+        }
+    }
+    None
+}
+
+fn check_rendered(text: &str, path: &str, errors: &mut Vec<String>) {
+    if let Some(var) = unrendered_artifact_var(text) {
+        errors.push(format!("{path}: template var {{{var}}} has no value — declare it in ports (or a tcp readiness port for {{port}})"));
+    }
+}
+
+fn render_artifact_command(spec: CommandSpec, vars: &HashMap<String, String>, path: &str, errors: &mut Vec<String>) -> CommandSpec {
+    let rendered = crate::shared::render::render_command(&spec, vars);
+    match &rendered {
+        CommandSpec::Argv { argv } => argv.iter().for_each(|a| check_rendered(a, path, errors)),
+        CommandSpec::Shell { shell, .. } => check_rendered(shell, path, errors),
+    }
+    rendered
+}
+
+/// Substitutes an artifact service's `{installDir}`/`{dataDir}`/`{port}`/`{portN}`/`{serviceId}`/
+/// `{projectRoot}` vars everywhere they can appear, in place on the finished definition. `urls`
+/// render but are not strict-checked — `{tailnetHost}` is a legal placeholder there.
+fn render_service_artifact(root: &Path, runtime_directory: &Path, def: &mut crate::catalog::ServiceDefinition, artifact: &mut crate::catalog::ServiceArtifact, path: &str, errors: &mut Vec<String>) {
+    use crate::shared::render::{render_env, render_readiness, render_str};
+    let ports: &[ServicePort] = def.ports.as_deref().unwrap_or(&[]);
+    let readiness_for_port = def.profiles.run.readiness().clone();
+    let vars = artifact_vars(root, runtime_directory, &def.id, &artifact.version, ports, Some(&readiness_for_port));
+    artifact.install_dir = Some(vars["installDir"].clone());
+    artifact.data_dir = Some(vars["dataDir"].clone());
+    match &mut def.profiles.run {
+        ServiceRunProfile::Verified { command, readiness, preparation_command, .. } => {
+            command.command = render_artifact_command(command.command.clone(), &vars, &format!("{path}.run"), errors);
+            command.cwd = render_str(&command.cwd, &vars);
+            check_rendered(&command.cwd, &format!("{path}.cwd"), errors);
+            if let Some(env) = &mut command.environment {
+                *env = render_env(env, &vars);
+                for value in env.values() {
+                    check_rendered(value, &format!("{path}.env"), errors);
+                }
+            }
+            if let Some(stop) = &mut command.docker_stop_command {
+                *stop = render_artifact_command(stop.clone(), &vars, &format!("{path}.stop"), errors);
+            }
+            let rendered_readiness = render_readiness(readiness, &vars);
+            match rendered_readiness {
+                Ok(r) => *readiness = r,
+                Err(e) => errors.push(format!("{path}.readiness: {}", e.0)),
+            }
+            if let Some(prep) = preparation_command {
+                prep.command = render_artifact_command(prep.command.clone(), &vars, &format!("{path}.preparationCommand"), errors);
+                if let Some(cwd) = &mut prep.cwd {
+                    *cwd = render_str(cwd, &vars);
+                }
+            }
+        }
+        ServiceRunProfile::Unresolved { .. } => {}
+    }
+    if let Some(build) = &mut def.profiles.build {
+        build.command.command = render_artifact_command(build.command.command.clone(), &vars, &format!("{path}.build"), errors);
+        build.command.cwd = render_str(&build.command.cwd, &vars);
+        if let Some(env) = &mut build.command.environment {
+            *env = render_env(env, &vars);
+        }
+    }
+    if let Some(urls) = &mut def.urls {
+        for entry in urls {
+            entry.url = render_str(&entry.url, &vars);
+        }
+    }
+}
 
 fn read_positive_u64(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<u64> {
     match value {
@@ -457,10 +634,22 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
                     }
                     match value {
                         Value::String(_) => {}
-                        Value::Object(o) => match o.get("version") {
-                            Some(Value::String(s)) if !s.is_empty() => {}
-                            _ => errors.push(format!("{path}.version must be a non-empty string")),
-                        },
+                        Value::Object(o) => {
+                            for key in o.keys() {
+                                if !["version", "preparationCommand", "attachArgs", "urls"].contains(&key.as_str()) {
+                                    errors.push(format!("{path} has unknown key \"{key}\" (known: version, preparationCommand, attachArgs, urls)"));
+                                }
+                            }
+                            match o.get("version") {
+                                Some(Value::String(s)) if !s.is_empty() => {}
+                                _ => errors.push(format!("{path}.version must be a non-empty string")),
+                            }
+                            if let Some(v) = o.get("attachArgs") {
+                                if !is_string_array(v) {
+                                    errors.push(format!("{path}.attachArgs must be an array of strings"));
+                                }
+                            }
+                        }
                         _ => errors.push(format!("{path} must be a version string or an object with version")),
                     }
                 }
@@ -475,6 +664,10 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
     if !errors.is_empty() {
         return Err(errors);
     }
+
+    // Resolved before the service loop: `artifact:` services render `{installDir}`/`{dataDir}`
+    // from it at parse time.
+    let runtime_directory_path = crate::paths::resolve_runtime_directory(root, top.get("runtimeDirectory").and_then(Value::as_str));
 
     let global_env = top.get("env").map(string_record).unwrap_or_default();
     let file_env = match top.get("envFile").and_then(Value::as_str) {
@@ -535,6 +728,15 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
                 None
             }
         };
+        let artifact = obj.get("artifact").and_then(|v| read_artifact(v, &format!("{svc_path}.artifact"), &mut errors));
+        if artifact.is_some() {
+            if ownership == Some(ServiceOwnership::External) {
+                errors.push(format!("{svc_path}.artifact needs a daemon-owned service — external units never spawn, so never install"));
+            }
+            if obj.get("run").is_none() {
+                errors.push(format!("{svc_path}.artifact needs a run command to install for"));
+            }
+        }
 
         let cwd = resolve_service_cwd(obj.get("cwd").and_then(Value::as_str), &svc_path, &mut errors);
         // Unconditional, even when the key is absent: `read_readiness` is what reports
@@ -616,15 +818,30 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             // Already recorded a more specific error above (bad run/readiness/cwd).
             continue;
         };
-        services.push(ServiceDefinition {
+        let disabled = match obj.get("disabled") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => {
+                errors.push(format!("{svc_path}.disabled must be a boolean"));
+                false
+            }
+        };
+        let mut definition = ServiceDefinition {
             id: id.clone(),
             label: obj.get("label").and_then(Value::as_str).map(str::to_string),
             kind,
             ownership,
+            disabled,
             profiles: ServiceProfiles { run: profile_run, build: profile_build },
             ports: ports.filter(|p| !p.is_empty()),
             urls: urls.filter(|u| !u.is_empty()),
-        });
+            artifact: None,
+        };
+        if let Some(mut artifact) = artifact {
+            render_service_artifact(root, &runtime_directory_path, &mut definition, &mut artifact, &svc_path, &mut errors);
+            definition.artifact = Some(artifact);
+        }
+        services.push(definition);
     }
 
     // `shared:` entries expand into generated `ownership: external` services (document order,
@@ -642,30 +859,105 @@ fn map_config_file(raw: &Value, root: &Path, _path: &Path) -> Result<ServiceCata
             if !is_valid_shared_name(name) || version.is_empty() {
                 continue;
             }
+            // Optional per-entry hooks: `preparationCommand` runs project-side before each attach
+            // (e.g. rendering the conf a recipe provision publishes); `attachArgs` append to the
+            // attach argv and land on the recipe's provision commands. `{dataDir}`/`{serviceId}`/
+            // `{projectRoot}` render like an artifact service — ports live in the smp registry,
+            // not this file, so they are not substituted here.
+            let shared_vars: HashMap<String, String> = HashMap::from([
+                ("dataDir".to_string(), crate::paths::service_data_dir(&runtime_directory_path, name).display().to_string()),
+                ("serviceId".to_string(), name.clone()),
+                ("projectRoot".to_string(), root.display().to_string()),
+            ]);
+            let mut preparation_command = None;
+            let mut attach_args: Vec<String> = Vec::new();
+            if let Value::Object(o) = value {
+                let svc_path = format!("shared.{name}");
+                preparation_command = o
+                    .get("preparationCommand")
+                    .and_then(|v| read_preparation_command(v, &format!("{svc_path}.preparationCommand"), &mut errors))
+                    .map(|mut prep| {
+                        prep.command = match prep.command {
+                            crate::catalog::CommandSpec::Argv { argv } => crate::catalog::CommandSpec::Argv {
+                                argv: argv.iter().map(|a| crate::shared::render::render_str(a, &shared_vars)).collect(),
+                            },
+                            crate::catalog::CommandSpec::Shell { shell, exec } => crate::catalog::CommandSpec::Shell {
+                                shell: crate::shared::render::render_str(&shell, &shared_vars),
+                                exec,
+                            },
+                        };
+                        if let Some(cwd) = &mut prep.cwd {
+                            *cwd = crate::shared::render::render_str(cwd, &shared_vars);
+                        }
+                        prep
+                    });
+                attach_args = string_array(o.get("attachArgs").unwrap_or(&Value::Null))
+                    .iter()
+                    .map(|a| crate::shared::render::render_str(a, &shared_vars))
+                    .collect();
+            }
+            let urls = value
+                .as_object()
+                .and_then(|o| read_urls(o.get("urls"), &format!("shared.{name}.urls"), &mut errors))
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|mut entry| {
+                            entry.url = crate::shared::render::render_str(&entry.url, &shared_vars);
+                            entry
+                        })
+                        .collect()
+                });
             let instance = crate::shared::instance_id(name, &version);
-            services.push(crate::shared::synthesize::project_service_entry(name.clone(), &instance, &exe));
+            services.push(crate::shared::synthesize::project_service_entry(name.clone(), &instance, &exe, preparation_command, attach_args, urls));
             shared_ids.push(name.clone());
         }
     }
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    let mut groups: HashMap<String, Vec<String>> = top
+    // `groups:` values may name other groups — members expand depth-first in declaration order,
+    // deduplicated on first occurrence. A name shared by a service and a group resolves as the
+    // service, matching `hearthd <target>` precedence.
+    let declared_groups: Vec<(String, Vec<String>)> = top
         .get("groups")
         .and_then(Value::as_object)
         .map(|g| g.iter().map(|(k, v)| (k.clone(), string_array(v))).collect())
         .unwrap_or_default();
+    let declared_map: HashMap<&str, &[String]> = declared_groups.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let service_ids: std::collections::HashSet<&str> = services.iter().map(|s| s.id.as_str()).collect();
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, members) in &declared_groups {
+        let mut resolved: Vec<String> = Vec::new();
+        let mut visiting: Vec<&str> = vec![name.as_str()];
+        expand_group_members(name, members, &declared_map, &service_ids, &mut visiting, &mut resolved, &mut errors);
+        groups.insert(name.clone(), resolved);
+    }
     // Shared services join the conventional `all` group when the project defines one — so
     // `hearthd start all` brings them up too. No `all` group → no implicit membership.
     if let Some(all) = groups.get_mut("all") {
-        all.extend(shared_ids);
+        for id in &shared_ids {
+            if !all.contains(id) {
+                all.push(id.clone());
+            }
+        }
+    }
+    // Disabled services never join a group target — `hearthd start <group>` skips them. They stay
+    // in `group_tree` (display membership is still meaningful) and as direct `start <id>` targets,
+    // where the operation itself is what gets rejected.
+    let disabled_ids: std::collections::HashSet<&str> = services.iter().filter(|s| s.disabled).map(|s| s.id.as_str()).collect();
+    for members in groups.values_mut() {
+        members.retain(|id| !disabled_ids.contains(id.as_str()));
+    }
+    if !errors.is_empty() {
+        return Err(errors);
     }
 
     Ok(ServiceCatalog {
         start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
         services,
         groups,
+        group_tree: declared_groups
+            .into_iter()
+            .map(|(name, members)| crate::catalog::CatalogGroup { name, members })
+            .collect(),
         compose_file: None,
         runtime_directory: top.get("runtimeDirectory").and_then(Value::as_str).map(str::to_string),
         private_file_guard: top.get("privateFileGuard").and_then(Value::as_bool),
@@ -907,7 +1199,7 @@ services:
         assert_eq!(
             err.errors,
             vec![
-                "services.api has unknown key \"command\" (known: label, kind, ownership, env, container, cwd, run, stop, build, readiness, readinessTimeoutMs, preparationCommand, ports, urls)"
+                "services.api has unknown key \"command\" (known: label, kind, ownership, disabled, env, container, cwd, run, stop, build, readiness, readinessTimeoutMs, preparationCommand, ports, urls, artifact)"
                     .to_string()
             ]
         );
@@ -950,6 +1242,102 @@ services:
         assert_eq!(&probe_argv[probe_argv.len() - 3..], ["shared", "probe", "postgres@16.4"]);
         assert!(command.docker_stop_command.is_some(), "stop must detach");
         assert_eq!(catalog.groups.get("all").unwrap(), &vec!["api".to_string(), "postgres".to_string(), "redis".to_string()]);
+    }
+
+    /// `shared:` entries may carry `preparationCommand` (project-side hook before every attach),
+    /// `attachArgs` (appended to the attach argv, forwarded to recipe provision commands), and
+    /// `urls`. `{dataDir}`/`{serviceId}`/`{projectRoot}` render like artifact services.
+    #[test]
+    fn shared_entries_support_prep_attach_args_and_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nshared:\n  nginx:\n    version: \"1.30.5\"\n    preparationCommand: { command: { argv: [prep.sh, \"{dataDir}\"] } }\n    attachArgs: [\"{dataDir}/conf.d\", fixed]\n    urls: [{ url: \"https://x.local/{serviceId}\", label: d }]\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let catalog = load_catalog(dir.path()).unwrap().catalog;
+        let nginx = catalog.services.iter().find(|s| s.id == "nginx").unwrap();
+        let crate::catalog::ServiceRunProfile::Verified { command, preparation_command, .. } = &nginx.profiles.run else { panic!() };
+        let crate::catalog::CommandSpec::Argv { argv } = &command.command else { panic!() };
+        let data_dir = crate::paths::service_data_dir(&dir.path().join(".hearth/runtime-v1"), "nginx").display().to_string();
+        assert_eq!(&argv[argv.len() - 5..], ["shared", "attach", "nginx@1.30.5", &format!("{data_dir}/conf.d"), "fixed"], "{argv:?}");
+        let prep = preparation_command.as_ref().expect("prep must render");
+        let crate::catalog::CommandSpec::Argv { argv: prep_argv } = &prep.command else { panic!() };
+        assert_eq!(prep_argv, &vec!["prep.sh".to_string(), data_dir]);
+        assert_eq!(nginx.urls.as_ref().unwrap()[0].url, "https://x.local/nginx");
+    }
+
+    #[test]
+    fn shared_entries_reject_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nshared:\n  nginx: { version: \"1.30.5\", bogus: 1 }\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("unknown key \"bogus\"")), "{:?}", err.errors);
+    }
+
+    /// `groups:` members may name other groups — expansion is depth-first in declaration order,
+    /// deduplicated on first occurrence, and `groupTree` keeps the raw declared members for
+    /// grouped display.
+    #[test]
+    fn groups_may_reference_other_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\ngroups:\n  infra: [db, cache]\n  app: [api]\n  all: [infra, app, db]\nservices:\n  db:\n    run: { argv: [x] }\n    readiness: { kind: process }\n  cache:\n    run: { argv: [x] }\n    readiness: { kind: process }\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let catalog = load_catalog(dir.path()).unwrap().catalog;
+        assert_eq!(catalog.groups["all"], vec!["db".to_string(), "cache".to_string(), "api".to_string()]);
+        assert_eq!(catalog.groups["infra"], vec!["db".to_string(), "cache".to_string()]);
+        let all = catalog.group_tree.iter().find(|g| g.name == "all").unwrap();
+        assert_eq!(all.members, vec!["infra".to_string(), "app".to_string(), "db".to_string()]);
+    }
+
+    #[test]
+    fn group_cycles_are_load_errors_not_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\ngroups:\n  a: [b]\n  b: [a]\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("group cycle: a -> b -> a") || e.contains("group cycle: b -> a -> b")), "{:?}", err.errors);
+    }
+
+    /// A member that is neither a service nor a group fails the load.
+    #[test]
+    fn group_members_must_be_services_or_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\ngroups:\n  app: [api, ghost]\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("group app references unknown service or group ghost")), "{:?}", err.errors);
+    }
+
+    /// `disabled: true` keeps the service in the catalog and in `groupTree` (display membership),
+    /// but group targets expand past it — `hearthd start <group>` never touches it.
+    #[test]
+    fn disabled_services_leave_group_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\ngroups:\n  all: [a, b]\n  app: [b]\nservices:\n  a:\n    disabled: true\n    run: { argv: [x] }\n    readiness: { kind: process }\n  b:\n    run: { argv: [y] }\n    readiness: { kind: process }\n",
+        );
+        let catalog = load_catalog(dir.path()).unwrap().catalog;
+        assert!(catalog.services[0].disabled);
+        assert!(!catalog.services[1].disabled);
+        assert_eq!(catalog.groups["all"], vec!["b".to_string()]);
+        assert_eq!(catalog.groups["app"], vec!["b".to_string()]);
+        assert_eq!(catalog.group_tree[0].members, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
@@ -1051,5 +1439,145 @@ services:
             errors,
             vec!["api:urls[0] has unknown placeholder {tailnethost} (known: {tailnetHost})".to_string(), "api:urls[1] must be an http:// or https:// URL".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_artifact_and_renders_vars_into_run_env_and_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            r#"
+version: 1
+services:
+  db:
+    artifact:
+      version: "16.4"
+      url: "https://example.test/pg.tar.gz"
+      sha256: "abc123"
+    run: { argv: ["{installDir}/bin/postgres", "-D", "{dataDir}", "-p", "{port}"] }
+    env: { PGDATA: "{dataDir}" }
+    readiness: { kind: tcp, port: 5432 }
+    urls:
+      - "http://127.0.0.1:{port}/"
+"#,
+        );
+        let loaded = load_catalog(dir.path()).expect("should load");
+        let service = &loaded.catalog.services[0];
+        let artifact = service.artifact.as_ref().expect("artifact");
+        let runtime = dir.path().join(".hearth/runtime-v1");
+        let install_dir = runtime.join("installs/db/16.4");
+        assert_eq!(artifact.version, "16.4");
+        assert_eq!(artifact.install_dir.as_deref(), Some(install_dir.to_str().unwrap()));
+        assert_eq!(artifact.data_dir.as_deref(), Some(runtime.join("data/db").to_str().unwrap()));
+        match &service.profiles.run {
+            ServiceRunProfile::Verified { command, .. } => match &command.command {
+                CommandSpec::Argv { argv } => {
+                    assert_eq!(argv[0], format!("{}/bin/postgres", install_dir.display()));
+                    assert_eq!(argv[1], "-D");
+                    assert_eq!(argv[2], format!("{}", runtime.join("data/db").display()));
+                    assert_eq!(argv[4], "5432");
+                }
+                _ => panic!("expected argv"),
+            },
+            _ => panic!("expected verified"),
+        }
+        let env = match &service.profiles.run {
+            ServiceRunProfile::Verified { command, .. } => command.environment.clone().unwrap(),
+            _ => panic!(),
+        };
+        assert_eq!(env["PGDATA"], format!("{}", runtime.join("data/db").display()));
+        assert_eq!(service.urls.as_ref().unwrap()[0].url, "http://127.0.0.1:5432/");
+    }
+
+    #[test]
+    fn artifact_port_vars_come_from_declared_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            r#"
+version: 1
+services:
+  db:
+    artifact: { version: "1.0", script: "pack.sh" }
+    run: { argv: ["x", "{port}", "{port2}"] }
+    readiness: { kind: process }
+    ports:
+      - { port: 1000, label: client }
+      - { port: 1001, label: admin }
+"#,
+        );
+        let loaded = load_catalog(dir.path()).expect("should load");
+        match &loaded.catalog.services[0].profiles.run {
+            ServiceRunProfile::Verified { command, .. } => match &command.command {
+                CommandSpec::Argv { argv } => assert_eq!(argv, &vec!["x".to_string(), "1000".to_string(), "1001".to_string()]),
+                _ => panic!("expected argv"),
+            },
+            _ => panic!("expected verified"),
+        }
+    }
+
+    #[test]
+    fn rejects_artifact_shape_and_context_errors() {
+        let cases = [
+            // version required
+            ("artifact: { url: 'file:///x.tgz', sha256: abc }", "version must be a non-empty"),
+            // url xor script
+            ("artifact: { version: '1', url: 'file:///x.tgz', sha256: abc, script: pack.sh }", "exactly one of url or script"),
+            ("artifact: { version: '1' }", "exactly one of url or script"),
+            // url needs sha256
+            ("artifact: { version: '1', url: 'file:///x.tgz' }", "sha256 is required"),
+            // scriptArgs must be strings
+            ("artifact: { version: '1', script: pack.sh, scriptArgs: [1] }", "scriptArgs must be an array"),
+        ];
+        for (snippet, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                &dir,
+                "hearth.yaml",
+                &format!("version: 1\nservices:\n  db:\n    {snippet}\n    run: {{ argv: [x] }}\n    readiness: {{ kind: process }}\n"),
+            );
+            let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+            assert!(errors.iter().any(|e| e.contains(expected)), "{expected:?} not in {errors:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_artifact_on_external_or_runless_services() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  ext:\n    ownership: external\n    artifact: { version: '1', script: pack.sh }\n    readiness: { kind: process }\n",
+        );
+        let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+        assert!(errors.iter().any(|e| e.contains("daemon-owned")), "{errors:?}");
+        assert!(errors.iter().any(|e| e.contains("needs a run command")), "{errors:?}");
+    }
+
+    #[test]
+    fn rejects_an_unresolvable_port_var() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  db:\n    artifact: { version: '1', script: pack.sh }\n    run: { argv: [x, \"{port}\"] }\n    readiness: { kind: process }\n",
+        );
+        let errors = load_catalog(dir.path()).expect_err("must not load").errors;
+        assert!(errors.iter().any(|e| e.contains("{port}") && e.contains("no value")), "{errors:?}");
+    }
+
+    #[test]
+    fn leaves_unknown_braces_alone_in_artifact_commands() {
+        // Shell commands legitimately carry braces (awk '{print}') — only the artifact var names
+        // are rendered/checked.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  db:\n    artifact: { version: '1', script: pack.sh }\n    run: { shell: \"echo awk '{print $1}' && sleep 1\" }\n    readiness: { kind: process }\n",
+        );
+        load_catalog(dir.path()).expect("braces that aren't artifact vars must pass");
     }
 }

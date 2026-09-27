@@ -25,7 +25,7 @@ use crate::catalog::{validate_catalog, ServiceCatalog, ServiceId, ServiceOwnersh
 use crate::file_io::{create_file_io, FileIo};
 use crate::platform::{is_supported_hearth_platform, unsupported_platform_message};
 use crate::state::{
-    ManagerInfo, ManagerMetadata, OperationError, OperationKind, PersistedManagerState, ServiceLifecycleState, ServiceOperationKind, PROTOCOL_VERSION, STATE_VERSION,
+    LogSlice, ManagerInfo, ManagerMetadata, OperationError, OperationKind, PersistedManagerState, ServiceLifecycleState, ServiceOperationKind, PROTOCOL_VERSION, STATE_VERSION,
 };
 use crate::supervisor::engine::ACTIVE_STATES;
 use crate::supervisor::types::{format_iso8601_millis, Host, SupervisorOptions};
@@ -460,6 +460,7 @@ pub fn router(manager: Arc<HearthManager>) -> Router {
         .route("/v1/events", get(get_events))
         .route("/v1/events/stream", get(get_events_stream))
         .route("/v1/logs/:id", get(get_logs))
+        .route("/v1/daemon/log", get(get_daemon_log))
         .route("/v1/manager/shutdown", post(post_shutdown));
     let authorized_routes = if manager.shared.is_some() {
         authorized_routes.merge(super::shared::shared_routes())
@@ -570,6 +571,11 @@ async fn post_operation_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Http
         Some("status") => ServiceOperationKind::Status,
         _ => return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_action", "action must be start, stop, restart, or status")),
     };
+    // A disabled service accepts reads (`status`) but no lifecycle action — `groups:` expands past
+    // it too, so the only way to land here is an explicit serviceId.
+    if action != ServiceOperationKind::Status && catalog.services.iter().find(|s| s.id == service_id).map(|s| s.disabled).unwrap_or(false) {
+        return Err(ManagerHttpError::new(StatusCode::CONFLICT, "service_disabled", "service is disabled"));
+    }
     let kill_unowned = match body.get("killUnowned") {
         None | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,
@@ -755,6 +761,12 @@ async fn post_bulk_start_inner(manager: Arc<HearthManager>, bytes: Bytes) -> Htt
     }
     if !ok {
         return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_targets", "targets must be a non-empty set of catalog services"));
+    }
+    // Disabled services are silent skips in a bulk start — the same way `groups:` expansion already
+    // drops them. When nothing runnable remains, the request itself is what's wrong.
+    targets.retain(|id| !catalog.services.iter().find(|s| &s.id == id).map(|s| s.disabled).unwrap_or(false));
+    if targets.is_empty() {
+        return Err(ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_targets", "targets must include at least one enabled catalog service"));
     }
     let kill_unowned = match body.get("killUnowned") {
         None | Some(Value::Bool(false)) => false,
@@ -997,6 +1009,42 @@ async fn get_logs(State(manager): State<Arc<HearthManager>>, AxumPath(raw_servic
     json_response(slice, StatusCode::OK)
 }
 
+/// `GET /v1/daemon/log` — the daemon's own `daemon.log` is a plain rotating file, not the
+/// per-service `CursorLogStore`, so it gets its own route. Returns a `LogSlice`-shaped tail:
+/// `reset` is always true (the whole tail is returned each poll — a diagnostic pane, not an
+/// incremental cursor) and `nextCursor` carries the byte length so callers can detect rotation.
+async fn get_daemon_log(State(manager): State<Arc<HearthManager>>, Query(params): Query<HashMap<String, String>>) -> Response {
+    let bytes = match params.get("bytes") {
+        None => 131_072_u64,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if (1..=1_048_576).contains(&n) => n,
+            _ => return ManagerHttpError::new(StatusCode::BAD_REQUEST, "invalid_bytes", "bytes must be an integer between 1 and 1048576").into_response(),
+        },
+    };
+    let path = manager.runtime_directory.join(crate::daemon::DAEMON_LOG_NAME);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "daemon_log_unreadable", format!("could not read daemon.log: {e}")).into_response(),
+    };
+    let size = raw.len() as u64;
+    let mut start = raw.len().saturating_sub(bytes as usize);
+    // Snap the tail start to a UTF-8 boundary — same rule as the app's LogController trim.
+    while start < raw.len() && (raw[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    let slice = LogSlice {
+        service_id: "daemon".to_string(),
+        generation: 0,
+        cursor: 0,
+        next_cursor: size,
+        data: String::from_utf8_lossy(&raw[start..]).into_owned(),
+        reset: true,
+        truncated: start > 0,
+    };
+    json_response(slice, StatusCode::OK)
+}
+
 async fn post_reload(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> Response {
     match post_reload_inner(manager, bytes).await {
         Ok(response) => response,
@@ -1093,6 +1141,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
@@ -1105,6 +1154,7 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         }
     }
 
@@ -1126,6 +1176,7 @@ mod tests {
         let catalog = ServiceCatalog {
             services: vec![tcp_service("api", port)],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -1207,6 +1258,18 @@ mod tests {
         let log_slice: Value = get("/v1/logs/api".to_string()).await.json().await.unwrap();
         assert_eq!(log_slice["serviceId"], "api");
 
+        // GET /v1/daemon/log — empty slice while no daemon.log exists, then a byte-bounded tail.
+        let empty_daemon: Value = get("/v1/daemon/log".to_string()).await.json().await.unwrap();
+        assert_eq!(empty_daemon["serviceId"], "daemon");
+        assert_eq!(empty_daemon["data"], "");
+        assert_eq!(empty_daemon["reset"], true);
+        std::fs::write(dir.path().join("daemon.log"), "aa bb\ncc dd\n").unwrap();
+        let daemon_log: Value = get("/v1/daemon/log?bytes=6".to_string()).await.json().await.unwrap();
+        assert_eq!(daemon_log["data"], "cc dd\n");
+        assert_eq!(daemon_log["truncated"], true);
+        let bad_bytes = get("/v1/daemon/log?bytes=0".to_string()).await;
+        assert_eq!(bad_bytes.status(), 400);
+
         // GET /v1/events — at least manager.started and some service.lifecycle events should exist.
         let events: Value = get("/v1/events".to_string()).await.json().await.unwrap();
         assert!(events["events"].as_array().unwrap().iter().any(|e| e["type"] == "manager.started"));
@@ -1275,6 +1338,7 @@ mod tests {
         let catalog = ServiceCatalog {
             services: vec![tcp_service("api", port)],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -1333,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_route_is_404() {
         let dir = tempfile::tempdir().unwrap();
-        let catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         let client = reqwest::Client::new();
         let response = client.get(format!("{}/v1/does-not-exist", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", "1").send().await.unwrap();
@@ -1348,6 +1412,7 @@ mod tests {
         let catalog = ServiceCatalog {
             services: vec![tcp_service("api", port)],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -1357,7 +1422,7 @@ mod tests {
         manager.supervisor().start(&"api".to_string(), None).await.unwrap();
         assert_eq!(manager.service_states()[0].actual_state, crate::state::ActualServiceState::Ready);
 
-        let empty_catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let empty_catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let outcome = manager.reload_catalog(empty_catalog).await.unwrap();
         assert_eq!(outcome.stopped, vec!["api".to_string()]);
         manager.close().await;
@@ -1379,6 +1444,7 @@ mod tests {
         let catalog = ServiceCatalog {
             services: vec![tcp_service("db", db_port)],
             groups: HashMap::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -1439,11 +1505,54 @@ mod tests {
         manager.close().await;
     }
 
+    /// `disabled: true` rejects direct lifecycle operations and is skipped by bulk-start.
+    #[tokio::test]
+    async fn disabled_services_reject_operations_and_skip_bulk_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut off = tcp_service("off", free_port());
+        off.disabled = true;
+        let api = tcp_service("api", free_port());
+        let catalog = ServiceCatalog { services: vec![off, api], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
+        let base = manager.base_url();
+        let token = manager.bearer_token().to_string();
+        let client = reqwest::Client::new();
+        let post = |path: String, body: Value| {
+            let (base, token, client) = (base.clone(), token.clone(), client.clone());
+            async move {
+                client.post(format!("{base}{path}")).bearer_auth(&token).header("x-hearth-protocol", "1").json(&body).send().await.unwrap()
+            }
+        };
+
+        let rejected = post("/v1/operations".to_string(), json!({"requestId": "req-off-1", "serviceId": "off", "action": "start"})).await;
+        assert_eq!(rejected.status(), 409);
+        assert_eq!(rejected.json::<Value>().await.unwrap()["error"]["code"], "service_disabled");
+
+        for action in ["stop", "restart"] {
+            let rejected = post("/v1/operations".to_string(), json!({"requestId": format!("req-off-{action}"), "serviceId": "off", "action": action})).await;
+            assert_eq!(rejected.status(), 409, "{action}");
+        }
+
+        let empty = post("/v1/operations/bulk-start".to_string(), json!({"requestId": "req-bulk-off", "targets": ["off"]})).await;
+        assert_eq!(empty.status(), 400);
+        assert_eq!(empty.json::<Value>().await.unwrap()["error"]["code"], "invalid_targets");
+
+        // Mixed targets: the disabled member is dropped, the rest start.
+        let accepted = post("/v1/operations/bulk-start".to_string(), json!({"requestId": "req-bulk-mixed", "targets": ["off", "api"]})).await;
+        assert_eq!(accepted.status(), 202);
+        let operation_id = accepted.json::<Value>().await.unwrap()["operation"]["id"].as_str().unwrap().to_string();
+        let settled = wait_for_operation(&client, &base, &token, &operation_id).await;
+        assert_eq!(settled["operation"]["status"], "succeeded");
+        assert_eq!(manager.service_states().iter().find(|s| s.service_id == "api").unwrap().actual_state, crate::state::ActualServiceState::Ready);
+
+        manager.close().await;
+    }
+
     #[tokio::test]
     async fn serves_resolved_service_urls_over_http() {
         let mut api = tcp_service("api", free_port());
         api.urls = Some(vec![crate::catalog::ServiceUrl { url: "http://127.0.0.1:18080/app".into(), label: Some("app".into()), requires_running: Some(false) }]);
-        let catalog = ServiceCatalog { services: vec![api], groups: HashMap::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+        let catalog = ServiceCatalog { services: vec![api], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let dir = tempfile::tempdir().unwrap();
         let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
 

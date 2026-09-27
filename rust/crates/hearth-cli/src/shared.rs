@@ -23,6 +23,7 @@ fn smp_catalog() -> ServiceCatalog {
     ServiceCatalog {
         services: vec![],
         groups: Default::default(),
+        group_tree: Vec::new(),
         compose_file: None,
         runtime_directory: Some(SHARED_RUNTIME_DIRECTORY_NAME.to_string()),
         start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -95,7 +96,7 @@ pub async fn run(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: Arc<d
 async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Arc<dyn Fn(&Path) + Send + Sync>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(args, &[FlagName::Json])?;
     let Some(subcommand) = flags.positionals.first().cloned() else {
-        return usage_err("usage: hearthd shared ensure|list|installed|status|attach|detach|probe|install|start|stop|remove [<name>@<version>] [--json]");
+        return usage_err("usage: hearthd shared ensure|list|installed|status|attach|detach|probe|install|start|stop|remove [<name>@<version>] [attach-args...] [--json]");
     };
     let rest = &flags.positionals[1..];
     match subcommand.as_str() {
@@ -157,8 +158,11 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
         }
         "attach" => {
             let id = parse_shared_id(rest.first())?;
+            // Trailing positionals are forwarded to the recipe's provision argv (e.g. the shared
+            // nginx recipe takes the project's rendered conf directory).
+            let attach_args: Vec<String> = rest.iter().skip(1).cloned().collect();
             let client = ensure_smp(spawn_smp).await?;
-            let body = json!({ "service": id, "projectRoot": root });
+            let body = json!({ "service": id, "projectRoot": root, "args": attach_args });
             let result = smp_request_slow(&client, "/v1/shared/attach", &body).await.map_err(|e| crate::LocalctlError { exit_code: crate::EXIT_FAILED, message: e })?;
             if flags.json {
                 (io.out)(&serde_json::to_string_pretty(&result).unwrap());

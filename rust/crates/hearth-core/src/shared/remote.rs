@@ -17,6 +17,11 @@ use super::{SharedError, SHARED_CATALOG_URL};
 
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const CACHE_FILE_NAME: &str = "catalog.json";
+/// The repo-root `catalog.json` baked into the binary — the same document the pinned URL
+/// serves. Last resort when the registry is unreachable and nothing is cached yet: the URL
+/// 404s for a private repo (raw.githubusercontent.com needs auth), so without this the
+/// catalog endpoint can never answer on a first run.
+const EMBEDDED_CATALOG: &str = include_str!("../../../../../catalog.json");
 
 /// Where the darwin-arm64 tarball comes from. Exactly one of `url` or `script`.
 ///
@@ -100,10 +105,27 @@ pub struct SharedRecipe {
     /// historical single-port allocation. Capped by `ports::MAX_SHARED_PORTS`.
     #[serde(default, skip_serializing_if = "is_zero_u16")]
     pub additional_ports: u16,
+    /// Explicitly pinned ports — bypasses hash allocation entirely (`ports[0]` is `{port}`, the
+    /// rest are `{port2}`…). For recipes whose port IS the feature (e.g. the shared nginx on
+    /// 80/443). Mutually exclusive with `additionalPorts`; capped by `ports::MAX_SHARED_PORTS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
     /// Display labels for `additional_ports`, in order (`"console"`, `"controller"`, …).
     /// Missing entries fall back to `port2`, `port3`, …
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_port_labels: Vec<String>,
+}
+
+impl SharedRecipe {
+    /// Effective extra-port count driving `{portN}` availability — pinned ports count like
+    /// `additionalPorts` does.
+    pub fn extra_port_count(&self) -> usize {
+        if !self.ports.is_empty() {
+            self.ports.len() - 1
+        } else {
+            self.additional_ports as usize
+        }
+    }
 }
 
 fn is_zero_u16(value: &u16) -> bool {
@@ -140,6 +162,18 @@ fn parse_document(text: &str) -> Result<SharedCatalogDocument, SharedError> {
         for (version, recipe) in &family.versions {
             for (platform, artifact) in &recipe.artifacts {
                 artifact.validate(&format!("{name}@{version} {platform}"))?;
+            }
+            if !recipe.ports.is_empty() && recipe.additional_ports > 0 {
+                return Err(SharedError(format!(
+                    "{name}@{version} declares both ports and additionalPorts"
+                )));
+            }
+            if recipe.ports.len() > super::ports::MAX_SHARED_PORTS as usize {
+                return Err(SharedError(format!(
+                    "{name}@{version} pins {} ports; the maximum is {}",
+                    recipe.ports.len(),
+                    super::ports::MAX_SHARED_PORTS
+                )));
             }
         }
     }
@@ -188,6 +222,9 @@ impl RemoteCatalog {
             Err(remote_error) => {
                 if let Some(doc) = self.load_cached() {
                     return Ok(doc);
+                }
+                if let Ok(doc) = parse_document(EMBEDDED_CATALOG) {
+                    return Ok(Arc::new(doc));
                 }
                 Err(remote_error)
             }
@@ -310,6 +347,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_pinned_ports() {
+        let doc = parse_document(
+            r#"{
+              "version": 1,
+              "services": {
+                "nginx": {
+                  "versions": {
+                    "1.30.5": {
+                      "artifacts": { "darwin-arm64": { "url": "file:///n.tgz", "sha256": "abc" } },
+                      "ports": [80, 443],
+                      "extraPortLabels": ["https"],
+                      "run": { "argv": ["{installDir}/bin/nginx", "-c", "{dataDir}/nginx.conf"] },
+                      "readiness": { "kind": "http", "url": "http://127.0.0.1:{port}/healthz" }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let recipe = doc.recipe("nginx", "1.30.5").unwrap();
+        assert_eq!(recipe.ports, vec![80, 443]);
+        assert_eq!(recipe.extra_port_count(), 1);
+    }
+
+    #[test]
+    fn rejects_ports_and_additional_ports_together() {
+        let error = parse_document(
+            r#"{
+              "version": 1,
+              "services": {
+                "nginx": {
+                  "versions": {
+                    "1.30.5": {
+                      "artifacts": { "darwin-arm64": { "url": "file:///n.tgz", "sha256": "abc" } },
+                      "ports": [80],
+                      "additionalPorts": 1,
+                      "run": { "argv": ["x"] },
+                      "readiness": { "kind": "process" }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap_err();
+        assert!(error.0.contains("both ports and additionalPorts"), "{error:?}");
+    }
+
+    #[test]
     fn rejects_an_artifact_that_sets_both_sources() {
         let err = parse_document(
             r#"{
@@ -361,6 +448,19 @@ mod tests {
         );
         let doc = remote.load(true).await.unwrap();
         assert!(doc.recipe("postgres", "16.4").is_some());
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_embedded_catalog_without_remote_or_cache() {
+        // No cached document: a private repo makes the pinned raw URL answer 404 forever,
+        // so the binary's own copy of catalog.json is what answers.
+        let dir = tempfile::tempdir().unwrap();
+        let remote = RemoteCatalog::new(
+            dir.path(),
+            Some("http://127.0.0.1:1/unreachable".to_string()),
+        );
+        let doc = remote.load(true).await.unwrap();
+        assert!(doc.services.contains_key("redis"));
     }
 
     fn brace_names(text: &str) -> Vec<String> {
@@ -418,7 +518,7 @@ mod tests {
             "version",
             "instanceId",
         ];
-        let project = ["projectId", "projectDb", "projectUser", "projectBucket"];
+        let project = ["projectId", "projectDb", "projectUser", "projectBucket", "projectRoot"];
         for (path, text) in &strings {
             let in_attachment = path.contains(".provision")
                 || path.contains(".deprovision")
@@ -436,10 +536,14 @@ mod tests {
                 let blob = serde_json::to_string(recipe).unwrap();
                 if brace_names(&blob).iter().any(|name| name == "port2") {
                     assert!(
-                        recipe.additional_ports >= 1,
-                        "{service}@{version} uses {{port2}} without additionalPorts"
+                        recipe.extra_port_count() >= 1,
+                        "{service}@{version} uses {{port2}} without a second port (ports/additionalPorts)"
                     );
                 }
+                assert!(
+                    !(recipe.additional_ports > 0 && !recipe.ports.is_empty()),
+                    "{service}@{version} declares both ports and additionalPorts"
+                );
                 let sha = &recipe.artifacts["darwin-arm64"].sha256;
                 assert!(
                     sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()),
@@ -464,11 +568,16 @@ mod tests {
             .values()
             .all(|recipe| recipe.prepare.is_some()));
         let mongo = doc.recipe("mongodb", "8.0.32").unwrap();
-        assert!(mongo.artifacts["darwin-arm64"]
-            .url
-            .as_deref()
-            .unwrap()
-            .contains("fastdl.mongodb.org"));
+        // mongodb is a `script` artifact too: the recipe repacks mongod+mongosh so provision can
+        // initiate the single-node rs0 (consumers use transactions).
+        assert!(mongo.artifacts["darwin-arm64"].script.is_some());
+        assert!(!mongo.provision.is_empty());
+        match &mongo.run {
+            crate::catalog::CommandSpec::Argv { argv } => {
+                assert!(argv.windows(2).any(|w| w == ["--replSet", "rs0"]))
+            }
+            _ => panic!("mongodb run must be argv"),
+        }
         assert!(doc.services["redis"]
             .versions
             .values()

@@ -638,6 +638,27 @@ impl RunBuild for DefaultRunBuild {
     }
 }
 
+/// `artifact:` installs for file-loaded catalogs — delegates to the same tarball machinery the
+/// shared-services installer uses, scoped to the project's runtime directory.
+pub struct DefaultArtifactInstaller {
+    pub root: PathBuf,
+    pub runtime_directory: PathBuf,
+}
+
+#[async_trait]
+impl super::types::ArtifactInstaller for DefaultArtifactInstaller {
+    async fn install(&self, service: &crate::catalog::ServiceDefinition, on_output: OnOutput) -> Result<(), SupervisorError> {
+        let artifact = service
+            .artifact
+            .clone()
+            .ok_or_else(|| SupervisorError(format!("{}: no artifact declared", service.id)))?;
+        crate::shared::install::install_service_artifact(&self.root, &self.runtime_directory, service, &artifact, &|line| on_output(line))
+            .await
+            .map(|_| ())
+            .map_err(|e| SupervisorError(e.0))
+    }
+}
+
 /// `base_environment` should come from `crate::env::resolve_base_environment` for a daemon that
 /// might be launched from a GUI (bare `PATH`, no login-shell customization) — defaults to the
 /// current process's own environment, i.e. whatever spawned the daemon, matching the TS default.
@@ -647,8 +668,9 @@ pub fn default_supervisor_options(root: PathBuf, runtime_directory: Option<PathB
     let http_client = reqwest::Client::new();
     let clock: Arc<dyn SupervisorClock> = Arc::new(SystemClock);
     SupervisorOptions {
-        process: Arc::new(DefaultProcessAdapter { root: root.clone(), runtime_directory, base_environment: base_environment.clone() }),
+        process: Arc::new(DefaultProcessAdapter { root: root.clone(), runtime_directory: runtime_directory.clone(), base_environment: base_environment.clone() }),
         run_build: Arc::new(DefaultRunBuild { root: root.clone(), base_environment: base_environment.clone() }),
+        artifact_installer: Some(Arc::new(DefaultArtifactInstaller { root: root.clone(), runtime_directory })),
         probes: Arc::new(DefaultProbeAdapter { root, base_environment, http_client }),
         preparation: None,
         clock,
@@ -797,6 +819,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd {
@@ -815,10 +838,12 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         };
         let catalog = ServiceCatalog {
             services: vec![service],
             groups: Map::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -928,6 +953,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd {
@@ -946,10 +972,12 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         };
         let catalog = ServiceCatalog {
             services: vec![service],
             groups: Map::new(),
+            group_tree: Vec::new(),
             compose_file: None,
             runtime_directory: None,
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
@@ -1065,6 +1093,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd { command: Spec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
@@ -1077,8 +1106,9 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         };
-        let catalog = ServiceCatalog { services: vec![service], groups: Map::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: None };
+        let catalog = ServiceCatalog { services: vec![service], groups: Map::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: None };
         let host = Arc::new(TestHost { catalog: Arc::new(catalog), states: StdMutex::new(Map::new()) });
 
         let runtime_dir = std::env::temp_dir().join(format!("hearth-core-real-preparation-command-test-{}", uuid::Uuid::new_v4()));

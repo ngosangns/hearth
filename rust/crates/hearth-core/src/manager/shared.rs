@@ -259,27 +259,46 @@ async fn ensure_registered_and_installed(
                     format!("{id} is not in the shared catalog"),
                 ));
             };
-            let count = recipe.additional_ports.saturating_add(1);
-            if count > MAX_SHARED_PORTS {
-                return Err(ManagerHttpError::new(
-                    StatusCode::BAD_REQUEST,
-                    "too_many_ports",
-                    format!("{id} asks for {count} ports; the maximum is {MAX_SHARED_PORTS}"),
-                ));
-            }
-            let taken: HashSet<u16> = ctx
-                .registry
-                .list()
-                .iter()
-                .flat_map(|i| i.all_ports())
-                .collect();
-            let ports = allocate_ports(&id, count, &taken).await.ok_or_else(|| {
-                ManagerHttpError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "no_free_port",
-                    "no free port block in the shared range",
-                )
-            })?;
+            let ports = if !recipe.ports.is_empty() {
+                // Pinned ports: the recipe IS its ports — nothing to probe, just a free check.
+                if recipe.ports.len() > MAX_SHARED_PORTS as usize {
+                    return Err(ManagerHttpError::new(
+                        StatusCode::BAD_REQUEST,
+                        "too_many_ports",
+                        format!("{id} pins {} ports; the maximum is {MAX_SHARED_PORTS}", recipe.ports.len()),
+                    ));
+                }
+                if !crate::shared::ports::ports_free(&recipe.ports).await {
+                    return Err(ManagerHttpError::new(
+                        StatusCode::CONFLICT,
+                        "port_in_use",
+                        format!("{id} cannot pin {:?}; one or more are in use", recipe.ports),
+                    ));
+                }
+                recipe.ports.clone()
+            } else {
+                let count = recipe.additional_ports.saturating_add(1);
+                if count > MAX_SHARED_PORTS {
+                    return Err(ManagerHttpError::new(
+                        StatusCode::BAD_REQUEST,
+                        "too_many_ports",
+                        format!("{id} asks for {count} ports; the maximum is {MAX_SHARED_PORTS}"),
+                    ));
+                }
+                let taken: HashSet<u16> = ctx
+                    .registry
+                    .list()
+                    .iter()
+                    .flat_map(|i| i.all_ports())
+                    .collect();
+                allocate_ports(&id, count, &taken).await.ok_or_else(|| {
+                    ManagerHttpError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "no_free_port",
+                        "no free port block in the shared range",
+                    )
+                })?
+            };
             let port = ports[0];
             let extra_ports = ports[1..].to_vec();
             ctx.registry
@@ -401,9 +420,22 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     let ctx = shared_ctx(manager)?;
     let body = strict_body(
         bytes,
-        &["requestId", "service", "projectRoot"],
+        &["requestId", "service", "projectRoot", "args"],
         &["service"],
     )?;
+    let attach_args: Vec<String> = match body.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => match v.as_array() {
+            Some(items) if items.iter().all(Value::is_string) => items.iter().filter_map(|s| s.as_str().map(str::to_string)).collect(),
+            _ => {
+                return Err(ManagerHttpError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "args must be an array of strings",
+                ))
+            }
+        },
+    };
     let (name, version) = parse_instance_id(body.get("service").unwrap_or(&Value::Null))?;
     let id = crate::shared::instance_id(&name, &version);
     let project_root = body.get("projectRoot").and_then(Value::as_str).map(|s| {
@@ -453,9 +485,21 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     // idempotent.
     let mut vars = instance_vars(&instance, &ctx.root);
     project_vars(&mut vars, &pid);
+    vars.insert("projectRoot".to_string(), project_root.display().to_string());
     let mut provision_error = None;
     for step in &instance.recipe.provision {
-        let command = render_command(step, &vars);
+        let mut command = render_command(step, &vars);
+        // Attach args append to the rendered argv — e.g. the shared nginx recipe takes the
+        // attaching project's rendered conf directory as a trailing argument.
+        if !attach_args.is_empty() {
+            match &mut command {
+                crate::catalog::CommandSpec::Argv { argv } => argv.extend(attach_args.iter().cloned()),
+                crate::catalog::CommandSpec::Shell { .. } => {
+                    provision_error = Some("attach args require argv provision commands".to_string());
+                    break;
+                }
+            }
+        }
         match run_recipe_command(&command, &instance.data_dir(&ctx.root)).await {
             Ok(0) => {}
             Ok(code) => {

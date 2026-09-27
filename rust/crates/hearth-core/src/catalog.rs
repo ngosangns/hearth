@@ -152,6 +152,41 @@ pub struct ServiceBuildProfile {
     pub serialization_key: Option<String>,
 }
 
+/// A versioned tarball installed before the service's run command starts — the same
+/// download/script → sha256 → extract → `.hearth-installed` marker machinery shared services use
+/// (`shared/install.rs`), scoped to this project instead of `~/.hearth/shared`: installs land in
+/// `<runtimeDir>/installs/<serviceId>/<version>` and the service gets a persistent
+/// `<runtimeDir>/data/<serviceId>`. The config-file parser renders `{installDir}`, `{dataDir}`,
+/// `{port}`/`{port2}…` (the service's declared ports, or the tcp readiness port for `{port}`),
+/// `{serviceId}` and `{projectRoot}` into run/stop/build/preparation/env/readiness/urls at load
+/// time, so the resolved definition always carries literal paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceArtifact {
+    /// Versions the install dir — bump it and the next start installs into a fresh directory.
+    pub version: String,
+    /// A downloadable tarball (`https://` or `file://`). Mutually exclusive with `script`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// A packager script run as `bash <script> <scriptArgs...> <out.tar.gz>` — a project-relative
+    /// path or a URL. Mutually exclusive with `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_args: Vec<String>,
+    /// Enforced for `url` artifacts; `script` output is never byte-reproducible (tar mtimes,
+    /// compile variance), so no committed hash can match — the script itself is the trust
+    /// boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Absolute paths the installer fills from its runtime directory when unset. File-loaded
+    /// catalogs always resolve these at parse time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServicePort {
@@ -263,19 +298,41 @@ pub struct ServiceDefinition {
     /// its own state machine when detected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ownership: Option<ServiceOwnership>,
+    /// `true`: the service stays in the catalog (visible, loadable) but accepts no
+    /// start/stop/restart — direct operations are rejected and group targets expand past it.
+    #[serde(default)]
+    pub disabled: bool,
     pub profiles: ServiceProfiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<ServicePort>>,
     /// Where this service can be reached — see `ServiceUrl`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<ServiceUrl>>,
+    /// A versioned tarball this service installs into the project runtime dir before starting —
+    /// see `ServiceArtifact`. Daemon-owned services only; `external` ones never spawn and so never
+    /// install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ServiceArtifact>,
+}
+
+/// A `groups:` entry as declared — `members` may name services or other groups (nested groups
+/// expand into `ServiceCatalog::groups` at load; this keeps the declaration so clients can show
+/// direct membership rather than the flattened superset).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogGroup {
+    pub name: String,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceCatalog {
     pub services: Vec<ServiceDefinition>,
+    /// Group name → flattened service ids, nested group members expanded depth-first.
     pub groups: HashMap<String, Vec<ServiceId>>,
+    /// Declaration order + raw members (group names included) for grouped display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_tree: Vec<CatalogGroup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_file: Option<String>,
     /// Runtime state directory, relative to the manager's root. Default: `.hearth/runtime-v1`.
@@ -384,6 +441,7 @@ mod tests {
             label: None,
             kind: None,
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
@@ -402,6 +460,7 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         }
     }
 
@@ -411,6 +470,7 @@ mod tests {
             label: None,
             kind: None,
             ownership: None,
+            disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
@@ -429,6 +489,7 @@ mod tests {
             },
             ports: None,
             urls: None,
+            artifact: None,
         }
     }
 
@@ -439,6 +500,7 @@ mod tests {
                 .iter()
                 .map(|(name, members)| (name.to_string(), members.iter().map(|m| m.to_string()).collect()))
                 .collect(),
+            group_tree: Vec::new(),
             services,
             compose_file: None,
             runtime_directory: None,
@@ -480,12 +542,14 @@ mod tests {
                 label: None,
                 kind: None,
                 ownership: None,
+                disabled: false,
                 profiles: ServiceProfiles {
                     run: ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
                     build: None,
                 },
                 ports: None,
                 urls: None,
+                artifact: None,
             }],
             &[],
         );

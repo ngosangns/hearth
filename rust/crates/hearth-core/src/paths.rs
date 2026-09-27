@@ -53,6 +53,22 @@ pub fn log_stream_state_path(runtime_directory: &Path) -> PathBuf {
     logs_dir(runtime_directory).join("streams.json")
 }
 
+/// Where a service's `artifact:` tarball extracts to — versioned so an upgrade installs into a
+/// fresh directory and never mutates a running install.
+pub fn install_dir(runtime_directory: &Path, service_id: &str, version: &str) -> PathBuf {
+    runtime_directory.join("installs").join(service_id).join(version)
+}
+
+/// A service's persistent data dir — survives reinstalls and is not the install dir.
+pub fn service_data_dir(runtime_directory: &Path, service_id: &str) -> PathBuf {
+    runtime_directory.join("data").join(service_id)
+}
+
+/// Staging area for artifact downloads/extraction — safe to delete at any time.
+pub fn downloads_dir(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("downloads")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

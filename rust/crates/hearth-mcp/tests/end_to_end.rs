@@ -31,12 +31,14 @@ fn tcp_service(id: &str, port: u16) -> ServiceDefinition {
         label: None,
         kind: Some(ServiceKind::Application),
         ownership: None,
+        disabled: false,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified { command: ServiceCommand { command: CommandSpec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None }, readiness: ReadinessSpec::Tcp { port }, readiness_timeout_ms: Some(5_000), preparation: None, preparation_command: None },
             build: None,
         },
         ports: None,
         urls: Some(vec![hearth_core::catalog::ServiceUrl { url: "http://127.0.0.1:18090/".into(), label: Some("app".into()), requires_running: None }]),
+        artifact: None,
     }
 }
 
@@ -48,7 +50,7 @@ fn args(value: Value) -> rmcp::model::JsonObject {
 async fn full_tool_lifecycle_over_a_real_bootstrapped_manager() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let catalog = ServiceCatalog { services: vec![tcp_service("api", port)], groups: HashMap::new(), compose_file: None, runtime_directory: Some(dir.path().to_string_lossy().to_string()), start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
+    let catalog = ServiceCatalog { services: vec![tcp_service("api", port)], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: Some(dir.path().to_string_lossy().to_string()), start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
     let manager = bootstrap(HearthManagerOptions { runtime_directory: None, root: Some(PathBuf::from("/tmp")), catalog: catalog.clone(), event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
 
     let options = LocalctlOptions { catalog, spawn_daemon: Box::new(|_| panic!("a running manager should never need spawning")), doctor_checks: None };
