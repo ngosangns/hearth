@@ -1,0 +1,53 @@
+name: Release
+
+# Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. CI's rust-test
+# job already runs on the same tag (ci.yml); this workflow builds the ad-hoc-signed Hearth.app and
+# attaches a zip to the GitHub Release that SUFeedURL in Info.plist points at.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos-app:
+    runs-on: [self-hosted, macmini]
+    env:
+      APP_ZIP: Hearth-${{ github.ref_name }}-macos.zip
+    steps:
+      - uses: actions/checkout@v7
+      # Same PATH problem as ci.yml: the runner service doesn't have a login-shell PATH, so cargo
+      # (rustup under ~/.cargo/bin here, Homebrew on dev machines) is absent unless added. Homebrew
+      # bin dirs are added unconditionally because `gh` (used in the publish step) lives there and
+      # the cargo candidate loop exits before appending it.
+      - name: Put toolchain on PATH
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$HOME/.cargo/bin" /opt/homebrew/bin /usr/local/bin >> "$GITHUB_PATH"
+      - name: Check toolchain
+        run: cargo --version && swift --version && gh --version
+      - name: Package Hearth.app
+        run: apps/macos/scripts/build-app.sh release
+      # ditto, not zip(1): preserves the resource forks/quarantine metadata a signed .app needs when
+      # unzipped on another machine.
+      - name: Zip the app bundle
+        working-directory: apps/macos/.build
+        run: |
+          set -euo pipefail
+          rm -f "$APP_ZIP"
+          ditto -c -k --keepParent Hearth.app "$APP_ZIP"
+          shasum -a 256 "$APP_ZIP"
+      - name: Publish GitHub Release
+        working-directory: apps/macos/.build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Idempotent so a re-run of a failed/partial release job still lands the asset.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$APP_ZIP" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$APP_ZIP" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

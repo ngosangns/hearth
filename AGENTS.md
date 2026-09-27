@@ -42,6 +42,10 @@ the fswatch rebuild loop).
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags.
 There is no npm publish. The binary is installed by hand or bundled into the macOS app.
+Pushing a `v*.*.*` tag also runs `.github/workflows/release.yml` on the self-hosted runner:
+`build-app.sh release` → `ditto` zip → `gh release create --generate-notes` (idempotent — a re-run
+uploads `--clobber` over the existing release). The zip is the asset `SUFeedURL`'s releases page
+serves; the app is still ad-hoc signed, so first launch elsewhere needs right-click > Open.
 `apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`)
 and runs `swift build` only — its tests need XCTest, which the self-hosted runner lacks.
 
