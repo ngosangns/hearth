@@ -241,6 +241,10 @@ from any dev box here, with the same username.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
   catalog reloads and is exempt from the apply-services prune.
+- The app's `displayState` collapse splits in-flight states the CLI's `text_state` does not:
+  `running`/`running-unready` → `running`, `starting`/`preparing` → `starting` (CLI prints both as
+  `running`). `ready` and `running` both count in the "ready/total" summaries — a `kind: process`
+  service sits in `running` forever and must not read as a stuck boot.
 
 **Testing gotchas**
 

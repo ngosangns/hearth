@@ -53,12 +53,20 @@ Produces an ad-hoc-signed `Hearth.app` bundling compiled `hearthd` at
 - Add/remove workspaces (folders), persisted locally.
 - Per-folder trust prompt before the first daemon connection.
 - Connect (spawn-or-adopt the daemon via `hearthd manager ensure`), list services with live status
-  (polling `/v1/services` every 2s), start/stop/restart per service.
-- Per-service log viewer.
+  (polling `/v1/services` every 2s), start/stop/restart per service and per catalog `groups:` section.
+- `disabled: true` services render inert — the catalog keeps them listed, the row offers no actions.
+- Live-status collapse: `running`/`running-unready` → `running` (mint), `starting`/`preparing` →
+  `starting` (yellow) — a `kind: process` service never reads as a stuck boot. Both `ready` and
+  `running` count toward the "ready/total" summaries.
+- Per-service log viewer, plus a pinned `daemon log` row fed by `GET /v1/daemon/log`.
+- Per-service URLs from `/v1/urls`, flagged when the service is down.
+- Kill & Start: when a port is held by an unowned process, a confirmed `killUnowned` start.
 - A workspace's live connection lives in `WorkspaceControllerRegistry` at the app level.
-- `MenuBarExtra` — a global "ready/total" summary across every trusted workspace.
+- `MenuBarExtra` — a global "ready/total" summary across every trusted workspace, plus a
+  `Shared Services` window (`hearthd shared ensure`) listing machine-global instances and the
+  installable catalog.
 - Config watch: editing `hearth.yaml`/`.yml`/`.json` triggers `hearthd manager reload`.
-- "Stop All" in the toolbar and menu bar.
+- "Stop All", "Restart Daemon", and a confirmed "Stop Daemon…" in the toolbar and menu bar.
 
 ## Known limitations
 
