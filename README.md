@@ -42,6 +42,36 @@ services:
       - { url: "https://{tailnetHost}:8443", label: admin, requiresRunning: false }
 ```
 
+`groups:` members may also name other groups — `all: [infra, app]` expands depth-first in
+declaration order (deduplicated, cycles rejected at load). A member naming both a service and a
+group resolves as the service. The app groups its service list by direct membership and offers
+per-group start/stop.
+
+`disabled: true` on a service keeps it in the catalog but out of every lifecycle action: direct
+start/stop/restart is rejected (`service_disabled`) and group targets expand past it. It does not
+stop a service already running — stop it before disabling, or leave it be.
+
+A service may declare a versioned tarball to install before its first start — same download/script
+→ sha256 → extract → marker machinery the shared-services catalog uses, scoped to the project's
+runtime directory instead of `~/.hearth/shared`:
+
+```yaml
+services:
+  postgres:
+    artifact:
+      version: "16.4"
+      url: "https://example.com/postgres-16.4-darwin-arm64.tar.gz"  # or script: packaging/pg-pack.sh
+      sha256: "…"                                                  # required for url artifacts
+    run: { argv: ["{installDir}/bin/postgres", "-D", "{dataDir}", "-p", "{port}"] }
+    readiness: { kind: tcp, port: 5432 }
+```
+
+`{installDir}` (`<runtimeDir>/installs/<service>/<version>`), `{dataDir}`
+(`<runtimeDir>/data/<service>`), `{port}`/`{port2}…` (declared `ports:`, else the tcp readiness
+port for `{port}`), `{serviceId}` and `{projectRoot}` render into run/stop/build/preparation
+commands, env values, readiness and urls at load time. The install runs once per version, before
+preparation and build; an `external` or run-less service cannot declare an `artifact:`.
+
 A `shared:` block registers machine-global singletons (postgres, redis, …) installed on the host
 under `~/.hearth/shared` and run by a separate global daemon (`hearthd smp`). Every repo that
 registers the same `name@version` shares one instance; different versions run side by side.
@@ -54,9 +84,26 @@ shared:
   redis: "8.2.10"
   mongodb: "8.0.32"
   minio: "RELEASE.2025-10-15T17-29-55Z"
-  nginx: "1.30.5"
   kafka: "4.3.1"
+  # object form: project hooks before attach + args forwarded to recipe provision + urls
+  nginx:
+    version: "1.30.5"
+    preparationCommand: { command: { argv: ["{projectRoot}/scripts/prepare-edge.sh", "{dataDir}", "{projectRoot}"] } }
+    attachArgs: ["{dataDir}/conf"]   # e.g. the shared nginx publishes this conf tree
+    urls: [{ url: "https://dev.local/", label: dev }]
 ```
+
+The shared `nginx` pins `127.0.0.1:18080` + `:18443`; a pf rdr anchor exposes them publicly as
+`:80`/`:443` (macOS keeps <1024 privileged for everyone — the redirect is the way around it):
+
+```bash
+printf 'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80  -> 127.0.0.1 port 18080\n'
+'$(printf 'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 443 -> 127.0.0.1 port 18443\n')' | sudo pfctl -a com.apple/hearth -f - && sudo pfctl -e
+``` A plain attach gets a
+`/<projectId>/` location + `www/` docroot; an attach with a conf source (dir →
+`conf.d/servers/<projectId>/`, file → `conf.d/servers/<projectId>.conf`) mounts whole server
+blocks into the shared instance — `nginx -t` validates before reload, so a bad drop fails the
+attach instead of wedging the singleton. Detach removes the project's confs via `deprovision`.
 
 Install `hearthd` into the app bundle, then drive a project:
 

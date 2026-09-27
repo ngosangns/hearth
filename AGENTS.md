@@ -115,6 +115,10 @@ from any dev box here, with the same username.
 - A persisted `externally-owned` (from a port held by an unowned process) is only re-evaluated on
   the next `start` — `sync_external_services` only polls `ownership: external` units, and `cleanup`
   does not touch it, so a dead squatter leaves a phantom "Port N is held" row in the UI forever.
+  The same blind spot hits a **renamed-ownership id**: removing a `shared:` key and re-adding it as
+  a `services:` entry keeps the old row (`adopted from external state`, `command` readiness) across
+  restarts — the new daemon-owned service never installs or spawns because `start` short-circuits
+  on the persisted `ready`. Fix: `manager stop`, delete the service's `state.json` row, restart.
   Manual reconcile: stop the daemon, then rewrite `state.json` `services` to `{}` (or delete the
   stale entries) — editing while the daemon lives is overwritten on shutdown.
   Squatters hide well: catalog `run:` commands like `exec node dist/main` leave a **relative**
@@ -139,8 +143,24 @@ from any dev box here, with the same username.
   share one key**: `ensure_local_certificates` is a check-then-generate race, and concurrent
   first-time prepares would corrupt the cert file.
 - `ownership: 'external'` is the docker/tailnet-task adoption carve-out.
+- A service's `artifact:` block (`version` + `url`|`script` + `sha256` for url) installs a
+  versioned tarball into `<runtimeDir>/installs/<id>/<version>` on every start before preparation
+  and build — the same marker-based machinery `shared/install.rs` uses for smp instances, via the
+  `ArtifactInstaller` option (`DefaultArtifactInstaller` is wired for file-loaded catalogs;
+  `None` → the start fails clearly). `{installDir}`/`{dataDir}`/`{port}`/`{portN}`/`{serviceId}`/
+  `{projectRoot}` are rendered into commands/env/urls at **catalog load**, not spawn — the served
+  catalog always carries literal paths. Only those var names are substituted — other braces
+  (`awk '{print}'`) are legal, and a `{port}` with no declared port fails the load.
 - Service order from a config file is **document order**, not sorted — it's user-visible in
   `/v1/catalog`, `hearthd status`, and both TUIs.
+- `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
+  into `ServiceCatalog.groups` for target resolution; the declared membership stays in
+  `group_tree` (`groupTree` on the wire) so the app can group by *direct* membership instead of
+  showing a giant `all` section. A member naming both a service and a group resolves as the
+  service. Cycles are a load error, not truncation.
+- `disabled: true` rejects direct start/stop/restart (`service_disabled`, `status` still works) and
+  is stripped from flattened `groups` — group ops skip it silently; `group_tree` still lists it for
+  display. It does not stop an already-running service — the row just stops being actionable.
 - A missing/invalid `readiness` must fail the load, not skip the service.
 
 **Shared services (`smp`)**
@@ -150,7 +170,10 @@ from any dev box here, with the same username.
   run = one-shot `hearthd shared attach <name@ver>` task, readiness = `hearthd shared probe`
   (exit 0 iff the instance is ready **and this project is attached**), stop = `hearthd shared
   detach`. `projectId` = sha256 of the canonicalized cwd, so attach/probe/stop commands all agree
-  by running with the project root as cwd.
+  by running with the project root as cwd. The object form (`{ version, preparationCommand,
+  attachArgs, urls }`) adds a project-side prep hook before every attach and trailing attach
+  args that land on the recipe's `provision` argv — how viclass/infra publish their nginx conf
+  trees into the shared instance.
 - The task semantics depend on a supervisor rule: `ownership: external` + `command` readiness ⇒
   the run command is a one-shot trigger, not the service process (`is_external_task`). A
   daemon-owned `command`-readiness service is still a normal long-lived process — don't widen it.
@@ -158,7 +181,12 @@ from any dev box here, with the same username.
   from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
-  `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance. A recipe's
+  `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance — the one
+  sanctioned exception is a recipe's `ports: […]` **pinned** field (the shared nginx's `[80, 443]`),
+  which skips hashing entirely and only bind-checks. For public :80/:443 on macOS there is no
+  privileged-bind workaround for userspace — the shared nginx pins `18080/18443` and a pf rdr
+  anchor (`com.apple/hearth`, loaded once with sudo `pfctl -a … -f - && pfctl -e`) maps the
+  public ports onto them. A recipe's
   `additionalPorts` reserves that many extra ports in one contiguous block (`{port2}`, …); every
   port in the block is taken. `prepare` is the idempotent init hook (runs before every start via
   `preparation_command`). `run` must stay the process `ps` keeps showing. A wrapper that does work
@@ -168,10 +196,21 @@ from any dev box here, with the same username.
   `{projectBucket}` is `h-<projectId>` — S3 bucket names reject the underscore in `{projectDb}`.
 - Install = tarball + sha256 into `installs/<name>/<version>` (atomic rename; `.hearth-installed`
   marker last). The catalog artifact is either a `url` (download that archive) or a `script`
-  (run it to write the archive). Recipe snapshots live in `registry.json`, so installed instances
+  (run it to write the archive). **sha256 is verified only for `url` artifacts** — script output is
+  never byte-reproducible (tar mtimes, compile variance), so no committed hash can match a
+  consumer's rebuild; the script itself is the trust boundary. Recipe snapshots live in
+  `registry.json`, so installed instances
   survive upstream removal from `catalog.json`. `catalog.json` at the repo root is the registry the pinned
   `SHARED_CATALOG_URL` serves; `HEARTH_SHARED_CATALOG_URL` overrides it for dev/tests (`file://`
-  works for both the catalog and artifact URLs).
+  works for both the catalog and artifact URLs). Catalog URL order: env →
+  `~/.hearth/shared/catalog-url` → pinned URL — the file exists because a GUI-launched `smp` daemon
+  doesn't inherit shell env. The repo is private, so the pinned raw URL
+  answers 404 without auth — `remote.rs` embeds the same `catalog.json` (`include_str!`) as the
+  final fallback after the disk cache, which is what actually answers on a fresh install.
+- Shared MongoDB runs `--replSet rs0` (consumers use transactions — e.g. engreel's
+  `WithTransaction`) and `--wiredTigerCacheSizeGB 0.25`; its `provision` payload initiates rs0
+  idempotently then writes the project-db marker, which is why the recipe needs the repacked
+  mongod+mongosh tarball rather than the bare upstream archive.
 - `POST /v1/shared/attach` blocks through install+start+provision — clients must not use the 10s
   manager timeout for it (`request_with_timeout` with `None`).
 

@@ -47,8 +47,17 @@ through `reload_catalog` — the old-catalog-stop rule applies unchanged.
 
 ## `catalog.json` (remote registry)
 
-Pinned URL in the binary (`SHARED_CATALOG_URL`). Tarball `sha256` lives in this file, so the file
-itself is trusted on TLS alone — fetching anywhere else is not supported.
+Catalog URL resolution order: `HEARTH_SHARED_CATALOG_URL` → `~/.hearth/shared/catalog-url` → the
+pinned `SHARED_CATALOG_URL` in the binary. The `catalog-url` file exists because a GUI-launched
+`smp` daemon does not inherit a developer's shell environment — write a `file://` (or `https://`)
+URL there to point every daemon at a local/private catalog, including its sibling `script`
+artifacts (`HEARTH_CATALOG_ORIGIN` then resolves to that catalog's own directory).
+
+Tarball `sha256` lives in this file, so the file itself is trusted on TLS alone — fetching anywhere
+else is not supported. The same file is also baked into the binary (`include_str!` in `remote.rs`)
+as the last-resort fallback after the disk cache — this matters because the pinned
+`raw.githubusercontent.com` URL answers 404 for a private repo, which is otherwise an unfetchable
+catalog on a fresh machine.
 
 ```json
 {
@@ -86,11 +95,15 @@ An artifact sets **one** of:
   path next to `catalog.json` and downloads that script. The script is given `HEARTH_CATALOG_ORIGIN`
   so it can pull sibling files from the same place.
 
-`sha256` is the digest of the tarball either source produced. `file://` artifact URLs are accepted
+`sha256` is the digest of the tarball either source produced — but it is **enforced only for `url`
+artifacts**. A `script` artifact's output is never byte-reproducible (tar mtimes, compile variance),
+so no committed hash could ever match a consumer's rebuild; the field records the producer's hash
+for reference only — the script itself is the trust boundary. `file://` artifact URLs are accepted
 for tests.
 
 Template vars: `{installDir}`, `{dataDir}`, `{port}`, `{port2}`…, `{projectId}`, `{projectDb}`,
-`{projectUser}`, `{projectBucket}`. `{port2}` exists only when the recipe sets `additionalPorts`.
+`{projectUser}`, `{projectBucket}`, `{projectRoot}` (in `provision`/`deprovision`/`connection`).
+`{port2}` exists only when the recipe reserves a second port (`additionalPorts` or `ports`).
 `{projectBucket}` is `h-<projectId>` — the S3-safe form of `{projectDb}`.
 
 Optional recipe fields beyond the example above:
@@ -100,31 +113,39 @@ Optional recipe fields beyond the example above:
   binary, because that is the command line `ps` must keep showing.
 - `additionalPorts` — extra listeners reserved as one contiguous block after `{port}`. MinIO uses
   one for the console (`{port2}`); Kafka uses one for the KRaft controller.
+- `ports` — explicitly pinned ports (`ports[0]` is `{port}`, the rest `{port2}`…). Skips hash
+  allocation entirely; registration only checks the set is bindable. For recipes whose port IS
+  the feature — the shared nginx pins `[80, 443]` so dev URLs need no port suffix. Mutually
+  exclusive with `additionalPorts`. macOS keeps <1024 privileged for everyone — the shared
+  nginx's public :80/:443 come from a pf rdr anchor onto its loopback pins 18080/18443.
 - `extraPortLabels` — display labels for those ports, in order.
 
-`deprovision` is left empty for the shipped recipes: detach drops the attachment and leaves the
-database, bucket, topic, or nginx snippet in place.
+`deprovision` runs best-effort on detach — nginx uses it to remove the project's published confs.
+The database recipes leave it empty: detach drops the attachment and leaves the database, bucket,
+or topic in place.
 
 ## Shipped recipes
 
-MongoDB's artifact is the official `fastdl.mongodb.org` tarball (`url`). Redis, MinIO, Nginx, and
-Kafka are `script` entries: `scripts/catalog/pack.sh` builds the tarball, because those publishers
-do not ship a darwin-arm64 archive in the layout the recipe runs. Versions and sha256 live in
-`catalog.json`.
+All shipped artifacts are `script` entries: `scripts/catalog/pack.sh` builds the tarball, because
+the publishers either do not ship a darwin-arm64 archive in the layout the recipe runs or (MongoDB)
+the recipe needs payload files repacked alongside it. Versions and sha256 live in `catalog.json`;
+`scripts/catalog/write-catalog.py` regenerates that file from `dist/catalog/*.sha256` after
+`package.sh` runs.
 Every listener is `127.0.0.1`. There is no per-project auth; MinIO's root credentials are the fixed
 dev pair `hearth` / `hearth-local-dev`.
 
 | Service | What `start` provisions | Connection |
 |---|---|---|
 | redis | nothing — every project shares DB 0 | `redis://127.0.0.1:{port}/0` |
-| mongodb | database name `h_<projectId>` (created on first use; the official tarball has no shell) | `mongodb://127.0.0.1:{port}/{projectDb}` |
+| mongodb | database name `h_<projectId>`; single-node replica set `rs0` initiated idempotently on first attach so transactions work; `--wiredTigerCacheSizeGB 0.25` | `mongodb://127.0.0.1:{port}/{projectDb}?replicaSet=rs0&directConnection=true` |
 | minio | bucket `h-<projectId>` (hyphen: S3 names reject `_`); API on `{port}`, console on `{port2}` | `http://127.0.0.1:{port}` plus `S3_*` / `AWS_*` env |
-| nginx | `location /<projectId>/` on the shared listener, static files under the instance data dir | `http://127.0.0.1:{port}/{projectId}/` |
+| nginx | a `location /<projectId>/` + `www/<projectId>/` drop-in — or, when the project attaches with a conf arg, the project's rendered conf tree under `conf.d/servers/<projectId>/` (whole server blocks; see project-side `attachArgs` below) | `http://127.0.0.1:{port}/{projectId}/` |
 | kafka | topic `h_<projectId>` on a single KRaft broker; controller on `{port2}` | `127.0.0.1:{port}` plus `KAFKA_BROKERS` / `KAFKA_TOPIC` |
 
 Kafka's tarball bundles a Temurin 21 JRE, so the broker does not need `java` on `PATH`. Nginx is
 built from the stable source with vendored PCRE2 and zlib. Redis is built from the upstream tag.
-MongoDB is the official darwin-arm64 server tarball plus mongosh. MinIO and `mc` are built from
+MongoDB's tarball repacks the official darwin-arm64 `mongod` plus `mongosh` (needed by the
+replica-set `provision` hook). MinIO and `mc` are built from
 their pinned release tags (`CGO_ENABLED=0`), not downloaded from `dl.min.io`.
 
 ## Port allocation
@@ -135,14 +156,30 @@ is persisted in `registry.json`. A recipe with `additionalPorts: N` takes a cont
 `1+N` ports that does not wrap off the end of the range; every port in the block counts as taken.
 Deterministic-first keeps the common case stateless.
 
+A recipe with `ports: […]` skips all of that — the declared ports are registered verbatim after a
+bind check. The shared nginx uses `[80, 443]`; since both are privileged on macOS the prepare
+script fails loudly (with the `sysctl` hint) instead of letting nginx die at readiness.
+
 ## Project side
 
 ```yaml
 version: 1
 shared:
   postgres: "16.4"        # exact version; must exist in catalog.json at attach time
+  nginx:                  # the object form adds per-project hooks:
+    version: "1.30.5"
+    # project-side, run before every attach — e.g. render the conf tree the recipe publishes
+    preparationCommand: { command: { argv: ["{projectRoot}/scripts/prepare-edge.sh", "{dataDir}", "{projectRoot}"] } }
+    # appended to the attach argv → forwarded onto the recipe's provision commands
+    attachArgs: ["{dataDir}/conf"]
+    urls: [{ url: "https://dev.local/", label: dev }]
 services: { … }
 ```
+
+`preparationCommand`/`attachArgs`/`urls` render `{dataDir}` (the project service's data dir),
+`{serviceId}`, and `{projectRoot}` like an `artifact:` service — `{port}` is not substituted
+here: the instance's ports live in the smp registry, not in this file. For the shared nginx the
+ports are pinned anyway, so project confs can hardcode 80/443.
 
 `config_file` generates, per entry, a normal `ServiceDefinition` (id = the map key):
 
