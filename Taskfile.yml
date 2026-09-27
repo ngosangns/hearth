@@ -89,5 +89,7 @@ tasks:
       - pkill -f "{{.APP_NAME}}/Contents/MacOS/HearthApp" || true
       - rm -rf "/Applications/{{.APP_NAME}}"
       - cp -R ".build/{{.APP_NAME}}" "/Applications/{{.APP_NAME}}"
-      - open "/Applications/{{.APP_NAME}}"
+      # LaunchServices may not have registered the freshly-copied bundle yet and answers -600 —
+      # give it a beat, then retry once.
+      - open "/Applications/{{.APP_NAME}}" || { sleep 1; open "/Applications/{{.APP_NAME}}"; }
 
