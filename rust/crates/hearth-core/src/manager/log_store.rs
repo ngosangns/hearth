@@ -25,6 +25,13 @@ pub const DEFAULT_LOG_MAX_BYTES: u64 = 256 * 1024;
 pub const DEFAULT_LOG_ROTATION_COUNT: usize = 2;
 const LOG_STREAM_STATE_VERSION: u32 = 1;
 
+/// The generation clients echo. `lifecycle` is the service restart count; `rotation` is how many
+/// times this process's log file has rolled. Packing them keeps one cursor and still resets a
+/// follower when either one changes.
+fn log_cursor_generation(lifecycle: u64, rotation: u64) -> u64 {
+    lifecycle.saturating_mul(1_000_000).saturating_add(rotation)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LogStoreError {
     #[error("Log append exceeds {0} byte limit")]
@@ -111,7 +118,12 @@ impl CursorLogStore {
         self.ensure_loaded().await;
         let path = self.path_for(service_id);
         let safe_limit = limit.unwrap_or(self.latest_tail_bytes).clamp(1, self.latest_tail_bytes);
-        let stale_generation = requested_generation.map(|g| g != lifecycle_generation).unwrap_or(false);
+        // Clients echo `generation` back. Fold the rotation counter into that same number so a
+        // rotation resets a follower the same way a process restart does. A bare lifecycle number
+        // from an older client mismatches once, then the client echoes the composite.
+        let rotation = *self.rotation_generations.lock().unwrap().get(service_id).unwrap_or(&1);
+        let generation = log_cursor_generation(lifecycle_generation, rotation);
+        let stale_generation = requested_generation.is_some_and(|g| g != generation);
         // One handle for the whole request: the cursor check, and a single window read. Appends and
         // rotations hold this same per-service lock, so its view of the file cannot shift. The tail
         // used to be located by re-opening the file once per byte it stepped over.
@@ -130,7 +142,7 @@ impl CursorLogStore {
         };
         LogSlice {
             service_id: service_id.clone(),
-            generation: lifecycle_generation,
+            generation,
             cursor: start,
             next_cursor: start + bytes_read,
             data,
@@ -372,6 +384,7 @@ mod tests {
         let slice = store.read(&"api".to_string(), Some(0), None, 5, Some(3)).await;
         assert!(slice.reset);
         assert_eq!(slice.data, "hello");
+        assert_eq!(slice.generation, log_cursor_generation(5, 1));
     }
 
     #[tokio::test]
@@ -383,12 +396,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn never_a_new_service_echoes_generation_zero() {
+    async fn an_unstarted_service_echoes_the_initial_rotation_generation() {
         let (store, _dir) = store(1024, 4096, 2);
         let slice = store.read(&"never-started".to_string(), None, None, 0, None).await;
-        assert_eq!(slice.generation, 0);
+        // No state row is lifecycle 0. The live file is rotation 1 until it rolls, so the echoed
+        // cursor is 1 — an older client that stored a bare `0` resets once, then follows this.
+        assert_eq!(slice.generation, log_cursor_generation(0, 1));
         assert_eq!(slice.data, "");
         assert!(!slice.reset);
+    }
+
+    #[tokio::test]
+    async fn rotation_resets_a_follower_that_echoes_the_previous_generation() {
+        let (store, _dir) = store(1024, 20, 2);
+        store.append(&"api".to_string(), "0123456789").await.unwrap();
+        let first = store.read(&"api".to_string(), None, None, 4, None).await;
+        assert_eq!(first.generation, log_cursor_generation(4, 1));
+        store.append(&"api".to_string(), "0123456789").await.unwrap();
+        store.append(&"api".to_string(), "x").await.unwrap();
+        let followed = store.read(&"api".to_string(), Some(first.next_cursor), None, 4, Some(first.generation)).await;
+        assert!(followed.reset, "a rotation must invalidate the cursor the client is echoing");
+        assert_eq!(followed.generation, log_cursor_generation(4, 2));
+        let resumed = store.read(&"api".to_string(), Some(followed.next_cursor), None, 4, Some(followed.generation)).await;
+        assert!(!resumed.reset);
+        assert_eq!(resumed.generation, followed.generation);
     }
 
     #[tokio::test]

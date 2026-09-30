@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use crate::catalog::{CommandSpec, ServiceCatalog, ServiceCommand, ServiceId};
 use crate::state::{ProcessIdentity, ServiceLifecycleState};
 
-use super::process_tree::ProcessTreeEntry;
+use super::process_tree::ProcessTreeSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSignal {
@@ -162,9 +162,10 @@ pub trait ProcessAdapter: Send + Sync {
     /// signalled), so only the resolved holder pids are signalled, one at a time.
     async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal);
     /// Snapshot of the whole process tree under `leader_pid`, taken before the first signal of a
-    /// stop. Empty unless the OS table still shows `leader_start_identity` for the leader — a
+    /// stop. `Absent` unless the OS table still shows `leader_start_identity` for the leader — a
     /// reused pid must never pull an unrelated live tree into a signal (see `build_process_tree`).
-    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry>;
+    /// `Unknown` means the table could not be read; that is not an empty tree.
+    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot;
     /// One `pid -> start identity` snapshot of every live process, or `None` when the table could
     /// not be read. What tree members are checked against, so a recycled pid never counts as ours.
     async fn live_start_identities(&self) -> Option<HashMap<i64, String>>;

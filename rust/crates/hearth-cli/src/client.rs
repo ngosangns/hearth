@@ -82,8 +82,8 @@ impl Client {
 
     /// `POST /v1/operations`. `kill_unowned` must only ever be set after an explicit user
     /// confirmation, and only for `start` — the daemon rejects it otherwise.
-    pub async fn submit(&self, action: ServiceOperationKind, service_id: &str, kill_unowned: bool) -> LocalctlResult<Operation> {
-        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "serviceId": service_id, "action": action.as_wire_str() });
+    pub async fn submit(&self, action: ServiceOperationKind, service_id: &str, kill_unowned: bool, request_id: &str) -> LocalctlResult<Operation> {
+        let mut body = json!({ "requestId": request_id, "serviceId": service_id, "action": action.as_wire_str() });
         if kill_unowned {
             body["killUnowned"] = json!(true);
         }
@@ -92,8 +92,8 @@ impl Client {
     }
 
     /// `POST /v1/operations/bulk-start`. `kill_unowned` applies to every target.
-    pub async fn bulk_start(&self, targets: &[String], kill_unowned: bool) -> LocalctlResult<Operation> {
-        let mut body = json!({ "requestId": uuid::Uuid::new_v4().to_string(), "targets": targets });
+    pub async fn bulk_start(&self, targets: &[String], kill_unowned: bool, request_id: &str) -> LocalctlResult<Operation> {
+        let mut body = json!({ "requestId": request_id, "targets": targets });
         if kill_unowned {
             body["killUnowned"] = json!(true);
         }
@@ -214,11 +214,23 @@ impl ManagerClient {
     }
 
     pub async fn submit(&self, action: ServiceOperationKind, service_id: &str, kill_unowned: bool) -> LocalctlResult<Operation> {
-        self.with(|c| async move { c.submit(action, service_id, kill_unowned).await }).await
+        // Minted once so the retry after a timeout reuses the id. The daemon dedupes on requestId;
+        // a second id would start the service twice when the first request actually landed.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.with(|c| {
+            let request_id = request_id.clone();
+            async move { c.submit(action, service_id, kill_unowned, &request_id).await }
+        })
+        .await
     }
 
     pub async fn bulk_start(&self, targets: &[String], kill_unowned: bool) -> LocalctlResult<Operation> {
-        self.with(|c| async move { c.bulk_start(targets, kill_unowned).await }).await
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.with(|c| {
+            let request_id = request_id.clone();
+            async move { c.bulk_start(targets, kill_unowned, &request_id).await }
+        })
+        .await
     }
 
     pub async fn wait(&self, id: &str, deadline: Option<tokio::time::Instant>) -> LocalctlResult<Operation> {

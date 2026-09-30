@@ -30,6 +30,19 @@ pub struct ProcessTreeEntry {
     pub start_identity: String,
 }
 
+/// What `ps` said about a leader's tree.
+///
+/// `Unknown` is not an empty tree: the table could not be read, so callers must not signal and
+/// must not treat the process as dead. `Absent` means the table was read and the leader pid is
+/// gone or its start identity no longer matches — signalling the stored pgid would hit a recycled
+/// group. Only `Present` is safe to signal, and only after a fresh identity check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessTreeSnapshot {
+    Unknown,
+    Absent,
+    Present(Vec<ProcessTreeEntry>),
+}
+
 fn tree_row_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^(\d+)\s+(\d+)\s+(\d+)\s+(.{24})").unwrap())

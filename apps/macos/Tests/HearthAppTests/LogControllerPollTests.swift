@@ -206,4 +206,71 @@ final class LogControllerPollTests: XCTestCase {
         XCTAssertEqual(deltas, [.reset("same tail\n")])
         XCTAssertEqual(sut.pollInterval, .seconds(2), "the daemon log polls slower than a service log")
     }
+
+    /// The panel calls `start` from appear and from selection handoff. A second call at the same
+    /// cadence must leave the in-flight poll alone so the cursor is not dropped.
+    func testStartWhilePollingDoesNotOpenASecondRequest() async {
+        let api = FakeManagerAPI()
+        let gate = SuspendGate()
+        api.logsHandler = { _, _ in
+            await gate.wait()
+            return makeLogSlice(data: "x\n", nextCursor: 1, generation: 1)
+        }
+
+        let sut = LogController(client: api, serviceId: "api")
+        sut.start(interval: .seconds(30))
+        await gate.untilWaiting()
+        XCTAssertEqual(api.logRequests.count, 1)
+        XCTAssertNil(api.logRequests[0].cursor)
+
+        sut.start(interval: .seconds(30))
+        let deadline = Date().addingTimeInterval(0.1)
+        while Date() < deadline {
+            if api.logRequests.count > 1 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(api.logRequests.count, 1, "a second start at the same interval must keep the in-flight poll")
+
+        gate.resume()
+        sut.stop()
+    }
+}
+
+/// Parks one poll inside `logs` until the test has observed the request and called `start` again.
+private final class SuspendGate: @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var waiting: CheckedContinuation<Void, Never>?
+    private let lock = NSLock()
+
+    func wait() async {
+        await withCheckedContinuation { (parked: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            continuation = parked
+            let ready = waiting
+            waiting = nil
+            lock.unlock()
+            ready?.resume()
+        }
+    }
+
+    func untilWaiting() async {
+        await withCheckedContinuation { (parked: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if continuation != nil {
+                lock.unlock()
+                parked.resume()
+                return
+            }
+            waiting = parked
+            lock.unlock()
+        }
+    }
+
+    func resume() {
+        lock.lock()
+        let parked = continuation
+        continuation = nil
+        lock.unlock()
+        parked?.resume()
+    }
 }

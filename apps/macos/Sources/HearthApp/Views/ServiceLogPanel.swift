@@ -38,6 +38,7 @@ struct ServiceLogPanel: View {
             Divider()
             LogTextView(log: log)
                 .background(Color(nsColor: .underPageBackgroundColor))
+                .staticTerminalSurface()
         }
         .onAppear { log.start() }
         .onDisappear { log.stop() }

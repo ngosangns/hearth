@@ -50,7 +50,7 @@ pub fn synthesize_service(
     instance: &SharedInstance,
 ) -> Result<ServiceDefinition, crate::shared::SharedError> {
     let vars = instance_vars(instance, root);
-    let readiness = render_readiness(&instance.recipe.readiness, &vars)?;
+    let readiness = render_readiness(&instance.recipe.readiness.resolve(instance.port), &vars)?;
     let environment = match instance.recipe.env.as_ref() {
         Some(env) => {
             for value in env.values() {
@@ -107,7 +107,11 @@ pub fn synthesize_service(
                         .map(|spec| render_command_checked(spec, &vars, "stop"))
                         .transpose()?,
                 },
-                readiness_timeout_ms: if matches!(readiness, ReadinessSpec::Exit) { None } else { Some(SHARED_INSTANCE_READINESS_TIMEOUT_MS) },
+                readiness_timeout_ms: if matches!(readiness, ReadinessSpec::Exit) {
+                    None
+                } else {
+                    Some(SHARED_INSTANCE_READINESS_TIMEOUT_MS)
+                },
                 readiness,
                 preparation: None,
                 preparation_command,
@@ -120,9 +124,11 @@ pub fn synthesize_service(
     })
 }
 
-/// First installs download+extract a tarball inside the attach task — the generated readiness probe
-/// must out-wait that, not the usual 10s default.
-pub const SHARED_READINESS_TIMEOUT_MS: u64 = 600_000;
+/// Project-side `hearthd shared probe` budget. Must out-wait a script artifact pack
+/// (`PACK_SCRIPT_TIMEOUT` in install.rs, 45 min) plus extract (120s) plus the instance
+/// readiness budget (`SHARED_INSTANCE_READINESS_TIMEOUT_MS`).
+pub const SHARED_READINESS_TIMEOUT_MS: u64 =
+    45 * 60 * 1000 + 120_000 + SHARED_INSTANCE_READINESS_TIMEOUT_MS;
 
 /// The project-side service a `shared:` yaml entry expands to (see `docs/shared-services.md`).
 /// `ownership: external` + `command` readiness makes its run command a one-shot task
@@ -158,9 +164,7 @@ pub fn project_service_entry(
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
                 command: ServiceCommand {
-                    command: CommandSpec::Argv {
-                        argv: attach_argv,
-                    },
+                    command: CommandSpec::Argv { argv: attach_argv },
                     cwd: ".".to_string(),
                     environment: None,
                     container_name: None,
@@ -231,9 +235,9 @@ mod tests {
                     ],
                 },
                 stop: None,
-                readiness: ReadinessSpec::Http {
+                readiness: crate::shared::remote::RecipeReadiness::Spec(ReadinessSpec::Http {
                     url: "http://127.0.0.1:{port}/minio/health/live".to_string(),
-                },
+                }),
                 provision: vec![],
                 deprovision: vec![],
                 connection: None,
@@ -310,13 +314,40 @@ mod tests {
     #[test]
     fn an_exit_recipe_waits_without_the_server_readiness_deadline() {
         let mut inst = instance(vec![43111]);
-        inst.recipe.readiness = ReadinessSpec::Exit;
+        inst.recipe.readiness = crate::shared::remote::RecipeReadiness::Spec(ReadinessSpec::Exit);
         let service = synthesize_service(Path::new("/shared"), &inst).unwrap();
-        let ServiceRunProfile::Verified { readiness, readiness_timeout_ms, .. } = &service.profiles.run else {
+        let ServiceRunProfile::Verified {
+            readiness,
+            readiness_timeout_ms,
+            ..
+        } = &service.profiles.run
+        else {
             panic!("shared instance must be a verified run profile")
         };
         assert!(matches!(readiness, ReadinessSpec::Exit));
         assert_eq!(*readiness_timeout_ms, None);
+    }
+
+    #[test]
+    fn a_primary_tcp_recipe_uses_the_allocated_port() {
+        let mut inst = instance(vec![43111]);
+        inst.recipe.readiness = crate::shared::remote::RecipeReadiness::PrimaryTcp;
+        let service = synthesize_service(Path::new("/shared"), &inst).unwrap();
+        let ServiceRunProfile::Verified { readiness, .. } = &service.profiles.run else {
+            panic!("shared instance must be a verified run profile")
+        };
+        assert!(matches!(readiness, ReadinessSpec::Tcp { port: 43110 }));
+    }
+
+    #[test]
+    fn project_probe_outwaits_a_script_pack_and_extract() {
+        // 45 min pack (`PACK_SCRIPT_TIMEOUT`) + 120s extract + the instance readiness budget.
+        // Inlined here so this module does not depend on install.rs.
+        assert_eq!(
+            SHARED_READINESS_TIMEOUT_MS,
+            45 * 60 * 1000 + 120_000 + SHARED_INSTANCE_READINESS_TIMEOUT_MS
+        );
+        assert_eq!(SHARED_READINESS_TIMEOUT_MS, 2_940_000);
     }
 
     #[test]

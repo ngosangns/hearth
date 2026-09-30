@@ -24,8 +24,8 @@ pub mod synthesize;
 
 pub use registry::{InstallState, SharedAttachment, SharedInstance, SharedRegistry};
 pub use remote::{
-    RemoteCatalog, SharedArtifact, SharedCatalogDocument, SharedConnection, SharedRecipe,
-    SharedServiceFamily,
+    RecipeReadiness, RemoteCatalog, SharedArtifact, SharedCatalogDocument, SharedConnection,
+    SharedRecipe, SharedServiceFamily,
 };
 
 /// The smp daemon's root directory: `~/.hearth/shared`. Unlike project daemons this root contains
@@ -118,7 +118,11 @@ pub(crate) async fn output_with_timeout(
             buf
         };
         let (status, stdout, stderr) = tokio::join!(child.wait(), read_out, read_err);
-        status.map(|status| std::process::Output { status, stdout, stderr })
+        status.map(|status| std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
     };
     match tokio::time::timeout(limit, wait).await {
         Ok(result) => result.map(Some),

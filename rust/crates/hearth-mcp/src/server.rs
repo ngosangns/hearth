@@ -173,7 +173,7 @@ impl HearthMcpServer {
         Ok(LogsArguments {
             service: self.require_service(arguments.get("service"))?,
             cursor: optional_integer(arguments.get("cursor"), "cursor", 0, None)?.map(|v| v as u64),
-            generation: optional_integer(arguments.get("generation"), "generation", 1, None)?.map(|v| v as u64),
+            generation: optional_integer(arguments.get("generation"), "generation", 0, None)?.map(|v| v as u64),
             limit: optional_integer(arguments.get("limit"), "limit", 1, Some(64 * 1024))?.map(|v| v as u64),
         })
     }
@@ -313,7 +313,7 @@ impl HearthMcpServer {
                     "properties": {
                         "service": { "type": "string", "enum": service_ids },
                         "cursor": { "type": "integer", "minimum": 0 },
-                        "generation": { "type": "integer", "minimum": 1 },
+                        "generation": { "type": "integer", "minimum": 0, "description": "Log cursor generation. 0 is valid: a service with no state row reports lifecycle generation 0." },
                         "limit": { "type": "integer", "minimum": 1, "maximum": 64 * 1024 },
                     },
                     "required": ["service"],

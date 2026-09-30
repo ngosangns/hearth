@@ -147,7 +147,11 @@ from any dev box here, with the same username.
   deserialize must fall through to quarantine, never panic — a panic in `load()` kills the daemon at
   bootstrap, the opposite of what quarantining exists for.
 - A `reset` from the event store returns the **whole** buffer, not an empty list. `reset` means the
-  client's cursor is unusable, so the reply is the snapshot it resynchronizes from.
+  client's cursor is unusable, so the reply is the snapshot it resynchronizes from. The SSE stream
+  copies that replay and registers the listener under the same lock, and holds live events until
+  the snapshot frames are queued. A reset does not subscribe. Backpressure stays 64 frames.
+- The log `generation` clients echo is `lifecycle * 1_000_000 + rotation`, not the lifecycle alone.
+  A rotation resets a follower the same way a restart does. Generation 0 is valid (no state row).
 
 **Catalog**
 
@@ -184,6 +188,14 @@ from any dev box here, with the same username.
   is stripped from flattened `groups` — group ops skip it silently; `group_tree` still lists it for
   display. It does not stop an already-running service — the row just stops being actionable.
 - A missing/invalid `readiness` must fail the load, not skip the service.
+- Readiness shorthand expands at project load, and for a shared recipe at synthesize: `kind: http`
+  with no `url` is `GET http://127.0.0.1:<primary>/health` (2xx); `path` replaces `/health`;
+  `kind: tcp` with no `port` uses the primary port (`ports[0]`, or the allocated shared port).
+  `url` together with `path` or `port` is a load error. Do not point `http` at `/health` unless
+  that process serves it — Redis and Kafka stay `command` (`hearth-ready`), MinIO stays
+  `/minio/health/live`, MongoDB is `tcp`. The daemon's own `GET /healthz` is the manager liveness
+  route, not a service probe. A recipe snapshot in `registry.json` is not refreshed when
+  `catalog.json` changes.
 
 **Shared services (`smp`)**
 
@@ -204,7 +216,7 @@ from any dev box here, with the same username.
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
   `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance — the one
-  sanctioned exception is a recipe's `ports: […]` **pinned** field (the shared nginx's `[80, 443]`),
+  sanctioned exception is a recipe's `ports: […]` **pinned** field (the shared nginx's `[18080, 18443]`),
   which skips hashing entirely and only bind-checks. For public :80/:443 on macOS there is no
   privileged-bind workaround for userspace — the shared nginx pins `18080/18443` and a pf rdr
   anchor (`com.apple/hearth`, loaded once with sudo `pfctl -a … -f - && pfctl -e`) maps the

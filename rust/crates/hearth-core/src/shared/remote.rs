@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::Mutex;
 
 use crate::catalog::{CommandSpec, ReadinessSpec};
@@ -70,6 +71,111 @@ pub struct SharedConnection {
     pub env: Option<HashMap<String, String>>,
 }
 
+/// A recipe's readiness before the allocated port exists.
+///
+/// `kind: http` with no `url` becomes `GET http://127.0.0.1:{port}<path>` (`path` defaults to
+/// `/health`). `kind: tcp` with no `port` stays [`RecipeReadiness::PrimaryTcp`] until
+/// [`RecipeReadiness::resolve`] fills in the instance port. Every other shape is a normal
+/// [`ReadinessSpec`]; `url` still carries `{port}` for [`crate::shared::render::render_readiness`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipeReadiness {
+    Spec(ReadinessSpec),
+    /// `{"kind":"tcp"}` — the instance's allocated primary port.
+    PrimaryTcp,
+}
+
+impl RecipeReadiness {
+    pub fn resolve(&self, primary_port: u16) -> ReadinessSpec {
+        match self {
+            Self::PrimaryTcp => ReadinessSpec::Tcp { port: primary_port },
+            Self::Spec(spec) => spec.clone(),
+        }
+    }
+}
+
+impl Serialize for RecipeReadiness {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Spec(spec) => spec.serialize(serializer),
+            Self::PrimaryTcp => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("kind", "tcp")?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RecipeReadiness {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        recipe_readiness_from_value(value).map_err(D::Error::custom)
+    }
+}
+
+fn valid_health_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains(char::is_whitespace)
+        && !path.contains("://")
+        && !path.contains('{')
+        && !path.contains('}')
+}
+
+fn recipe_readiness_from_value(value: serde_json::Value) -> Result<RecipeReadiness, String> {
+    let kind = value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("")
+        .to_string();
+    match kind.as_str() {
+        "tcp" if value.get("port").is_none() => Ok(RecipeReadiness::PrimaryTcp),
+        "http" => {
+            let has_path = value.get("path").is_some();
+            let has_port = value.get("port").is_some();
+            let has_url = value.get("url").is_some();
+            if has_url && (has_path || has_port) {
+                return Err(
+                    "readiness http must not set url together with path or port".to_string()
+                );
+            }
+            if has_port {
+                return Err(
+                    "readiness http on a shared recipe uses path or url, not a fixed port"
+                        .to_string(),
+                );
+            }
+            if has_url {
+                let empty = value
+                    .get("url")
+                    .and_then(|url| url.as_str())
+                    .filter(|url| !url.is_empty())
+                    .is_none();
+                if empty {
+                    return Err("readiness url must be a non-empty string".to_string());
+                }
+                let spec = serde_json::from_value(value).map_err(|error| error.to_string())?;
+                return Ok(RecipeReadiness::Spec(spec));
+            }
+            let path = match value.get("path") {
+                None => "/health".to_string(),
+                Some(serde_json::Value::String(path)) if valid_health_path(path) => path.clone(),
+                Some(serde_json::Value::String(_)) => {
+                    return Err("readiness path must be an absolute path".to_string())
+                }
+                Some(_) => return Err("readiness path must be a string".to_string()),
+            };
+            Ok(RecipeReadiness::Spec(ReadinessSpec::Http {
+                url: format!("http://127.0.0.1:{{port}}{path}"),
+            }))
+        }
+        _ => {
+            let spec = serde_json::from_value(value).map_err(|error| error.to_string())?;
+            Ok(RecipeReadiness::Spec(spec))
+        }
+    }
+}
+
 /// Everything needed to install+run+provision one `name@version`, snapshotted into `registry.json`
 /// at registration time — an installed instance keeps working even if the version is later removed
 /// from the remote registry.
@@ -83,7 +189,7 @@ pub struct SharedRecipe {
     /// Graceful stop template, optional (SIGTERM to the process tree is the default path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<CommandSpec>,
-    pub readiness: ReadinessSpec,
+    pub readiness: RecipeReadiness,
     /// Per-project provisioning, run once per attaching project — `{projectId}`, `{projectDb}`,
     /// `{projectUser}` templates. Commands must be idempotent (re-attach reuses the cached result).
     #[serde(default)]
@@ -419,7 +525,10 @@ mod tests {
             }"#,
         )
         .unwrap_err();
-        assert!(error.0.contains("both ports and additionalPorts"), "{error:?}");
+        assert!(
+            error.0.contains("both ports and additionalPorts"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -496,7 +605,10 @@ mod tests {
     }
 
     fn brace_names(text: &str) -> Vec<String> {
-        crate::catalog::template_vars(text).into_iter().map(str::to_string).collect()
+        crate::catalog::template_vars(text)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     fn walk_strings(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
@@ -539,7 +651,13 @@ mod tests {
             "version",
             "instanceId",
         ];
-        let project = ["projectId", "projectDb", "projectUser", "projectBucket", "projectRoot"];
+        let project = [
+            "projectId",
+            "projectDb",
+            "projectUser",
+            "projectBucket",
+            "projectRoot",
+        ];
         for (path, text) in &strings {
             let in_attachment = path.contains(".provision")
                 || path.contains(".deprovision")
@@ -603,5 +721,104 @@ mod tests {
             .versions
             .values()
             .all(|recipe| recipe.artifacts["darwin-arm64"].script.is_some()));
+        assert!(matches!(
+            doc.recipe("mongodb", "8.0.32").unwrap().readiness,
+            RecipeReadiness::PrimaryTcp
+        ));
+        match &doc.recipe("nginx", "1.30.5").unwrap().readiness {
+            RecipeReadiness::Spec(ReadinessSpec::Http { url }) => {
+                assert_eq!(url, "http://127.0.0.1:{port}/health")
+            }
+            other => panic!("nginx readiness {other:?}"),
+        }
+        match &doc.services["minio"]
+            .versions
+            .values()
+            .next()
+            .unwrap()
+            .readiness
+        {
+            RecipeReadiness::Spec(ReadinessSpec::Http { url }) => {
+                assert_eq!(url, "http://127.0.0.1:{port}/minio/health/live")
+            }
+            other => panic!("minio readiness {other:?}"),
+        }
+        for name in ["redis", "kafka"] {
+            let readiness = &doc.services[name]
+                .versions
+                .values()
+                .next()
+                .unwrap()
+                .readiness;
+            let RecipeReadiness::Spec(ReadinessSpec::Command {
+                command: CommandSpec::Argv { argv },
+                ..
+            }) = readiness
+            else {
+                panic!("{name} readiness {readiness:?}")
+            };
+            assert_eq!(argv.len(), 2, "{name}");
+            assert!(argv[0].ends_with("/hearth-ready"), "{name} {argv:?}");
+            assert_eq!(argv[1], "{port}");
+        }
+    }
+
+    #[test]
+    fn readiness_shorthand_normalizes_and_legacy_shapes_still_parse() {
+        let doc = parse_document(
+            r#"{
+              "version": 1,
+              "services": {
+                "mongodb": { "versions": { "8.0.32": {
+                  "artifacts": { "darwin-arm64": { "url": "file:///m.tgz", "sha256": "abc" } },
+                  "run": { "argv": ["mongod"] },
+                  "readiness": { "kind": "tcp" }
+                } } },
+                "nginx": { "versions": { "1.30.5": {
+                  "artifacts": { "darwin-arm64": { "url": "file:///n.tgz", "sha256": "abc" } },
+                  "run": { "argv": ["nginx"] },
+                  "readiness": { "kind": "http", "path": "/health" }
+                } } },
+                "legacy": { "versions": { "1": {
+                  "artifacts": { "darwin-arm64": { "url": "file:///l.tgz", "sha256": "abc" } },
+                  "run": { "argv": ["mongod"] },
+                  "readiness": { "kind": "command", "command": { "shell": "perl -e 'exit 0'" } }
+                } } }
+              }
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            doc.recipe("mongodb", "8.0.32").unwrap().readiness,
+            RecipeReadiness::PrimaryTcp
+        ));
+        let encoded =
+            serde_json::to_value(&doc.recipe("mongodb", "8.0.32").unwrap().readiness).unwrap();
+        assert_eq!(encoded, serde_json::json!({"kind": "tcp"}));
+        match &doc.recipe("nginx", "1.30.5").unwrap().readiness {
+            RecipeReadiness::Spec(ReadinessSpec::Http { url }) => {
+                assert_eq!(url, "http://127.0.0.1:{port}/health")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            doc.recipe("legacy", "1").unwrap().readiness,
+            RecipeReadiness::Spec(ReadinessSpec::Command {
+                command: CommandSpec::Shell { .. },
+                ..
+            })
+        ));
+        let rejected = parse_document(
+            r#"{
+              "version": 1,
+              "services": { "x": { "versions": { "1": {
+                "artifacts": { "darwin-arm64": { "url": "file:///x.tgz", "sha256": "abc" } },
+                "run": { "argv": ["x"] },
+                "readiness": { "kind": "http", "url": "http://127.0.0.1/health", "path": "/health" }
+              } } } }
+            }"#,
+        );
+        let error = rejected.unwrap_err();
+        assert!(error.0.contains("url"), "{error}");
     }
 }

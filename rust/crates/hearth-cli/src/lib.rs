@@ -305,10 +305,15 @@ async fn discover_probed(root: &Path, catalog: &ServiceCatalog) -> (Discovery, b
 /// Discovers a live daemon, spawning one (via `options.spawn_daemon`) and polling if none is found.
 pub async fn ensure(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Client> {
     let discovered = discover(root, &options.catalog).await;
-    if let Discovery::Live { client } = discovered {
-        return Ok(client);
-    } else if let Discovery::Incompatible { .. } = discovered {
-        return fail_err(EXIT_PROTOCOL, "hearth manager protocol is incompatible");
+    match discovered {
+        Discovery::Live { client } => return Ok(client),
+        Discovery::Incompatible { .. } => return fail_err(EXIT_PROTOCOL, "hearth manager protocol is incompatible"),
+        // `/healthz` failed but the recorded pid is still alive. Spawning another daemon would
+        // fight it for the lock; report unavailable and let the caller retry or restart.
+        Discovery::Stale { client } if hearth_core::platform::is_pid_alive(client.metadata.pid) => {
+            return fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable");
+        }
+        _ => {}
     }
     (options.spawn_daemon)(root);
     for _ in 0..100 {
@@ -503,6 +508,11 @@ pub async fn cleanup(root: &Path, options: &LocalctlOptions) -> LocalctlResult<(
             continue;
         }
         if entry == "manager.lock" {
+            // A live pid — including a stale or protocol-incompatible daemon — still owns this
+            // lock. Deleting it makes `LockOwnershipWatch` exit the process that is actually running.
+            if hearth_core::platform::is_pid_alive(artifacts.metadata.pid) {
+                continue;
+            }
             let _ = remove_directory(&path);
             continue;
         }
@@ -520,11 +530,15 @@ pub async fn logs(mut client: Client, service_id: &str, tail: u64, follow: bool,
     let mut cursor: Option<u64> = None;
     let mut generation: Option<u64> = None;
     let mut reconnects = 0u32;
+    // `--tail` trims the first snapshot only. Later follow chunks are the new lines since the
+    // cursor; trimming each one drops everything but the last N lines of every poll.
+    let mut first = true;
     loop {
         match client.log(service_id, cursor, generation, Some(16_384)).await {
             Ok(slice) => {
                 let lines: Vec<&str> = slice.data.lines().filter(|l| !l.is_empty()).collect();
-                let tail_lines: &[&str] = if lines.len() as u64 > tail { &lines[lines.len() - tail as usize..] } else { &lines };
+                let tail_lines: &[&str] = if first && lines.len() as u64 > tail { &lines[lines.len() - tail as usize..] } else { &lines };
+                first = false;
                 let joined = if lines.is_empty() { String::new() } else { format!("{}\n", tail_lines.join("\n")) };
                 if json_output {
                     // The server's whole `LogSlice` (its echoed `cursor`, `truncated`), with `data`
@@ -884,7 +898,7 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
     if command == "start" && !is_single_service {
         // An explicit `--kill-unowned` is the confirmation for every member of the group; there is
         // no per-service prompt on a bulk start.
-        let accepted = client.bulk_start(&selected, flags.kill_unowned).await?;
+        let accepted = client.bulk_start(&selected, flags.kill_unowned, &uuid::Uuid::new_v4().to_string()).await?;
         let operation = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
         if flags.json {
             (io.out)(&print_value(&json!({ "operation": operation }), true));
@@ -923,7 +937,7 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
         }
         let mut completed;
         loop {
-            let accepted = client.submit(action, service_id, kill_unowned).await?;
+            let accepted = client.submit(action, service_id, kill_unowned, &uuid::Uuid::new_v4().to_string()).await?;
             completed = if flags.wait { wait_operation(&client, &accepted.id).await? } else { accepted };
             // Post-failure prompt: a FRESH conflict only surfaces once the operation completes,
             // which needs --wait. Re-read the row — the daemon just persisted `externally-owned`

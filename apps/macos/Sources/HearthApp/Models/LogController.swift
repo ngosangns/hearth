@@ -42,6 +42,10 @@ final class LogController: ObservableObject {
     private var cursor: Int?
     private var generation: Int?
     private var pollTask: Task<Void, Never>?
+    /// Bumped on every real start and stop so a cancelled loop cannot clear a newer task.
+    private var pollGeneration = 0
+    /// Interval of the live loop. A second `start` at this cadence is a no-op.
+    private var activeInterval: Duration?
     /// `start()`'s default cadence.
     let pollInterval: Duration
 
@@ -68,12 +72,26 @@ final class LogController: ObservableObject {
     }
 
     func start(interval: Duration? = nil) {
-        stop()
-        isGone = false
         let interval = interval ?? pollInterval
+        // The panel's appear and the selection handoff both call `start`. Cancelling a live loop
+        // would drop the cursor's in-flight fetch and paint the buffer twice.
+        if pollTask != nil, activeInterval == interval, !isGone { return }
+        stop()
+        // `@Published` emits even when the value is unchanged. Retargeting calls `start` from
+        // `updateNSView`, so a no-op write here publishes in the middle of a view update.
+        if isGone { isGone = false }
+        activeInterval = interval
+        pollGeneration += 1
+        let generation = pollGeneration
         // `self` is re-resolved weakly on every pass — though the strong binding then lasts the
         // whole pass (sleep included), so a dropped controller ends one interval later at worst.
         pollTask = Task { [weak self] in
+            defer {
+                if let self, self.pollGeneration == generation {
+                    self.pollTask = nil
+                    self.activeInterval = nil
+                }
+            }
             while !Task.isCancelled {
                 guard let self, !self.isGone else { return }
                 await self.fetchOnce()
@@ -84,8 +102,10 @@ final class LogController: ObservableObject {
     }
 
     func stop() {
+        pollGeneration += 1
         pollTask?.cancel()
         pollTask = nil
+        activeInterval = nil
     }
 
     deinit {
@@ -146,9 +166,15 @@ final class LogController: ObservableObject {
             if lastError != nil { lastError = nil }
         } catch ManagerClientError.http(_, "service_not_found", _) {
             isGone = true
-            lastError = "This service is no longer in the catalog."
+            setLastError("This service is no longer in the catalog.")
         } catch {
-            lastError = error.localizedDescription
+            setLastError(error.localizedDescription)
         }
+    }
+
+    /// `@Published` notifies on every assign, even when the string is unchanged.
+    private func setLastError(_ message: String) {
+        guard lastError != message else { return }
+        lastError = message
     }
 }

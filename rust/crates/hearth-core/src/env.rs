@@ -45,9 +45,12 @@ fn split_key_value(line: &str) -> Option<(String, String)> {
 /// ignored rather than corrupting the parse. Failures (unknown shell, timeout, non-interactive
 /// sandboxed shell) resolve to `{}` — never panics/errors — so a caller can always fall back to the
 /// process's own environment.
-fn run_login_shell_env(shell: &str, timeout: Duration) -> HashMap<String, String> {
+/// `Some` only when the shell actually ran and both markers were present — an empty map between
+/// them is a successful capture. Spawn failure, a timeout, or output with no markers is `None`,
+/// which must not be cached: the next startup should try again.
+fn run_login_shell_env(shell: &str, timeout: Duration) -> Option<HashMap<String, String>> {
     let script = format!("printf '%s' '{START_MARKER}'; env -0; printf '%s' '{END_MARKER}'");
-    let attempt = (|| -> std::io::Result<HashMap<String, String>> {
+    let attempt = (|| -> std::io::Result<Option<HashMap<String, String>>> {
         let mut command = Command::new(shell);
         command.arg("-ilc").arg(&script).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
         // Its own process group, so the timeout can kill everything the rc files started — a
@@ -78,11 +81,11 @@ fn run_login_shell_env(shell: &str, timeout: Duration) -> HashMap<String, String
         let start = stdout.find(START_MARKER);
         let end = stdout.find(END_MARKER);
         match (start, end) {
-            (Some(s), Some(e)) if e >= s => Ok(parse_env_block(&stdout[s + START_MARKER.len()..e])),
-            _ => Ok(HashMap::new()),
+            (Some(s), Some(e)) if e >= s => Ok(Some(parse_env_block(&stdout[s + START_MARKER.len()..e]))),
+            _ => Ok(None),
         }
     })();
-    attempt.unwrap_or_default()
+    attempt.ok().flatten()
 }
 
 /// Directories where the tools this daemon itself invokes (`docker`, `tailscale`, `bun`, `ps`) are
@@ -129,7 +132,9 @@ pub fn resolve_login_shell_env(shell: Option<&str>, timeout: Option<Duration>) -
             return cached.clone();
         }
     }
-    let resolved = run_login_shell_env(&shell, timeout);
+    let Some(resolved) = run_login_shell_env(&shell, timeout) else {
+        return HashMap::new();
+    };
     cache.lock().unwrap().insert(shell, resolved.clone());
     resolved
 }
@@ -263,12 +268,37 @@ mod tests {
     }
 
     #[test]
-    fn caches_per_shell_path() {
+    fn a_failed_login_shell_probe_is_not_cached() {
         clear_login_shell_env_cache_for_tests();
         let shell = "/definitely/not/a/shell/either";
-        let first = resolve_login_shell_env(Some(shell), Some(Duration::from_millis(200)));
-        let second = resolve_login_shell_env(Some(shell), Some(Duration::from_millis(200)));
-        assert_eq!(first, second);
+        assert!(resolve_login_shell_env(Some(shell), Some(Duration::from_millis(200))).is_empty());
+        assert!(!login_shell_env_cache().lock().unwrap().contains_key(shell));
+    }
+
+    #[test]
+    fn a_successful_login_shell_probe_is_cached_and_a_markerless_one_is_not() {
+        clear_login_shell_env_cache_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good-shell");
+        let bad = dir.path().join("bad-shell");
+        std::fs::write(&good, "#!/bin/sh\nprintf '%s' '__hearthd_env_start__'\nprintf 'FOO=bar\\0'\nprintf '%s' '__hearthd_env_end__'\n").unwrap();
+        std::fs::write(&bad, "#!/bin/sh\nprintf '%s' 'no markers here'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let good_path = good.to_str().unwrap();
+        let first = resolve_login_shell_env(Some(good_path), Some(Duration::from_secs(2)));
+        assert_eq!(first.get("FOO").map(String::as_str), Some("bar"));
+        std::fs::write(&good, "#!/bin/sh\nexit 1\n").unwrap();
+        let second = resolve_login_shell_env(Some(good_path), Some(Duration::from_secs(2)));
+        assert_eq!(second.get("FOO").map(String::as_str), Some("bar"), "a captured env stays cached");
+
+        let bad_path = bad.to_str().unwrap();
+        assert!(resolve_login_shell_env(Some(bad_path), Some(Duration::from_secs(2))).is_empty());
+        assert!(!login_shell_env_cache().lock().unwrap().contains_key(bad_path));
     }
 
     #[test]

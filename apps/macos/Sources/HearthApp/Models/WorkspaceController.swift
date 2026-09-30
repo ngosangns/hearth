@@ -30,10 +30,16 @@ final class WorkspaceController: ObservableObject {
     let workspace: Workspace
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var services: [ServiceLifecycleState] = [] {
-        didSet { servicesById = Dictionary(services.map { ($0.serviceId, $0) }, uniquingKeysWith: { first, _ in first }) }
+        didSet {
+            servicesById = Dictionary(services.map { ($0.serviceId, $0) }, uniquingKeysWith: { first, _ in first })
+            recomputeCounts()
+        }
     }
     @Published private(set) var catalog: ServiceCatalogSummary? {
-        didSet { catalogServices = Dictionary(catalog?.services.map { ($0.id, $0) } ?? [], uniquingKeysWith: { first, _ in first }) }
+        didSet {
+            catalogServices = Dictionary(catalog?.services.map { ($0.id, $0) } ?? [], uniquingKeysWith: { first, _ in first })
+            recomputeCounts()
+        }
     }
     /// Every registered service URL, placeholders resolved by the daemon. Fetched on connect and
     /// after each catalog reload — URLs only change when the catalog does (or the tailnet host does,
@@ -46,9 +52,20 @@ final class WorkspaceController: ObservableObject {
     private var catalogServices: [String: CatalogService] = [:]
     private var urlsByService: [String: [ResolvedServiceUrl]] = [:]
     private var servicesById: [String: ServiceLifecycleState] = [:]
-    /// Hoisted out of the detail view so switching workspaces (which recreates `ServiceListView`)
+    /// Rebuilt when `services` or the catalog changes, so a sidebar tick does not rescan every service.
+    private var cachedCounts = ServiceCounts()
+    /// Hoisted out of the detail view. The detail stays mounted across workspace switches, and this
     /// restores the last focused row and its cached log tail instead of refetching from byte 0.
-    @Published var selectedServiceId: String?
+    ///
+    /// Not `@Published` here. A row click must not `objectWillChange` this controller — the service
+    /// list and the sidebar row observe it, and the snapshots have not changed. The log pane
+    /// observes `selection` instead. The id is stored immediately; the notification waits a turn
+    /// because `List` writes the binding from inside a view update.
+    var selectedServiceId: String? {
+        get { selection.serviceId }
+        set { selection.setServiceId(newValue) }
+    }
+    let selection = ServiceSelection()
     @Published private(set) var actionsInFlight: Set<String> = []
     /// Nested start-then-stop on the same row would otherwise drop the spinner when the start
     /// operation settled while the stop was still in flight.
@@ -145,7 +162,7 @@ final class WorkspaceController: ObservableObject {
         } catch {
             // The daemon may still be alive (or never answered) — keep the current connection and
             // surface the reason rather than pretending the stop landed.
-            phase = .failed(error.localizedDescription)
+            failPhase(error.localizedDescription)
         }
     }
 
@@ -161,7 +178,8 @@ final class WorkspaceController: ObservableObject {
             let client = try await obtain(workspace.path)
             dropLogControllers()
             self.client = client
-            catalog = try? await client.catalog() // best-effort — service status doesn't depend on it
+            let freshCatalog = try? await client.catalog() // best-effort — service status doesn't depend on it
+            if freshCatalog != catalog { catalog = freshCatalog }
             await refreshUrls()
             applyServices(try await client.services())
             phase = .connected
@@ -170,7 +188,7 @@ final class WorkspaceController: ObservableObject {
                 startConfigWatcher()
             }
         } catch {
-            phase = .failed(error.localizedDescription)
+            failPhase(error.localizedDescription)
         }
     }
 
@@ -218,7 +236,7 @@ final class WorkspaceController: ObservableObject {
     /// failing the connection.
     func refreshUrls() async {
         guard let client else { return }
-        if let fresh = try? await client.urls() { urls = fresh }
+        if let fresh = try? await client.urls(), fresh != urls { urls = fresh }
     }
 
     /// The registered URLs for one service, in catalog order.
@@ -235,12 +253,20 @@ final class WorkspaceController: ObservableObject {
         catalogServices[serviceId]?.displayName ?? serviceId
     }
 
-    var counts: ServiceCounts {
-        var counts = ServiceCounts()
+    var counts: ServiceCounts { cachedCounts }
+
+    private func recomputeCounts() {
+        var next = ServiceCounts()
         for service in services {
-            counts.add(service, finite: isFinite(service.serviceId))
+            next.add(service, finite: isFinite(service.serviceId))
         }
-        return counts
+        cachedCounts = next
+    }
+
+    /// Skips the assign when the message is already showing. `@Published` notifies on every set.
+    private func failPhase(_ message: String) {
+        if case .failed(let existing) = phase, existing == message { return }
+        phase = .failed(message)
     }
 
     /// What `EventWatchLoop` calls per (coalesced) batch of stream events. The catalog and URLs
@@ -248,7 +274,7 @@ final class WorkspaceController: ObservableObject {
     private func sync(_ batch: EventBatch) async {
         await refresh()
         guard batch.resync || batch.types.contains("manager.catalog-reloaded"), let client else { return }
-        if let fresh = try? await client.catalog() { catalog = fresh }
+        if let fresh = try? await client.catalog(), fresh != catalog { catalog = fresh }
         await refreshUrls()
     }
 
@@ -263,7 +289,7 @@ final class WorkspaceController: ObservableObject {
         } catch {
             // `.connecting` belongs to `establish` — a late refresh failure must not overwrite it,
             // or the reconnect guard would fire a second `ensure` mid-transition.
-            if phase != .connecting { phase = .failed(error.localizedDescription) }
+            if phase != .connecting { failPhase(error.localizedDescription) }
         }
     }
 
@@ -278,6 +304,16 @@ final class WorkspaceController: ObservableObject {
             : LogController(client: client, serviceId: serviceId)
         logControllers[serviceId] = created
         return created
+    }
+
+    /// The cached tail, without creating one. Selection handoff uses this to stop the row being left.
+    func cachedLogController(for serviceId: String) -> LogController? {
+        logControllers[serviceId]
+    }
+
+    /// Stops every live tail poll. Cursors and buffers stay cached so focusing the row again resumes.
+    func stopLogTails() {
+        for controller in logControllers.values { controller.stop() }
     }
 
     private func applyServices(_ fresh: [ServiceLifecycleState]) {
@@ -379,6 +415,9 @@ final class WorkspaceController: ObservableObject {
 
     private func beginFlight(_ serviceId: String) {
         inFlightCounts[serviceId, default: 0] += 1
+        // A nested start-then-stop is already showing the spinner. Inserting an id the set
+        // already has still publishes, and every row rebuilds for a busy flag that did not change.
+        guard !actionsInFlight.contains(serviceId) else { return }
         actionsInFlight.insert(serviceId)
     }
 
@@ -386,9 +425,32 @@ final class WorkspaceController: ObservableObject {
         let next = (inFlightCounts[serviceId] ?? 1) - 1
         if next <= 0 {
             inFlightCounts.removeValue(forKey: serviceId)
-            actionsInFlight.remove(serviceId)
+            if actionsInFlight.contains(serviceId) { actionsInFlight.remove(serviceId) }
         } else {
             inFlightCounts[serviceId] = next
+        }
+    }
+}
+
+/// Focused service row. Its own object so a click does not publish `WorkspaceController`.
+///
+/// The value is stored immediately, but `objectWillChange` waits until the next turn.
+/// `List(selection:)` writes the binding from inside a view update, and publishing there makes
+/// SwiftUI re-enter the update.
+@MainActor
+final class ServiceSelection: ObservableObject {
+    private(set) var serviceId: String?
+    private var notifyScheduled = false
+
+    func setServiceId(_ newValue: String?) {
+        guard serviceId != newValue else { return }
+        serviceId = newValue
+        guard !notifyScheduled else { return }
+        notifyScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.notifyScheduled = false
+            self.objectWillChange.send()
         }
     }
 }

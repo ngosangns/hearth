@@ -54,6 +54,13 @@ pub fn normalize_observed_command_fingerprint(command: &str) -> String {
     sha256_hex(&collapse_whitespace(stripped.trim()))
 }
 
+/// The raw `ps` command line is still the `sh -c` wrapper, not the program it will exec.
+/// Octal escapes (`\012` for a newline inside the script) keep the hash from matching the logical
+/// command, so a hash compare alone will not recognize the wrapper.
+pub fn is_shell_wrapper_command(command: &str) -> bool {
+    sh_c_prefix_re().is_match(command.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +117,13 @@ mod tests {
         let logical = normalize_command_fingerprint(&command);
         let observed = normalize_observed_command_fingerprint("sh -c echo hi");
         assert_eq!(logical, observed);
+    }
+
+    #[test]
+    fn a_ps_wrapper_line_is_still_the_shell_even_with_an_octal_newline() {
+        assert!(is_shell_wrapper_command("/bin/sh -c sleep 2\\012exec nginx"));
+        assert!(is_shell_wrapper_command("sh -lc echo hi"));
+        assert!(!is_shell_wrapper_command("nginx: master process nginx"));
     }
 
     #[test]

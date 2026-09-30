@@ -86,12 +86,8 @@ document = {
                         "--wiredTigerCacheSizeGB",
                         "0.25",
                     ),
-                    "readiness": {
-                        "kind": "command",
-                        "command": {
-                            "shell": "perl -e 'use IO::Socket::INET; my $p = shift; exit(IO::Socket::INET->new(PeerAddr => \"127.0.0.1:$p\", Timeout => 1) ? 0 : 1)' {port}"
-                        },
-                    },
+                    # TCP accept only. Replica-set initiation runs in provision, after this probe.
+                    "readiness": {"kind": "tcp"},
                     # provision runs after the first ready: hearth-provision initiates rs0
                     # (idempotent) before writing the project-db marker — rs state then persists
                     # in dataDir across restarts.
@@ -116,7 +112,7 @@ document = {
                         "--console-address",
                         "127.0.0.1:{port2}",
                     ),
-                    "readiness": {"kind": "http", "url": "http://127.0.0.1:{port}/minio/health/live"},
+                    "readiness": {"kind": "http", "path": "/minio/health/live"},
                     "provision": [argv("{installDir}/bin/hearth-provision", "{dataDir}", "{port}", "{projectBucket}", "{projectUser}", "{projectId}")],
                     "connection": {
                         "url": "http://127.0.0.1:{port}",
@@ -151,7 +147,7 @@ document = {
                         "shell": "exec {installDir}/bin/nginx -p {dataDir} -c {dataDir}/nginx.conf",
                         "exec": True,
                     },
-                    "readiness": {"kind": "http", "url": "http://127.0.0.1:{port}/healthz"},
+                    "readiness": {"kind": "http", "path": "/health"},
                     "provision": [argv("{installDir}/bin/hearth-provision", "{dataDir}", "{port}", "{projectDb}", "{projectUser}", "{projectId}")],
                     "deprovision": [argv("{installDir}/bin/hearth-deprovision", "{dataDir}", "{port}", "{projectDb}", "{projectUser}", "{projectId}")],
                     "connection": {"url": "http://127.0.0.1:{port}/{projectId}/"},

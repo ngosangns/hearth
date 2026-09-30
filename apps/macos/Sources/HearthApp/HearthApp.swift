@@ -24,6 +24,7 @@ struct HearthApp: App {
                 }
         }
         .defaultSize(width: 960, height: 640)
+        .windowToolbarStyle(.unified)
         .handlesExternalEvents(matching: Set(arrayLiteral: "*"))
 
         // `Window` (not `WindowGroup`) — the shared catalog is a singleton: one smp daemon per
@@ -34,6 +35,7 @@ struct HearthApp: App {
                 .frame(minWidth: 700, minHeight: 440)
                 .background(WindowFrameAutosave(name: "HearthShared"))
         }
+        .windowToolbarStyle(.unified)
 
         MenuBarExtra {
             MenuBarContentView()

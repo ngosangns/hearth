@@ -36,7 +36,11 @@ for name, family in doc["services"].items():
         archive = dist / f"{name}-{version}-darwin-arm64.tar.gz"
         if not archive.is_file():
             raise SystemExit(f"missing tarball {archive}")
-        recipe["artifacts"]["darwin-arm64"]["url"] = "file://" + str(archive)
+        art = recipe["artifacts"]["darwin-arm64"]
+        art["url"] = "file://" + str(archive)
+        # SharedArtifact::validate rejects an artifact that sets both url and script.
+        art.pop("script", None)
+        art.pop("scriptArgs", None)
 out = pathlib.Path(os.environ["HOME"]) / "catalog.json"
 out.write_text(json.dumps(doc))
 print(out)
@@ -80,7 +84,7 @@ REDIS_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["p
 
 attach "nginx@${NGINX_VERSION}"
 NGINX_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attachment"]["connection"]["url"])' "$HOME_DIR/nginx_${NGINX_VERSION}.json")"
-curl -fsS "http://127.0.0.1:$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$HOME_DIR/nginx_${NGINX_VERSION}.json")/healthz" | grep -q ok
+curl -fsS "http://127.0.0.1:$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$HOME_DIR/nginx_${NGINX_VERSION}.json")/health" | grep -q ok
 curl -fsS "$NGINX_URL" | grep -q "hearth nginx"
 
 attach "minio@${MINIO_VERSION}"
@@ -92,7 +96,7 @@ MC_CONFIG_DIR="$HOME_DIR/.hearth/shared/instances/minio@${MINIO_VERSION}/mc" \
 
 attach "mongodb@${MONGODB_VERSION}"
 MONGO_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$HOME_DIR/mongodb_${MONGODB_VERSION}.json")"
-MONGO_DB="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["attachment"]["connection"]["url"].rsplit("/",1)[-1])' "$HOME_DIR/mongodb_${MONGODB_VERSION}.json")"
+MONGO_DB="$(python3 -c 'import json,sys; u=json.load(open(sys.argv[1]))["attachment"]["connection"]["url"].split("#",1)[0].split("?",1)[0]; print(u.rsplit("/",1)[-1])' "$HOME_DIR/mongodb_${MONGODB_VERSION}.json")"
 MONGOSH_NO_TELEMETRY=1 "$HOME_DIR/.hearth/shared/installs/mongodb/${MONGODB_VERSION}/bin/mongosh" --quiet --norc --host 127.0.0.1 --port "$MONGO_PORT" "$MONGO_DB" --eval 'const d=db.hearth.findOne({_id:"hearth"}); if(!d) quit(1)'
 
 attach "kafka@${KAFKA_VERSION}"

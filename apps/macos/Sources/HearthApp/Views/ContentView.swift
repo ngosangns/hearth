@@ -5,53 +5,106 @@ struct ContentView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
     @EnvironmentObject private var registry: WorkspaceControllerRegistry
     @Environment(\.openWindow) private var openWindow
+    /// Workspace whose log tails are polling. Switching away stops them without tearing the detail down.
+    @State private var visibleWorkspaceId: UUID?
 
     var body: some View {
         NavigationSplitView {
-            List(workspaceStore.workspaces, selection: $workspaceStore.selectedId) { workspace in
-                WorkspaceRow(workspace: workspace, controller: registry.controllers[workspace.id])
-                    .tag(workspace.id)
-            }
-            .navigationTitle("Workspaces")
-            .toolbar {
-                ToolbarItem { Button(action: addWorkspace) { Label("Add Folder", systemImage: "plus") } }
-            }
-            .overlay {
-                if workspaceStore.workspaces.isEmpty {
-                    ContentUnavailableViewCompat(
-                        title: "No workspaces",
-                        message: "Add a folder that has a hearth.yaml to manage its services here.",
-                        systemImage: "folder.badge.plus"
-                    )
+            workspaceList
+                .navigationTitle("Workspaces")
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button(action: addWorkspace) {
+                            Label("Add Folder", systemImage: "plus")
+                        }
+                        .help("Add Folder")
+                    }
                 }
-            }
-            .safeAreaInset(edge: .top) {
-                if let error = workspaceStore.loadError {
-                    ErrorBanner(text: error) { workspaceStore.dismissLoadError() }
-                }
-            }
-            .safeAreaInset(edge: .bottom) {
-                SummaryStrip(workspaces: workspaceStore.workspaces, registry: registry, pulse: registry.menuBarPulse)
-            }
         } detail: {
-            if let selection = workspaceStore.selectedId, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }),
-               let controller = registry.controllers[workspace.id] {
-                // A read-only lookup: the registry creates controllers in `sync(_:)`, never here —
-                // creating one from inside `body` would publish a change during a view update. The
-                // controller is resolved here (where `registry` — an @EnvironmentObject — is
-                // actually available) and passed down, rather than WorkspaceDetailView resolving it
-                // itself in an `init`, where @EnvironmentObject cannot be read yet.
-                WorkspaceDetailView(controller: controller, workspace: workspace)
-                    .id(workspace.id) // resets per-view state (e.g. an open log sheet) on selection change
-            } else if workspaceStore.selectedId != nil {
-                // Only reachable for the frame between a workspace being added and `sync(_:)`
-                // running for the changed list.
-                ContentUnavailableViewCompat(title: "Preparing…", message: "Setting up this workspace.", systemImage: "folder")
-            } else {
-                ContentUnavailableViewCompat(title: "Select a workspace", message: "Choose a folder from the sidebar.", systemImage: "folder")
+            detail
+                .animation(Motion.layout, value: detailBranch)
+        }
+        .navigationSplitViewStyle(.balanced)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 400)
+        .safeAreaInset(edge: .top) {
+            if let error = workspaceStore.loadError {
+                ErrorBanner(text: error) { workspaceStore.dismissLoadError() }
             }
         }
-        .onAppear { captureWindowOpener() }
+        .onAppear {
+            captureWindowOpener()
+            visibleWorkspaceId = workspaceStore.selectedId
+        }
+        .onChange(of: workspaceStore.selectedId) { newId in
+            if let previous = visibleWorkspaceId, previous != newId {
+                registry.controllers[previous]?.stopLogTails()
+            }
+            visibleWorkspaceId = newId
+        }
+    }
+
+    /// Which placeholder or workspace pane is showing. Stays `"workspace"` across sidebar switches
+    /// so that change updates the mounted detail in place instead of crossfading the log.
+    private var detailBranch: String {
+        if let selection = workspaceStore.selectedId, workspaceStore.workspaces.contains(where: { $0.id == selection }) {
+            return registry.controllers[selection] == nil ? "preparing" : "workspace"
+        }
+        return workspaceStore.workspaces.isEmpty ? "empty" : "unselected"
+    }
+
+    private var workspaceList: some View {
+        List(selection: $workspaceStore.selectedId) {
+            ForEach(workspaceStore.workspaces) { workspace in
+                WorkspaceRow(workspace: workspace, controller: registry.controllers[workspace.id]) {
+                    workspaceStore.remove(id: workspace.id)
+                }
+                .tag(workspace.id)
+            }
+            // In the scroll content, under the last row. With no workspaces it is the first row.
+            Button(action: addWorkspace) {
+                Label("Add Folder", systemImage: "plus")
+            }
+            .buttonStyle(.plain)
+            .modifier(SidebarAddRow())
+        }
+        .listStyle(.sidebar)
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        if let selection = workspaceStore.selectedId, let workspace = workspaceStore.workspaces.first(where: { $0.id == selection }),
+           let controller = registry.controllers[workspace.id] {
+            // A read-only lookup: the registry creates controllers in `sync(_:)`, never here —
+            // creating one from inside `body` would publish a change during a view update. The
+            // controller is resolved here (where `registry` — an @EnvironmentObject — is
+            // actually available) and passed down, rather than WorkspaceDetailView resolving it
+            // itself in an `init`, where @EnvironmentObject cannot be read yet.
+            // No `.id(workspace.id)`: that destroyed the split view and the log text view on every
+            // sidebar click. Dialog state resets inside the detail when `workspace.id` changes.
+            WorkspaceDetailView(controller: controller, workspace: workspace)
+                .transition(.opacity)
+        } else if workspaceStore.selectedId != nil {
+            // Only reachable for the frame between a workspace being added and `sync(_:)`
+            // running for the changed list.
+            ContentUnavailableViewCompat(title: "Preparing…", message: "Setting up this workspace.", systemImage: "folder")
+                .navigationTitle("Hearth")
+                .transition(.opacity)
+        } else if workspaceStore.workspaces.isEmpty {
+            ContentUnavailableViewCompat(
+                title: "No workspaces",
+                message: "Add a folder that has a hearth.yaml to manage its services here.",
+                systemImage: "folder.badge.plus"
+            ) {
+                Button("Add Folder", action: addWorkspace)
+                    .buttonStyle(.borderedProminent)
+            }
+            .navigationTitle("Hearth")
+            .transition(.opacity)
+        } else {
+            ContentUnavailableViewCompat(title: "Select a workspace", message: "Choose a folder from the sidebar.", systemImage: "folder")
+                .navigationTitle("Hearth")
+                .transition(.opacity)
+        }
     }
 
     private func addWorkspace() {
@@ -71,111 +124,146 @@ struct ContentView: View {
     }
 }
 
-/// Xcode-style status strip: the same glanceable summary the menu bar shows, so the number stays
-/// visible even while the sidebar is scrolled. Its own view observing `menuBarPulse`: `ContentView`
-/// deliberately does not observe the controllers (see `WorkspaceControllerRegistry`), so computed
-/// inline there it only redrew when something unrelated invalidated the window.
-private struct SummaryStrip: View {
-    let workspaces: [Workspace]
-    let registry: WorkspaceControllerRegistry
-    @ObservedObject var pulse: MenuBarPulse
-
-    var body: some View {
-        let summary = MenuBarSummary.compute(workspaces: workspaces, registry: registry)
-        if summary.total > 0 {
-            HStack(spacing: 6) {
-                Image(systemName: "server.rack")
-                if summary.failed > 0 {
-                    Text("\(summary.ready)/\(summary.total) ready · \(summary.failed) failed")
-                        .foregroundStyle(.red)
-                } else {
-                    Text("\(summary.ready)/\(summary.total) services ready")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .font(.caption)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.bar)
+/// `selectionDisabled` is macOS 14. The Add row must not become the list selection.
+private struct SidebarAddRow: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14, *) {
+            content.selectionDisabled(true)
+        } else {
+            content
         }
     }
 }
 
 private struct WorkspaceRow: View {
     let workspace: Workspace
-    /// The live controller, if the registry has made one — drives the trailing status.
+    /// The live controller, if the registry has made one — drives the status line.
     let controller: WorkspaceController?
+    let onRemove: () -> Void
+    @State private var confirmRemove = false
 
     var body: some View {
-        let exists = workspace.existsOnDisk
-        HStack(spacing: 8) {
-            Image(systemName: exists ? "folder.fill" : "folder.badge.questionmark")
-                .foregroundStyle(exists ? Color.accentColor : .secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(workspace.displayName)
-                    .fontWeight(.medium)
-                Text(workspace.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-            if let controller {
-                WorkspaceRowStatus(controller: controller)
-            } else if !workspace.trusted {
-                Image(systemName: "lock").foregroundStyle(.secondary)
-            }
+        if let controller {
+            LiveWorkspaceRow(workspace: workspace, controller: controller, onRemove: onRemove)
+        } else {
+            row(status: workspace.trusted ? workspace.displayPath : "Not trusted", failed: false)
         }
-        .padding(.vertical, 2)
+    }
+
+    private func row(status: String, failed: Bool) -> some View {
+        HStack(spacing: 8) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(workspace.displayName)
+                        .lineLimit(1)
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(failed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                        .lineLimit(1)
+                }
+            } icon: {
+                Image(systemName: workspace.existsOnDisk ? "folder" : "folder.badge.questionmark")
+                    .foregroundStyle(workspace.existsOnDisk ? Color.accentColor : .secondary)
+            }
+            Spacer(minLength: 0)
+            SidebarRemoveButton { confirmRemove = true }
+        }
+        .help(workspace.path)
+        .contextMenu {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: workspace.path)])
+            }
+            Button("Remove Workspace", role: .destructive) { confirmRemove = true }
+        }
+        .alert("Remove \"\(workspace.displayName)\"?", isPresented: $confirmRemove) {
+            Button("Remove", role: .destructive, action: onRemove)
+        } message: {
+            Text("Hearth will stop showing this folder. The folder stays on disk.")
+        }
     }
 }
 
-/// A compact trailing status: a ready/total count while connected, a glyph for anything else.
-/// A separate view so it can observe the controller — `WorkspaceRow` gets it as a plain value from
-/// `ContentView`, which does not observe controllers, so the count went stale there.
-private struct WorkspaceRowStatus: View {
+/// Observes the controller so the status line tracks live counts. `WorkspaceRow` gets the
+/// controller as a plain value from `ContentView`, which does not observe controllers.
+private struct LiveWorkspaceRow: View {
+    let workspace: Workspace
     @ObservedObject var controller: WorkspaceController
+    let onRemove: () -> Void
+    @State private var confirmRemove = false
 
     var body: some View {
+        HStack(spacing: 8) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(workspace.displayName)
+                        .lineLimit(1)
+                    Text(statusLine)
+                        .font(.caption)
+                        .foregroundStyle(failed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                        .lineLimit(1)
+                }
+            } icon: {
+                Image(systemName: workspace.existsOnDisk ? "folder" : "folder.badge.questionmark")
+                    .foregroundStyle(workspace.existsOnDisk ? Color.accentColor : .secondary)
+            }
+            Spacer(minLength: 0)
+            SidebarRemoveButton { confirmRemove = true }
+        }
+        .help(workspace.path)
+        .contextMenu {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: workspace.path)])
+            }
+            Button("Remove Workspace", role: .destructive) { confirmRemove = true }
+        }
+        .alert("Remove \"\(workspace.displayName)\"?", isPresented: $confirmRemove) {
+            Button("Remove", role: .destructive, action: onRemove)
+        } message: {
+            Text("Hearth will stop showing this folder. The folder stays on disk.")
+        }
+    }
+
+    private var failed: Bool {
+        if case .failed = controller.phase { return true }
+        return controller.phase == .connected && controller.counts.failed > 0
+    }
+
+    private var statusLine: String {
+        if !workspace.trusted { return "Not trusted" }
         switch controller.phase {
         case .connected:
             let counts = controller.counts
-            if counts.failed > 0 {
-                Text("\(counts.ready)/\(counts.total) · \(counts.failed) failed")
-                    .font(.caption).monospacedDigit().foregroundStyle(.red)
-            } else {
-                Text("\(counts.ready)/\(counts.total)")
-                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
-            }
+            if counts.total == 0 { return "No services" }
+            if counts.failed > 0 { return "\(counts.ready)/\(counts.total) · \(counts.failed) failed" }
+            return "\(counts.ready)/\(counts.total) ready"
         case .connecting:
-            ActionSpinner()
+            return "Starting…"
         case .idle:
             // Resting state — the daemon has never been started for this workspace in this
-            // session. Showing a spinner here made every untouched row look stuck loading.
-            EmptyView()
+            // session. A spinner here made every untouched row look stuck loading.
+            return workspace.displayPath
         case .failed:
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            return "Daemon failed"
         case .stopped:
-            Image(systemName: "stop.circle").foregroundStyle(.secondary)
+            return "Daemon stopped"
         }
     }
 }
 
-/// `ContentUnavailableView` is macOS 14+; this app targets macOS 13, so a small compatible stand-in.
-struct ContentUnavailableViewCompat: View {
-    let title: String
-    let message: String
-    let systemImage: String
+/// Trailing control on a sidebar row. A real button so the click does not also select the row.
+private struct SidebarRemoveButton: View {
+    let action: () -> Void
 
     var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: systemImage).font(.system(size: 36)).foregroundStyle(.secondary)
-            Text(title).font(.headline)
-            Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        Button(action: action) {
+            Image(systemName: "trash")
         }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Remove Workspace")
+        .help("Remove Workspace")
     }
 }
+
+

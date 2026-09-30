@@ -17,29 +17,63 @@ enum StatusStyle {
     }
 }
 
-/// 8-pt colored dot — the app's state glyph. Drawn once here so every list row agrees.
+/// Status mark shared by every list row. A template `circle.fill` so the dot tracks the
+/// system symbol font; the state word next to it is what VoiceOver reads.
 struct StatusDot: View {
     let state: String
 
     var body: some View {
-        Circle()
-            .fill(StatusStyle.color(for: state))
+        Image(systemName: "circle.fill")
+            .resizable()
             .frame(width: 8, height: 8)
+            .foregroundStyle(StatusStyle.color(for: state))
+            .accessibilityHidden(true)
     }
 }
 
-/// The state word as a small tinted capsule — used where the state should be scannable at a
-/// glance (log header, shared instance detail) rather than read as prose in a metadata line.
+/// The state word in the system label color for that state. Used where the state should be
+/// scannable at a glance (log header) rather than read as prose in a metadata line.
 struct StateBadge: View {
     let state: String
 
     var body: some View {
         Text(state)
-            .font(.caption.weight(.medium))
+            .font(.subheadline.weight(.medium))
             .foregroundStyle(StatusStyle.color(for: state))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 1)
-            .background(StatusStyle.color(for: state).opacity(0.15), in: Capsule())
+    }
+}
+
+/// Toolbar item in the unified title bar. The visible label is the short title; `help` is the
+/// longer name shown on hover. Same shape as ns-adeck's Grid button.
+struct ToolbarButton: View {
+    let title: String
+    var help: String? = nil
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label {
+                Text(title)
+            } icon: {
+                Image(systemName: systemImage)
+            }
+        }
+        .help(help ?? title)
+    }
+}
+
+/// Drops `navigationSubtitle` when there is nothing to say, so the unified toolbar does not
+/// reserve a blank second line.
+struct DetailSubtitle: ViewModifier {
+    var text: String
+
+    func body(content: Content) -> some View {
+        if text.isEmpty {
+            content
+        } else {
+            content.navigationSubtitle(text)
+        }
     }
 }
 
@@ -51,7 +85,7 @@ struct IconActionButton: View {
     let systemImage: String
     var role: ButtonRole? = nil
     /// `true` in list rows — a fixed box keeps a row of icons evenly spaced despite SF Symbols'
-    /// different natural widths. `false` in toolbars, which size their items themselves.
+    /// different natural widths.
     var compact: Bool = true
     let action: () -> Void
 
@@ -92,20 +126,74 @@ struct ErrorBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(.red)
-            Text(text)
-                .font(.callout)
-                .lineLimit(2)
-            Spacer()
-            Button("Dismiss", action: onDismiss)
-                .buttonStyle(.borderless)
-                .font(.caption)
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+                Text(text)
+                    .font(.callout)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                Button("Dismiss", action: onDismiss)
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            Divider()
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(.red.opacity(0.12))
+        .background(.bar)
+    }
+}
+
+/// `ContentUnavailableView` is macOS 14+; this app targets macOS 13. Same anatomy as the system
+/// view: a large symbol, a title, a secondary explanation, then optional actions.
+struct ContentUnavailableViewCompat<Actions: View>: View {
+    let title: String
+    let message: String
+    let systemImage: String
+    var symbolColor: Color = .secondary
+    private let actions: Actions
+
+    init(title: String, message: String, systemImage: String, symbolColor: Color = .secondary, @ViewBuilder actions: () -> Actions) {
+        self.title = title
+        self.message = message
+        self.systemImage = systemImage
+        self.symbolColor = symbolColor
+        self.actions = actions()
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            VStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 40))
+                    .foregroundStyle(symbolColor)
+                    .accessibilityHidden(true)
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                if !message.isEmpty {
+                    Text(message)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 380)
+                        .textSelection(.enabled)
+                }
+            }
+            actions
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+extension ContentUnavailableViewCompat where Actions == EmptyView {
+    init(title: String, message: String, systemImage: String, symbolColor: Color = .secondary) {
+        self.init(title: title, message: message, systemImage: systemImage, symbolColor: symbolColor) { EmptyView() }
     }
 }
 

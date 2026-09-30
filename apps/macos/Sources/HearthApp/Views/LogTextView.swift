@@ -51,6 +51,10 @@ struct LogTextView: NSViewRepresentable {
         context.coordinator.attach(nil, to: log) // re-subscribes only if the controller changed
     }
 
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        coordinator.releaseLog()
+    }
+
     @MainActor
     final class Coordinator {
         private weak var textView: NSTextView?
@@ -60,11 +64,28 @@ struct LogTextView: NSViewRepresentable {
 
         /// Seeds the view from `log.text`, then follows `log.deltas`. Both happen on the main
         /// actor in one step, so no delta can land between the seed and the subscription.
+        /// A different controller reuses this text view: stop the previous poll, follow the new
+        /// tail, then start the new poll. The first attach does not start polling — the panel
+        /// does that on appear.
         func attach(_ newTextView: NSTextView?, to newLog: LogController) {
             if let newTextView { textView = newTextView } else if newLog === log { return }
+            let previous = log
+            let switchingLog = previous != nil && previous !== newLog
             log = newLog
-            replace(with: newLog.text)
+            // Subscribe before stopping the old poll so an in-flight slice cannot append to this
+            // view after the seed. `start` only schedules work, so the seed still lands first.
             subscription = newLog.deltas.sink { [weak self] delta in self?.apply(delta) }
+            if switchingLog { previous?.stop() }
+            replace(with: newLog.text, forceFollow: switchingLog)
+            if switchingLog { newLog.start() }
+        }
+
+        /// Stops the poll this text view is actually following. `onDisappear` can still see a
+        /// controller from before the last retarget.
+        func releaseLog() {
+            log?.stop()
+            log = nil
+            subscription = nil
         }
 
         private func apply(_ delta: LogDelta) {
@@ -88,11 +109,12 @@ struct LogTextView: NSViewRepresentable {
             }
         }
 
-        private func replace(with text: String) {
+        private func replace(with text: String, forceFollow: Bool = false) {
             guard let textView, let storage = textView.textStorage else { return }
             // Full replacements still respect the read position: a `.reset` delta (the daemon
             // log's only shape) must not pull a scrolled-up user back to the tail every poll.
-            let wasAtBottom = showingPlaceholder || isScrolledToBottom(textView)
+            // `forceFollow` is only for attaching a different controller onto this same view.
+            let wasAtBottom = forceFollow || showingPlaceholder || isScrolledToBottom(textView)
             showingPlaceholder = text.isEmpty
             if showingPlaceholder {
                 var attributes = LogTextView.attributes

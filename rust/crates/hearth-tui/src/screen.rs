@@ -3,7 +3,7 @@
 use hearth_core::state::ActualServiceState;
 
 use crate::state::{display_state, Service};
-use crate::text_utils::{sanitize_terminal_text, truncate_to_width};
+use crate::text_utils::{sanitize_terminal_text, truncate_to_width, visible_width};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Viewport {
@@ -148,7 +148,7 @@ impl ServiceScreen {
         let service_width = width.saturating_sub(if has_service_scrollbar { 1 } else { 0 });
         let logs = split_lines(&self.state.log, log_height);
 
-        let mut lines: Vec<String> = vec![fit(HEADER_LINE_1, width), fit(HEADER_LINE_2, width), fit(&self.state.notice, width)];
+        let mut lines: Vec<String> = vec![fit(HEADER_LINE_1, width), fit(HEADER_LINE_2, width), fit_notice(&self.state.notice, width)];
         lines.truncate(rows);
 
         if service_height > 0 {
@@ -228,6 +228,28 @@ impl ServiceScreen {
 
 fn fit(text: &str, width: usize) -> String {
     truncate_to_width(&sanitize_terminal_text(text), width, true)
+}
+
+/// The reclaim confirm lives at the end of the notice, after the holder description. Truncating
+/// the tail hides "press again to kill" on a narrow terminal; keep that suffix and cut the holder.
+/// Service and log rows stay on `fit`, which cuts the end.
+fn fit_notice(text: &str, width: usize) -> String {
+    let text = sanitize_terminal_text(text);
+    const MARKER: &str = "press again";
+    if let Some(index) = text.find(MARKER) {
+        let suffix = &text[index..];
+        if visible_width(&text) > width {
+            let suffix_width = visible_width(suffix);
+            if suffix_width >= width {
+                return truncate_to_width(suffix, width, true);
+            }
+            let head = truncate_to_width(&text[..index], width - suffix_width, false);
+            let mut combined = head;
+            combined.push_str(suffix);
+            return truncate_to_width(&combined, width, true);
+        }
+    }
+    truncate_to_width(&text, width, true)
 }
 
 fn status_colour(state: ActualServiceState) -> u8 {
@@ -369,6 +391,14 @@ mod tests {
         for old in ["old-1", "old-2", "old-3", "old-4"] {
             assert!(!joined.contains(old));
         }
+    }
+
+    #[test]
+    fn a_reclaim_notice_keeps_the_confirm_phrase_on_a_narrow_line() {
+        let notice = format!("{} — press again to kill it and start api", "x".repeat(80));
+        let fitted = fit_notice(&notice, 40);
+        assert!(fitted.contains("press again to kill"), "{fitted}");
+        assert!(visible_width(&fitted) <= 40, "{}", visible_width(&fitted));
     }
 
     #[test]

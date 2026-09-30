@@ -1,25 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// One top-bar action — rendered as a toolbar button while it fits, collapsing into the trailing
-/// menu when the window narrows. Suffix order is collapse order: the least-used actions move into
-/// the menu first.
-private struct TopBarAction: Identifiable {
-    let id: String
-    let title: String
-    let systemImage: String
-    var disabled = false
-    let run: () -> Void
-}
-
-/// Width of the detail pane, measured by a `GeometryReader` in the view's background — the toolbar
-/// itself proposes each item its ideal width and clips the overflow, so the items have to decide
-/// how many of them fit from the pane's width instead.
-private struct DetailWidthKey: PreferenceKey {
-    static let defaultValue: CGFloat = .infinity
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
-
 struct WorkspaceDetailView: View {
     @EnvironmentObject private var workspaceStore: WorkspaceStore
     @Environment(\.openWindow) private var openWindow
@@ -29,49 +10,7 @@ struct WorkspaceDetailView: View {
     @ObservedObject var controller: WorkspaceController
     let workspace: Workspace
     @State private var confirmStopDaemon = false
-    @State private var detailWidth: CGFloat = .infinity
-
-    /// Top-bar actions in priority order — the leftmost stays on the bar longest. Destructive
-    /// items (`Stop Daemon…`, `Remove Workspace`) stay pinned to the menu: they were behind a
-    /// second click before, and a one-click toolbar button should not get cheaper than that.
-    private var topBarActions: [TopBarAction] {
-        var actions: [TopBarAction] = []
-        if workspace.trusted, controller.phase == .connected {
-            actions.append(TopBarAction(id: "stopAll", title: "Stop All Services", systemImage: "stop.circle") { Task { await controller.stopAll() } })
-        }
-        // The daemon lifecycle items stay visible in every phase but `connecting` — a failed
-        // workspace is exactly where a daemon swap is worth trying (the controller guards
-        // re-entry, so a double click cannot stack two swaps).
-        if workspace.trusted, controller.phase != .connecting {
-            actions.append(TopBarAction(id: "restartDaemon", title: "Restart Daemon", systemImage: "arrow.triangle.2.circlepath", disabled: controller.daemonTransitionInFlight) { Task { await controller.restartDaemon() } })
-        }
-        actions.append(TopBarAction(id: "shared", title: "Shared Services…", systemImage: "shippingbox") { openWindow(id: SharedWindow.id) })
-        actions.append(TopBarAction(id: "reveal", title: "Reveal in Finder", systemImage: "folder") {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: workspace.path)])
-        })
-        actions.append(TopBarAction(id: "updates", title: "Check for Updates…", systemImage: "arrow.down.circle") {
-            NSWorkspace.shared.open(AppLinks.releases)
-        })
-        return actions
-    }
-
-    /// Title+icon toolbar buttons size to their label — estimate ~7.5pt per character plus the
-    /// icon and padding. Reserve room for the window title and the sidebar toggle, and for the
-    /// overflow menu itself while it still holds collapsed items.
-    private var visibleTopBarCount: Int {
-        let items = topBarActions
-        let budget = detailWidth - 300
-        func width(_ item: TopBarAction) -> CGFloat { CGFloat(item.title.count) * 7.5 + 56 }
-        if items.reduce(0, { $0 + width($1) }) <= budget { return items.count }
-        var used: CGFloat = 44
-        var count = 0
-        for item in items {
-            used += width(item)
-            if used > budget { break }
-            count += 1
-        }
-        return count
-    }
+    @State private var confirmRemoveWorkspace = false
 
     var body: some View {
         Group {
@@ -80,61 +19,104 @@ struct WorkspaceDetailView: View {
                     workspaceStore.setTrusted(true, id: workspace.id)
                     Task { await controller.connect() }
                 }
+                .transition(.opacity)
             } else {
                 connectedBody
+                    .transition(.opacity)
             }
         }
-        .background(GeometryReader { geo in Color.clear.preference(key: DetailWidthKey.self, value: geo.size.width) })
-        .onPreferenceChange(DetailWidthKey.self) { detailWidth = $0 }
         .navigationTitle(workspace.displayName)
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                let actions = topBarActions
-                let visible = visibleTopBarCount
-                ForEach(actions.prefix(visible)) { action in
-                    Button(action: action.run) {
-                        Label(action.title, systemImage: action.systemImage)
-                            .labelStyle(.titleAndIcon)
-                    }
-                    .padding(.horizontal, 6)
-                    .disabled(action.disabled)
-                    .help(action.title)
-                }
-                Menu {
-                    ForEach(actions.dropFirst(visible)) { action in
-                        Button(action: action.run) {
-                            Label(action.title, systemImage: action.systemImage)
-                        }
-                        .disabled(action.disabled)
-                    }
-                    if visible < actions.count {
-                        Divider()
-                    }
-                    // `stopDaemon` takes the daemon AND all its services down — destructive
-                    // enough to confirm, and only offered while the daemon may be alive
-                    // (connected, or failed with a possibly-wedged daemon still running).
-                    if workspace.trusted, controller.phase != .connecting, controller.phase.mayHaveLiveDaemon {
-                        Button(role: .destructive) { confirmStopDaemon = true } label: {
-                            Label("Stop Daemon…", systemImage: "power")
-                        }
-                        .disabled(controller.daemonTransitionInFlight)
-                    }
-                    Divider()
-                    Button(role: .destructive) { workspaceStore.remove(id: workspace.id) } label: {
-                        Label("Remove Workspace", systemImage: "trash")
-                    }
-                } label: {
-                    Label("Workspace actions", systemImage: "ellipsis.circle")
-                        .labelStyle(.iconOnly)
-                }
-                .help("Workspace actions")
-                .stopDaemonConfirmation(isPresented: $confirmStopDaemon) {
-                    Task { await controller.stopDaemon() }
+        .modifier(DetailSubtitle(text: workspace.displayPath))
+        .toolbar { toolbar }
+        .animation(Motion.layout, value: workspace.trusted)
+        .animation(Motion.layout, value: phaseKey)
+        .task(id: workspace.id) {
+            if workspace.trusted, controller.phase == .idle { await controller.connect() }
+        }
+        .onChange(of: workspace.id) { _ in
+            confirmStopDaemon = false
+            confirmRemoveWorkspace = false
+        }
+    }
+
+    /// Coarse phase so a new failure message does not replay the transition.
+    private var phaseKey: String {
+        switch controller.phase {
+        case .idle, .connecting: return "starting"
+        case .failed: return "failed"
+        case .stopped: return "stopped"
+        case .connected: return "connected"
+        }
+    }
+
+    /// Two labeled actions in the unified toolbar, matching ns-adeck's single primary control
+    /// plus the rest behind a menu. Destructive items stay behind a second click.
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        if workspace.trusted, controller.phase == .connected {
+            ToolbarItem(id: "stopAll", placement: .primaryAction) {
+                ToolbarButton(title: "Stop All", help: "Stop All Services", systemImage: "stop.circle") {
+                    Task { await controller.stopAll() }
                 }
             }
         }
-        .task {
-            if workspace.trusted, controller.phase == .idle { await controller.connect() }
+        // The daemon lifecycle item stays visible in every phase but `connecting` — a failed
+        // workspace is exactly where a daemon swap is worth trying (the controller guards
+        // re-entry, so a double click cannot stack two swaps).
+        if workspace.trusted, controller.phase != .connecting {
+            ToolbarItem(id: "restartDaemon", placement: .primaryAction) {
+                ToolbarButton(title: "Restart", help: "Restart Daemon", systemImage: "arrow.triangle.2.circlepath") {
+                    Task { await controller.restartDaemon() }
+                }
+                .disabled(controller.daemonTransitionInFlight)
+            }
+        }
+        ToolbarItem(id: "workspaceMenu", placement: .primaryAction) {
+            Menu {
+                Button {
+                    openWindow(id: SharedWindow.id)
+                } label: {
+                    Label("Shared Services…", systemImage: "shippingbox")
+                }
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: workspace.path)])
+                } label: {
+                    Label("Reveal in Finder", systemImage: "folder")
+                }
+                Button {
+                    NSWorkspace.shared.open(AppLinks.releases)
+                } label: {
+                    Label("Check for Updates…", systemImage: "arrow.down.circle")
+                }
+                Divider()
+                // `stopDaemon` takes the daemon AND all its services down — destructive
+                // enough to confirm, and only offered while the daemon may be alive
+                // (connected, or failed with a possibly-wedged daemon still running).
+                if workspace.trusted, controller.phase != .connecting, controller.phase.mayHaveLiveDaemon {
+                    Button(role: .destructive) { confirmStopDaemon = true } label: {
+                        Label("Stop Daemon…", systemImage: "power")
+                    }
+                    .disabled(controller.daemonTransitionInFlight)
+                }
+                Button(role: .destructive) { confirmRemoveWorkspace = true } label: {
+                    Label("Remove Workspace", systemImage: "trash")
+                }
+            } label: {
+                Label {
+                    Text("Actions")
+                } icon: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+            .help("Workspace actions")
+            .stopDaemonConfirmation(isPresented: $confirmStopDaemon) {
+                Task { await controller.stopDaemon() }
+            }
+            .alert("Remove \"\(workspace.displayName)\"?", isPresented: $confirmRemoveWorkspace) {
+                Button("Remove", role: .destructive) { workspaceStore.remove(id: workspace.id) }
+            } message: {
+                Text("Hearth will stop showing this folder. The folder stays on disk.")
+            }
         }
     }
 
@@ -147,28 +129,31 @@ struct WorkspaceDetailView: View {
                 Text("Starting daemon…").font(.callout).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .transition(.opacity)
         case .failed(let message):
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 40)).foregroundStyle(.orange)
-                Text("Daemon failed to start").font(.title3).fontWeight(.medium)
-                Text(message).multilineTextAlignment(.center).foregroundStyle(.secondary)
-                    .textSelection(.enabled).frame(maxWidth: 420)
-                Button("Retry") { Task { await controller.connect() } }.buttonStyle(.borderedProminent)
+            ContentUnavailableViewCompat(
+                title: "Daemon failed to start",
+                message: message,
+                systemImage: "exclamationmark.triangle.fill",
+                symbolColor: .orange
+            ) {
+                Button("Retry") { Task { await controller.connect() } }
+                    .buttonStyle(.borderedProminent)
             }
-            .padding()
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .transition(.opacity)
         case .stopped:
-            VStack(spacing: 12) {
-                Image(systemName: "stop.circle").font(.system(size: 40)).foregroundStyle(.secondary)
-                Text("Daemon stopped").font(.title3).fontWeight(.medium)
-                Text("Services are down. Start the daemon to bring the workspace back.")
-                    .font(.callout).foregroundStyle(.secondary)
-                Button("Start Daemon") { Task { await controller.connect() } }.buttonStyle(.borderedProminent)
+            ContentUnavailableViewCompat(
+                title: "Daemon stopped",
+                message: "Services are down. Start the daemon to bring the workspace back.",
+                systemImage: "stop.circle"
+            ) {
+                Button("Start Daemon") { Task { await controller.connect() } }
+                    .buttonStyle(.borderedProminent)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .transition(.opacity)
         case .connected:
             ServiceListView(controller: controller)
+                .transition(.identity)
         }
     }
 }
@@ -178,24 +163,21 @@ private struct TrustPromptView: View {
     let onTrust: () -> Void
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "shield.lefthalf.filled").font(.system(size: 44)).foregroundStyle(Color.accentColor)
-            Text("Trust this folder?").font(.title2).bold()
-            Text("\(workspace.path)\n\nThis folder's hearth.yaml names commands the daemon will run on your behalf. Only trust folders you wrote or downloaded from somewhere you trust.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
-            Button("Trust and Start", action: onTrust).buttonStyle(.borderedProminent)
+        ContentUnavailableViewCompat(
+            title: "Trust this folder?",
+            message: "\(workspace.path)\n\nThis folder's hearth.yaml names commands the daemon will run on your behalf. Only trust folders you wrote or downloaded from somewhere you trust.",
+            systemImage: "shield.lefthalf.filled",
+            symbolColor: .accentColor
+        ) {
+            Button("Trust and Start", action: onTrust)
+                .buttonStyle(.borderedProminent)
         }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
 /// A master-detail split: the service list on the left drives a live log panel on the right for
-/// whichever row is focused/selected. Selection and log tails live on `WorkspaceController` so they
-/// survive switching workspaces (this view is recreated via `.id(workspace.id)`).
+/// whichever row is focused/selected. Selection and log tails live on `WorkspaceController`.
+/// The log text view stays mounted across row and workspace switches. `LogTextView` retargets it.
 private struct ServiceListView: View {
     @ObservedObject var controller: WorkspaceController
 
@@ -226,6 +208,7 @@ private struct ServiceListView: View {
                             Section {
                                 ForEach(section.serviceIds.compactMap { controller.service($0) }) { service in
                                     ServiceRow(
+                                        workspaceID: controller.workspace.id,
                                         service: service,
                                         label: controller.displayName(for: service.serviceId),
                                         busy: controller.actionsInFlight.contains(service.serviceId),
@@ -236,6 +219,7 @@ private struct ServiceListView: View {
                                             Task { await controller.perform(action, serviceId: service.serviceId, killUnowned: killUnowned) }
                                         }
                                     )
+                                    .equatable()
                                     .tag(service.serviceId)
                                 }
                             } header: {
@@ -270,27 +254,37 @@ private struct ServiceListView: View {
             }
             .frame(minWidth: 220, idealWidth: 240, maxWidth: 320)
 
-            logPanel
+            LogPane(controller: controller, selection: controller.selection)
                 .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
         }
     }
+}
 
-    @ViewBuilder
-    private var logPanel: some View {
-        if let selectedServiceId = controller.selectedServiceId, let logController = controller.logController(for: selectedServiceId) {
-            let service = controller.service(selectedServiceId)
-            let label = selectedServiceId == LogController.daemonServiceId
-                ? "daemon log"
-                : controller.displayName(for: selectedServiceId)
-            ServiceLogPanel(serviceLabel: label, state: service?.displayState, log: logController)
-                .id(selectedServiceId)
-        } else {
-            ContentUnavailableViewCompat(
-                title: "No selection",
-                message: "Select a service to view its logs.",
-                systemImage: "doc.plaintext"
-            )
+/// Observes selection on its own, so a row click does not rebuild the service list.
+private struct LogPane: View {
+    @ObservedObject var controller: WorkspaceController
+    @ObservedObject var selection: ServiceSelection
+
+    var body: some View {
+        Group {
+            if let selectedServiceId = selection.serviceId, let logController = controller.logController(for: selectedServiceId) {
+                let service = controller.service(selectedServiceId)
+                let label = selectedServiceId == LogController.daemonServiceId
+                    ? "daemon log"
+                    : controller.displayName(for: selectedServiceId)
+                ServiceLogPanel(serviceLabel: label, state: service?.displayState, log: logController)
+                    .transition(.identity)
+            } else {
+                ContentUnavailableViewCompat(
+                    title: "No selection",
+                    message: "Select a service to view its logs.",
+                    systemImage: "doc.plaintext"
+                )
+                .transition(.opacity)
+            }
         }
+        // Only the empty ↔ log swap fades. Switching rows keeps the text view and skips the animation.
+        .animation(Motion.layout, value: selection.serviceId == nil)
     }
 }
 
@@ -326,7 +320,8 @@ private struct GroupSectionHeader: View {
     }
 }
 
-private struct ServiceRow: View {
+private struct ServiceRow: View, Equatable {
+    let workspaceID: UUID
     let service: ServiceLifecycleState
     let label: String
     let busy: Bool
@@ -336,6 +331,16 @@ private struct ServiceRow: View {
     let urls: [ResolvedServiceUrl]
     let onAction: (ManagerAction, Bool) -> Void
     @State private var confirmReclaim = false
+
+    static func == (lhs: ServiceRow, rhs: ServiceRow) -> Bool {
+        lhs.workspaceID == rhs.workspaceID
+            && lhs.service.isVisuallyEqual(to: rhs.service)
+            && lhs.label == rhs.label
+            && lhs.busy == rhs.busy
+            && lhs.disabled == rhs.disabled
+            && lhs.finite == rhs.finite
+            && lhs.urls == rhs.urls
+    }
 
     /// Same rule as `hearthd urls` and both TUIs: in-flight states count as running.
     private var isRunning: Bool { ["ready", "running", "starting"].contains(service.displayState) }
@@ -347,32 +352,7 @@ private struct ServiceRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(label).fontWeight(.medium)
                     .foregroundStyle(disabled ? .secondary : .primary)
-                HStack(spacing: 6) {
-                    Text(service.displayState)
-                        .font(.caption)
-                        .foregroundStyle(StatusStyle.color(for: service.displayState))
-                    if disabled {
-                        Text("disabled")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(.quaternary, in: Capsule())
-                    }
-                    if let pid = service.identity?.pid {
-                        Text("pid \(pid)").font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let detail = service.readinessDetail, service.displayState == "failed" {
-                        Text(detail).font(.caption).foregroundStyle(.red).lineLimit(1)
-                    }
-                    // `externally-owned` means a process this daemon does not own holds the service's
-                    // port — the daemon's own reason ("Port 1166 is held by an unowned process") is
-                    // the only thing that explains why Stop cannot work here, so the row shows it
-                    // rather than leaving a button that looks broken.
-                    if let reason = service.error, service.displayState == "external" {
-                        Text(reason).font(.caption).foregroundStyle(.orange).lineLimit(1)
-                    }
-                }
+                metadata
                 if !urls.isEmpty {
                     links
                 }
@@ -382,27 +362,56 @@ private struct ServiceRow: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle()) // the whole row is clickable/selectable, not just the text
+        .onChange(of: workspaceID) { _ in confirmReclaim = false }
+    }
+
+    /// State, then the facts that qualify it, in one secondary line — the same shape as a Finder
+    /// list subtitle. The state keeps its status color; everything else is secondary except a
+    /// failure reason.
+    private var metadata: some View {
+        HStack(spacing: 0) {
+            Text(service.displayState)
+                .foregroundStyle(StatusStyle.color(for: service.displayState))
+                .layoutPriority(1)
+            if disabled {
+                Text(" · disabled").foregroundStyle(.secondary)
+            }
+            if let pid = service.identity?.pid {
+                Text(" · pid \(pid)").foregroundStyle(.secondary)
+            }
+            if let detail = service.readinessDetail, service.displayState == "failed" {
+                Text(" · \(detail)")
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            // `externally-owned` means a process this daemon does not own holds the service's
+            // port — the daemon's own reason ("Port 1166 is held by an unowned process") is
+            // the only thing that explains why Stop cannot work here, so the row shows it
+            // rather than leaving a button that looks broken.
+            if let reason = service.error, service.displayState == "external" {
+                Text(" · \(reason)")
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .font(.caption)
+        .lineLimit(1)
     }
 
     /// One link per registered URL. A URL that needs the service running is dimmed while it is not,
     /// so a dead link is recognisable before anyone clicks it — still clickable, since the catalog
     /// can't know for certain (another process may be serving it).
     private var links: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             ForEach(urls, id: \.self) { entry in
                 if let destination = URL(string: entry.url) {
                     let stale = entry.requiresRunning && !isRunning
-                    Link(destination: destination) {
-                        Label(entry.displayName, systemImage: "arrow.up.right.square")
-                            .labelStyle(.titleAndIcon)
-                            .lineLimit(1)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(.quaternary, in: Capsule())
-                    }
-                    .font(.caption)
-                    .opacity(stale ? 0.45 : 1)
-                    .help(stale ? "\(entry.url) — \(label) is not running" : entry.url)
+                    Link(entry.displayName, destination: destination)
+                        .font(.caption)
+                        .opacity(stale ? 0.45 : 1)
+                        .help(stale ? "\(entry.url) — \(label) is not running" : entry.url)
                 }
             }
         }
@@ -415,53 +424,50 @@ private struct ServiceRow: View {
         if disabled {
             EmptyView()
         } else {
-        HStack(spacing: 8) {
-            if busy {
-                ActionSpinner()
-            }
-            if busy {
-                // Keep Stop available for the whole start/restart flight so the user can abort
-                // without waiting for readiness.
-                if service.displayState != "stopping" {
-                    IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
+            HStack(spacing: 8) {
+                if busy {
+                    ActionSpinner()
                 }
-            } else {
-                switch service.displayState {
-                // `orphaned`: the daemon no longer owns the process it recorded (a reused pid, or a
-                // program that replaced it). Start re-runs the catalog's run command; Stop runs its
-                // `stop:` command — or reports why it cannot, which is the only honest answer for a
-                // process this daemon does not own.
-                case "orphaned":
-                    IconActionButton("Start", systemImage: "play.fill") { onAction(.start, false) }
-                    IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
-                // `externally-owned`: a process this daemon does not own holds the service's port, so
-                // it has no process to kill. "Kill & Start" asks the daemon to terminate that
-                // process (SIGTERM, then SIGKILL) and continue the start — destructive, so it is
-                // gated behind a confirmation and rendered red. Stop is still offered because the
-                // catalog's `stop:` command is the other lever that works here.
-                case "external":
-                    Button(role: .destructive) { confirmReclaim = true } label: {
-                        Label("Kill the process holding the port, then start", systemImage: "bolt.fill")
-                            .labelStyle(.iconOnly)
+                if busy {
+                    // Keep Stop available for the whole start/restart flight so the user can abort
+                    // without waiting for readiness.
+                    if service.displayState != "stopping" {
+                        IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
                     }
-                    .buttonStyle(.borderless)
-                    .help("Kill the process holding the port, then start")
-                    .confirmationDialog(
-                        "Kill the process holding this port?",
-                        isPresented: $confirmReclaim,
-                        titleVisibility: .visible
-                    ) {
-                        Button("Kill & Start", role: .destructive) { onAction(.start, true) }
-                        Button("Cancel", role: .cancel) {}
-                    } message: {
-                        Text(service.error ?? "A process this manager does not own holds the port.")
+                } else {
+                    switch service.displayState {
+                    // `orphaned`: the daemon no longer owns the process it recorded (a reused pid, or a
+                    // program that replaced it). Start re-runs the catalog's run command; Stop runs its
+                    // `stop:` command — or reports why it cannot, which is the only honest answer for a
+                    // process this daemon does not own.
+                    case "orphaned":
+                        IconActionButton("Start", systemImage: "play.fill") { onAction(.start, false) }
+                        IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
+                    // `externally-owned`: a process this daemon does not own holds the service's port, so
+                    // it has no process to kill. "Kill & Start" asks the daemon to terminate that
+                    // process (SIGTERM, then SIGKILL) and continue the start — destructive, so it is
+                    // gated behind a confirmation and rendered red. Stop is still offered because the
+                    // catalog's `stop:` command is the other lever that works here.
+                    case "external":
+                        IconActionButton("Kill the process holding the port, then start", systemImage: "bolt.fill", role: .destructive) {
+                            confirmReclaim = true
+                        }
+                        IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
+                    default:
+                        LifecycleButtons(state: service.displayState, finite: finite) { onAction($0, false) }
                     }
-                    IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
-                default:
-                    LifecycleButtons(state: service.displayState, finite: finite) { onAction($0, false) }
                 }
             }
-        }
+            .confirmationDialog(
+                "Kill the process holding this port?",
+                isPresented: $confirmReclaim,
+                titleVisibility: .visible
+            ) {
+                Button("Kill & Start", role: .destructive) { onAction(.start, true) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(service.error ?? "A process this manager does not own holds the port.")
+            }
         }
     }
 }

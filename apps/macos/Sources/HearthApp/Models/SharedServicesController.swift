@@ -31,6 +31,11 @@ final class SharedServicesController: ObservableObject {
     @Published var lastActionError: String?
 
     private var client: (any SharedAPI)?
+    /// Bumped at the start of `connect()`. A `refresh()` that began earlier, or one that fails
+    /// while a newer connect is in flight, must not publish `.failed` or overwrite `instances`.
+    private var refreshGeneration: UInt64 = 0
+    /// Overlapping actions on the same id stay in `actionsInFlight` until the last one finishes.
+    private var inFlightCounts: [String: Int] = [:]
     /// Same SSE stream every client uses — smp is a normal manager, so `manager.*` events and
     /// service transitions drive `refresh()` exactly like a project daemon's.
     private lazy var watchLoop = EventWatchLoop(pollInterval: pollInterval, handlers: .init(
@@ -63,6 +68,8 @@ final class SharedServicesController: ObservableObject {
     func connect() async {
         guard phase != .connecting else { return }
         if client != nil, case .connected = phase { return }
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         phase = .connecting
         client = nil
         for controller in logControllers.values { controller.stop() }
@@ -72,26 +79,36 @@ final class SharedServicesController: ObservableObject {
         // `watchLoop.start()` below cancels the old loop once the new client is live.
         do {
             let client = try await connector()
+            guard generation == refreshGeneration else { return }
             // Not `refresh()`: it swallows its error into `.failed`, which the `.connected` below
             // would then paper over — a daemon whose `/v1/shared` fails is not connected.
-            instances = try await client.sharedInstances()
+            let fresh = try await client.sharedInstances()
+            guard generation == refreshGeneration else { return }
+            instances = fresh
             self.client = client
             dropStaleSelection()
             await refreshCatalog()
+            guard generation == refreshGeneration else { return }
             phase = .connected
             watchLoop.start()
         } catch {
+            guard generation == refreshGeneration else { return }
             phase = .failed(error.localizedDescription)
         }
     }
 
     func refresh() async {
+        guard phase != .connecting else { return }
+        let generation = refreshGeneration
         guard let client else { return }
         do {
-            instances = try await client.sharedInstances()
+            let fresh = try await client.sharedInstances()
+            guard generation == refreshGeneration, phase != .connecting else { return }
+            instances = fresh
             dropStaleSelection()
             if case .failed = phase { phase = .connected }
         } catch {
+            guard generation == refreshGeneration, phase != .connecting else { return }
             phase = .failed(error.localizedDescription)
         }
     }
@@ -152,9 +169,9 @@ final class SharedServicesController: ObservableObject {
 
     private func run(_ id: String, _ work: @escaping @Sendable (any SharedAPI) async throws -> Void) {
         guard let client else { return }
-        actionsInFlight.insert(id)
+        beginFlight(id)
         Task {
-            defer { actionsInFlight.remove(id) }
+            defer { endFlight(id) }
             do {
                 try await work(client)
                 await refresh()
@@ -162,6 +179,24 @@ final class SharedServicesController: ObservableObject {
                 lastActionError = error.localizedDescription
                 await refresh()
             }
+        }
+    }
+
+    private func beginFlight(_ id: String) {
+        inFlightCounts[id, default: 0] += 1
+        // A nested start-then-stop is already showing the spinner. Inserting an id the set
+        // already has still publishes, and every row rebuilds for a busy flag that did not change.
+        guard !actionsInFlight.contains(id) else { return }
+        actionsInFlight.insert(id)
+    }
+
+    private func endFlight(_ id: String) {
+        let next = (inFlightCounts[id] ?? 1) - 1
+        if next <= 0 {
+            inFlightCounts.removeValue(forKey: id)
+            if actionsInFlight.contains(id) { actionsInFlight.remove(id) }
+        } else {
+            inFlightCounts[id] = next
         }
     }
 
@@ -173,5 +208,10 @@ final class SharedServicesController: ObservableObject {
         let created = LogController(client: client, serviceId: id)
         logControllers[id] = created
         return created
+    }
+
+    /// The cached tail, without creating one. Selection handoff uses this to stop the instance being left.
+    func cachedLogController(for id: String) -> LogController? {
+        logControllers[id]
     }
 }

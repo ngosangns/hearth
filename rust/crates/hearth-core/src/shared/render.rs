@@ -186,7 +186,7 @@ mod tests {
                 artifacts: HashMap::new(),
                 run: CommandSpec::Argv { argv: vec![] },
                 stop: None,
-                readiness: ReadinessSpec::Process,
+                readiness: crate::shared::remote::RecipeReadiness::Spec(ReadinessSpec::Process),
                 provision: vec![],
                 deprovision: vec![],
                 connection: None,

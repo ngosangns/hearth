@@ -19,7 +19,7 @@ use crate::state::{
 use crate::sync::KeyedLock;
 
 use super::fingerprint::normalize_command_fingerprint;
-use super::process_tree::{process_tree_alive, secondary_process_groups, ProcessTreeEntry};
+use super::process_tree::{process_tree_alive, secondary_process_groups, ProcessTreeEntry, ProcessTreeSnapshot};
 use super::types::{
     Host, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, ProcessRecord, ProcessSignal, SpawnInput,
     StartOptions, SupervisorError, SupervisorOptions,
@@ -44,6 +44,11 @@ fn is_active_state(state: ActualServiceState) -> bool {
 /// How much of an externally-owned container's existing log to replay when a tail attaches — its
 /// retained history could be days old, so the follow is bounded to a useful recent window.
 const EXTERNAL_LOG_BACKLOG_LINES: u64 = 200;
+
+/// How often a live leader's tree is snapshotted. Children (air's server, a shell background job)
+/// can appear after spawn; the snapshot used when the leader exits has to be from while it was
+/// still alive, because the tree walk refuses a pid whose start identity is already gone.
+const TREE_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// A "task" command has no long-lived managed process to track — it runs once to bring external
 /// state into the desired shape (generalizes a tailnet-serve-config runner).
@@ -112,6 +117,9 @@ struct Active {
     /// Written by the watcher *before* `exited` flips. The readiness wait holds the per-service
     /// queue, so it can read the code here; `on_exit` only runs once that wait releases the queue.
     exit_code: Arc<AtomicI32>,
+    /// Tree last observed while the leader's start identity still matched. `on_exit` signals only
+    /// secondary groups from this snapshot — the dead leader's pgid may already have been recycled.
+    last_tree: Arc<Mutex<Vec<ProcessTreeEntry>>>,
 }
 
 /// Tri-state patch for an optional field: keep the previous value, clear it, or set a new one.
@@ -317,17 +325,8 @@ impl ProcessSupervisor {
             return;
         }
         let ProcessIdentity::Posix(posix) = identity else { return };
-        let tree = self.process_tree(posix.pid, &posix.start_identity).await;
-        self.signal_process_tree(&tree, posix.pgid, ProcessSignal::Sigterm).await;
-        let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
-        while self.options.clock.now_millis() < deadline {
-            if !self.process_tree_alive(&tree).await {
-                return;
-            }
-            self.options.clock.sleep(self.options.readiness_backoff_ms).await;
-        }
-        if self.process_tree_alive(&tree).await {
-            self.signal_process_tree(&tree, posix.pgid, ProcessSignal::Sigkill).await;
+        if let Err(error) = self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid).await {
+            self.host.record_background_error("supervisor.terminate", &format!("{}: {}", posix.service_id, error.0));
         }
     }
 
@@ -450,6 +449,10 @@ impl ProcessSupervisor {
                     }
                     let Ok(profile) = profile_for(&sup.host.catalog(), &service_id) else { return };
                     let token = sup.current_token(&service_id);
+                    // A spawned service already has an exit watcher. An adopted one (this daemon
+                    // just attached to a live pid) does not — without one, a later crash stays
+                    // `ready` until the next restart.
+                    sup.arm_adopted_watch(&service_id, updated_identity.clone(), profile.command.clone(), state.generation, token);
                     let _ = sup.readiness_with_adopted(&service_id, &profile, state.generation, Some(updated_identity), token, None, true).await;
                 })
                 .await;
@@ -552,9 +555,14 @@ impl ProcessSupervisor {
         }
         let profile = profile_for(&self.host.catalog(), service_id)?;
         let current = self.state(service_id);
-        let existing_stopped = { let active = self.active.lock().unwrap(); active.get(service_id).map(|a| a.stopped) };
-        if let Some(stopped) = existing_stopped {
-            if !stopped && current.as_ref().map(|s| s.actual_state) != Some(ActualServiceState::Failed) {
+        let existing_stopped = {
+            let active = self.active.lock().unwrap();
+            active.get(service_id).map(|a| (a.stopped, a.exited.load(Ordering::SeqCst)))
+        };
+        if let Some((stopped, exited)) = existing_stopped {
+            // `exited` is set by the watcher before it can take this queue. A start that still
+            // holds the queue would otherwise report success over a process that is already dead.
+            if !stopped && !exited && current.as_ref().map(|s| s.actual_state) != Some(ActualServiceState::Failed) {
                 return Ok(());
             }
         }
@@ -607,11 +615,43 @@ impl ProcessSupervisor {
             // An adopted identity is only worth keeping while it still answers its readiness probe.
             let outcome = self.await_readiness(service_id, &profile, generation, Some(identity.clone()), token, true).await;
             match outcome {
-                ReadinessOutcome::Ready | ReadinessOutcome::Superseded => return Ok(()),
+                ReadinessOutcome::Ready => {
+                    self.arm_adopted_watch(service_id, identity, profile.command.clone(), generation, token);
+                    return Ok(());
+                }
+                ReadinessOutcome::Superseded => return Ok(()),
                 _ => {}
             }
             token = self.cancel(service_id);
-            self.report_terminate_failure(service_id, self.terminate(&identity, &profile.command).await);
+            // Replacement is only safe once terminate has actually stopped the old process. An
+            // unverified liveness check used to be swallowed, and the next spawn ran beside it.
+            match self.terminate(&identity, &profile.command).await {
+                Err(error) => {
+                    self.transition(
+                        service_id,
+                        generation,
+                        ActualServiceState::Failed,
+                        ServiceReadiness::Failed,
+                        Changes { error: Patch::Set(error.0.clone()), identity: Patch::Set(identity), ..Default::default() },
+                    )
+                    .await;
+                    return Err(error);
+                }
+                Ok(()) => {
+                    if self.owns_identity(&identity).await != Some(false) {
+                        let error = SupervisorError(format!("{service_id} was not replaced: the adopted process is still alive"));
+                        self.transition(
+                            service_id,
+                            generation,
+                            ActualServiceState::Failed,
+                            ServiceReadiness::Failed,
+                            Changes { error: Patch::Set(error.0.clone()), identity: Patch::Set(identity.clone()), ..Default::default() },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+            }
         }
 
         self.transition(
@@ -833,8 +873,10 @@ impl ProcessSupervisor {
         // `succeeded` / `failed` as they are, so a group stop does not fail on a build that
         // already finished and does not wipe its exit code. In-flight and orphaned rows still
         // fall through — an orphaned process may still be alive.
-        if self.exit_command_is_idle(service_id, &state) {
-            return Ok(());
+        match self.exit_command_is_idle(service_id, &state).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
         }
         let has_active = self.active.lock().unwrap().contains_key(service_id);
         if state.identity.is_none() {
@@ -882,8 +924,21 @@ impl ProcessSupervisor {
                 }
                 Inspection::Observed(ObservedProcess { alive: true, .. }) => {}
                 Inspection::Gone | Inspection::Observed(_) => {
-                    if has_active {
-                        self.active.lock().unwrap().remove(service_id);
+                    // The leader is already gone, so `terminate` will not walk its tree. Children
+                    // that forked into their own group are still in the last snapshot taken while
+                    // the leader was alive.
+                    let (tree, leader_pgid) = {
+                        let mut active = self.active.lock().unwrap();
+                        let entry = active.remove(service_id);
+                        let tree = entry.as_ref().map(|active| active.last_tree.lock().unwrap().clone()).unwrap_or_default();
+                        let leader_pgid = entry.as_ref().and_then(|active| match &active.identity {
+                            ProcessIdentity::Posix(posix) => Some(posix.pgid),
+                            ProcessIdentity::Docker(_) => None,
+                        });
+                        (tree, leader_pgid)
+                    };
+                    if let Some(pgid) = leader_pgid {
+                        self.reap_secondary_groups(&tree, pgid).await;
                     }
                     self.transition(
                         service_id,
@@ -1039,6 +1094,21 @@ impl ProcessSupervisor {
         let catalog = self.host.catalog();
         let definition = definition_for(&catalog, service_id);
         if (is_task_command(&profile.readiness) || is_external_task(definition, profile)) && !app.record.is_docker() {
+            let ProcessRecord::Posix(record) = &app.record else {
+                return Err(SupervisorError(format!("{service_id} task did not spawn a process")));
+            };
+            // Not stored on the service: the run command is the one-shot trigger, not the service
+            // process. It is kept only so a failed readiness can still stop this process.
+            let task_identity = ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+                manager_instance_id: self.host.instance_id(),
+                service_id: service_id.clone(),
+                generation,
+                started_at: self.options.clock.now(),
+                pid: record.pid,
+                pgid: record.pgid,
+                start_identity: record.start_identity.clone(),
+                command_fingerprint: record.command_fingerprint.clone(),
+            });
             self.transition(
                 service_id,
                 generation,
@@ -1047,8 +1117,17 @@ impl ProcessSupervisor {
                 Changes { identity: Patch::Clear, ..Default::default() },
             )
             .await;
-            let _ = self.readiness(service_id, profile, generation, None, token, operation_id).await;
-            return Ok(());
+            let result = self.readiness(service_id, profile, generation, None, token, operation_id).await;
+            if result.is_err() || !self.valid(service_id, generation, token) {
+                if let Err(error) = self.terminate(&task_identity, &profile.command).await {
+                    self.report_terminate_failure(service_id, Err(SupervisorError(error.0.clone())));
+                    if let Err(ready) = result {
+                        return Err(SupervisorError(format!("{}; the task process could not be stopped: {}", ready.0, error.0)));
+                    }
+                    return Err(error);
+                }
+            }
+            return result;
         }
 
         let identity = match &app.record {
@@ -1077,22 +1156,8 @@ impl ProcessSupervisor {
             self.report_terminate_failure(service_id, self.terminate(&identity, &profile.command).await);
             return Ok(());
         }
-        let exited_flag = Arc::new(AtomicBool::new(false));
-        let exit_code = Arc::new(AtomicI32::new(0));
-        self.active.lock().unwrap().insert(
-            service_id.clone(),
-            Active { command: profile.command.clone(), identity: identity.clone(), stopped: false, exited: exited_flag.clone(), exit_code: exit_code.clone() },
-        );
+        self.track_spawned(service_id, profile.command.clone(), identity.clone(), generation, token, app.exited);
         self.attach_output(service_id, output_source(&identity, false));
-        let sup = self.clone();
-        let sid = service_id.clone();
-        let exited = app.exited;
-        tokio::spawn(async move {
-            let code = exited.await.unwrap_or(-1);
-            exit_code.store(code, Ordering::SeqCst);
-            exited_flag.store(true, Ordering::SeqCst);
-            sup.on_exit(&sid, generation, token, code).await;
-        });
         self.transition(service_id, generation, ActualServiceState::RunningUnready, ServiceReadiness::NotReady, Changes { identity: Patch::Set(identity), ..Default::default() }).await;
         self.readiness(service_id, profile, generation, self.state(service_id).and_then(|s| s.identity), token, operation_id).await
     }
@@ -1363,10 +1428,30 @@ impl ProcessSupervisor {
 
     /// `true` when a `readiness: exit` command has already settled, so stop has no process to
     /// signal and must not report a failure or clear the recorded exit code.
-    fn exit_command_is_idle(&self, service_id: &ServiceId, state: &ServiceLifecycleState) -> bool {
-        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else { return false };
-        matches!(profile.readiness, ReadinessSpec::Exit)
-            && matches!(state.actual_state, ActualServiceState::Succeeded | ActualServiceState::Failed)
+    /// `Ok(true)` when a `readiness: exit` command has already settled and nothing of ours is
+    /// still alive, so stop succeeds without signalling and without clearing the recorded exit
+    /// code. `Ok(false)` falls through to a real stop. `Err` is an unverifiable probe — stop must
+    /// not report success over a process that may still be running (a timed-out exit job whose
+    /// terminate failed).
+    async fn exit_command_is_idle(&self, service_id: &ServiceId, state: &ServiceLifecycleState) -> Result<bool, SupervisorError> {
+        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else { return Ok(false) };
+        if !matches!(profile.readiness, ReadinessSpec::Exit) {
+            return Ok(false);
+        }
+        if !matches!(state.actual_state, ActualServiceState::Succeeded | ActualServiceState::Failed) {
+            return Ok(false);
+        }
+        let Some(identity) = &state.identity else { return Ok(true) };
+        match self.owns_identity(identity).await {
+            Some(true) => Ok(false),
+            None => Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified"))),
+            Some(false) => match self.options.process.inspect(identity).await {
+                // Alive, but not ours. Fall through so stop refuses instead of reporting success.
+                Inspection::Observed(ObservedProcess { alive: true, .. }) => Ok(false),
+                Inspection::Unknown => Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified"))),
+                Inspection::Gone | Inspection::Observed(_) => Ok(true),
+            },
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // the full per-start context; bundling it would only move the list
@@ -1423,7 +1508,17 @@ impl ProcessSupervisor {
                 }
                 // `finish_exit` already settled a `readiness: exit` command. A late `on_exit`
                 // must not replace `succeeded` with `failed`.
-                if matches!(state.actual_state, ActualServiceState::Succeeded | ActualServiceState::Stopped | ActualServiceState::Stopping) {
+                // Already settled: a late watcher must not replace `succeeded` or a timeout's
+                // `failed` with a second exit error. The active entry is still dropped so a later
+                // start is not stuck behind it.
+                if matches!(
+                    state.actual_state,
+                    ActualServiceState::Succeeded | ActualServiceState::Stopped | ActualServiceState::Stopping | ActualServiceState::Failed
+                ) {
+                    let mut active = sup.active.lock().unwrap();
+                    if active.get(&sid).is_some_and(|a| a.identity.generation() == generation) {
+                        active.remove(&sid);
+                    }
                     return;
                 }
                 sup.transition_if_current(
@@ -1481,21 +1576,7 @@ impl ProcessSupervisor {
             }
             ProcessIdentity::Posix(posix) => {
                 self.detach_output(&posix.service_id);
-                let tree = self.process_tree(posix.pid, &posix.start_identity).await;
-                self.signal_process_tree(&tree, posix.pgid, ProcessSignal::Sigterm).await;
-                let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
-                loop {
-                    if self.options.clock.now_millis() >= deadline {
-                        break;
-                    }
-                    if !self.process_tree_alive(&tree).await {
-                        return Ok(());
-                    }
-                    self.options.clock.sleep(self.options.readiness_backoff_ms).await;
-                }
-                if self.process_tree_alive(&tree).await {
-                    self.signal_process_tree(&tree, posix.pgid, ProcessSignal::Sigkill).await;
-                }
+                self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid).await?;
             }
         }
         Ok(())
@@ -1511,35 +1592,237 @@ impl ProcessSupervisor {
         }
     }
 
-    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry> {
+    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
         self.options.process.process_tree(leader_pid, leader_start_identity).await
     }
 
-    async fn process_tree_alive(&self, tree: &[ProcessTreeEntry]) -> bool {
+    /// `None` when the live table could not be read. An empty snapshot is dead (`Some(false)`).
+    async fn process_tree_alive(&self, tree: &[ProcessTreeEntry]) -> Option<bool> {
         if tree.is_empty() {
-            return false;
+            return Some(false);
         }
-        let Some(alive) = self.options.process.live_start_identities().await else { return false };
-        process_tree_alive(tree, &alive)
+        let alive = self.options.process.live_start_identities().await?;
+        Some(process_tree_alive(tree, &alive))
     }
 
-    /// Signals the leader's group, then every other process group in the tree snapshot — the `air`
-    /// case, where the real server runs in its own group and survives a leader-only signal. A
-    /// secondary group is signalled only while one of its snapshotted members still shows the same
-    /// start identity in a fresh table snapshot, so a group whose members all exited (and whose
-    /// pgid may since have been recycled) is never signalled.
-    async fn signal_process_tree(&self, tree: &[ProcessTreeEntry], leader_pgid: i64, signal: ProcessSignal) {
-        self.options.process.signal_group(leader_pgid, signal).await;
+    async fn secondary_groups_alive(&self, tree: &[ProcessTreeEntry], leader_pgid: i64) -> Option<bool> {
         let groups = secondary_process_groups(tree, leader_pgid);
         if groups.is_empty() {
-            return;
+            return Some(false);
         }
+        let alive = self.options.process.live_start_identities().await?;
+        Some(groups.values().flatten().any(|member| alive.get(&member.pid) == Some(&member.start_identity)))
+    }
+
+    /// Signals the leader's group, then every other process group in the snapshot — the `air`
+    /// case, where the real server runs in its own group and survives a leader-only signal.
+    /// Nothing is signalled when the snapshot is missing or the fresh table cannot be read, and a
+    /// group is signalled only while one of its snapshotted members still shows the same start
+    /// identity, so a recycled pgid is never signalled.
+    async fn signal_process_tree(&self, snapshot: &ProcessTreeSnapshot, leader_pgid: i64, signal: ProcessSignal) {
+        let ProcessTreeSnapshot::Present(tree) = snapshot else { return };
+        self.signal_verified_members(tree, leader_pgid, signal, true).await;
+    }
+
+    async fn signal_secondary_groups(&self, tree: &[ProcessTreeEntry], leader_pgid: i64, signal: ProcessSignal) {
+        self.signal_verified_members(tree, leader_pgid, signal, false).await;
+    }
+
+    async fn signal_verified_members(&self, tree: &[ProcessTreeEntry], leader_pgid: i64, signal: ProcessSignal, include_leader: bool) {
         let Some(alive) = self.options.process.live_start_identities().await else { return };
-        for (pgid, members) in groups {
+        if include_leader {
+            let leader_live = tree.iter().any(|member| member.pgid == leader_pgid && alive.get(&member.pid) == Some(&member.start_identity));
+            if leader_live {
+                self.options.process.signal_group(leader_pgid, signal).await;
+            }
+        }
+        for (pgid, members) in secondary_process_groups(tree, leader_pgid) {
             if members.iter().any(|member| alive.get(&member.pid) == Some(&member.start_identity)) {
                 self.options.process.signal_group(pgid, signal).await;
             }
         }
+    }
+
+    /// SIGTERM, wait, SIGKILL — but only from a snapshot that still names our leader. `Unknown`
+    /// fails the stop. `Absent` (leader gone or pid reused) signals nothing and succeeds.
+    async fn terminate_posix_tree(&self, pid: i64, start_identity: &str, pgid: i64) -> Result<(), SupervisorError> {
+        let snapshot = self.process_tree(pid, start_identity).await;
+        let tree = match &snapshot {
+            ProcessTreeSnapshot::Unknown => {
+                return Err(SupervisorError("the process tree could not be read; refusing to report it stopped".to_string()));
+            }
+            ProcessTreeSnapshot::Absent => return Ok(()),
+            ProcessTreeSnapshot::Present(tree) => tree.clone(),
+        };
+        self.signal_process_tree(&snapshot, pgid, ProcessSignal::Sigterm).await;
+        let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
+        loop {
+            if self.options.clock.now_millis() >= deadline {
+                break;
+            }
+            match self.process_tree_alive(&tree).await {
+                Some(false) => return Ok(()),
+                Some(true) => self.options.clock.sleep(self.options.readiness_backoff_ms).await,
+                None => return Err(SupervisorError("the process's liveness could not be verified; refusing to report it stopped".to_string())),
+            }
+        }
+        match self.process_tree_alive(&tree).await {
+            Some(false) => Ok(()),
+            None => Err(SupervisorError("the process's liveness could not be verified; refusing to report it stopped".to_string())),
+            Some(true) => {
+                self.signal_process_tree(&ProcessTreeSnapshot::Present(tree), pgid, ProcessSignal::Sigkill).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// After the leader has exited: signal only secondary groups from the last snapshot taken
+    /// while it was alive. Never `killpg` the dead leader's pgid.
+    async fn reap_secondary_groups(&self, tree: &[ProcessTreeEntry], leader_pgid: i64) {
+        if secondary_process_groups(tree, leader_pgid).is_empty() {
+            return;
+        }
+        self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigterm).await;
+        let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
+        loop {
+            if self.options.clock.now_millis() >= deadline {
+                break;
+            }
+            match self.secondary_groups_alive(tree, leader_pgid).await {
+                Some(true) => self.options.clock.sleep(self.options.readiness_backoff_ms).await,
+                Some(false) | None => return,
+            }
+        }
+        if self.secondary_groups_alive(tree, leader_pgid).await == Some(true) {
+            self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigkill).await;
+        }
+    }
+
+    fn insert_active(
+        &self,
+        service_id: &ServiceId,
+        command: ServiceCommand,
+        identity: ProcessIdentity,
+    ) -> (Arc<AtomicBool>, Arc<AtomicI32>, Arc<Mutex<Vec<ProcessTreeEntry>>>) {
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let last_tree = Arc::new(Mutex::new(Vec::new()));
+        self.active.lock().unwrap().insert(
+            service_id.clone(),
+            Active {
+                command,
+                identity,
+                stopped: false,
+                exited: exited.clone(),
+                exit_code: exit_code.clone(),
+                last_tree: last_tree.clone(),
+            },
+        );
+        (exited, exit_code, last_tree)
+    }
+
+    fn spawn_tree_sampler(self: &Arc<Self>, service_id: ServiceId, identity: ProcessIdentity, last_tree: Arc<Mutex<Vec<ProcessTreeEntry>>>, exited: Arc<AtomicBool>) {
+        let ProcessIdentity::Posix(posix) = &identity else { return };
+        let pid = posix.pid;
+        let start_identity = posix.start_identity.clone();
+        let sup = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                let still = {
+                    let active = sup.active.lock().unwrap();
+                    active.get(&service_id).is_some_and(|entry| !entry.stopped && Arc::ptr_eq(&entry.last_tree, &last_tree))
+                };
+                if !still {
+                    return;
+                }
+                if let ProcessTreeSnapshot::Present(tree) = sup.options.process.process_tree(pid, &start_identity).await {
+                    *last_tree.lock().unwrap() = tree;
+                }
+                tokio::time::sleep(TREE_SAMPLE_INTERVAL).await;
+            }
+        });
+    }
+
+    fn track_spawned(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        command: ServiceCommand,
+        identity: ProcessIdentity,
+        generation: u64,
+        token: u64,
+        exited_rx: tokio::sync::oneshot::Receiver<i32>,
+    ) {
+        let (exited_flag, exit_code, last_tree) = self.insert_active(service_id, command, identity.clone());
+        self.spawn_tree_sampler(service_id.clone(), identity.clone(), last_tree.clone(), exited_flag.clone());
+        let sup = self.clone();
+        let sid = service_id.clone();
+        tokio::spawn(async move {
+            let code = exited_rx.await.unwrap_or(-1);
+            let tree = last_tree.lock().unwrap().clone();
+            let leader_pgid = match &identity {
+                ProcessIdentity::Posix(posix) => Some(posix.pgid),
+                ProcessIdentity::Docker(_) => None,
+            };
+            exit_code.store(code, Ordering::SeqCst);
+            exited_flag.store(true, Ordering::SeqCst);
+            if let Some(pgid) = leader_pgid {
+                sup.reap_secondary_groups(&tree, pgid).await;
+            }
+            sup.on_exit(&sid, generation, token, code).await;
+        });
+    }
+
+    /// Adopted processes have no child handle. Poll `inspect` until the process is gone (`Unknown`
+    /// keeps waiting) and sample the tree while it is alive so exit can reap secondary groups.
+    fn arm_adopted_watch(self: &Arc<Self>, service_id: &ServiceId, identity: ProcessIdentity, command: ServiceCommand, generation: u64, token: u64) {
+        if self.active.lock().unwrap().contains_key(service_id) {
+            return;
+        }
+        let (exited, exit_code, last_tree) = self.insert_active(service_id, command, identity.clone());
+        let sup = self.clone();
+        let sid = service_id.clone();
+        tokio::spawn(async move {
+            loop {
+                if exited.load(Ordering::SeqCst) {
+                    return;
+                }
+                let still = {
+                    let active = sup.active.lock().unwrap();
+                    active.get(&sid).is_some_and(|entry| !entry.stopped && Arc::ptr_eq(&entry.last_tree, &last_tree))
+                };
+                if !still {
+                    return;
+                }
+                match sup.options.process.inspect(&identity).await {
+                    Inspection::Unknown => {}
+                    Inspection::Gone | Inspection::Observed(ObservedProcess { alive: false, .. }) => {
+                        let tree = last_tree.lock().unwrap().clone();
+                        let leader_pgid = match &identity {
+                            ProcessIdentity::Posix(posix) => Some(posix.pgid),
+                            ProcessIdentity::Docker(_) => None,
+                        };
+                        exit_code.store(-1, Ordering::SeqCst);
+                        exited.store(true, Ordering::SeqCst);
+                        if let Some(pgid) = leader_pgid {
+                            sup.reap_secondary_groups(&tree, pgid).await;
+                        }
+                        sup.on_exit(&sid, generation, token, -1).await;
+                        return;
+                    }
+                    Inspection::Observed(_) => {
+                        if let ProcessIdentity::Posix(posix) = &identity {
+                            if let ProcessTreeSnapshot::Present(tree) = sup.options.process.process_tree(posix.pid, &posix.start_identity).await {
+                                *last_tree.lock().unwrap() = tree;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(TREE_SAMPLE_INTERVAL).await;
+            }
+        });
     }
 
     async fn build(
@@ -1622,10 +1905,9 @@ impl ProcessSupervisor {
                 if cancel.is_cancelled() {
                     return Err(SupervisorError("Build cancelled".to_string()));
                 }
-                tokio::select! {
-                    result = run_build.run(&command, on_output, cancel.clone()) => result,
-                    _ = cancel.cancelled() => Err(SupervisorError("Build cancelled".to_string())),
-                }
+                // `run` owns the cancel path (SIGTERM, grace, SIGKILL). A second select here drops
+                // that future during the grace and leaks the build process.
+                run_build.run(&command, on_output, cancel).await
             })
             .await
     }
@@ -1907,6 +2189,7 @@ fn output_source(identity: &ProcessIdentity, skip_backlog: bool) -> OutputSource
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervisor::process_tree::ProcessTreeSnapshot;
     use crate::catalog::{
         CommandSpec, ReadinessSpec, ServiceBuildProfile, ServiceCommand, ServiceDefinition, ServiceKind, ServiceOwnership,
         ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
@@ -1962,6 +2245,8 @@ mod tests {
         tail_dones: HashMap<ServiceId, Arc<std::sync::atomic::AtomicBool>>,
         tails_stopped: Vec<ServiceId>,
         stop_container_calls: Vec<String>,
+        /// `ps` could not be read. Distinct from an empty tree (leader gone).
+        tree_unknown: bool,
     }
     struct FakeProcessAdapter {
         state: Arc<Mutex<FakeProcessAdapterState>>,
@@ -2106,8 +2391,11 @@ mod tests {
             }
         }
 
-        async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry> {
+        async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
             let state = self.state.lock().unwrap();
+            if state.tree_unknown {
+                return ProcessTreeSnapshot::Unknown;
+            }
             let rows: Vec<crate::supervisor::process_tree::PsTreeRow> = state
                 .alive
                 .values()
@@ -2118,7 +2406,12 @@ mod tests {
                     start_identity: r.start_identity.clone(),
                 })
                 .collect();
-            crate::supervisor::process_tree::build_process_tree(&rows, leader_pid, leader_start_identity)
+            let tree = crate::supervisor::process_tree::build_process_tree(&rows, leader_pid, leader_start_identity);
+            if tree.is_empty() {
+                ProcessTreeSnapshot::Absent
+            } else {
+                ProcessTreeSnapshot::Present(tree)
+            }
         }
 
         async fn live_start_identities(&self) -> Option<HashMap<i64, String>> {
@@ -3425,7 +3718,76 @@ mod tests {
 
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
-        assert_eq!(state.error.as_deref(), Some("Managed process is no longer alive"));
+        let error = state.error.unwrap_or_default();
+        assert!(
+            error.contains("no longer alive") || error.contains("exited with code"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_does_not_signal_when_the_process_tree_cannot_be_read() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_tcp_ready(8080, true);
+        h.supervisor.start(&"api".to_string(), None).await.unwrap();
+        h.process.state.lock().unwrap().tree_unknown = true;
+
+        let error = h.supervisor.stop(&"api".to_string(), None).await.unwrap_err();
+        assert!(error.0.contains("could not be read") || error.0.contains("could not be verified"), "{error:?}");
+        assert!(h.process.signals().is_empty(), "a failed ps must not signal a pgid: {:?}", h.process.signals());
+        assert_ne!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_leader_exit_reaps_a_child_in_its_own_process_group() {
+        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        h.probes.set_tcp_ready(8080, true);
+        h.supervisor.start(&"api".to_string(), None).await.unwrap();
+        let leader = match h.host.state_of("api").unwrap().identity.unwrap() {
+            ProcessIdentity::Posix(p) => p.pid,
+            _ => panic!("expected posix identity"),
+        };
+        let child = h.process.fork_into_own_group(leader);
+        // The sampler records the tree while the leader is alive, then the leader exits on its own.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        h.process.kill_externally(leader, -1);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && h.process.is_alive(child) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!h.process.is_alive(child), "the child in its own process group must not survive the leader");
+        assert!(h.process.signals().contains(&(child, ProcessSignal::Sigterm)), "secondary group must be signalled: {:?}", h.process.signals());
+        assert!(!h.process.signals().iter().any(|(pgid, _)| *pgid == leader), "the dead leader pgid must not be signalled");
+        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_failed_one_shot_task_is_stopped_and_the_error_is_returned() {
+        let mut service = argv_verified("api", ReadinessSpec::Command { command: CommandSpec::Argv { argv: vec!["attach".to_string()] }, cwd: None });
+        service.ownership = Some(ServiceOwnership::External);
+        let host = FakeHost::new(one_service_catalog(service));
+        let process = FakeProcessAdapter::new();
+        let probes = Arc::new(CommandCapableProbeAdapter { result: std::sync::Mutex::new(Some(false)), ..Default::default() });
+        let supervisor = ProcessSupervisor::new(
+            host.clone(),
+            SupervisorOptions {
+                process: process.clone(),
+                run_build: FakeRunBuild::new(),
+                probes,
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: None,
+                clock: FakeClock::new(),
+                readiness_timeout_ms: 30,
+                readiness_backoff_ms: 5,
+                termination_grace_ms: 50,
+                is_closing: Arc::new(|| false),
+            },
+        );
+        let error = supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        assert!(error.0.contains("Readiness timed out"), "{error:?}");
+        assert!(process.state.lock().unwrap().alive.is_empty(), "the one-shot process must be stopped when readiness fails");
+        assert!(host.state_of("api").unwrap().identity.is_none(), "a task failure must not persist the trigger process as the service identity");
     }
 
     fn with_exit_timeout(mut service: ServiceDefinition, timeout_ms: u64) -> ServiceDefinition {
@@ -3575,6 +3937,6 @@ mod tests {
         assert_eq!(state.actual_state, ActualServiceState::Failed);
         assert_ne!(state.actual_state, ActualServiceState::Succeeded);
         let error = state.error.unwrap_or_default();
-        assert!(error.contains("exit code unknown") || error.contains("no longer alive"), "{error}");
+        assert!(error.contains("exit code unknown") || error.contains("no longer alive") || error.contains("exited with code"), "{error}");
     }
 }

@@ -279,7 +279,7 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
 
 /// Submits one operation to smp, waits for it, prints its outcome, and fails when it failed.
 async fn run_operation(client: &Client, action: ServiceOperationKind, id: &str, io: &mut Io<'_>) -> LocalctlResult<i32> {
-    let accepted = client.submit(action, id, false).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.message })?;
+    let accepted = client.submit(action, id, false, &uuid::Uuid::new_v4().to_string()).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.message })?;
     let operation = wait_operation(client, &accepted.id).await?;
     (io.out)(&format!("{} {} {}", operation.status.as_wire_str(), id, operation.id));
     if operation.status == OperationStatus::Failed {

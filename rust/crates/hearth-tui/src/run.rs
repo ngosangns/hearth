@@ -147,7 +147,11 @@ impl TuiApp {
                 if !self.state.apply_snapshot(*current_fence, &services) {
                     return;
                 }
-                self.state.notice.clear();
+                // A pending reclaim's notice is the confirm prompt. A snapshot must not wipe it
+                // or the second press has nothing left on screen telling the user what it will kill.
+                if self.pending_reclaim.is_none() {
+                    self.state.notice.clear();
+                }
                 self.draw();
                 let fence = self.state.begin_request();
                 self.refresh_selected(client, fence).await;
@@ -214,9 +218,17 @@ impl TuiApp {
                 }
                 _ => {}
             },
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
                 let selected = self.state.selection.selected().cloned();
-                let Some(action) = keyboard_action(key, selected.as_ref()) else { return };
+                let Some(action) = keyboard_action(key, selected.as_ref()) else {
+                    // Esc and any other unmapped key disarms a pending reclaim. Repeat is ignored
+                    // above, so holding the confirm key cannot fire the kill on its own.
+                    if self.pending_reclaim.take().is_some() {
+                        self.state.notice.clear();
+                        self.draw();
+                    }
+                    return;
+                };
                 if action != TuiAction::Reclaim {
                     self.pending_reclaim = None;
                 }
@@ -280,7 +292,9 @@ impl TuiApp {
                 if let Ok(urls) = client.urls().await {
                     self.urls = urls;
                 }
-                self.state.notice.clear();
+                if self.pending_reclaim.is_none() {
+                    self.state.notice.clear();
+                }
                 self.draw();
                 let fence = self.state.begin_request();
                 self.refresh_selected(client, fence).await;

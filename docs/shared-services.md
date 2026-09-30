@@ -91,6 +91,21 @@ rather than a server. Exit 0 settles `succeeded`. That recipe does not inherit t
 readiness deadline applied to shared servers, so a long job is not killed for still running.
 A port is still allocated; a command that does not listen can ignore `{port}`.
 
+Recipe readiness uses the same shorthand as `hearth.yaml`, resolved when the instance port is
+known:
+
+- `{ "kind": "http" }` probes `GET http://127.0.0.1:{port}/health` (2xx). `"path"` replaces
+  `/health` — MinIO stays `/minio/health/live` because that is the path MinIO serves. The shared
+  nginx serves `/health` (and `/healthz`, the same body).
+- `{ "kind": "tcp" }` with no `port` connects to the allocated primary port. MongoDB is this:
+  replica-set init runs in `provision`, after the port accepts a connection.
+- `{ "kind": "command" }` is for a protocol check a bare connect cannot express. Redis and Kafka
+  run `{installDir}/bin/hearth-ready {port}` (`PING`, broker ApiVersions). `pg_isready` above is
+  the same kind.
+
+A recipe snapshot already stored in `registry.json` is not rewritten when `catalog.json` changes.
+The shorthand applies to instances registered after the binary that understands it.
+
 An artifact sets **one** of:
 
 - `url` — a tarball that already exists (`https://…` or `file://` in tests). The daemon downloads it.
@@ -174,8 +189,8 @@ is persisted in `registry.json`. A recipe with `additionalPorts: N` takes a cont
 Deterministic-first keeps the common case stateless.
 
 A recipe with `ports: […]` skips all of that — the declared ports are registered verbatim after a
-bind check. The shared nginx uses `[80, 443]`; since both are privileged on macOS the prepare
-script fails loudly (with the `sysctl` hint) instead of letting nginx die at readiness.
+bind check. The shared nginx pins `[18080, 18443]`. macOS keeps ports below 1024 privileged for
+every user, so a pf rdr anchor maps public `:80`/`:443` onto those loopback pins.
 
 ## Project side
 
@@ -210,7 +225,7 @@ ports are pinned anyway, so project confs can hardcode 80/443.
   plain `syncExternalServices`.
 - `stop`: `argv [hearthd, "shared", "detach", "postgres@16.4"]` — releases the attachment; the
   instance keeps running.
-- `readinessTimeoutMs`: 10 min default (first start includes download+install).
+- `readinessTimeoutMs`: 49 min default. The project-side probe has to out-wait a script artifact pack (45 min) plus extract and the instance readiness budget. The instance server itself stays at 2 min.
 - Joins group `all` when it exists. A `shared` key colliding with a `services` id is a validation
   error via the existing duplicate-service check.
 

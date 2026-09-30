@@ -21,6 +21,22 @@ struct Workspace: Codable, Equatable, Identifiable {
         URL(fileURLWithPath: path).lastPathComponent
     }
 
+    /// `path` with the home directory written as `~`, same folding ns-adeck uses for a session's cwd.
+    var displayPath: String {
+        let home = Self.canonical(NSHomeDirectory())
+        let path = Self.canonical(self.path)
+        if path == home { return "~" }
+        let prefix = home + "/"
+        if path.hasPrefix(prefix) { return "~/" + path.dropFirst(prefix.count) }
+        return path
+    }
+
+    private static func canonical(_ path: String) -> String {
+        var resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        if resolved.count > 1, resolved.hasSuffix("/") { resolved.removeLast() }
+        return resolved
+    }
+
     /// True when the folder itself still exists on disk — a workspace is never silently dropped from
     /// the list just because its folder moved or was deleted; the UI surfaces this instead.
     var existsOnDisk: Bool {

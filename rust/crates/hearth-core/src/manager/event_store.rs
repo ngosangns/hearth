@@ -72,17 +72,29 @@ impl ManagerEventStore {
 
     /// Returns an unsubscribe handle — call it (or drop it) to stop receiving events.
     pub fn subscribe(self: &Arc<Self>, listener: EventListener) -> Box<dyn FnOnce() + Send> {
-        let id = {
-            let mut inner = self.inner.lock().unwrap();
-            let id = inner.next_listener_id;
-            inner.next_listener_id += 1;
-            inner.listeners.insert(id, listener);
-            id
-        };
+        let (_, unsubscribe) = self.subscribe_and_replay(None, None, listener, |_| true);
+        unsubscribe.expect("subscribe always registers")
+    }
+
+    /// Copies the replay and, when `subscribe_if` accepts it, registers `listener`, both under the
+    /// same lock `publish` holds. Registering before the copy would deliver an event that is also
+    /// in the snapshot. Registering after releasing the lock would drop an event that is in
+    /// neither. A reset (or any rejected snapshot) does not subscribe — the caller resynchronizes
+    /// from the returned buffer instead.
+    pub fn subscribe_and_replay(self: &Arc<Self>, after_sequence: Option<u64>, epoch: Option<&str>, listener: EventListener, subscribe_if: impl FnOnce(&Replay) -> bool) -> (Replay, Option<Box<dyn FnOnce() + Send>>) {
+        let mut inner = self.inner.lock().unwrap();
+        let replay = Self::replay_locked(&self.epoch, &inner, after_sequence, epoch);
+        if !subscribe_if(&replay) {
+            return (replay, None);
+        }
+        let id = inner.next_listener_id;
+        inner.next_listener_id += 1;
+        inner.listeners.insert(id, listener);
+        drop(inner);
         let store = self.clone();
-        Box::new(move || {
+        (replay, Some(Box::new(move || {
             store.inner.lock().unwrap().listeners.remove(&id);
-        })
+        })))
     }
 
     #[cfg(test)]
@@ -92,9 +104,13 @@ impl ManagerEventStore {
 
     pub fn replay(&self, after_sequence: Option<u64>, epoch: Option<&str>) -> Replay {
         let inner = self.inner.lock().unwrap();
+        Self::replay_locked(&self.epoch, &inner, after_sequence, epoch)
+    }
+
+    fn replay_locked(epoch: &str, inner: &Inner, after_sequence: Option<u64>, cursor_epoch: Option<&str>) -> Replay {
         let oldest_sequence = inner.events.front().map(|e| e.sequence).unwrap_or(inner.next_sequence);
         let latest_sequence = inner.next_sequence.saturating_sub(1);
-        let epoch_mismatch = epoch.is_some_and(|e| e != self.epoch);
+        let epoch_mismatch = cursor_epoch.is_some_and(|e| e != epoch);
         let out_of_range = after_sequence.is_some_and(|after| {
             (oldest_sequence > 0 && after < oldest_sequence - 1) || after > latest_sequence
         });
@@ -107,7 +123,7 @@ impl ManagerEventStore {
             Some(after) if !reset => inner.events.iter().filter(|e| e.sequence > after).cloned().collect(),
             _ => inner.events.iter().cloned().collect(),
         };
-        Replay { epoch: self.epoch.clone(), reset, events, latest_sequence }
+        Replay { epoch: epoch.to_string(), reset, events, latest_sequence }
     }
 }
 
@@ -221,6 +237,41 @@ mod tests {
         unsubscribe();
         store.publish("b", data());
         assert_eq!(*received.lock().unwrap(), vec![1]);
+        assert_eq!(store.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn subscribe_and_replay_includes_the_snapshot_once_and_live_events_after_it() {
+        let store = ManagerEventStore::new(None, None);
+        store.publish("a", data());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let (replay, unsubscribe) = store.subscribe_and_replay(None, None, Arc::new(move |event: &ManagerEvent| {
+            received_clone.lock().unwrap().push(event.sequence);
+        }), |replay| !replay.reset);
+        let unsubscribe = unsubscribe.expect("an in-range snapshot subscribes");
+        assert_eq!(replay.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1]);
+        store.publish("b", data());
+        assert_eq!(*received.lock().unwrap(), vec![2], "the snapshot event must not be delivered again");
+        unsubscribe();
+        store.publish("c", data());
+        assert_eq!(*received.lock().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn subscribe_and_replay_does_not_subscribe_when_the_snapshot_is_rejected() {
+        let store = ManagerEventStore::new(None, Some("epoch-a".to_string()));
+        store.publish("a", data());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let (replay, unsubscribe) = store.subscribe_and_replay(None, Some("epoch-b"), Arc::new(move |event: &ManagerEvent| {
+            received_clone.lock().unwrap().push(event.sequence);
+        }), |replay| !replay.reset);
+        assert!(replay.reset);
+        assert!(unsubscribe.is_none());
+        assert_eq!(replay.events.len(), 1, "a reset still returns the whole buffer");
+        store.publish("b", data());
+        assert!(received.lock().unwrap().is_empty());
         assert_eq!(store.subscriber_count(), 0);
     }
 }

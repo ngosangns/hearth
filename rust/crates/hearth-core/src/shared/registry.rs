@@ -206,7 +206,7 @@ mod tests {
                 argv: vec!["run".to_string()],
             },
             stop: None,
-            readiness: ReadinessSpec::Process,
+            readiness: crate::shared::remote::RecipeReadiness::Spec(ReadinessSpec::Process),
             provision: vec![],
             deprovision: vec![],
             connection: Some(SharedConnection {

@@ -713,9 +713,20 @@ async fn post_operation(State(manager): State<Arc<HearthManager>>, bytes: Bytes)
         }
         .boxed()
     });
-    let operation = manager.operations.schedule(input, execute, Some(rejected))?;
-    if action == ServiceOperationKind::Start {
-        queue_stopped_services_for_start(&manager, &start_services, &operation.id).await;
+    // The worker is spawned inside `schedule` and skips a start whose desired state is not yet
+    // `running` ("start cancelled"), then reports success. Hold it until the desired state is
+    // published, or a stopped service is left in `queued-start` after the operation already finished.
+    let (operation, release) = manager.operations.schedule_when_released(input, execute, Some(rejected))?;
+    if let Some(release) = release {
+        if action == ServiceOperationKind::Start {
+            queue_stopped_services_for_start(&manager, &start_services, &operation.id).await;
+        }
+        let _ = release.send(());
+    } else if action == ServiceOperationKind::Start && matches!(operation.status, crate::state::OperationStatus::Succeeded | crate::state::OperationStatus::Failed) {
+        // A duplicate request id that already settled between resolve and schedule. This call did
+        // not queue, but clearing the finished operation's id drops a row it left in `queued-start`.
+        // An in-flight duplicate (queued/running) keeps the row: that worker clears it on completion.
+        clear_queued_starts(&manager, &start_services, &operation.id).await;
     }
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
@@ -885,8 +896,13 @@ async fn post_bulk_start(State(manager): State<Arc<HearthManager>>, bytes: Bytes
         }
         .boxed()
     });
-    let operation = manager.operations.schedule(input, execute, Some(rejected))?;
-    queue_stopped_services_for_start(&manager, &selected, &operation.id).await;
+    let (operation, release) = manager.operations.schedule_when_released(input, execute, Some(rejected))?;
+    if let Some(release) = release {
+        queue_stopped_services_for_start(&manager, &selected, &operation.id).await;
+        let _ = release.send(());
+    } else if matches!(operation.status, crate::state::OperationStatus::Succeeded | crate::state::OperationStatus::Failed) {
+        clear_queued_starts(&manager, &selected, &operation.id).await;
+    }
     Ok(json_response(json!({ "operation": operation }), StatusCode::ACCEPTED))
 }
 
@@ -993,23 +1009,79 @@ async fn get_events_stream(State(manager): State<Arc<HearthManager>>, Query(para
         Ok(a) => a,
         Err(error) => return error.into_response(),
     };
-    let replay = manager.events.replay(after, params.get("epoch").map(|s| s.as_str()));
 
     const MAX_QUEUE_FRAMES: usize = 64;
     type SseItem = Result<Event, std::convert::Infallible>;
     let (tx, rx) = tokio::sync::mpsc::channel::<SseItem>(MAX_QUEUE_FRAMES);
 
-    if replay.reset || replay.events.len() + 1 > MAX_QUEUE_FRAMES {
-        let _ = tx.try_send(Ok(replay_event(&replay.epoch, true, replay.latest_sequence)));
-        // Reset case is terminal — no live subscription, matching the TS "force a REST refetch"
-        // behavior for a replay window that itself would overflow the queue.
+    // Live events buffer here until the snapshot frames are queued, then drain under this same
+    // mutex as the gate flips. Otherwise a publish that lands after subscribe and before the
+    // snapshot `try_send`s is delivered ahead of the replay the client resynchronizes from.
+    struct PrefixGate {
+        open: bool,
+        pending: Vec<crate::state::ManagerEvent>,
+    }
+    let prefix = Arc::new(std::sync::Mutex::new(PrefixGate { open: false, pending: Vec::new() }));
+    let overflowed = Arc::new(tokio::sync::Notify::new());
+    let watchdog_tx = tx.clone();
+    let snapshot_tx = tx.clone();
+    let sender_slot = Arc::new(std::sync::Mutex::new(Some(tx)));
+
+    let prefix_for_listener = prefix.clone();
+    let listener_slot = sender_slot.clone();
+    let overflowed_for_listener = overflowed.clone();
+    let deliver = |slot: &Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<SseItem>>>>, overflowed: &Arc<tokio::sync::Notify>, event: &crate::state::ManagerEvent| {
+        let mut guard = slot.lock().unwrap();
+        let full = match guard.as_ref() {
+            Some(sender) => sender.try_send(Ok(event_to_sse(event))).is_err(),
+            None => return,
+        };
+        if full {
+            guard.take();
+            overflowed.notify_one();
+        }
+    };
+    let (replay, unsubscribe) = manager.events.subscribe_and_replay(
+        after,
+        params.get("epoch").map(|s| s.as_str()),
+        Arc::new(move |event| {
+            let mut gate = prefix_for_listener.lock().unwrap();
+            if !gate.open {
+                gate.pending.push(event.clone());
+                return;
+            }
+            deliver(&listener_slot, &overflowed_for_listener, event);
+        }),
+        |replay| !replay.reset && replay.events.len() < MAX_QUEUE_FRAMES,
+    );
+
+    let Some(unsubscribe) = unsubscribe else {
+        let _ = snapshot_tx.try_send(Ok(replay_event(&replay.epoch, true, replay.latest_sequence)));
+        // Reset, or a snapshot that would itself overflow the queue, is terminal — no live
+        // subscription. The client refetches. Dropping every sender closes the stream after the
+        // one reset frame.
+        drop(snapshot_tx);
+        sender_slot.lock().unwrap().take();
+        drop(watchdog_tx);
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         return Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
-    }
-    let _ = tx.try_send(Ok(replay_event(&replay.epoch, false, replay.latest_sequence)));
+    };
+
+    let _ = snapshot_tx.try_send(Ok(replay_event(&replay.epoch, false, replay.latest_sequence)));
     for event in &replay.events {
-        if tx.try_send(Ok(event_to_sse(event))).is_err() {
+        if snapshot_tx.try_send(Ok(event_to_sse(event))).is_err() {
             break;
+        }
+    }
+    drop(snapshot_tx);
+    {
+        let mut gate = prefix.lock().unwrap();
+        let pending = std::mem::take(&mut gate.pending);
+        // Open before draining so a listener that acquires this lock next sends *after* `pending`,
+        // which is written while the lock is still held.
+        gate.open = true;
+        for event in &pending {
+            deliver(&sender_slot, &overflowed, event);
         }
     }
 
@@ -1022,22 +1094,6 @@ async fn get_events_stream(State(manager): State<Arc<HearthManager>>, Query(para
     // Closing means dropping every `Sender`: the one the listener holds (taken out of the slot
     // below) and the one the watchdog holds. `Notify` is what lets the listener, which is a sync
     // closure, wake the async watchdog to do its half.
-    let overflowed = Arc::new(tokio::sync::Notify::new());
-    let overflowed_for_listener = overflowed.clone();
-    let watchdog_tx = tx.clone();
-    let sender_slot = Arc::new(std::sync::Mutex::new(Some(tx)));
-    let listener_slot = sender_slot.clone();
-    let unsubscribe = manager.events.subscribe(Arc::new(move |event| {
-        let mut guard = listener_slot.lock().unwrap();
-        let full = match guard.as_ref() {
-            Some(sender) => sender.try_send(Ok(event_to_sse(event))).is_err(),
-            None => return,
-        };
-        if full {
-            guard.take();
-            overflowed_for_listener.notify_one();
-        }
-    }));
     tokio::spawn(async move {
         tokio::select! {
             // The client hung up.

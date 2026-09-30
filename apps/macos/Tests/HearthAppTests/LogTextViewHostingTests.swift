@@ -290,4 +290,114 @@ final class LogTextViewHostingTests: XCTestCase {
         let textView = try XCTUnwrap(findTextView(in: hosting.view))
         XCTAssertEqual(textView.string, log.text)
     }
+
+    /// Switching the selected service must retarget the mounted `NSTextView` instead of building
+    /// a second one and laying the buffer out again.
+    @MainActor
+    func testSwitchingServicesReusesTheLogTextView() async throws {
+        let api = FakeManagerAPI()
+        api.servicesHandler = { [makeService("api", actualState: "ready")] }
+        api.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)]) }
+        api.urlsHandler = { [] }
+        api.daemonLogHandler = { makeLogSlice(data: "daemon log line\n", nextCursor: 16, generation: 1, reset: true) }
+        api.logsHandler = { _, _ in makeLogSlice(data: "api log line\n", nextCursor: 13, generation: 1) }
+
+        let workspace = makeWorkspace()
+        let controller = WorkspaceController(workspace: workspace, watchesConfigFile: false, connector: { _ in api })
+        await controller.connect()
+        defer { controller.stop() }
+
+        let hosting = NSHostingController(rootView: WorkspaceDetailView(controller: controller, workspace: workspace).environmentObject(WorkspaceStore()))
+        let window = NSWindow(contentViewController: hosting)
+        window.setContentSize(NSSize(width: 760, height: 480))
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+
+        controller.selectedServiceId = LogController.daemonServiceId
+        let first = try await waitForTextView(in: hosting.view, containing: "daemon log line")
+
+        controller.selectedServiceId = "api"
+        let second = try await waitForTextView(in: hosting.view, containing: "api log line")
+        XCTAssertTrue(first === second, "selecting another service built a new NSTextView")
+        XCTAssertFalse(second.string.contains("daemon log line"))
+        XCTAssertEqual(findTextViews(in: hosting.view).count, 1)
+    }
+
+    /// Switching workspaces updates the mounted detail. The log view stays.
+    @MainActor
+    func testSwitchingWorkspacesReusesTheLogTextView() async throws {
+        let apiA = FakeManagerAPI()
+        apiA.servicesHandler = { [makeService("api", actualState: "ready")] }
+        apiA.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)]) }
+        apiA.urlsHandler = { [] }
+        apiA.logsHandler = { _, _ in makeLogSlice(data: "workspace-a log\n", nextCursor: 16, generation: 1) }
+        let apiB = FakeManagerAPI()
+        apiB.servicesHandler = { [makeService("api", actualState: "ready")] }
+        apiB.catalogHandler = { ServiceCatalogSummary(services: [CatalogService(id: "api", label: "API", kind: nil, ownership: nil)]) }
+        apiB.urlsHandler = { [] }
+        apiB.logsHandler = { _, _ in makeLogSlice(data: "workspace-b log\n", nextCursor: 16, generation: 1) }
+
+        let workspaceA = makeWorkspace(path: "/tmp/ws-a")
+        let workspaceB = makeWorkspace(path: "/tmp/ws-b")
+        let controllerA = WorkspaceController(workspace: workspaceA, watchesConfigFile: false, connector: { _ in apiA })
+        let controllerB = WorkspaceController(workspace: workspaceB, watchesConfigFile: false, connector: { _ in apiB })
+        await controllerA.connect()
+        await controllerB.connect()
+        defer { controllerA.stop(); controllerB.stop() }
+        controllerA.selectedServiceId = "api"
+        controllerB.selectedServiceId = "api"
+
+        let box = DetailIndex()
+        let hosting = NSHostingController(
+            rootView: SwitchingDetail(box: box, workspaces: [workspaceA, workspaceB], controllers: [controllerA, controllerB])
+                .environmentObject(WorkspaceStore())
+        )
+        let window = NSWindow(contentViewController: hosting)
+        window.setContentSize(NSSize(width: 760, height: 480))
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+
+        let first = try await waitForTextView(in: hosting.view, containing: "workspace-a log")
+        box.index = 1
+        let second = try await waitForTextView(in: hosting.view, containing: "workspace-b log")
+        XCTAssertTrue(first === second, "switching workspaces built a new NSTextView")
+        XCTAssertFalse(second.string.contains("workspace-a log"))
+        XCTAssertEqual(findTextViews(in: hosting.view).count, 1)
+    }
+
+    @MainActor
+    private func waitForTextView(in root: NSView, containing needle: String) async throws -> NSTextView {
+        var matched: NSTextView?
+        for _ in 0 ..< 100 {
+            try await Task.sleep(for: .milliseconds(50))
+            if let textView = findTextView(in: root), textView.string.contains(needle) {
+                matched = textView
+                break
+            }
+        }
+        let current = findTextViews(in: root).map(\.string).joined(separator: " | ")
+        return try XCTUnwrap(matched, "log text \(needle.debugDescription) never reached the NSTextView; current: \(current.debugDescription)")
+    }
+
+    private func findTextViews(in view: NSView) -> [NSTextView] {
+        var found: [NSTextView] = []
+        if let textView = view as? NSTextView { found.append(textView) }
+        for sub in view.subviews { found.append(contentsOf: findTextViews(in: sub)) }
+        return found
+    }
+}
+
+@MainActor
+private final class DetailIndex: ObservableObject {
+    @Published var index = 0
+}
+
+private struct SwitchingDetail: View {
+    @ObservedObject var box: DetailIndex
+    let workspaces: [Workspace]
+    let controllers: [WorkspaceController]
+
+    var body: some View {
+        WorkspaceDetailView(controller: controllers[box.index], workspace: workspaces[box.index])
+    }
 }

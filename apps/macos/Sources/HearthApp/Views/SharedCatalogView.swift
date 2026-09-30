@@ -11,6 +11,8 @@ struct SharedCatalogView: View {
     /// The instance id whose row armed the remove confirmation — destructive enough (deletes the
     /// install and its data dir) that it never fires on a bare click.
     @State private var removeTarget: String?
+    /// Instance id whose tail this view started. Switching rows retargets the text view in place.
+    @State private var trackedLogId: String?
 
     var body: some View {
         Group {
@@ -18,31 +20,38 @@ struct SharedCatalogView: View {
             case .idle, .connecting:
                 ProgressView("Starting shared daemon…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .transition(.opacity)
             case .failed(let message):
-                VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
-                    Text(message).multilineTextAlignment(.center).foregroundStyle(.secondary).textSelection(.enabled)
+                ContentUnavailableViewCompat(
+                    title: "Shared services unavailable",
+                    message: message,
+                    systemImage: "exclamationmark.triangle.fill",
+                    symbolColor: .orange
+                ) {
                     Button("Retry") { Task { await controller.connect() } }
+                        .buttonStyle(.borderedProminent)
                 }
-                .padding()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .transition(.opacity)
             case .connected:
                 catalogBody
+                    .transition(.identity)
             }
         }
-        .navigationTitle("Shared Services")
         .toolbar {
             if controller.phase == .connected {
-                ToolbarItem {
-                    IconActionButton("Refresh", systemImage: "arrow.clockwise") {
+                ToolbarItem(id: "refresh", placement: .primaryAction) {
+                    ToolbarButton(title: "Refresh", systemImage: "arrow.clockwise") {
                         Task { await controller.refresh(); await controller.refreshCatalog() }
                     }
                 }
             }
         }
+        .animation(Motion.layout, value: phaseKey)
         .task {
             if controller.phase == .idle { await controller.connect() }
         }
+        .onAppear { trackedLogId = controller.selectedId }
+        .onChange(of: controller.selectedId) { handoffLog(to: $0) }
         .confirmationDialog(
             "Remove this shared service?",
             isPresented: Binding(get: { removeTarget != nil }, set: { if !$0 { removeTarget = nil } }),
@@ -67,7 +76,7 @@ struct SharedCatalogView: View {
         NavigationSplitView {
             List(selection: $controller.selectedId) {
                 if !controller.instances.isEmpty {
-                    Section("Installed on this machine") {
+                    Section("Installed") {
                         ForEach(controller.instances) { instance in
                             SharedInstanceRow(instance: instance, busy: controller.actionsInFlight.contains(instance.id))
                                 .tag(instance.id)
@@ -77,34 +86,42 @@ struct SharedCatalogView: View {
                 if let services = controller.catalogDoc?.services, !services.isEmpty {
                     Section("Available") {
                         ForEach(availableRows(services), id: \.self) { row in
-                            SharedCatalogRow(name: row.name, version: row.version, installed: row.installed, busy: controller.actionsInFlight.contains(row.id)) {
-                                controller.install(row.id)
-                            }
-                            .tag(row.id)
+                            SharedCatalogRow(name: row.name, version: row.version, installed: row.installed, busy: controller.actionsInFlight.contains(row.id))
+                                .tag(row.id)
                         }
                     }
                 }
                 if let error = controller.catalogError {
                     Section {
                         Label("Registry unavailable", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.orange)
-                        Text(error).font(.caption2).foregroundStyle(.secondary)
+                            .help(error)
                     }
                 }
             }
+            .listStyle(.sidebar)
             .navigationTitle("Catalog")
-            .overlay {
-                if controller.instances.isEmpty && (controller.catalogDoc?.services.isEmpty ?? true) {
-                    ContentUnavailableViewCompat(
-                        title: controller.catalogError != nil ? "Registry unavailable" : "Empty catalog",
-                        message: controller.catalogError ?? "The shared-services registry lists nothing this machine can install.",
-                        systemImage: "shippingbox"
-                    )
-                }
-            }
         } detail: {
             detailPane
+                .animation(Motion.layout, value: detailKind)
+                .navigationTitle(detailTitle)
+                .modifier(DetailSubtitle(text: detailSubtitle))
         }
+        .navigationSplitViewStyle(.balanced)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 400)
+    }
+
+    private var detailTitle: String {
+        if let instance = controller.instance(controller.selectedId) { return instance.id }
+        if let entry = controller.catalogEntry(controller.selectedId) { return entry.name }
+        return "Shared Services"
+    }
+
+    private var detailSubtitle: String {
+        if let instance = controller.instance(controller.selectedId) {
+            return "port \(instance.port)"
+        }
+        if let entry = controller.catalogEntry(controller.selectedId) { return entry.version }
+        return ""
     }
 
     /// Every `(service, version)` in the registry, sorted for display, flagged when an instance
@@ -128,24 +145,61 @@ struct SharedCatalogView: View {
                 onAction: { controller.perform($0, instance.id) },
                 onRemove: { removeTarget = instance.id }
             )
-            .id(instance.id)
+            .transition(.identity)
         } else if let entry = controller.catalogEntry(controller.selectedId) {
-            VStack(spacing: 12) {
-                Image(systemName: "shippingbox").font(.system(size: 40)).foregroundStyle(.secondary)
-                Text("\(entry.name) \(entry.version)").font(.title2).bold()
-                Text("Not installed — the first project that needs it will install it, or install it now.")
-                    .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 380)
-                Button("Install \(entry.name)@\(entry.version)") { controller.install("\(entry.name)@\(entry.version)") }
+            let id = "\(entry.name)@\(entry.version)"
+            ContentUnavailableViewCompat(
+                title: "\(entry.name) \(entry.version)",
+                message: "Not installed. The first project that needs it will install it, or install it now.",
+                systemImage: "shippingbox"
+            ) {
+                Button("Install \(id)") { controller.install(id) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(controller.actionsInFlight.contains("\(entry.name)@\(entry.version)"))
+                    .disabled(controller.actionsInFlight.contains(id))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .transition(.opacity)
+        } else if controller.instances.isEmpty && (controller.catalogDoc?.services.isEmpty ?? true) {
+            ContentUnavailableViewCompat(
+                title: controller.catalogError != nil ? "Registry unavailable" : "Empty catalog",
+                message: controller.catalogError ?? "The shared-services registry lists nothing this machine can install.",
+                systemImage: "shippingbox"
+            )
+            .transition(.opacity)
         } else {
-            VStack(spacing: 8) {
-                Image(systemName: "server.rack").font(.system(size: 32)).foregroundStyle(.secondary)
-                Text("Select a shared service").foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ContentUnavailableViewCompat(
+                title: "Select a shared service",
+                message: "Choose an installed instance or a service from the catalog.",
+                systemImage: "server.rack"
+            )
+            .transition(.opacity)
+        }
+    }
+
+    /// Stays `"instance"` across installed-row switches so the log text view is retargeted, not rebuilt.
+    private var detailKind: String {
+        if controller.instance(controller.selectedId) != nil { return "instance" }
+        if controller.catalogEntry(controller.selectedId) != nil { return "entry" }
+        if controller.instances.isEmpty && (controller.catalogDoc?.services.isEmpty ?? true) { return "empty" }
+        return "select"
+    }
+
+    private var phaseKey: String {
+        switch controller.phase {
+        case .idle, .connecting: return "starting"
+        case .failed: return "failed"
+        case .connected: return "connected"
+        }
+    }
+
+    /// Stops the tail being left and starts the one being shown. Catalog rows that are not installed have no log.
+    private func handoffLog(to newId: String?) {
+        if removeTarget != nil { removeTarget = nil }
+        if let previous = trackedLogId, previous != newId {
+            controller.cachedLogController(for: previous)?.stop()
+        }
+        trackedLogId = newId
+        if let newId, controller.instance(newId) != nil {
+            controller.logController(for: newId)?.start()
         }
     }
 
@@ -163,31 +217,38 @@ private struct SharedInstanceRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            StatusDot(state: instance.displayState)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(instance.id).fontWeight(.medium)
-                HStack(spacing: 6) {
-                    Text(instance.displayState)
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(instance.id)
+                        .lineLimit(1)
+                    Text(statusLine)
                         .font(.caption)
-                        .foregroundStyle(StatusStyle.color(for: instance.displayState))
-                    Text("port \(instance.port)").font(.caption).foregroundStyle(.secondary)
-                    if instance.installState == "installing" {
-                        Text("installing").font(.caption).foregroundStyle(.orange)
-                    }
-                    if let error = instance.installError {
-                        Text(error).font(.caption).foregroundStyle(.red).lineLimit(1)
-                    }
-                    let attached = instance.attachments.count
-                    if attached > 0 {
-                        Text("\(attached) project\(attached == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
-                    }
+                        .foregroundStyle(instance.installError != nil ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                        .lineLimit(1)
                 }
+            } icon: {
+                Image(systemName: "server.rack")
+                    .foregroundStyle(Color.accentColor)
             }
-            Spacer()
-            if busy { ActionSpinner() }
+            Spacer(minLength: 0)
         }
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
+        .help(help)
+    }
+
+    private var statusLine: String {
+        if busy || instance.installState == "installing" { return "Installing…" }
+        if let error = instance.installError { return error }
+        let attached = instance.attachments.count
+        if attached > 0 {
+            return "\(instance.displayState) · \(attached) project\(attached == 1 ? "" : "s")"
+        }
+        return instance.displayState
+    }
+
+    private var help: String {
+        var parts = ["port \(instance.port)", instance.displayState]
+        if let error = instance.installError { parts.append(error) }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -196,31 +257,26 @@ private struct SharedCatalogRow: View {
     let version: String
     let installed: Bool
     let busy: Bool
-    let onInstall: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "shippingbox").foregroundStyle(Color.accentColor)
-            Text(name).fontWeight(.medium)
-            Text(version)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1)
-                .background(.quaternary, in: Capsule())
-            Spacer()
-            if busy {
-                ActionSpinner()
-            } else if installed {
-                Label("Installed", systemImage: "checkmark.circle.fill")
-                    .labelStyle(.iconOnly)
-                    .foregroundStyle(.green)
-                    .help("Already installed on this machine")
-            } else {
-                IconActionButton("Install \(name)@\(version)", systemImage: "square.and.arrow.down", action: onInstall)
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name)
+                        .lineLimit(1)
+                    Text(busy ? "Installing…" : version)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } icon: {
+                Image(systemName: installed ? "shippingbox.fill" : "shippingbox")
+                    .foregroundStyle(installed ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
             }
+            Spacer(minLength: 0)
         }
-        .contentShape(Rectangle())
+        .help(installed ? "\(name) \(version) is already installed on this machine" : "\(name) \(version)")
     }
 }
 
@@ -251,15 +307,16 @@ private struct SharedInstanceDetail: View {
     private var header: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
-                Text(instance.id).font(.headline)
-                HStack(spacing: 8) {
+                Text(instance.id).font(.title3.weight(.semibold))
+                HStack(spacing: 0) {
                     Text(instance.displayState)
-                    Text("port \(instance.port)")
-                    Text(instance.installState)
+                        .foregroundStyle(StatusStyle.color(for: instance.displayState))
+                    Text(" · port \(instance.port) · \(instance.installState)")
+                        .foregroundStyle(.secondary)
                 }
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.subheadline)
                 if let error = instance.installError {
-                    Text(error).font(.caption).foregroundStyle(.red)
+                    Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
                 }
             }
             Spacer()
@@ -267,7 +324,8 @@ private struct SharedInstanceDetail: View {
             // Icon-only like the service rows — the tooltip carries the name.
             LifecycleButtons(state: instance.displayState, finite: finite, onAction: onAction)
             Button("Remove…", role: .destructive, action: onRemove)
-                .padding(.leading, 8)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
         }
         .padding(12)
     }
@@ -275,15 +333,24 @@ private struct SharedInstanceDetail: View {
     @ViewBuilder
     private var attachments: some View {
         if instance.attachments.isEmpty {
-            Text("No projects attached").font(.callout).foregroundStyle(.secondary).padding(12)
+            Text("No projects attached")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
         } else {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Attached projects").font(.caption).foregroundStyle(.secondary).textCase(.uppercase)
-                ForEach(instance.attachments, id: \.projectId) { attachment in
-                    AttachmentRow(attachment: attachment)
+            // A grouped form is the system key-value layout, and it hugs its rows so the log
+            // below keeps the rest of the pane.
+            Form {
+                Section("Attached projects") {
+                    ForEach(instance.attachments, id: \.projectId) { attachment in
+                        AttachmentRow(attachment: attachment)
+                    }
                 }
             }
-            .padding(12)
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -292,27 +359,37 @@ private struct AttachmentRow: View {
     let attachment: SharedAttachment
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Image(systemName: "folder").foregroundStyle(.secondary)
-                Text(attachment.projectRoot).font(.callout).lineLimit(1).truncationMode(.middle)
-                if !attachment.provisioned {
-                    Text("provisioning…").font(.caption).foregroundStyle(.orange)
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent {
+                HStack(spacing: 4) {
+                    if !attachment.provisioned {
+                        Text("provisioning…").foregroundStyle(.orange)
+                    }
+                    if let url = attachment.connection?.url {
+                        IconActionButton("Copy connection URL", systemImage: "doc.on.doc") { Pasteboard.copy(url) }
+                    }
                 }
-                Spacer()
-                if let url = attachment.connection?.url {
-                    IconActionButton("Copy connection URL", systemImage: "doc.on.doc") { Pasteboard.copy(url) }
-                        .font(.caption)
-                }
+            } label: {
+                Label(attachment.projectRoot, systemImage: "folder")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
             }
             if let env = attachment.connection?.env, !env.isEmpty {
                 ForEach(env.keys.sorted(), id: \.self) { key in
-                    HStack {
-                        Text(key).font(.caption.monospaced()).foregroundStyle(.secondary)
-                        Text(env[key] ?? "").font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                        Spacer(minLength: 4)
-                        IconActionButton("Copy \(key)", systemImage: "doc.on.doc") { Pasteboard.copy("\(key)=\(env[key] ?? "")") }
-                            .font(.caption)
+                    LabeledContent {
+                        HStack(spacing: 4) {
+                            Text(env[key] ?? "")
+                                .font(.body.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
+                            IconActionButton("Copy \(key)", systemImage: "doc.on.doc") {
+                                Pasteboard.copy("\(key)=\(env[key] ?? "")")
+                            }
+                        }
+                    } label: {
+                        Text(key).font(.body.monospaced())
                     }
                 }
             }

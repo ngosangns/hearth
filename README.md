@@ -67,6 +67,20 @@ services:
     readiness: { kind: exit }
 ```
 
+Readiness is the completion signal, not the deadline. Pick the kind that matches what the process actually does:
+
+| Kind | Ready when | Write it |
+|---|---|---|
+| `http` | `GET` returns 2xx | `{ kind: http }` is `http://127.0.0.1:<port>/health`. Set `path` for any other path (`/metrics`, `/minio/health/live`). Set `url` when the host or port is not that default. `url` cannot be combined with `path` or `port`. |
+| `tcp` | the port accepts a connection | `{ kind: tcp, port: 4222 }`, or `{ kind: tcp }` when `ports:` already names the port |
+| `command` | the command exits 0 | a real protocol check (`redis-cli ping`, `pg_isready`). Retries until `readinessTimeoutMs` |
+| `exit` | the run command itself exits | one-shot builds. Exit 0 is `succeeded` |
+| `container` | the named container is running | docker compose services |
+| `process` | the process is alive | no port and no HTTP |
+| `tailnet` | Tailscale serve is up | tailnet tasks |
+
+`http` and `tcp` with no port use the first `ports:` entry. Omitting both is a load error (`needs a port`). Do not point `http` at `/health` unless that process serves the path.
+
 A service may declare a versioned tarball to install before its first start — same download/script
 → sha256 → extract → marker machinery the shared-services catalog uses, scoped to the project's
 runtime directory instead of `~/.hearth/shared`:

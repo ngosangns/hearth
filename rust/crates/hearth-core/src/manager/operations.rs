@@ -176,8 +176,25 @@ impl OperationScheduler {
     }
 
     pub fn schedule(self: &Arc<Self>, input: OperationInput, execute: OperationExecute, rejected: Option<OperationRejected>) -> Result<Operation, RequestIdConflict> {
+        let (operation, release) = self.schedule_inner(input, execute, rejected, false)?;
+        if let Some(release) = release {
+            let _ = release.send(());
+        }
+        Ok(operation)
+    }
+
+    /// Like `schedule`, but when this call *creates* the operation the worker does not observe
+    /// state until `release` is signaled. Callers that publish `desired: running` before the start
+    /// worker runs hold that sender across the publish. Dropping it abandons the operation: the
+    /// rejected callback runs and the operation fails, so a row queued for it is not left behind.
+    /// An idempotent replay of an existing request returns `None` — that worker is already released.
+    pub fn schedule_when_released(self: &Arc<Self>, input: OperationInput, execute: OperationExecute, rejected: Option<OperationRejected>) -> Result<(Operation, Option<tokio::sync::oneshot::Sender<()>>), RequestIdConflict> {
+        self.schedule_inner(input, execute, rejected, true)
+    }
+
+    fn schedule_inner(self: &Arc<Self>, input: OperationInput, execute: OperationExecute, rejected: Option<OperationRejected>, defer: bool) -> Result<(Operation, Option<tokio::sync::oneshot::Sender<()>>), RequestIdConflict> {
         if let Some(existing) = self.resolve_request(&input)? {
-            return Ok(existing);
+            return Ok((existing, None));
         }
         let created_at = now();
         let operation = Operation {
@@ -212,12 +229,35 @@ impl OperationScheduler {
         self.active_targets.lock().unwrap().insert(target.clone(), operation.id.clone());
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         self.done.lock().unwrap().insert(operation.id.clone(), done_rx);
+        let (release_tx, release_rx) = if defer {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let scheduler = self.clone();
         let kind = operation.kind;
         let target_for_task = target.clone();
         let operation_id_for_task = operation.id.clone();
         let handle_for_task = handle.clone();
         tokio::spawn(async move {
+            if let Some(release_rx) = release_rx {
+                if release_rx.await.is_err() {
+                    if let Some(rejected) = rejected {
+                        rejected(handle_for_task.clone()).await;
+                    }
+                    scheduler.transition(&handle_for_task, OperationStatus::Failed, "Operation abandoned before it started");
+                    {
+                        let mut active = scheduler.active_targets.lock().unwrap();
+                        if active.get(&target_for_task).map(String::as_str) == Some(operation_id_for_task.as_str()) {
+                            active.remove(&target_for_task);
+                        }
+                    }
+                    let _ = done_tx.send(true);
+                    scheduler.settle(&operation_id_for_task);
+                    return;
+                }
+            }
             let guard = scheduler.queues.lock(&target_for_task).await;
             let is_closing = scheduler.closing.load(Ordering::SeqCst);
             if is_closing && matches!(kind, OperationKind::Service | OperationKind::BulkStart) {
@@ -252,7 +292,7 @@ impl OperationScheduler {
             let _ = done_tx.send(true);
             scheduler.settle(&operation_id_for_task);
         });
-        Ok(operation)
+        Ok((operation, release_tx))
     }
 
     pub fn trace(&self, handle: &OperationHandle, message: &str) {
@@ -309,6 +349,62 @@ mod tests {
         scheduler.wait(&operation).await;
         let final_state = scheduler.get(&operation.id).unwrap();
         assert_eq!(final_state.status, OperationStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_operation_waits_for_release_and_dropping_it_rejects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = started.clone();
+        let rejected = Arc::new(AtomicBool::new(false));
+        let rejected_flag = rejected.clone();
+        let (operation, release) = scheduler
+            .schedule_when_released(
+                service_input("req-held", "api", ServiceOperationKind::Start),
+                Box::new(move |_handle| {
+                    let started_flag = started_flag.clone();
+                    Box::pin(async move {
+                        started_flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                Some(Box::new(move |_handle| {
+                    let rejected_flag = rejected_flag.clone();
+                    Box::pin(async move {
+                        rejected_flag.store(true, Ordering::SeqCst);
+                    })
+                })),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!started.load(Ordering::SeqCst), "the worker must not run before release");
+        assert_eq!(scheduler.get(&operation.id).unwrap().status, OperationStatus::Queued);
+        drop(release);
+        scheduler.wait(&operation).await;
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(rejected.load(Ordering::SeqCst));
+        assert_eq!(scheduler.get(&operation.id).unwrap().status, OperationStatus::Failed);
+
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = started.clone();
+        let (operation, release) = scheduler
+            .schedule_when_released(
+                service_input("req-go", "api", ServiceOperationKind::Start),
+                Box::new(move |_handle| {
+                    let started_flag = started_flag.clone();
+                    Box::pin(async move {
+                        started_flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        release.expect("a new operation is held").send(()).unwrap();
+        scheduler.wait(&operation).await;
+        assert!(started.load(Ordering::SeqCst));
+        assert_eq!(scheduler.get(&operation.id).unwrap().status, OperationStatus::Succeeded);
     }
 
     #[tokio::test]

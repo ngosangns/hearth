@@ -13,7 +13,7 @@ pub mod types;
 pub use default_adapters::default_supervisor_options;
 pub use engine::ProcessSupervisor;
 pub use fingerprint::{command_argv, normalize_command_fingerprint, normalize_observed_command_fingerprint};
-pub use process_tree::ProcessTreeEntry;
+pub use process_tree::{ProcessTreeEntry, ProcessTreeSnapshot};
 pub use types::{
     Host, ManagedProcess, OnOutput, OutputSource, PreparationAdapter, ProbeAdapter, ProcessAdapter, ProcessRecord,
     ProcessSignal, RunBuild, SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,

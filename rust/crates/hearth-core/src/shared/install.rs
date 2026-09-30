@@ -13,7 +13,9 @@ use tokio::io::AsyncWriteExt;
 
 use super::registry::SharedInstance;
 use super::remote::{SharedArtifact, SharedRecipe};
-use super::{blocking, hex, output_with_timeout, SharedContext, SharedError, SHARED_ARTIFACT_PLATFORM};
+use super::{
+    blocking, hex, output_with_timeout, SharedContext, SharedError, SHARED_ARTIFACT_PLATFORM,
+};
 
 const INSTALLED_MARKER: &str = ".hearth-installed";
 const EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -46,7 +48,12 @@ impl From<&SharedArtifact> for ArtifactSpec {
 
 impl From<&crate::catalog::ServiceArtifact> for ArtifactSpec {
     fn from(a: &crate::catalog::ServiceArtifact) -> Self {
-        Self { url: a.url.clone(), script: a.script.clone(), script_args: a.script_args.clone(), sha256: a.sha256.clone() }
+        Self {
+            url: a.url.clone(),
+            script: a.script.clone(),
+            script_args: a.script_args.clone(),
+            sha256: a.sha256.clone(),
+        }
     }
 }
 
@@ -77,7 +84,11 @@ impl TarballInstaller {
     /// Project-scoped installs: relative `script` paths resolve under `project_root`, and
     /// `HEARTH_CATALOG_ORIGIN` handed to the script is the root as a `file://` URL.
     pub fn project(project_root: &Path, downloads_dir: PathBuf) -> Self {
-        Self { http: reqwest::Client::new(), downloads_dir, script_origin: ScriptOrigin::ProjectDir(project_root.to_path_buf()) }
+        Self {
+            http: reqwest::Client::new(),
+            downloads_dir,
+            script_origin: ScriptOrigin::ProjectDir(project_root.to_path_buf()),
+        }
     }
 
     /// Idempotent install into `install_dir` — early-returns when the marker is already present.
@@ -99,11 +110,16 @@ impl TarballInstaller {
         })
         .await?;
         let archive_path = self.downloads_dir.join(format!("{name}.tar.gz"));
-        let digest = self.materialize_archive(name, artifact, &archive_path, on_progress).await?;
+        let digest = self
+            .materialize_archive(name, artifact, &archive_path, on_progress)
+            .await?;
         if artifact.url.is_some() {
             // The digest was computed while the bytes were written — no second read of the file.
             let expected = artifact.sha256.as_deref().unwrap_or_default();
-            if !digest.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(expected)) {
+            if !digest
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case(expected))
+            {
                 let _ = std::fs::remove_file(&archive_path);
                 return Err(SharedError(format!(
                     "sha256 mismatch: expected {expected}, got {}",
@@ -178,11 +194,7 @@ impl TarballInstaller {
             .stderr(std::process::Stdio::piped());
         let output = output_with_timeout(command, PACK_SCRIPT_TIMEOUT)
             .await
-            .map_err(|e| {
-                SharedError(format!(
-                    "{name}: failed to run packaging script: {e}"
-                ))
-            })?
+            .map_err(|e| SharedError(format!("{name}: failed to run packaging script: {e}")))?
             .ok_or_else(|| SharedError(format!("{name}: packaging script timed out")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -228,7 +240,10 @@ impl TarballInstaller {
                 if path.is_file() {
                     return Ok(path);
                 }
-                Err(SharedError(format!("{name}: packaging script not found: {}", path.display())))
+                Err(SharedError(format!(
+                    "{name}: packaging script not found: {}",
+                    path.display()
+                )))
             }
         }
     }
@@ -246,7 +261,8 @@ impl TarballInstaller {
             // file:// artifacts exist for tests and local fixtures — still hashed for the sha check.
             let (src, dest, url) = (PathBuf::from(rest), dest.to_path_buf(), url.to_string());
             return blocking(move || {
-                copy_hashing(&src, &dest).map_err(|e| SharedError(format!("failed to copy {url}: {e}")))
+                copy_hashing(&src, &dest)
+                    .map_err(|e| SharedError(format!("failed to copy {url}: {e}")))
             })
             .await;
         }
@@ -304,7 +320,11 @@ fn copy_hashing(src: &Path, dest: &Path) -> std::io::Result<String> {
 /// Moves the extracted payload into `install_dir` and writes the marker. Rename into place only
 /// once the payload is complete; a leftover target from a previous failed attempt is quarantined
 /// aside first, never deleted.
-fn finish_install(staging: &Path, archive_path: &Path, install_dir: &Path) -> Result<PathBuf, SharedError> {
+fn finish_install(
+    staging: &Path,
+    archive_path: &Path,
+    install_dir: &Path,
+) -> Result<PathBuf, SharedError> {
     let payload = payload_dir(staging)?;
     if install_dir.exists() {
         let quarantined =
@@ -360,7 +380,12 @@ pub async fn ensure_installed(
     }
     let artifact = artifact_for(&instance.id(), &instance.recipe)?;
     TarballInstaller::shared(ctx)
-        .install(&instance.id(), &install_dir, &ArtifactSpec::from(artifact), &on_progress)
+        .install(
+            &instance.id(),
+            &install_dir,
+            &ArtifactSpec::from(artifact),
+            &on_progress,
+        )
         .await
 }
 
@@ -379,17 +404,28 @@ pub async fn install_service_artifact(
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::paths::install_dir(runtime_directory, &service.id, &artifact.version));
+        .unwrap_or_else(|| {
+            crate::paths::install_dir(runtime_directory, &service.id, &artifact.version)
+        });
     let data_dir = artifact
         .data_dir
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::paths::service_data_dir(runtime_directory, &service.id));
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| SharedError(format!("cannot create data dir {}: {e}", data_dir.display())))?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| {
+        SharedError(format!(
+            "cannot create data dir {}: {e}",
+            data_dir.display()
+        ))
+    })?;
     TarballInstaller::project(project_root, crate::paths::downloads_dir(runtime_directory))
-        .install(&service.id, &install_dir, &ArtifactSpec::from(artifact), on_progress)
+        .install(
+            &service.id,
+            &install_dir,
+            &ArtifactSpec::from(artifact),
+            on_progress,
+        )
         .await
 }
 
@@ -499,7 +535,7 @@ mod tests {
                 )]),
                 run: CommandSpec::Argv { argv: vec![] },
                 stop: None,
-                readiness: ReadinessSpec::Process,
+                readiness: crate::shared::remote::RecipeReadiness::Spec(ReadinessSpec::Process),
                 provision: vec![],
                 deprovision: vec![],
                 connection: None,
@@ -591,7 +627,10 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
             project.path().join("pack.sh"),
-            format!("#!/bin/bash\nset -euo pipefail\ncp '{}' \"$1\"\n", archive.display()),
+            format!(
+                "#!/bin/bash\nset -euo pipefail\ncp '{}' \"$1\"\n",
+                archive.display()
+            ),
         )
         .unwrap();
         let runtime = tempfile::tempdir().unwrap();
@@ -602,7 +641,12 @@ mod tests {
             ownership: None,
             disabled: false,
             profiles: crate::catalog::ServiceProfiles {
-                run: crate::catalog::ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
+                run: crate::catalog::ServiceRunProfile::Unresolved {
+                    readiness: ReadinessSpec::Process,
+                    readiness_timeout_ms: None,
+                    preparation: None,
+                    preparation_command: None,
+                },
                 build: None,
             },
             ports: None,
@@ -618,11 +662,19 @@ mod tests {
             install_dir: None,
             data_dir: None,
         };
-        let install_dir = install_service_artifact(project.path(), runtime.path(), &service, &artifact, &|_| {}).await.unwrap();
-        assert_eq!(install_dir, crate::paths::install_dir(runtime.path(), "db", "1.0"));
+        let install_dir =
+            install_service_artifact(project.path(), runtime.path(), &service, &artifact, &|_| {})
+                .await
+                .unwrap();
+        assert_eq!(
+            install_dir,
+            crate::paths::install_dir(runtime.path(), "db", "1.0")
+        );
         assert!(install_dir.join("bin/hello").exists());
         assert!(crate::paths::service_data_dir(runtime.path(), "db").is_dir());
         // Idempotent.
-        install_service_artifact(project.path(), runtime.path(), &service, &artifact, &|_| {}).await.unwrap();
+        install_service_artifact(project.path(), runtime.path(), &service, &artifact, &|_| {})
+            .await
+            .unwrap();
     }
 }

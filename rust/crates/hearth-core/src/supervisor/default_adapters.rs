@@ -25,8 +25,8 @@ use crate::catalog::{is_container_command, CommandSpec, ServiceCommand, ServiceI
 use crate::paths::{logs_dir, raw_log_path, resolve_runtime_directory};
 use crate::state::ProcessIdentity;
 
-use super::fingerprint::{command_argv, normalize_observed_command_fingerprint};
-use super::process_tree::{build_process_tree, parse_ps_alive_rows, parse_ps_tree_rows, ProcessTreeEntry};
+use super::fingerprint::{command_argv, is_shell_wrapper_command, normalize_observed_command_fingerprint};
+use super::process_tree::{build_process_tree, parse_ps_alive_rows, parse_ps_tree_rows, ProcessTreeSnapshot};
 use super::types::{
     DockerContainerRecord, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, PortHolder, PosixProcessRecord,
     ProbeAdapter, ProcessAdapter, ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock,
@@ -69,13 +69,21 @@ fn send_signal_to_group(pgid: i64, signal: ProcessSignal) {
 /// Runs an observational command and returns `(exit code, stdout)`; `-1` means it could not be
 /// spawned or did not finish within `PROBE_COMMAND_TIMEOUT` (its process group is then killed).
 async fn capture_command(argv: &[&str]) -> (i32, String) {
+    let (code, stdout, _) = capture_command_output(argv).await;
+    (code, stdout)
+}
+
+/// Same as `capture_command`, plus stderr. Docker inspect writes "Cannot connect to the Docker
+/// daemon" and "No such container" there; dropping stderr makes both look like an empty answer.
+async fn capture_command_output(argv: &[&str]) -> (i32, String, String) {
     if argv.is_empty() {
-        return (-1, String::new());
+        return (-1, String::new(), String::new());
     }
     let mut cmd = Command::new(argv[0]);
-    cmd.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).process_group(0);
-    let Ok(mut child) = cmd.spawn() else { return (-1, String::new()) };
+    cmd.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    let Ok(mut child) = cmd.spawn() else { return (-1, String::new(), String::new()) };
     let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let read_stdout = async move {
         let mut buf = Vec::new();
         if let Some(mut stdout) = stdout {
@@ -83,10 +91,21 @@ async fn capture_command(argv: &[&str]) -> (i32, String) {
         }
         buf
     };
-    let finished = tokio::time::timeout(PROBE_COMMAND_TIMEOUT, async { tokio::join!(read_stdout, child.wait()) }).await;
+    let read_stderr = async move {
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut buf).await;
+        }
+        buf
+    };
+    let finished = tokio::time::timeout(PROBE_COMMAND_TIMEOUT, async { tokio::join!(read_stdout, read_stderr, child.wait()) }).await;
     match finished {
-        Ok((buf, Ok(status))) => (status.code().unwrap_or(-1), String::from_utf8_lossy(&buf).into_owned()),
-        Ok((_, Err(_))) => (-1, String::new()),
+        Ok((out, err, Ok(status))) => (
+            status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        ),
+        Ok((_, _, Err(_))) => (-1, String::new(), String::new()),
         Err(_) => {
             // `id()` is only `Some` while the child is unreaped, which is what keeps its pid (and so
             // its pgid) from having been recycled — never signal a group we can't vouch for.
@@ -94,9 +113,23 @@ async fn capture_command(argv: &[&str]) -> (i32, String) {
                 send_signal_to_group(pid as i64, ProcessSignal::Sigkill);
             }
             let _ = child.kill().await;
-            (-1, String::new())
+            (-1, String::new(), String::new())
         }
     }
+}
+
+/// `docker inspect` exit 1 is two different answers. "No such container" means the container is
+/// gone. Anything else (daemon socket down, empty stderr, a timeout) means the probe could not
+/// be asked — callers must treat that as unknown, never as gone.
+fn docker_inspect_answered(code: i32, stderr: &str) -> bool {
+    if code == 0 {
+        return true;
+    }
+    if code == -1 {
+        return false;
+    }
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no such object") || lower.contains("no such container")
 }
 
 fn ps_observed_re() -> &'static Regex {
@@ -147,33 +180,42 @@ async fn process_inspection_available() -> bool {
 }
 
 /// Snapshot of `leader_pid`'s whole tree — see `ProcessAdapter::process_tree`.
-async fn system_process_tree(leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry> {
+/// A non-zero `ps` (spawn failure, timeout, or a real error) is `Unknown`, never an empty tree:
+/// an empty tree is what a reused leader pid looks like, and signalling from it would hit the
+/// wrong group.
+async fn system_process_tree(leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
     let (code, stdout) = capture_command(&["ps", "-Ao", "pid=,ppid=,pgid=,lstart="]).await;
-    if code == -1 {
-        return Vec::new();
+    if code != 0 {
+        return ProcessTreeSnapshot::Unknown;
     }
-    build_process_tree(&parse_ps_tree_rows(&stdout), leader_pid, leader_start_identity)
+    let tree = build_process_tree(&parse_ps_tree_rows(&stdout), leader_pid, leader_start_identity);
+    if tree.is_empty() {
+        ProcessTreeSnapshot::Absent
+    } else {
+        ProcessTreeSnapshot::Present(tree)
+    }
 }
 
 /// `pid -> lstart` for every live process — see `ProcessAdapter::live_start_identities`.
+/// `None` when `ps` could not be read. A non-zero exit is that failure, not "nobody is alive".
 async fn system_live_start_identities() -> Option<HashMap<i64, String>> {
     let (code, stdout) = capture_command(&["ps", "-Ao", "pid=,lstart="]).await;
-    (code != -1).then(|| parse_ps_alive_rows(&stdout))
+    (code == 0).then(|| parse_ps_alive_rows(&stdout))
 }
 
 async fn container_running(container_name: &str) -> Result<bool, ()> {
-    let (code, stdout) = capture_command(&["docker", "inspect", "-f", "{{.State.Running}}", container_name]).await;
-    if code == -1 {
+    let (code, stdout, stderr) = capture_command_output(&["docker", "inspect", "-f", "{{.State.Running}}", container_name]).await;
+    if !docker_inspect_answered(code, &stderr) {
         return Err(());
     }
     Ok(stdout.trim() == "true")
 }
 
-/// `Err` when the probe itself failed (spawn/timeout): a wedged Docker Desktop must not read as
-/// "container gone".
+/// `Err` when the probe itself failed (spawn/timeout, or a daemon that cannot be reached): a
+/// wedged Docker Desktop must not read as "container gone". "No such container" is `Ok(None)`.
 async fn container_record(container_name: &str, command_fingerprint: &str) -> Result<Option<DockerContainerRecord>, ()> {
-    let (code, stdout) = capture_command(&["docker", "inspect", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}", container_name]).await;
-    if code == -1 {
+    let (code, stdout, stderr) = capture_command_output(&["docker", "inspect", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}", container_name]).await;
+    if !docker_inspect_answered(code, &stderr) {
         return Err(());
     }
     let parts: Vec<&str> = stdout.trim().split('\t').collect();
@@ -190,12 +232,13 @@ async fn container_record(container_name: &str, command_fingerprint: &str) -> Re
 }
 
 /// `container id -> StartedAt` for each of `container_ids` that is currently running, from one
-/// `docker inspect`. `None` when docker could not be asked at all (a missing id is simply absent).
+/// `docker inspect`. `None` when docker could not be asked at all (a missing id is simply absent
+/// from the map, which is how a stopped container is reported).
 async fn running_containers(container_ids: &[String]) -> Option<HashMap<String, String>> {
     let mut argv = vec!["docker", "inspect", "--type", "container", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}"];
     argv.extend(container_ids.iter().map(String::as_str));
-    let (code, stdout) = capture_command(&argv).await;
-    if code == -1 {
+    let (code, stdout, stderr) = capture_command_output(&argv).await;
+    if !docker_inspect_answered(code, &stderr) {
         return None;
     }
     Some(
@@ -373,10 +416,17 @@ async fn run_command(argv: &[String], cwd: &Path, env: &HashMap<String, String>,
 }
 
 async fn stop_unverified_child(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        send_signal(pid as i64, ProcessSignal::Sigterm);
-    }
+    // The child was spawned with `process_group(0)`, so its pgid is its pid. Signalling only the
+    // leader leaves grandchildren (the shell's own children) holding the port. SIGKILL after the
+    // grace matches `run_command`'s drop guard.
+    let Some(pid) = child.id() else { return };
+    let pgid = pid as i64;
+    send_signal_to_group(pgid, ProcessSignal::Sigterm);
     let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    if child.id().is_some() {
+        send_signal_to_group(pgid, ProcessSignal::Sigkill);
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    }
 }
 /// Whether an observation of a just-spawned non-exec process can be trusted as its identity's
 /// command fingerprint.
@@ -414,9 +464,9 @@ async fn observed_stable_exec_process(child: &mut tokio::process::Child, expecte
     let mut candidate: Option<PosixProcessRecord> = None;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        let observed = observed_system_process(pid).await;
+        let observed = observed_system_process_with_command(pid).await;
         let posix = match observed {
-            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(r), .. })) => Some(r),
+            Ok(Some((record, command_line))) if !is_shell_wrapper_command(&command_line) => Some(record),
             _ => None,
         };
         let Some(rec) = posix else {
@@ -433,9 +483,12 @@ async fn observed_stable_exec_process(child: &mut tokio::process::Child, expecte
             continue;
         }
         tokio::time::sleep(Duration::from_millis(EXEC_IDENTITY_SETTLE_MS)).await;
-        let settled = observed_system_process(pid).await;
-        if let Ok(Some(ObservedProcess { record: ProcessRecord::Posix(settled_rec), .. })) = settled {
-            if Some(&settled_rec) == candidate.as_ref() {
+        let settled = observed_system_process_with_command(pid).await;
+        if let Ok(Some((settled_rec, command_line))) = settled {
+            if !is_shell_wrapper_command(&command_line)
+                && settled_rec.command_fingerprint != expected_fingerprint
+                && Some(&settled_rec) == candidate.as_ref()
+            {
                 return Ok(settled_rec);
             }
         }
@@ -443,6 +496,42 @@ async fn observed_stable_exec_process(child: &mut tokio::process::Child, expecte
     }
     stop_unverified_child(child).await;
     Err(SupervisorError("Unable to establish stable POSIX exec process identity".to_string()))
+}
+
+/// Non-exec shell identity. The first `ps` row of `sh -c` already hashes to the logical command,
+/// and macOS `sh` then implicit-execs (dropping quotes) so that stored identity no longer matches
+/// the live process. Wait until the same row is still there after `EXEC_IDENTITY_SETTLE_MS`. A
+/// wrapper that never execs stays `sh -c` for the whole window and is accepted. A line that
+/// changes restarts the window on the new row.
+async fn observed_stable_shell_process(child: &mut tokio::process::Child) -> Result<PosixProcessRecord, SupervisorError> {
+    let pid = child.id().ok_or_else(|| SupervisorError("child has no pid".to_string()))? as i64;
+    let mut candidate: Option<PosixProcessRecord> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let rec = match observed_system_process(pid).await {
+            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(rec), .. })) => Some(rec),
+            _ => None,
+        };
+        let Some(rec) = rec else {
+            candidate = None;
+            continue;
+        };
+        if candidate.as_ref() != Some(&rec) {
+            candidate = Some(rec);
+            continue;
+        }
+        tokio::time::sleep(Duration::from_millis(EXEC_IDENTITY_SETTLE_MS)).await;
+        match observed_system_process(pid).await {
+            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(settled), .. })) if Some(&settled) == candidate.as_ref() => {
+                return Ok(settled);
+            }
+            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(settled), .. })) => candidate = Some(settled),
+            _ => candidate = None,
+        }
+    }
+    stop_unverified_child(child).await;
+    Err(SupervisorError("Unable to establish stable POSIX shell process identity".to_string()))
 }
 
 /// The longest prefix of `bytes` that does not end mid-way through a UTF-8 sequence, so a chunked
@@ -636,6 +725,8 @@ impl ProcessAdapter for DefaultProcessAdapter {
 
         let record = if exec {
             observed_stable_exec_process(&mut child, &input.command_fingerprint).await?
+        } else if matches!(input.command.command, CommandSpec::Shell { .. }) {
+            observed_stable_shell_process(&mut child).await?
         } else {
             // A freshly spawned child can still be mid-`execve` when `ps` is asked about it, and
             // macOS then reports a placeholder command line — literally `(sh)` — instead of the
@@ -724,7 +815,7 @@ impl ProcessAdapter for DefaultProcessAdapter {
         send_signal_to_group(pgid, signal);
     }
 
-    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry> {
+    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
         system_process_tree(leader_pid, leader_start_identity).await
     }
 
@@ -748,7 +839,11 @@ impl ProcessAdapter for DefaultProcessAdapter {
     async fn stop_container(&self, command: &ServiceCommand, on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
         let default_stop = CommandSpec::Argv { argv: vec!["docker".to_string(), "compose".to_string(), "stop".to_string()] };
         let (argv, _) = command_argv(command.docker_stop_command.as_ref().unwrap_or(&default_stop));
-        let code = run_command(&argv, &self.root, &self.base_environment, Some(on_output)).await;
+        // Compose is cwd- and env-sensitive (`COMPOSE_FILE`, `COMPOSE_PROJECT_NAME`). Stop has to
+        // use the same directory and merged environment the start used, or it targets a different project.
+        let cwd = self.root.join(&command.cwd);
+        let env = merged_environment(&self.base_environment, &command.environment);
+        let code = run_command(&argv, &cwd, &env, Some(on_output)).await;
         Some(if code != 0 { Err(SupervisorError(format!("Docker service stop exited with {code}"))) } else { Ok(()) })
     }
 
@@ -820,6 +915,9 @@ impl RunBuild for DefaultRunBuild {
         cmd.args(&argv[1..]).current_dir(&cwd).env_clear().envs(&env).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
         let mut child = cmd.spawn().map_err(|e| SupervisorError(format!("Build command failed to start: {e}")))?;
         let pid = child.id().map(|p| p as i64);
+        // If this future is dropped mid-cancel (a caller racing its own select against `run`),
+        // the group is still killed. Cleared once the child has been reaped.
+        let mut kill_on_drop = KillGroupOnDrop(pid);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_task = tokio::spawn(forward_stream(stdout, Some(on_output.clone())));
@@ -827,6 +925,7 @@ impl RunBuild for DefaultRunBuild {
 
         tokio::select! {
             status = child.wait() => {
+                kill_on_drop.0 = None;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
                 let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
@@ -835,8 +934,13 @@ impl RunBuild for DefaultRunBuild {
             _ = cancel.cancelled() => {
                 if let Some(pid) = pid { send_signal_to_group(pid, ProcessSignal::Sigterm); }
                 let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                if let Some(pid) = pid { send_signal_to_group(pid, ProcessSignal::Sigkill); }
-                let _ = child.wait().await;
+                if child.id().is_some() {
+                    if let Some(pid) = pid { send_signal_to_group(pid, ProcessSignal::Sigkill); }
+                    let _ = child.wait().await;
+                }
+                kill_on_drop.0 = None;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
                 Err(SupervisorError("Build cancelled".to_string()))
             }
         }
@@ -894,6 +998,16 @@ pub fn default_supervisor_options(root: PathBuf, runtime_directory: Option<PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_inspect_distinguishes_a_missing_container_from_a_dead_daemon() {
+        assert!(docker_inspect_answered(0, ""));
+        assert!(docker_inspect_answered(1, "Error: No such container: api"));
+        assert!(docker_inspect_answered(1, "Error: No such object: abc"));
+        assert!(!docker_inspect_answered(-1, ""));
+        assert!(!docker_inspect_answered(1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"));
+        assert!(!docker_inspect_answered(1, ""));
+    }
     use crate::catalog::{ServiceCatalog, ServiceDefinition, StartFailurePolicy};
     use crate::state::{ActualServiceState, DesiredServiceState, ServiceLifecycleState, ServiceReadiness};
     use crate::supervisor::{Host, ProcessSupervisor};
