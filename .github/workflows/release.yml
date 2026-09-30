@@ -3,8 +3,9 @@ name: Release
 # Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. The tag push
 # runs CI (ci.yml) first; this workflow starts when that CI run completes and only publishes if it
 # succeeded, so a tag whose tests or clippy fail never gets a release asset. It builds the
-# ad-hoc-signed Hearth.app and attaches a zip to the GitHub Release the app's "Check for Updates…"
-# link points at.
+# ad-hoc-signed Hearth.app, signs that zip with Sparkle's EdDSA key, and attaches it to the GitHub
+# Release. The appcast Sparkle checks is then published to GitHub Pages
+# (https://ngosangns.github.io/hearth/appcast.xml), the same shape as xmannv/xkey.
 #
 # `workflow_run` always runs this file from the default branch, and `github.ref*` there describe
 # that branch — the tag and commit come from `github.event.workflow_run` instead.
@@ -39,25 +40,74 @@ jobs:
           tools: cargo swift gh
       - name: Package Hearth.app
         run: apps/macos/scripts/build-app.sh release
-      # ditto, not zip(1): preserves the resource forks/quarantine metadata a signed .app needs when
-      # unzipped on another machine.
+      # ditto, not zip(1): preserves the symlinks and resource forks a signed .app needs.
+      # --sequesterRsrc is the form Sparkle documents for a zip enclosure.
       - name: Zip the app bundle
         working-directory: apps/macos/.build
         run: |
           set -euo pipefail
           rm -f "$APP_ZIP"
-          ditto -c -k --keepParent Hearth.app "$APP_ZIP"
+          ditto -c -k --sequesterRsrc --keepParent Hearth.app "$APP_ZIP"
           shasum -a 256 "$APP_ZIP"
+      - name: Sign the update
+        working-directory: apps/macos/.build
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]; then
+            echo "error: SPARKLE_ED_PRIVATE_KEY is not set; refusing to publish an update Sparkle cannot verify" >&2
+            exit 1
+          fi
+          tmp="$(mktemp -d)"
+          curl -fsSL -o "$tmp/Sparkle.tar.xz" \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz
+          tar -xf "$tmp/Sparkle.tar.xz" -C "$tmp"
+          # The key stays on stdin. -p prints only the signature, which is the signature.txt asset.
+          printf '%s\n' "$SPARKLE_ED_PRIVATE_KEY" | "$tmp/bin/sign_update" --ed-key-file - -p "$APP_ZIP" > signature.txt
+          rm -rf "$tmp"
       - name: Publish GitHub Release
         working-directory: apps/macos/.build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Idempotent so a re-run of a failed/partial release job still lands the asset.
+          # Idempotent so a re-run of a failed/partial release job still lands the assets.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$APP_ZIP" --clobber
+            gh release upload "$RELEASE_TAG" "$APP_ZIP" signature.txt --clobber
           else
-            gh release create "$RELEASE_TAG" "$APP_ZIP" \
+            gh release create "$RELEASE_TAG" "$APP_ZIP" signature.txt \
               --title "$RELEASE_TAG" --generate-notes --verify-tag
           fi
+      - name: Write the appcast
+        working-directory: apps/macos/.build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ngosangns/hearth
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json body,publishedAt --jq .body > notes.txt
+          published="$(gh release view "$RELEASE_TAG" --json publishedAt --jq .publishedAt)"
+          length="$(stat -f %z "$APP_ZIP")"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/generate_appcast.py" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --asset-name "$APP_ZIP" \
+            --length "$length" \
+            --signature-file signature.txt \
+            --notes-file notes.txt \
+            --published-at "$published" \
+            --output appcast.xml
+          mkdir -p appcast-deploy
+          cp appcast.xml appcast-deploy/appcast.xml
+      - name: Deploy the appcast
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: apps/macos/.build/appcast-deploy
+          publish_branch: gh-pages
+          keep_files: false
+          enable_jekyll: false
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com
+          commit_message: "Update appcast.xml from ${{ github.event.workflow_run.head_branch }}"

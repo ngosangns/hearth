@@ -75,8 +75,13 @@ Produces an ad-hoc-signed `Hearth.app` bundling compiled `hearthd` at
 
 ## Known limitations
 
-- **No distributable `.app`** — `build-app.sh` ad-hoc signs with the hardened runtime
-  (`--options runtime`) and stamps the bundle version from `hearthd --version`. Shipping to another
-  machine still needs a Developer ID cert + `notarytool submit` + stapler. Sparkle is not linked (so
-  Info.plist carries no `SUFeedURL`); **Check for Updates…** opens the GitHub Releases page
-  (`AppLinks.releases`) until a signed appcast exists. A `bun build --compile` sidecar was tried and rejected (see AGENTS.md).
+- **No notarized `.app`** — `build-app.sh` ad-hoc signs with the hardened runtime
+  (`--options runtime`) and stamps the bundle version from `hearthd --version`. First launch on
+  another machine still needs right-click > Open. Sparkle then installs later versions itself.
+- **Check for Updates…** uses Sparkle (`SUFeedURL` → `https://ngosangns.github.io/hearth/appcast.xml`).
+  Automatic checks run about a day apart, and once more a few seconds after launch. The unpackaged
+  `swift build` binary has no feed in its bundle, so the same menu item opens the GitHub releases
+  page instead. An update replaces `Hearth.app`, including the bundled `hearthd`. A daemon that is
+  already running keeps the previous binary until Restart Daemon; its services stay up.
+  The EdDSA private key is the `SPARKLE_ED_PRIVATE_KEY` Actions secret. The public key is
+  `SUPublicEDKey` in Info.plist. A `bun build --compile` sidecar was tried and rejected (see AGENTS.md).

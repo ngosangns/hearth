@@ -9,6 +9,30 @@
 # Usage: apps/macos/scripts/build-app.sh [debug|release]  (default: release)
 set -euo pipefail
 
+# Copies Sparkle.framework out of the SwiftPM artifact into the app bundle. ditto keeps the
+# framework's symlinks and its existing code signature intact.
+embed_sparkle() {
+  local app_bundle="$1"
+  local framework="" fallback="" path
+  while IFS= read -r path; do
+    case "$path" in
+      *.app/*) continue ;;
+      *macos-arm64_x86_64*) framework="$path"; break ;;
+    esac
+    fallback="$path"
+  done < <(find "$app_root/.build" -type d -name Sparkle.framework)
+  if [ -z "$framework" ]; then
+    framework="$fallback"
+  fi
+  if [ -z "$framework" ]; then
+    echo "error: Sparkle.framework not found under $app_root/.build (did swift build resolve Sparkle?)" >&2
+    exit 1
+  fi
+  echo "==> embedding Sparkle.framework from $framework"
+  mkdir -p "$app_bundle/Contents/Frameworks"
+  ditto "$framework" "$app_bundle/Contents/Frameworks/Sparkle.framework"
+}
+
 configuration="${1:-release}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 app_root="$script_dir/.."       # apps/macos
@@ -50,6 +74,14 @@ else
   echo "warning: $app_root/AppIcon.icns not found — run scripts/generate-icon.sh first" >&2
 fi
 cp "$hearthd_binary" "$app_bundle/Contents/Resources/hearthd/bin/hearthd"
+embed_sparkle "$app_bundle"
+
+# The SwiftPM binary's rpath points at the .build directory. The packaged app loads Sparkle from
+# Contents/Frameworks instead. install_name_tool must run before codesign.
+app_executable="$app_bundle/Contents/MacOS/HearthApp"
+if ! otool -l "$app_executable" | grep -q '@executable_path/../Frameworks'; then
+  install_name_tool -add_rpath @executable_path/../Frameworks "$app_executable"
+fi
 
 version="$("$hearthd_binary" --version | awk '{print $NF}')"
 if [ -n "$version" ]; then
@@ -60,14 +92,18 @@ fi
 
 entitlements="$app_root/HearthApp.entitlements"
 echo "==> ad-hoc codesign with hardened runtime (local use only — see this script's header comment)"
+# Sign hearthd, then the app. Omit --deep so codesign seals nested Sparkle code in one pass
+# instead of rewriting it twice. The framework ends up ad-hoc, same as the app;
+# disable-library-validation is what lets the hardened runtime load it.
 codesign --force --sign - --options runtime "$app_bundle/Contents/Resources/hearthd/bin/hearthd"
 if [ -f "$entitlements" ]; then
-  codesign --force --deep --sign - --options runtime --entitlements "$entitlements" "$app_bundle"
+  codesign --force --sign - --options runtime --entitlements "$entitlements" "$app_bundle"
 else
-  codesign --force --deep --sign - --options runtime "$app_bundle"
+  codesign --force --sign - --options runtime "$app_bundle"
 fi
+codesign --verify --deep --strict "$app_bundle"
 
 echo "==> done: $app_bundle"
 echo "    First launch via Finder needs a right-click > Open (ad-hoc signed, not notarized)."
-echo "    Bundles a compiled \`hearthd\` sidecar."
+echo "    Bundles a compiled \`hearthd\` sidecar and Sparkle.framework."
 echo "    Notarization still needs a Developer ID certificate — see apps/macos/README.md."

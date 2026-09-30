@@ -84,9 +84,12 @@ struct WorkspaceDetailView: View {
                     Label("Reveal in Finder", systemImage: "folder")
                 }
                 Button {
-                    NSWorkspace.shared.open(AppLinks.releases)
+                    UpdateController.shared.checkForUpdates()
                 } label: {
                     Label("Check for Updates…", systemImage: "arrow.down.circle")
+                }
+                if UpdateController.shared.isRunning {
+                    Toggle("Check for Updates Automatically", isOn: UpdateController.shared.automaticChecksBinding)
                 }
                 Divider()
                 // `stopDaemon` takes the daemon AND all its services down — destructive

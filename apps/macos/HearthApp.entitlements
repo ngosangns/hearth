@@ -4,5 +4,9 @@
 <dict>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- Sparkle.framework keeps its own Developer ID signature. Hardened runtime
+	     would refuse to load it into this ad-hoc app. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
 </dict>
 </plist>

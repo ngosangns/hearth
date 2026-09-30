@@ -98,7 +98,10 @@ struct MenuBarContentView: View {
             Button("Shared Services…") { openWindow(id: SharedWindow.id) }
             Divider()
             Button("Open Hearth") { openWindow(id: MainWindow.id) }
-            Button("Check for Updates…") { NSWorkspace.shared.open(AppLinks.releases) }
+            Button("Check for Updates…") { UpdateController.shared.checkForUpdates() }
+            if UpdateController.shared.isRunning {
+                Toggle("Check for Updates Automatically", isOn: UpdateController.shared.automaticChecksBinding)
+            }
             Button("Quit") { NSApp.terminate(nil) }
         }
     }

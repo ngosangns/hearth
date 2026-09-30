@@ -44,10 +44,13 @@ the fswatch rebuild loop).
 There is no npm publish. The binary is installed by hand or bundled into the macOS app.
 Pushing a `v*.*.*` tag runs CI, and a successful tag CI run triggers `.github/workflows/release.yml`
 (`workflow_run`, so a red tag never publishes; tag/sha come from `github.event.workflow_run`, not
-`github.ref`) on the self-hosted runner: `build-app.sh release` → `ditto` zip →
+`github.ref`) on the self-hosted runner: `build-app.sh release` → `ditto` zip → Sparkle
+`sign_update` (secret `SPARKLE_ED_PRIVATE_KEY`; the public half is `SUPublicEDKey`) →
 `gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
-release). The zip is served from the repo's GitHub Releases page (`AppLinks.releases` in the app);
-the app is still ad-hoc signed, so first launch elsewhere needs right-click > Open.
+release, including `signature.txt`) → `appcast.xml` on `gh-pages`
+(`https://ngosangns.github.io/hearth/appcast.xml`). The app is still ad-hoc signed, so first launch
+elsewhere needs right-click > Open. Sparkle replaces later builds in place. A daemon already
+running keeps its old `hearthd` until Restart Daemon.
 `apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`)
 and runs `swift build` only — its tests need XCTest, which the self-hosted runner lacks.
 

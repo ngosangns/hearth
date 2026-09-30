@@ -2,19 +2,24 @@ import XCTest
 @testable import HearthApp
 
 final class AppLinksTests: XCTestCase {
-    func testReleasesPageIsDerivedFromAGitHubFeed() {
-        XCTAssertEqual(
-            AppLinks.releasesPage(forFeed: URL(string: "https://github.com/ngosangns/hearth/releases.atom")!),
-            URL(string: "https://github.com/ngosangns/hearth/releases")
-        )
+    func testTheReleasesPageAndTheAppcastAreTheShippedURLs() {
+        XCTAssertEqual(AppLinks.releases.absoluteString, "https://github.com/ngosangns/hearth/releases")
+        XCTAssertEqual(AppLinks.appcast.absoluteString, "https://ngosangns.github.io/hearth/appcast.xml")
     }
 
-    func testANonGitHubFeedHasNoReleasesPage() {
-        XCTAssertNil(AppLinks.releasesPage(forFeed: URL(string: "https://example.com/appcast.xml")!))
-    }
-
-    /// No `SUFeedURL` in the bundle (Sparkle is not linked) — the fallback is this repo's page.
-    func testTheFallbackIsThisRepositorysReleases() {
-        XCTAssertEqual(AppLinks.fallbackReleases.absoluteString, "https://github.com/ngosangns/hearth/releases")
+    /// Sparkle reads `SUFeedURL` and `SUPublicEDKey` from the packaged Info.plist. Those strings
+    /// have to be the same ones the appcast publisher and the menus use.
+    func testInfoPlistMatchesTheSparkleConstants() throws {
+        let plist = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Info.plist")
+        let data = try Data(contentsOf: plist)
+        let dict = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        XCTAssertEqual(dict["SUFeedURL"] as? String, AppLinks.appcast.absoluteString)
+        XCTAssertEqual(dict["SUPublicEDKey"] as? String, AppLinks.publicEDKey)
+        XCTAssertEqual(dict["SUEnableAutomaticChecks"] as? Bool, true)
+        XCTAssertEqual(dict["SUScheduledCheckInterval"] as? Int, 86400)
     }
 }

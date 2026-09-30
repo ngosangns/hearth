@@ -15,26 +15,14 @@ enum SharedWindow {
     static let id = "shared"
 }
 
-/// Where "Check for Updates…" goes. Derived from a GitHub `SUFeedURL` (`…/owner/repo/releases.atom`)
-/// if the bundle ever declares one again (Sparkle is not linked today, so Info.plist carries none),
-/// else this repo's releases page — one constant, so the toolbar and menu bar cannot disagree.
+/// Links the updater and the menus share. `appcast` is Sparkle's `SUFeedURL` (also in Info.plist).
+/// `releases` is the human page Sparkle opens for version history, and the fallback when this
+/// process is the unpackaged `swift build` binary and Sparkle is not running.
 enum AppLinks {
-    static let fallbackReleases = URL(string: "https://github.com/ngosangns/hearth/releases")!
-
-    static let releases: URL = {
-        guard let feed = (Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String).flatMap(URL.init(string:)) else {
-            return fallbackReleases
-        }
-        return releasesPage(forFeed: feed) ?? fallbackReleases
-    }()
-
-    /// `https://github.com/<owner>/<repo>/…` → `https://github.com/<owner>/<repo>/releases`; `nil`
-    /// for anything that is not a GitHub repo URL.
-    static func releasesPage(forFeed feed: URL) -> URL? {
-        let parts = feed.pathComponents.filter { $0 != "/" }
-        guard feed.host == "github.com", parts.count >= 2 else { return nil }
-        return URL(string: "https://github.com/\(parts[0])/\(parts[1])/releases")
-    }
+    static let releases = URL(string: "https://github.com/ngosangns/hearth/releases")!
+    static let appcast = URL(string: "https://ngosangns.github.io/hearth/appcast.xml")!
+    /// EdDSA public key. The private key is the `SPARKLE_ED_PRIVATE_KEY` Actions secret, never a file in the repo.
+    static let publicEDKey = "EtGf+EeGit+bpDNQlXB82OewI0gYrvKW6iY0O8QqJaM="
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -56,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showMainWindow), name: Self.showWindowNotification, object: nil)
+        UpdateController.shared.start()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
