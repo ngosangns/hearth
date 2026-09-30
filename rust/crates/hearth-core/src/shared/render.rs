@@ -127,6 +127,7 @@ pub fn render_readiness(
             command: render_command_checked(command, vars, "readiness.command")?,
             cwd: cwd.clone(),
         },
+        ReadinessSpec::Exit => ReadinessSpec::Exit,
     })
 }
 
@@ -197,6 +198,12 @@ mod tests {
             },
             attachments: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn render_readiness_keeps_exit() {
+        let rendered = render_readiness(&ReadinessSpec::Exit, &HashMap::new()).unwrap();
+        assert!(matches!(rendered, ReadinessSpec::Exit));
     }
 
     #[test]

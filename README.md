@@ -53,6 +53,20 @@ per-group start/stop.
 start/stop/restart is rejected (`service_disabled`) and group targets expand past it. It does not
 stop a service already running — stop it before disabling, or leave it be.
 
+A command that runs and then exits — a one-shot build, not a server — uses
+`readiness: { kind: exit }`. The row stays `running` until the process exits. Exit 0 becomes
+`succeeded` and is not run again until you start it; any other exit is `failed`. Leave
+`readinessTimeoutMs` unset when the command may take longer than a probe: there is no default
+deadline.
+
+```yaml
+services:
+  fe:
+    cwd: viclass
+    run: { argv: [task, fe] }
+    readiness: { kind: exit }
+```
+
 A service may declare a versioned tarball to install before its first start — same download/script
 → sha256 → extract → marker machinery the shared-services catalog uses, scoped to the project's
 runtime directory instead of `~/.hearth/shared`:

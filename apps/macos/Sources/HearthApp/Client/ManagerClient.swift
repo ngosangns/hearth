@@ -33,7 +33,7 @@ final class ManagerClient: ManagerAPI, SharedAPI {
     /// `protocolVersion` a `hearthd ... ensure --json` reports before any request is made — see
     /// `DaemonConnection.decodeConnection`. Echoing the daemon's own value back would make the
     /// header check pass against a daemon this client cannot actually decode.
-    static let supportedProtocolVersion = 1
+    static let supportedProtocolVersion = 2
 
     private let connection: ManagerConnection
     private let session: URLSession

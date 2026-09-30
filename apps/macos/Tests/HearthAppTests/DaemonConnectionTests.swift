@@ -53,7 +53,7 @@ final class DaemonConnectionTests: XCTestCase {
     }
 
     func testDecodeConnectionAcceptsTheSupportedProtocol() throws {
-        let json = #"{"instanceId":"i","port":62066,"token":"t","protocolVersion":1,"runtimeDirectory":"/r","root":"/x"}"#
+        let json = #"{"instanceId":"i","port":62066,"token":"t","protocolVersion":2,"runtimeDirectory":"/r","root":"/x"}"#
         let connection = try DaemonConnection.decodeConnection(json)
         XCTAssertEqual(connection.port, 62066)
     }
@@ -61,9 +61,9 @@ final class DaemonConnectionTests: XCTestCase {
     /// A `PROTOCOL_VERSION` bump is breaking — refuse before any request, with a message that says
     /// what to do, rather than as scattered decode errors later.
     func testDecodeConnectionRejectsAnotherProtocolVersion() {
-        let json = #"{"instanceId":"i","port":62066,"token":"t","protocolVersion":2,"runtimeDirectory":"/r","root":"/x"}"#
+        let json = #"{"instanceId":"i","port":62066,"token":"t","protocolVersion":3,"runtimeDirectory":"/r","root":"/x"}"#
         XCTAssertThrowsError(try DaemonConnection.decodeConnection(json)) { error in
-            guard case DaemonConnectionError.incompatibleProtocol(daemon: 2, app: ManagerClient.supportedProtocolVersion) = error else {
+            guard case DaemonConnectionError.incompatibleProtocol(daemon: 3, app: ManagerClient.supportedProtocolVersion) = error else {
                 return XCTFail("expected incompatibleProtocol, got \(error)")
             }
             XCTAssertTrue(error.localizedDescription.contains("Restart Daemon"))

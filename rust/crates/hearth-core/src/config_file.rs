@@ -98,7 +98,7 @@ pub fn load_catalog_from_file(path: &Path, root: &Path) -> Result<LoadedCatalog,
 // Declarative shape -> ServiceCatalog
 // -------------------------------------------------------------------------------------------
 
-const READINESS_KINDS: [&str; 6] = ["process", "tcp", "http", "container", "tailnet", "command"];
+const READINESS_KINDS: [&str; 7] = ["process", "tcp", "http", "container", "tailnet", "command", "exit"];
 const SERVICE_KINDS: [&str; 2] = ["application", "infrastructure"];
 const OWNERSHIPS: [&str; 2] = ["daemon", "external"];
 
@@ -267,6 +267,7 @@ fn read_readiness(value: &Value, path: &str, errors: &mut Vec<String>) -> Option
                 }
             }
         }
+        "exit" => Some(ReadinessSpec::Exit),
         _ => {
             // kind === "command"
             let default_command = Value::Null;
@@ -527,7 +528,7 @@ fn render_service_artifact(root: &Path, runtime_directory: &Path, def: &mut crat
                 ReadinessSpec::Command { command, .. } => {
                     *command = render_artifact_command(command, &vars, &format!("{path}.readiness.command"), errors);
                 }
-                ReadinessSpec::Process | ReadinessSpec::Tcp { .. } | ReadinessSpec::Container | ReadinessSpec::Tailnet => {}
+                ReadinessSpec::Process | ReadinessSpec::Tcp { .. } | ReadinessSpec::Container | ReadinessSpec::Tailnet | ReadinessSpec::Exit => {}
             }
             if let Some(prep) = preparation_command {
                 prep.command = render_artifact_command(&prep.command, &vars, &format!("{path}.preparationCommand"), errors);
@@ -1126,6 +1127,22 @@ services:
             ServiceRunProfile::Verified { readiness_timeout_ms, .. } => assert_eq!(*readiness_timeout_ms, Some(30_000)),
             _ => panic!("expected verified"),
         }
+    }
+
+    #[test]
+    fn exit_readiness_loads_and_external_ownership_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, "hearth.yaml", "version: 1\nservices:\n  fe:\n    cwd: viclass\n    run: { argv: [task, fe] }\n    readiness: { kind: exit }\n");
+        let loaded = load_catalog(dir.path()).expect("exit readiness should load");
+        assert!(matches!(loaded.catalog.services[0].profiles.run.readiness(), ReadinessSpec::Exit));
+
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  fe:\n    ownership: external\n    run: { argv: [task, fe] }\n    readiness: { kind: exit }\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(err.errors.iter().any(|error| error.contains("daemon-owned")), "{:?}", err.errors);
     }
 
     #[test]

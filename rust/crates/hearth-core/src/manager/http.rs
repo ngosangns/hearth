@@ -1256,7 +1256,7 @@ mod tests {
 
     async fn wait_for_operation(client: &reqwest::Client, base: &str, token: &str, id: &str) -> Value {
         for _ in 0..100 {
-            let resp: Value = client.get(format!("{base}/v1/operations/{id}")).bearer_auth(token).header("x-hearth-protocol", "1").send().await.unwrap().json().await.unwrap();
+            let resp: Value = client.get(format!("{base}/v1/operations/{id}")).bearer_auth(token).header("x-hearth-protocol", PROTOCOL_VERSION.to_string()).send().await.unwrap().json().await.unwrap();
             let status = resp["operation"]["status"].as_str().unwrap_or("");
             if status == "succeeded" || status == "failed" {
                 return resp;
@@ -1314,11 +1314,11 @@ mod tests {
             let client = client.clone();
             let base = base.clone();
             let token = token.clone();
-            async move { client.get(format!("{base}{path}")).bearer_auth(&token).header("x-hearth-protocol", "1").send().await.unwrap() }
+            async move { client.get(format!("{base}{path}")).bearer_auth(&token).header("x-hearth-protocol", PROTOCOL_VERSION.to_string()).send().await.unwrap() }
         };
 
         let manager_info: Value = get("/v1/manager".to_string()).await.json().await.unwrap();
-        assert_eq!(manager_info["protocolVersion"], 1);
+        assert_eq!(manager_info["protocolVersion"].as_u64(), Some(u64::from(PROTOCOL_VERSION)));
         assert_eq!(manager_info["instanceId"], json!(manager.instance_id));
 
         let catalog_resp: Value = get("/v1/catalog".to_string()).await.json().await.unwrap();
@@ -1331,7 +1331,7 @@ mod tests {
         let start_response: Value = client
             .post(format!("{base}/v1/operations"))
             .bearer_auth(&token)
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
             .json(&json!({"requestId": "req-start-1", "serviceId": "api", "action": "start"}))
             .send()
             .await
@@ -1375,7 +1375,7 @@ mod tests {
         let duplicate: Value = client
             .post(format!("{base}/v1/operations"))
             .bearer_auth(&token)
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
             .json(&json!({"requestId": "req-start-1", "serviceId": "api", "action": "start"}))
             .send()
             .await
@@ -1389,7 +1389,7 @@ mod tests {
         let stop_response: Value = client
             .post(format!("{base}/v1/operations"))
             .bearer_auth(&token)
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
             .json(&json!({"requestId": "req-stop-1", "serviceId": "api", "action": "stop"}))
             .send()
             .await
@@ -1407,7 +1407,7 @@ mod tests {
         let shutdown_response = client
             .post(format!("{base}/v1/manager/shutdown"))
             .bearer_auth(&token)
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
             .json(&json!({"requestId": "req-shutdown-1", "mode": "stop-services"}))
             .send()
             .await
@@ -1460,7 +1460,7 @@ mod tests {
                 client
                     .post(format!("{base}/v1/manager/shutdown"))
                     .bearer_auth(&token)
-                    .header("x-hearth-protocol", "1")
+                    .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
                     .json(&json!({ "requestId": format!("req-shutdown-{mode}"), "mode": mode }))
                     .send()
                     .await
@@ -1496,7 +1496,7 @@ mod tests {
         let catalog = ServiceCatalog { services: vec![], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         let client = reqwest::Client::new();
-        let response = client.get(format!("{}/v1/does-not-exist", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", "1").send().await.unwrap();
+        let response = client.get(format!("{}/v1/does-not-exist", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", PROTOCOL_VERSION.to_string()).send().await.unwrap();
         assert_eq!(response.status(), 404);
         manager.close().await;
     }
@@ -1552,7 +1552,7 @@ mod tests {
         let catalog = ServiceCatalog { services: vec![tcp_service("api", free_port())], groups: HashMap::new(), group_tree: Vec::new(), compose_file: None, runtime_directory: None, start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted, private_file_guard: Some(false) };
         let manager = bootstrap(HearthManagerOptions { runtime_directory: Some(dir.path().to_path_buf()), root: Some(PathBuf::from("/tmp")), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }).await.unwrap();
         let client = reqwest::Client::new();
-        let post = |body: Value| client.post(format!("{}/v1/manager/reload", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", "1").json(&body).send();
+        let post = |body: Value| client.post(format!("{}/v1/manager/reload", manager.base_url())).bearer_auth(manager.bearer_token()).header("x-hearth-protocol", PROTOCOL_VERSION.to_string()).json(&body).send();
 
         // `startFailurePolicy` is optional.
         let next = json!({ "services": [], "groups": {} });
@@ -1621,7 +1621,7 @@ mod tests {
         let accepted: Value = client
             .post(format!("{base}/v1/operations"))
             .bearer_auth(&token)
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
             .json(&json!({ "requestId": "req-stale-intent", "serviceId": "db", "action": "start" }))
             .send()
             .await
@@ -1659,7 +1659,7 @@ mod tests {
         let post = |path: String, body: Value| {
             let (base, token, client) = (base.clone(), token.clone(), client.clone());
             async move {
-                client.post(format!("{base}{path}")).bearer_auth(&token).header("x-hearth-protocol", "1").json(&body).send().await.unwrap()
+                client.post(format!("{base}{path}")).bearer_auth(&token).header("x-hearth-protocol", PROTOCOL_VERSION.to_string()).json(&body).send().await.unwrap()
             }
         };
 
@@ -1698,7 +1698,7 @@ mod tests {
         let body: Value = reqwest::Client::new()
             .get(format!("{}/v1/urls", manager.base_url()))
             .bearer_auth(manager.bearer_token())
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
             .send()
             .await
             .unwrap()

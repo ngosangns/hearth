@@ -235,7 +235,13 @@ final class WorkspaceController: ObservableObject {
         catalogServices[serviceId]?.displayName ?? serviceId
     }
 
-    var counts: ServiceCounts { ServiceCounts(services) }
+    var counts: ServiceCounts {
+        var counts = ServiceCounts()
+        for service in services {
+            counts.add(service, finite: isFinite(service.serviceId))
+        }
+        return counts
+    }
 
     /// What `EventWatchLoop` calls per (coalesced) batch of stream events. The catalog and URLs
     /// only move on a catalog reload — or on a resync, which may have skipped one.
@@ -318,6 +324,12 @@ final class WorkspaceController: ObservableObject {
     /// lifecycle action (start/stop/restart are rejected daemon-side too).
     func isDisabled(_ serviceId: String) -> Bool {
         catalogServices[serviceId]?.isDisabled ?? false
+    }
+
+    /// `readiness: { kind: exit }` in the catalog. Lifecycle state has no `readinessKind` until
+    /// the first start, so the Run button and the ready/total skip have to come from here.
+    func isFinite(_ serviceId: String) -> Bool {
+        catalogServices[serviceId]?.isFinite ?? false
     }
 
     /// No bulk-stop endpoint on the daemon (see `ManagerClient.bulkStart`) — stops every currently

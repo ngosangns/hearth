@@ -2,7 +2,7 @@
 //! OS only through the `ProcessAdapter`/`ProbeAdapter`/`PreparationAdapter`/`Host` traits, so it
 //! runs against fakes in its unit tests; `default_adapters.rs` is the production implementation.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +68,7 @@ fn readiness_kind_of(readiness: &ReadinessSpec) -> ReadinessKind {
         ReadinessSpec::Container => ReadinessKind::Container,
         ReadinessSpec::Tailnet => ReadinessKind::Tailnet,
         ReadinessSpec::Command { .. } => ReadinessKind::Command,
+        ReadinessSpec::Exit => ReadinessKind::Exit,
     }
 }
 
@@ -108,6 +109,9 @@ struct Active {
     /// per-service lock — which an in-flight start holds through readiness — so the readiness loop
     /// reads this instead of spawning `ps`/`docker inspect` on every iteration to notice an exit.
     exited: Arc<AtomicBool>,
+    /// Written by the watcher *before* `exited` flips. The readiness wait holds the per-service
+    /// queue, so it can read the code here; `on_exit` only runs once that wait releases the queue.
+    exit_code: Arc<AtomicI32>,
 }
 
 /// Tri-state patch for an optional field: keep the previous value, clear it, or set a new one.
@@ -342,7 +346,7 @@ impl ProcessSupervisor {
                     return Ok(());
                 }
                 let profile = profile_for(&sup.host.catalog(), &id)?;
-                if matches!(profile.readiness, ReadinessSpec::Process) {
+                if matches!(profile.readiness, ReadinessSpec::Process | ReadinessSpec::Exit) {
                     return Ok(());
                 }
                 if !sup.probe(&profile.readiness, &id).await {
@@ -825,6 +829,13 @@ impl ProcessSupervisor {
         if state.actual_state == ActualServiceState::Stopped {
             return Ok(());
         }
+        // A finished `readiness: exit` command has nothing to signal. Stop succeeds and leaves
+        // `succeeded` / `failed` as they are, so a group stop does not fail on a build that
+        // already finished and does not wipe its exit code. In-flight and orphaned rows still
+        // fall through — an orphaned process may still be alive.
+        if self.exit_command_is_idle(service_id, &state) {
+            return Ok(());
+        }
         let has_active = self.active.lock().unwrap().contains_key(service_id);
         if state.identity.is_none() {
             // Only a start still in flight has nothing to stop yet. This used to also cover every
@@ -1067,9 +1078,10 @@ impl ProcessSupervisor {
             return Ok(());
         }
         let exited_flag = Arc::new(AtomicBool::new(false));
+        let exit_code = Arc::new(AtomicI32::new(0));
         self.active.lock().unwrap().insert(
             service_id.clone(),
-            Active { command: profile.command.clone(), identity: identity.clone(), stopped: false, exited: exited_flag.clone() },
+            Active { command: profile.command.clone(), identity: identity.clone(), stopped: false, exited: exited_flag.clone(), exit_code: exit_code.clone() },
         );
         self.attach_output(service_id, output_source(&identity, false));
         let sup = self.clone();
@@ -1077,6 +1089,7 @@ impl ProcessSupervisor {
         let exited = app.exited;
         tokio::spawn(async move {
             let code = exited.await.unwrap_or(-1);
+            exit_code.store(code, Ordering::SeqCst);
             exited_flag.store(true, Ordering::SeqCst);
             sup.on_exit(&sid, generation, token, code).await;
         });
@@ -1111,7 +1124,14 @@ impl ProcessSupervisor {
         match outcome {
             ReadinessOutcome::Ready | ReadinessOutcome::Superseded => Ok(()),
             ReadinessOutcome::Exited { message } => {
-                self.fail(service_id, generation, token, identity, &message, operation_id, None).await;
+                // `await_exit` already recorded `failed` for a command whose exit it observed.
+                // `fail` again would terminate a process that is already gone and drop the code.
+                let already_settled = self.state(service_id).is_some_and(|s| {
+                    matches!(s.actual_state, ActualServiceState::Failed | ActualServiceState::Succeeded | ActualServiceState::Stopped)
+                });
+                if !already_settled {
+                    self.fail(service_id, generation, token, identity, &message, operation_id, None).await;
+                }
                 Err(SupervisorError(message))
             }
             ReadinessOutcome::Timeout { message, detail } => {
@@ -1132,6 +1152,9 @@ impl ProcessSupervisor {
         token: u64,
         adopted: bool,
     ) -> ReadinessOutcome {
+        if matches!(profile.readiness, ReadinessSpec::Exit) {
+            return self.await_exit(service_id, profile, generation, identity, token, adopted).await;
+        }
         if matches!(profile.readiness, ReadinessSpec::Process) {
             if !self.valid(service_id, generation, token) {
                 return ReadinessOutcome::Superseded;
@@ -1205,6 +1228,147 @@ impl ProcessSupervisor {
         }
     }
 
+    /// Wait until a `readiness: exit` command's process exits. Exit 0 is `succeeded` with desired
+    /// `stopped` (reconcile must not run it again). Any other code is `failed`, also with desired
+    /// `stopped`. `readiness_timeout_ms` is the only deadline — the supervisor's default timeout
+    /// is for probes, and a build can run for minutes.
+    ///
+    /// An adopted process (daemon restarted while the command was still running) has no watcher,
+    /// so its exit code is unknown: when it disappears the result is `failed`, never `succeeded`.
+    async fn await_exit(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+        generation: u64,
+        identity: Option<ProcessIdentity>,
+        token: u64,
+        adopted: bool,
+    ) -> ReadinessOutcome {
+        if !self.valid(service_id, generation, token) {
+            return ReadinessOutcome::Superseded;
+        }
+        self.transition_if_current(
+            service_id,
+            generation,
+            token,
+            ActualServiceState::RunningUnready,
+            ServiceReadiness::NotReady,
+            Changes {
+                identity: identity.clone().map(Patch::Set).unwrap_or(Patch::Keep),
+                readiness_kind: Patch::Set(ReadinessKind::Exit),
+                readiness_detail: Patch::Set("waiting for the command to exit".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let deadline = profile.readiness_timeout_ms.map(|ms| self.options.clock.now_millis() + ms as i64);
+        loop {
+            if !self.valid(service_id, generation, token) {
+                return ReadinessOutcome::Superseded;
+            }
+            if !adopted {
+                if let Some(code) = self.observed_exit_code(service_id, generation) {
+                    return self.finish_exit(service_id, generation, token, code).await;
+                }
+            } else if let Some(identity) = &identity {
+                if self.owns_identity(identity).await == Some(false) {
+                    let message = "Command exited while the daemon was down; exit code unknown".to_string();
+                    self.transition_if_current(
+                        service_id,
+                        generation,
+                        token,
+                        ActualServiceState::Failed,
+                        ServiceReadiness::Failed,
+                        Changes {
+                            desired_state: Some(DesiredServiceState::Stopped),
+                            error: Patch::Set(message.clone()),
+                            identity: Patch::Clear,
+                            exited_at: Patch::Set(self.options.clock.now()),
+                            readiness_kind: Patch::Set(ReadinessKind::Exit),
+                            readiness_detail: Patch::Set(message.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    return ReadinessOutcome::Exited { message };
+                }
+            }
+            if let Some(deadline) = deadline {
+                if self.options.clock.now_millis() > deadline {
+                    let timeout = profile.readiness_timeout_ms.unwrap_or(0);
+                    return ReadinessOutcome::Timeout {
+                        message: "Readiness timed out".to_string(),
+                        detail: format!("Command did not exit within {timeout}ms"),
+                    };
+                }
+            }
+            self.options.clock.sleep(self.options.readiness_backoff_ms).await;
+        }
+    }
+
+    fn observed_exit_code(&self, service_id: &ServiceId, generation: u64) -> Option<i32> {
+        let active = self.active.lock().unwrap();
+        let active = active.get(service_id)?;
+        if active.identity.generation() != generation || !active.exited.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(active.exit_code.load(Ordering::SeqCst))
+    }
+
+    async fn finish_exit(self: &Arc<Self>, service_id: &ServiceId, generation: u64, token: u64, code: i32) -> ReadinessOutcome {
+        if !self.valid(service_id, generation, token) {
+            return ReadinessOutcome::Superseded;
+        }
+        let (actual, readiness, message) = if code == 0 {
+            (ActualServiceState::Succeeded, ServiceReadiness::Ready, "exited 0".to_string())
+        } else {
+            (ActualServiceState::Failed, ServiceReadiness::Failed, format!("Process exited with code {code}"))
+        };
+        self.transition_if_current(
+            service_id,
+            generation,
+            token,
+            actual,
+            readiness,
+            Changes {
+                desired_state: Some(DesiredServiceState::Stopped),
+                exit_code: Patch::Set(code),
+                exited_at: Patch::Set(self.options.clock.now()),
+                error: if code == 0 { Patch::Clear } else { Patch::Set(message.clone()) },
+                identity: Patch::Clear,
+                readiness_kind: Patch::Set(ReadinessKind::Exit),
+                readiness_detail: Patch::Set(message.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        if self.state(service_id).map(|s| s.actual_state) != Some(actual) {
+            return ReadinessOutcome::Superseded;
+        }
+        // Drop the active entry before releasing the queue so `on_exit` does not overwrite this
+        // settlement with `failed`.
+        {
+            let mut active = self.active.lock().unwrap();
+            if active.get(service_id).is_some_and(|entry| entry.identity.generation() == generation) {
+                active.remove(service_id);
+            }
+        }
+        self.detach_output(service_id);
+        if code == 0 {
+            ReadinessOutcome::Ready
+        } else {
+            ReadinessOutcome::Exited { message }
+        }
+    }
+
+    /// `true` when a `readiness: exit` command has already settled, so stop has no process to
+    /// signal and must not report a failure or clear the recorded exit code.
+    fn exit_command_is_idle(&self, service_id: &ServiceId, state: &ServiceLifecycleState) -> bool {
+        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else { return false };
+        matches!(profile.readiness, ReadinessSpec::Exit)
+            && matches!(state.actual_state, ActualServiceState::Succeeded | ActualServiceState::Failed)
+    }
+
     #[allow(clippy::too_many_arguments)] // the full per-start context; bundling it would only move the list
     async fn fail(
         self: &Arc<Self>,
@@ -1219,6 +1383,7 @@ impl ProcessSupervisor {
         if !self.valid(service_id, generation, token) {
             return;
         }
+        let exit_command = profile_for(&self.host.catalog(), service_id).ok().is_some_and(|profile| matches!(profile.readiness, ReadinessSpec::Exit));
         self.transition_if_current(
             service_id,
             generation,
@@ -1226,6 +1391,7 @@ impl ProcessSupervisor {
             ActualServiceState::Failed,
             ServiceReadiness::Failed,
             Changes {
+                desired_state: if exit_command { Some(DesiredServiceState::Stopped) } else { None },
                 identity: identity.clone().map(Patch::Set).unwrap_or(Patch::Keep),
                 error: Patch::Set(error.to_string()),
                 current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
@@ -1253,6 +1419,11 @@ impl ProcessSupervisor {
                 let Some(state) = sup.state(&sid) else { return };
                 let active_matches = { sup.active.lock().unwrap().get(&sid).map(|a| !a.stopped).unwrap_or(false) };
                 if state.generation != generation || !active_matches {
+                    return;
+                }
+                // `finish_exit` already settled a `readiness: exit` command. A late `on_exit`
+                // must not replace `succeeded` with `failed`.
+                if matches!(state.actual_state, ActualServiceState::Succeeded | ActualServiceState::Stopped | ActualServiceState::Stopping) {
                     return;
                 }
                 sup.transition_if_current(
@@ -1495,7 +1666,7 @@ impl ProcessSupervisor {
                     None => false,
                 }
             }
-            ReadinessSpec::Process => false,
+            ReadinessSpec::Process | ReadinessSpec::Exit => false,
         }
     }
 
@@ -1854,6 +2025,12 @@ mod tests {
         }
         fn is_alive(&self, pid: i64) -> bool {
             self.state.lock().unwrap().alive.contains_key(&pid)
+        }
+        fn insert_alive(&self, pid: i64, fingerprint: &str, start_identity: &str) {
+            self.state.lock().unwrap().alive.insert(
+                pid,
+                PosixProcessRecord { pid, pgid: pid, start_identity: start_identity.to_string(), command_fingerprint: fingerprint.to_string() },
+            );
         }
         fn mutate_fingerprint(&self, pid: i64, new_fingerprint: &str) {
             if let Some(record) = self.state.lock().unwrap().alive.get_mut(&pid) {
@@ -3249,5 +3426,155 @@ mod tests {
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
         assert_eq!(state.error.as_deref(), Some("Managed process is no longer alive"));
+    }
+
+    fn with_exit_timeout(mut service: ServiceDefinition, timeout_ms: u64) -> ServiceDefinition {
+        if let ServiceRunProfile::Verified { readiness_timeout_ms, .. } = &mut service.profiles.run {
+            *readiness_timeout_ms = Some(timeout_ms);
+        }
+        service
+    }
+
+    async fn wait_for_posix_pid(host: &FakeHost, service_id: &str) -> i64 {
+        loop {
+            if let Some(ProcessIdentity::Posix(posix)) = host.state_of(service_id).and_then(|state| state.identity) {
+                return posix.pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exit_command_that_returns_zero_is_succeeded_and_not_restarted() {
+        let h = build_harness_with_timeout(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)), 30);
+        let supervisor = h.supervisor.clone();
+        let host = h.host.clone();
+        let process = h.process.clone();
+        let clock = h.clock.clone();
+        let started = clock.now_millis();
+        let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
+        let pid = wait_for_posix_pid(&host, "fe").await;
+        while clock.now_millis() < started + 40 {
+            tokio::task::yield_now().await;
+        }
+        process.kill_externally(pid, 0);
+        run.await.unwrap().unwrap();
+
+        let state = host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Succeeded);
+        assert_eq!(state.desired_state, DesiredServiceState::Stopped);
+        assert_eq!(state.exit_code, Some(0));
+        assert!(state.identity.is_none());
+        assert!(state.error.is_none());
+
+        h.supervisor.reconcile().await;
+        let after = h.host.state_of("fe").unwrap();
+        assert_eq!(after.actual_state, ActualServiceState::Succeeded);
+        assert!(!h.process.is_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn an_exit_command_that_returns_nonzero_is_failed() {
+        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let supervisor = h.supervisor.clone();
+        let host = h.host.clone();
+        let process = h.process.clone();
+        let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
+        let pid = wait_for_posix_pid(&host, "fe").await;
+        process.kill_externally(pid, 1);
+        let error = run.await.unwrap().unwrap_err();
+        assert!(error.0.contains("code 1"), "{error:?}");
+        let state = host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Failed);
+        assert_eq!(state.desired_state, DesiredServiceState::Stopped);
+        assert_eq!(state.exit_code, Some(1));
+        assert!(state.identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn stopping_an_exit_command_mid_run_records_stopped() {
+        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let supervisor = h.supervisor.clone();
+        let host = h.host.clone();
+        let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
+        let _pid = wait_for_posix_pid(&host, "fe").await;
+        h.supervisor.stop(&"fe".to_string(), None).await.unwrap();
+        let _ = run.await.unwrap();
+        let state = h.host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Stopped);
+        assert_ne!(state.actual_state, ActualServiceState::Succeeded);
+        assert_ne!(state.actual_state, ActualServiceState::Failed);
+    }
+
+    #[tokio::test]
+    async fn an_exit_command_times_out_only_when_a_deadline_is_set() {
+        let h = build_harness(one_service_catalog(with_exit_timeout(argv_verified("fe", ReadinessSpec::Exit), 40)));
+        let error = h.supervisor.start(&"fe".to_string(), None).await.unwrap_err();
+        assert_eq!(error.0, "Readiness timed out");
+        let state = h.host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Failed);
+        assert_eq!(state.desired_state, DesiredServiceState::Stopped);
+        assert!(state.readiness_detail.as_deref().unwrap_or("").contains("did not exit"));
+    }
+
+    #[tokio::test]
+    async fn stop_on_a_succeeded_exit_command_keeps_succeeded() {
+        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let supervisor = h.supervisor.clone();
+        let host = h.host.clone();
+        let process = h.process.clone();
+        let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
+        let pid = wait_for_posix_pid(&host, "fe").await;
+        process.kill_externally(pid, 0);
+        run.await.unwrap().unwrap();
+        h.supervisor.stop(&"fe".to_string(), None).await.unwrap();
+        let state = h.host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Succeeded);
+        assert_eq!(state.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn an_adopted_exit_command_that_disappears_is_not_succeeded() {
+        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let start_identity = "Fake Jan  1 00:00:00 2024".to_string();
+        h.process.insert_alive(42, "fp", &start_identity);
+        h.host.seed(ServiceLifecycleState {
+            service_id: "fe".to_string(),
+            desired_state: DesiredServiceState::Running,
+            actual_state: ActualServiceState::RunningUnready,
+            readiness: ServiceReadiness::NotReady,
+            generation: 1,
+            identity: Some(ProcessIdentity::Posix(PosixProcessIdentity {
+                manager_instance_id: "instance-1".to_string(),
+                service_id: "fe".to_string(),
+                generation: 1,
+                pid: 42,
+                pgid: 42,
+                started_at: "2024-01-01T00:00:00.000Z".to_string(),
+                start_identity,
+                command_fingerprint: "fp".to_string(),
+            })),
+            readiness_kind: Some(crate::state::ReadinessKind::Exit),
+            readiness_detail: None,
+            created_at: "2024-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+            exited_at: None,
+            exit_code: None,
+            error: None,
+            current_operation_id: None,
+        });
+        let supervisor = h.supervisor.clone();
+        let process = h.process.clone();
+        let reconcile = tokio::spawn(async move { supervisor.reconcile().await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        process.kill_externally(42, 0);
+        reconcile.await.unwrap();
+        let state = h.host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Failed);
+        assert_ne!(state.actual_state, ActualServiceState::Succeeded);
+        let error = state.error.unwrap_or_default();
+        assert!(error.contains("exit code unknown") || error.contains("no longer alive"), "{error}");
     }
 }

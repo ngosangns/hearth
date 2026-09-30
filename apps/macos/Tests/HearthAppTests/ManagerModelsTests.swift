@@ -71,7 +71,16 @@ final class ManagerModelsTests: XCTestCase {
         let response = try JSONDecoder().decode(CatalogResponse.self, from: Data(json.utf8))
         XCTAssertEqual(response.catalog.services.map(\.id), ["sleeper"])
         XCTAssertEqual(response.catalog.services[0].displayName, "sleeper") // falls back to id when label is absent
+        XCTAssertFalse(response.catalog.services[0].isFinite)
         XCTAssertNil(response.catalog.groupTree)
+    }
+
+    func testCatalogMarksExitReadinessAsFinite() throws {
+        let json = """
+        {"catalog":{"services":[{"id":"fe","profiles":{"run":{"commandStatus":"verified","readiness":{"kind":"exit"},"command":{"command":{"argv":["task","fe"]},"cwd":"viclass"}}}}]}}
+        """
+        let response = try JSONDecoder().decode(CatalogResponse.self, from: Data(json.utf8))
+        XCTAssertTrue(response.catalog.services[0].isFinite)
     }
 
     func testDecodesLogSlice() throws {
@@ -105,12 +114,32 @@ final class ManagerModelsTests: XCTestCase {
             ("failed", "failed"),
             ("orphaned", "orphaned"),
             ("externally-owned", "external"),
+            ("succeeded", "succeeded"),
             ("stopped", "stopped"),
         ]
         for (actual, expectedDisplay) in cases {
             let state = ServiceLifecycleState(serviceId: "x", desiredState: "running", actualState: actual, readiness: "unknown", generation: 0, identity: nil, readinessKind: nil, readinessDetail: nil, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", exitedAt: nil, exitCode: nil, error: nil, currentOperationId: nil)
             XCTAssertEqual(state.displayState, expectedDisplay, "actualState \(actual)")
         }
+    }
+
+    func testFiniteServicesStayOutOfReadyTotalsUnlessTheyFailed() {
+        var counts = ServiceCounts()
+        counts.add(makeService("api", actualState: "ready"))
+        counts.add(makeService("fe", actualState: "stopped"), finite: true)
+        counts.add(makeService("build", actualState: "succeeded"), finite: true)
+        counts.add(makeService("lint", actualState: "failed"), finite: true)
+        XCTAssertEqual(counts.ready, 1)
+        XCTAssertEqual(counts.total, 2)
+        XCTAssertEqual(counts.failed, 1)
+    }
+
+    func testRunTitleForFiniteCommands() {
+        XCTAssertEqual(LifecycleButtons.runTitle(state: "stopped", finite: true), "Run")
+        XCTAssertEqual(LifecycleButtons.runTitle(state: "failed", finite: true), "Run")
+        XCTAssertEqual(LifecycleButtons.runTitle(state: "succeeded", finite: false), "Run")
+        XCTAssertEqual(LifecycleButtons.runTitle(state: "stopped", finite: false), "Start")
+        XCTAssertNil(LifecycleButtons.runTitle(state: "ready", finite: true))
     }
 }
 

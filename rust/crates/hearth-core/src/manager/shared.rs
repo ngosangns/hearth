@@ -628,6 +628,7 @@ mod tests {
     use super::*;
     use crate::manager::http::{bootstrap, HearthManagerOptions};
     use crate::shared::synthesize::synthesize_catalog;
+    use crate::state::PROTOCOL_VERSION;
     use sha2::Digest;
 
     fn make_tarball(dir: &Path) -> (PathBuf, String) {
@@ -705,7 +706,7 @@ mod tests {
         client
             .request(method, format!("{}{}", manager.base_url(), path))
             .bearer_auth(manager.bearer_token())
-            .header("x-hearth-protocol", "1")
+            .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
     }
 
     #[tokio::test]

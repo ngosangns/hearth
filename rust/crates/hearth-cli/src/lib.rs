@@ -468,6 +468,7 @@ async fn service_rows(client: &Client) -> LocalctlResult<Vec<ServiceLifecycleSta
 fn text_state(state: Option<&ServiceLifecycleState>) -> &'static str {
     match state.map(|s| s.actual_state) {
         Some(ActualServiceState::Ready) => "ready",
+        Some(ActualServiceState::Succeeded) => "succeeded",
         Some(ActualServiceState::QueuedStart) => "queued-start",
         Some(ActualServiceState::Running) | Some(ActualServiceState::RunningUnready) | Some(ActualServiceState::Starting) | Some(ActualServiceState::Preparing) => "running",
         Some(ActualServiceState::Stopping) => "stopping",
@@ -1757,6 +1758,7 @@ mod tests {
             (ActualServiceState::Running, "running"),
             (ActualServiceState::RunningUnready, "running"),
             (ActualServiceState::Ready, "ready"),
+            (ActualServiceState::Succeeded, "succeeded"),
             (ActualServiceState::Stopping, "stopping"),
             (ActualServiceState::Failed, "failed"),
             (ActualServiceState::Orphaned, "orphaned"),

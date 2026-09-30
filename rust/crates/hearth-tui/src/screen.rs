@@ -232,7 +232,7 @@ fn fit(text: &str, width: usize) -> String {
 
 fn status_colour(state: ActualServiceState) -> u8 {
     match state {
-        ActualServiceState::Ready => 32,
+        ActualServiceState::Ready | ActualServiceState::Succeeded => 32,
         ActualServiceState::Running => 36,
         ActualServiceState::Preparing | ActualServiceState::QueuedStart | ActualServiceState::Starting | ActualServiceState::Stopping | ActualServiceState::RunningUnready => 33,
         ActualServiceState::Stopped => 90,

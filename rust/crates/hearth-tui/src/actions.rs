@@ -40,7 +40,10 @@ pub fn keyboard_action(key: KeyEvent, selected: Option<&Service>) -> Option<TuiA
                 // is the reclaim.
                 return Some(TuiAction::Reclaim);
             }
-            let starting = matches!(selected.map(|s| s.state), Some(ActualServiceState::Stopped | ActualServiceState::QueuedStart));
+            let starting = matches!(
+                selected.map(|s| s.state),
+                Some(ActualServiceState::Stopped | ActualServiceState::QueuedStart | ActualServiceState::Succeeded)
+            );
             Some(if starting { TuiAction::Start } else { TuiAction::Stop })
         }
         _ => None,
@@ -71,6 +74,13 @@ mod tests {
     #[test]
     fn enter_and_space_start_a_queued_service_rather_than_stopping_it() {
         let selected = service("queued-start");
+        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&selected)), Some(TuiAction::Start));
+        assert_eq!(keyboard_action(key(' '), Some(&selected)), Some(TuiAction::Start));
+    }
+
+    #[test]
+    fn enter_starts_a_succeeded_command_again() {
+        let selected = service("succeeded");
         assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&selected)), Some(TuiAction::Start));
         assert_eq!(keyboard_action(key(' '), Some(&selected)), Some(TuiAction::Start));
     }

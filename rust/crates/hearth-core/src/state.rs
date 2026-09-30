@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::ServiceId;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const STATE_VERSION: u32 = 1;
 
 pub const STALE_LOCK_MARKER_NAME: &str = "quarantine.json";
@@ -39,6 +39,9 @@ pub enum ActualServiceState {
     Running,
     RunningUnready,
     Ready,
+    /// A `readiness: exit` command finished with exit code 0. Desired is `stopped`, so a later
+    /// reconcile does not run it again. Not an active state.
+    Succeeded,
     Stopping,
     Failed,
     Orphaned,
@@ -65,6 +68,7 @@ impl ActualServiceState {
             Self::Running => "running",
             Self::RunningUnready => "running-unready",
             Self::Ready => "ready",
+            Self::Succeeded => "succeeded",
             Self::Stopping => "stopping",
             Self::Failed => "failed",
             Self::Orphaned => "orphaned",
@@ -73,7 +77,7 @@ impl ActualServiceState {
     }
 
     /// Every variant, so exhaustive tests cannot silently miss one added later.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Stopped,
         Self::QueuedStart,
         Self::Preparing,
@@ -81,6 +85,7 @@ impl ActualServiceState {
         Self::Running,
         Self::RunningUnready,
         Self::Ready,
+        Self::Succeeded,
         Self::Stopping,
         Self::Failed,
         Self::Orphaned,
@@ -167,6 +172,8 @@ pub enum ReadinessKind {
     Container,
     Tailnet,
     Command,
+    /// `readiness: { kind: exit }` — the run command itself is the job.
+    Exit,
     /// Reserved: never produced. There is no custom readiness probe (a closure can't cross the
     /// YAML/JSON boundary — `command` is the stand-in); the variant stays only so a persisted or
     /// wire value that carries it still decodes. Removing it is a `PROTOCOL_VERSION` bump.
@@ -186,11 +193,12 @@ impl ReadinessKind {
             Self::Container => "container",
             Self::Tailnet => "tailnet",
             Self::Command => "command",
+            Self::Exit => "exit",
             Self::Custom => "custom",
         }
     }
 
-    pub const ALL: [Self; 7] = [Self::Process, Self::Tcp, Self::Http, Self::Container, Self::Tailnet, Self::Command, Self::Custom];
+    pub const ALL: [Self; 8] = [Self::Process, Self::Tcp, Self::Http, Self::Container, Self::Tailnet, Self::Command, Self::Exit, Self::Custom];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

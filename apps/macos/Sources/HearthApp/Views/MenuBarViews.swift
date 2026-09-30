@@ -17,7 +17,10 @@ struct MenuBarSummary {
         var counts = ServiceCounts()
         for workspace in workspaces where workspace.trusted {
             guard let controller = registry.controllers[workspace.id] else { continue }
-            for service in controller.services { counts.add(service) }
+            let workspaceCounts = controller.counts
+            counts.ready += workspaceCounts.ready
+            counts.failed += workspaceCounts.failed
+            counts.total += workspaceCounts.total
         }
         return MenuBarSummary(counts: counts)
     }

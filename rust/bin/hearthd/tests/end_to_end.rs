@@ -62,7 +62,7 @@ fn full_lifecycle_over_the_real_compiled_binary() {
     let ensure_response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("manager ensure --json must print exactly one JSON object");
     assert!(ensure_response["port"].as_u64().unwrap() > 0);
     assert!(ensure_response["token"].as_str().unwrap().len() > 10);
-    assert_eq!(ensure_response["protocolVersion"], 1);
+    assert_eq!(ensure_response["protocolVersion"].as_u64(), Some(u64::from(hearth_core::state::PROTOCOL_VERSION)));
 
     // `start api --wait --json` — waits for the real nc-backed service to become ready.
     let (code, stdout, stderr) = run_lsd(dir.path(), &["start", "api", "--wait", "--json"]);

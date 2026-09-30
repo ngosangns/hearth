@@ -321,6 +321,44 @@ final class WorkspaceControllerTests: XCTestCase {
         XCTAssertEqual(Set(api.performed.map(\.serviceId)), ["ready-one", "queued-one"])
         sut.stop()
     }
+
+    func testCountsSkipFiniteServicesUnlessTheyFailed() async {
+        let api = FakeManagerAPI()
+        api.catalogHandler = {
+            ServiceCatalogSummary(services: [
+                CatalogService(id: "api", label: nil, kind: nil, ownership: nil),
+                CatalogService(
+                    id: "fe",
+                    label: nil,
+                    kind: nil,
+                    ownership: nil,
+                    profiles: CatalogProfiles(run: CatalogRunProfile(readiness: CatalogReadiness(kind: "exit")))
+                ),
+                CatalogService(
+                    id: "lint",
+                    label: nil,
+                    kind: nil,
+                    ownership: nil,
+                    profiles: CatalogProfiles(run: CatalogRunProfile(readiness: CatalogReadiness(kind: "exit")))
+                ),
+            ])
+        }
+        api.servicesHandler = {
+            [
+                makeService("api", actualState: "ready"),
+                makeService("fe", actualState: "succeeded"),
+                makeService("lint", actualState: "failed"),
+            ]
+        }
+        let sut = controller(api)
+        await sut.connect()
+        XCTAssertTrue(sut.isFinite("fe"))
+        XCTAssertFalse(sut.isFinite("api"))
+        XCTAssertEqual(sut.counts.ready, 1)
+        XCTAssertEqual(sut.counts.failed, 1)
+        XCTAssertEqual(sut.counts.total, 2)
+        sut.stop()
+    }
 }
 
 /// Small mutable helpers for use inside `@Sendable` fake handlers.

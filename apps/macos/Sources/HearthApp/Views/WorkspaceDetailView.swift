@@ -230,6 +230,7 @@ private struct ServiceListView: View {
                                         label: controller.displayName(for: service.serviceId),
                                         busy: controller.actionsInFlight.contains(service.serviceId),
                                         disabled: controller.isDisabled(service.serviceId),
+                                        finite: controller.isFinite(service.serviceId),
                                         urls: controller.urls(for: service.serviceId),
                                         onAction: { action, killUnowned in
                                             Task { await controller.perform(action, serviceId: service.serviceId, killUnowned: killUnowned) }
@@ -242,7 +243,10 @@ private struct ServiceListView: View {
                                     // Group actions expand past `disabled: true` members — the
                                     // daemon would skip them in a bulk start anyway.
                                     let enabledIds = section.serviceIds.filter { !controller.isDisabled($0) }
-                                    let allStarted = !enabledIds.isEmpty && enabledIds.allSatisfy { controller.service($0)?.isUp ?? false }
+                                    // Finite jobs don't count as "up". A group of only those stays
+                                    // on Start so it can be run again; start/stop still include them.
+                                    let longLivedIds = enabledIds.filter { !controller.isFinite($0) }
+                                    let allStarted = !longLivedIds.isEmpty && longLivedIds.allSatisfy { controller.service($0)?.isUp ?? false }
                                     if enabledIds.isEmpty {
                                         Text(name)
                                     } else {
@@ -327,6 +331,8 @@ private struct ServiceRow: View {
     let label: String
     let busy: Bool
     let disabled: Bool
+    /// `readiness: exit` — the primary button says Run, including before the first start.
+    let finite: Bool
     let urls: [ResolvedServiceUrl]
     let onAction: (ManagerAction, Bool) -> Void
     @State private var confirmReclaim = false
@@ -452,7 +458,7 @@ private struct ServiceRow: View {
                     }
                     IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop, false) }
                 default:
-                    LifecycleButtons(state: service.displayState) { onAction($0, false) }
+                    LifecycleButtons(state: service.displayState, finite: finite) { onAction($0, false) }
                 }
             }
         }

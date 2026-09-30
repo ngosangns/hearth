@@ -61,6 +61,9 @@ pub enum ReadinessSpec {
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+    /// The run command is the job. Exit 0 settles `succeeded` with desired `stopped`; any other
+    /// exit is `failed`. There is no liveness probe after the process is gone.
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +452,16 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
                 errors.push(format!("{place}.label must be a non-empty string"));
             }
         }
+        if matches!(profile.readiness(), ReadinessSpec::Exit) {
+            if matches!(service.ownership, Some(ServiceOwnership::External)) {
+                errors.push(format!("{}: readiness exit requires a daemon-owned service", service.id));
+            }
+            if let ServiceRunProfile::Verified { command, .. } = profile {
+                if is_container_command(command) {
+                    errors.push(format!("{}: readiness exit cannot run a container command", service.id));
+                }
+            }
+        }
         if let ReadinessSpec::Tcp { port } = profile.readiness() {
             if let Some(existing) = verified_ports.get(port) {
                 if *existing != &service.id {
@@ -612,6 +625,33 @@ mod tests {
         });
         let c = catalog(vec![service], &[]);
         assert!(validate_catalog(&c).errors.contains(&"api:build has an invalid timeout".to_string()));
+    }
+
+    #[test]
+    fn exit_readiness_rejects_external_ownership_and_container_commands() {
+        let mut external = argv_service("fe");
+        external.ownership = Some(ServiceOwnership::External);
+        if let ServiceRunProfile::Verified { readiness, .. } = &mut external.profiles.run {
+            *readiness = ReadinessSpec::Exit;
+        }
+        let mut catalog = ServiceCatalog {
+            services: vec![external],
+            groups: HashMap::new(),
+            group_tree: Vec::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+            private_file_guard: None,
+        };
+        assert!(validate_catalog(&catalog).errors.iter().any(|error| error.contains("daemon-owned")));
+
+        let mut container = argv_service("job");
+        if let ServiceRunProfile::Verified { command, readiness, .. } = &mut container.profiles.run {
+            command.container_name = Some("job".to_string());
+            *readiness = ReadinessSpec::Exit;
+        }
+        catalog.services = vec![container];
+        assert!(validate_catalog(&catalog).errors.iter().any(|error| error.contains("container")));
     }
 
     // Wire-format regression — see the equivalent tests in state.rs for why this matters.

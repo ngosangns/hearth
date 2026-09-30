@@ -122,6 +122,7 @@ struct SharedCatalogView: View {
         if let instance = controller.instance(controller.selectedId) {
             SharedInstanceDetail(
                 instance: instance,
+                finite: controller.catalogDoc?.services[instance.name]?.versions[instance.version]?.isFinite ?? false,
                 busy: controller.actionsInFlight.contains(instance.id),
                 log: controller.logController(for: instance.id),
                 onAction: { controller.perform($0, instance.id) },
@@ -228,6 +229,7 @@ private struct SharedCatalogRow: View {
 /// and the service's own output both land there).
 private struct SharedInstanceDetail: View {
     let instance: SharedInstance
+    var finite: Bool = false
     let busy: Bool
     let log: LogController?
     let onAction: (ManagerAction) -> Void
@@ -263,7 +265,7 @@ private struct SharedInstanceDetail: View {
             Spacer()
             if busy { ActionSpinner() }
             // Icon-only like the service rows — the tooltip carries the name.
-            LifecycleButtons(state: instance.displayState, onAction: onAction)
+            LifecycleButtons(state: instance.displayState, finite: finite, onAction: onAction)
             Button("Remove…", role: .destructive, action: onRemove)
                 .padding(.leading, 8)
         }

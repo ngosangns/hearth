@@ -77,6 +77,7 @@ struct ServiceLifecycleState: Codable, Equatable, Identifiable {
         case "running", "running-unready": return "running"
         case "starting", "preparing": return "starting"
         case "stopping": return "stopping"
+        case "succeeded": return "succeeded"
         case "failed": return "failed"
         case "orphaned": return "orphaned"
         case "externally-owned": return "external"
@@ -97,7 +98,13 @@ struct ServiceCounts: Equatable {
         for service in services { add(service) }
     }
 
-    mutating func add(_ service: ServiceLifecycleState) {
+    /// `finite` is a `readiness: exit` command. It is a job, not a server, so it stays out of
+    /// ready/total unless it failed — a never-run build must not turn the summary into `12/13`,
+    /// and a failed one still raises the red badge.
+    mutating func add(_ service: ServiceLifecycleState, finite: Bool = false) {
+        if finite && service.displayState != "failed" {
+            return
+        }
         total += 1
         if service.isUp {
             ready += 1
@@ -111,15 +118,32 @@ struct ServicesResponse: Codable {
     let services: [ServiceLifecycleState]
 }
 
+/// Enough of `profiles.run.readiness` to tell a finite command (`kind: exit`) from a server
+/// before the first start. The lifecycle row has no `readinessKind` until then.
+struct CatalogReadiness: Codable, Equatable {
+    let kind: String
+}
+
+struct CatalogRunProfile: Codable, Equatable {
+    var readiness: CatalogReadiness? = nil
+}
+
+struct CatalogProfiles: Codable, Equatable {
+    let run: CatalogRunProfile
+}
+
 struct CatalogService: Codable, Equatable, Identifiable {
     let id: String
     let label: String?
     let kind: String?
     let ownership: String?
     var disabled: Bool? = nil
+    var profiles: CatalogProfiles? = nil
 
     var displayName: String { label ?? id }
     var isDisabled: Bool { disabled ?? false }
+    /// `readiness: { kind: exit }` — the run command is a job that exits.
+    var isFinite: Bool { profiles?.run.readiness?.kind == "exit" }
 }
 
 /// One `groups:` entry as declared — `members` may name services or other groups. The flattened
@@ -270,10 +294,14 @@ struct SharedInstancesResponse: Codable {
     let instances: [SharedInstance]
 }
 
-/// A recipe as the catalog UI needs it — the version key is the datum; the body is only decoded
-/// for an optional human description. Permissive on purpose (see this file's header comment).
+/// A recipe as the catalog UI needs it — the version key is the datum; the body is decoded only
+/// for an optional description and `readiness.kind` (so a finite recipe can say Run before its
+/// first start). Permissive on purpose (see this file's header comment).
 struct SharedRecipeSummary: Codable, Equatable {
     let description: String?
+    var readiness: CatalogReadiness? = nil
+
+    var isFinite: Bool { readiness?.kind == "exit" }
 }
 
 struct SharedFamily: Codable, Equatable {

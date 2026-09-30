@@ -107,8 +107,8 @@ pub fn synthesize_service(
                         .map(|spec| render_command_checked(spec, &vars, "stop"))
                         .transpose()?,
                 },
+                readiness_timeout_ms: if matches!(readiness, ReadinessSpec::Exit) { None } else { Some(SHARED_INSTANCE_READINESS_TIMEOUT_MS) },
                 readiness,
-                readiness_timeout_ms: Some(SHARED_INSTANCE_READINESS_TIMEOUT_MS),
                 preparation: None,
                 preparation_command,
             },
@@ -305,6 +305,18 @@ mod tests {
         assert_eq!(ports[0].port, 43110);
         assert_eq!(ports[1].label, "console");
         assert_eq!(ports[1].port, 43111);
+    }
+
+    #[test]
+    fn an_exit_recipe_waits_without_the_server_readiness_deadline() {
+        let mut inst = instance(vec![43111]);
+        inst.recipe.readiness = ReadinessSpec::Exit;
+        let service = synthesize_service(Path::new("/shared"), &inst).unwrap();
+        let ServiceRunProfile::Verified { readiness, readiness_timeout_ms, .. } = &service.profiles.run else {
+            panic!("shared instance must be a verified run profile")
+        };
+        assert!(matches!(readiness, ReadinessSpec::Exit));
+        assert_eq!(*readiness_timeout_ms, None);
     }
 
     #[test]

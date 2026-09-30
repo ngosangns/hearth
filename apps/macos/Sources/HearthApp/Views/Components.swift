@@ -7,7 +7,7 @@ import SwiftUI
 enum StatusStyle {
     static func color(for state: String) -> Color {
         switch state {
-        case "ready": return .green
+        case "ready", "succeeded": return .green
         case "running": return .mint
         case "starting", "queued": return .yellow
         case "failed": return .red
@@ -118,16 +118,27 @@ enum Pasteboard {
 }
 
 /// The lifecycle buttons for a (display-collapsed) state that both a service row and a shared
-/// instance share: Start from rest, Restart+Stop while up, Cancel for a queued start. States with
+/// instance share: Start from rest, Restart+Stop while up, Cancel for a queued start. A finite
+/// command (`readiness: exit`) says Run, including after it has already `succeeded`. States with
 /// their own affordances (`orphaned`, `external`) are handled by the caller before this.
 struct LifecycleButtons: View {
     let state: String
+    var finite: Bool = false
     let onAction: (ManagerAction) -> Void
+
+    /// Title of the button that runs the service again. `nil` when this state is not a run/start.
+    static func runTitle(state: String, finite: Bool) -> String? {
+        switch state {
+        case "succeeded": return "Run"
+        case "stopped", "failed": return finite ? "Run" : "Start"
+        default: return nil
+        }
+    }
 
     var body: some View {
         switch state {
-        case "stopped", "failed":
-            IconActionButton("Start", systemImage: "play.fill") { onAction(.start) }
+        case "succeeded", "stopped", "failed":
+            IconActionButton(Self.runTitle(state: state, finite: finite) ?? "Start", systemImage: "play.fill") { onAction(.start) }
         case "ready", "running", "starting":
             IconActionButton("Restart", systemImage: "arrow.clockwise") { onAction(.restart) }
             IconActionButton("Stop", systemImage: "stop.fill") { onAction(.stop) }
