@@ -3,5 +3,6 @@
 .claude/settings.local.json
 rust/target/
 /dist/
+/.build/
 rust/crates/hearth-web/ui/node_modules/
 rust/crates/hearth-web/ui/dist/
