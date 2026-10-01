@@ -10,7 +10,10 @@ use futures::future::BoxFuture;
 use uuid::Uuid;
 
 use crate::catalog::ServiceId;
-use crate::state::{Operation, OperationError, OperationKind, OperationStatus, OperationTraceEntry, ServiceOperationKind};
+use crate::state::{
+    Operation, OperationError, OperationKind, OperationStatus, OperationTraceEntry,
+    ServiceOperationKind,
+};
 use crate::supervisor::types::format_iso8601_millis;
 use crate::sync::KeyedLock;
 
@@ -27,7 +30,10 @@ const SETTLED_OPERATION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_SETTLED_OPERATIONS: usize = 1024;
 
 fn now() -> String {
-    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     format_iso8601_millis(millis)
 }
 
@@ -45,7 +51,8 @@ pub struct OperationInput {
 pub struct RequestIdConflict;
 
 pub type OperationHandle = Arc<Mutex<Operation>>;
-pub type OperationExecute = Box<dyn FnOnce(OperationHandle) -> BoxFuture<'static, Result<(), OperationError>> + Send>;
+pub type OperationExecute =
+    Box<dyn FnOnce(OperationHandle) -> BoxFuture<'static, Result<(), OperationError>> + Send>;
 pub type OperationRejected = Box<dyn FnOnce(OperationHandle) -> BoxFuture<'static, ()> + Send>;
 
 pub struct OperationScheduler {
@@ -74,7 +81,9 @@ pub struct OperationScheduler {
 }
 
 fn target_of(service_id: &Option<ServiceId>) -> String {
-    service_id.clone().unwrap_or_else(|| MANAGER_TARGET.to_string())
+    service_id
+        .clone()
+        .unwrap_or_else(|| MANAGER_TARGET.to_string())
 }
 
 fn same_service_ids(left: &Option<Vec<ServiceId>>, right: &Option<Vec<ServiceId>>) -> bool {
@@ -106,7 +115,11 @@ impl OperationScheduler {
             let mut settled = self.settled.lock().unwrap();
             settled.push_back((now, id.to_string()));
             let mut evicted = Vec::new();
-            while settled.front().is_some_and(|(at, _)| now.duration_since(*at) > SETTLED_OPERATION_TTL) || settled.len() > MAX_SETTLED_OPERATIONS {
+            while settled
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > SETTLED_OPERATION_TTL)
+                || settled.len() > MAX_SETTLED_OPERATIONS
+            {
                 if let Some((_, id)) = settled.pop_front() {
                     evicted.push(id);
                 }
@@ -121,21 +134,33 @@ impl OperationScheduler {
         let mut done = self.done.lock().unwrap();
         for id in evicted {
             done.remove(&id);
-            let Some(handle) = operations.remove(&id) else { continue };
+            let Some(handle) = operations.remove(&id) else {
+                continue;
+            };
             let request_id = handle.lock().unwrap().request_id.clone();
             // Only if the request id still maps to this operation — never evict a newer one.
-            if request_ids.get(&request_id).is_some_and(|current| Arc::ptr_eq(current, &handle)) {
+            if request_ids
+                .get(&request_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
                 request_ids.remove(&request_id);
             }
         }
     }
 
     pub fn get(&self, id: &str) -> Option<Operation> {
-        self.operations.lock().unwrap().get(id).map(|h| h.lock().unwrap().clone())
+        self.operations
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|h| h.lock().unwrap().clone())
     }
 
     pub fn is_queued(&self, operation: &Operation) -> bool {
-        self.active_targets.lock().unwrap().contains_key(&target_of(&operation.service_id))
+        self.active_targets
+            .lock()
+            .unwrap()
+            .contains_key(&target_of(&operation.service_id))
     }
 
     pub fn close_mutations(&self) {
@@ -145,7 +170,14 @@ impl OperationScheduler {
     /// Waits for every currently in-flight *service-targeted* operation to finish (excludes the
     /// manager-wide target) — used by shutdown to let in-flight work settle before stopping services.
     pub async fn drain_services(&self) {
-        let ids: Vec<String> = self.active_targets.lock().unwrap().iter().filter(|(target, _)| *target != MANAGER_TARGET).map(|(_, id)| id.clone()).collect();
+        let ids: Vec<String> = self
+            .active_targets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(target, _)| *target != MANAGER_TARGET)
+            .map(|(_, id)| id.clone())
+            .collect();
         let waits = ids.iter().map(|id| self.wait_for_id(id));
         futures::future::join_all(waits).await;
     }
@@ -165,17 +197,36 @@ impl OperationScheduler {
         }
     }
 
-    pub fn resolve_request(&self, input: &OperationInput) -> Result<Option<Operation>, RequestIdConflict> {
-        let existing = self.request_ids.lock().unwrap().get(&input.request_id).cloned();
-        let Some(existing) = existing else { return Ok(None) };
+    pub fn resolve_request(
+        &self,
+        input: &OperationInput,
+    ) -> Result<Option<Operation>, RequestIdConflict> {
+        let existing = self
+            .request_ids
+            .lock()
+            .unwrap()
+            .get(&input.request_id)
+            .cloned();
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
         let snapshot = existing.lock().unwrap().clone();
-        if snapshot.kind != input.kind || snapshot.service_id != input.service_id || snapshot.action != input.action || !same_service_ids(&snapshot.target_service_ids, &input.target_service_ids) {
+        if snapshot.kind != input.kind
+            || snapshot.service_id != input.service_id
+            || snapshot.action != input.action
+            || !same_service_ids(&snapshot.target_service_ids, &input.target_service_ids)
+        {
             return Err(RequestIdConflict);
         }
         Ok(Some(snapshot))
     }
 
-    pub fn schedule(self: &Arc<Self>, input: OperationInput, execute: OperationExecute, rejected: Option<OperationRejected>) -> Result<Operation, RequestIdConflict> {
+    pub fn schedule(
+        self: &Arc<Self>,
+        input: OperationInput,
+        execute: OperationExecute,
+        rejected: Option<OperationRejected>,
+    ) -> Result<Operation, RequestIdConflict> {
         let (operation, release) = self.schedule_inner(input, execute, rejected, false)?;
         if let Some(release) = release {
             let _ = release.send(());
@@ -188,11 +239,22 @@ impl OperationScheduler {
     /// worker runs hold that sender across the publish. Dropping it abandons the operation: the
     /// rejected callback runs and the operation fails, so a row queued for it is not left behind.
     /// An idempotent replay of an existing request returns `None` — that worker is already released.
-    pub fn schedule_when_released(self: &Arc<Self>, input: OperationInput, execute: OperationExecute, rejected: Option<OperationRejected>) -> Result<(Operation, Option<tokio::sync::oneshot::Sender<()>>), RequestIdConflict> {
+    pub fn schedule_when_released(
+        self: &Arc<Self>,
+        input: OperationInput,
+        execute: OperationExecute,
+        rejected: Option<OperationRejected>,
+    ) -> Result<(Operation, Option<tokio::sync::oneshot::Sender<()>>), RequestIdConflict> {
         self.schedule_inner(input, execute, rejected, true)
     }
 
-    fn schedule_inner(self: &Arc<Self>, input: OperationInput, execute: OperationExecute, rejected: Option<OperationRejected>, defer: bool) -> Result<(Operation, Option<tokio::sync::oneshot::Sender<()>>), RequestIdConflict> {
+    fn schedule_inner(
+        self: &Arc<Self>,
+        input: OperationInput,
+        execute: OperationExecute,
+        rejected: Option<OperationRejected>,
+        defer: bool,
+    ) -> Result<(Operation, Option<tokio::sync::oneshot::Sender<()>>), RequestIdConflict> {
         if let Some(existing) = self.resolve_request(&input)? {
             return Ok((existing, None));
         }
@@ -207,7 +269,10 @@ impl OperationScheduler {
             status: OperationStatus::Queued,
             created_at: created_at.clone(),
             updated_at: created_at.clone(),
-            trace: vec![OperationTraceEntry { at: created_at, message: "Operation accepted".to_string() }],
+            trace: vec![OperationTraceEntry {
+                at: created_at,
+                message: "Operation accepted".to_string(),
+            }],
             error: None,
         };
         let handle: OperationHandle = Arc::new(Mutex::new(operation.clone()));
@@ -220,15 +285,34 @@ impl OperationScheduler {
             request_ids.insert(input.request_id.clone(), handle.clone());
         }
         let mut event_data = serde_json::Map::new();
-        event_data.insert("operationId".to_string(), serde_json::Value::String(operation.id.clone()));
-        event_data.insert("requestId".to_string(), serde_json::Value::String(operation.request_id.clone()));
-        event_data.insert("serviceId".to_string(), operation.service_id.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        event_data.insert(
+            "operationId".to_string(),
+            serde_json::Value::String(operation.id.clone()),
+        );
+        event_data.insert(
+            "requestId".to_string(),
+            serde_json::Value::String(operation.request_id.clone()),
+        );
+        event_data.insert(
+            "serviceId".to_string(),
+            operation
+                .service_id
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
         self.events.publish("operation.accepted", event_data);
 
         let target = target_of(&operation.service_id);
-        self.active_targets.lock().unwrap().insert(target.clone(), operation.id.clone());
+        self.active_targets
+            .lock()
+            .unwrap()
+            .insert(target.clone(), operation.id.clone());
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-        self.done.lock().unwrap().insert(operation.id.clone(), done_rx);
+        self.done
+            .lock()
+            .unwrap()
+            .insert(operation.id.clone(), done_rx);
         let (release_tx, release_rx) = if defer {
             let (tx, rx) = tokio::sync::oneshot::channel();
             (Some(tx), Some(rx))
@@ -246,10 +330,16 @@ impl OperationScheduler {
                     if let Some(rejected) = rejected {
                         rejected(handle_for_task.clone()).await;
                     }
-                    scheduler.transition(&handle_for_task, OperationStatus::Failed, "Operation abandoned before it started");
+                    scheduler.transition(
+                        &handle_for_task,
+                        OperationStatus::Failed,
+                        "Operation abandoned before it started",
+                    );
                     {
                         let mut active = scheduler.active_targets.lock().unwrap();
-                        if active.get(&target_for_task).map(String::as_str) == Some(operation_id_for_task.as_str()) {
+                        if active.get(&target_for_task).map(String::as_str)
+                            == Some(operation_id_for_task.as_str())
+                        {
                             active.remove(&target_for_task);
                         }
                     }
@@ -264,12 +354,27 @@ impl OperationScheduler {
                 if let Some(rejected) = rejected {
                     rejected(handle_for_task.clone()).await;
                 }
-                handle_for_task.lock().unwrap().error = Some(OperationError { code: "manager_closing".to_string(), message: "Manager is shutting down".to_string() });
-                scheduler.transition(&handle_for_task, OperationStatus::Failed, "Operation rejected because manager is shutting down");
+                handle_for_task.lock().unwrap().error = Some(OperationError {
+                    code: "manager_closing".to_string(),
+                    message: "Manager is shutting down".to_string(),
+                });
+                scheduler.transition(
+                    &handle_for_task,
+                    OperationStatus::Failed,
+                    "Operation rejected because manager is shutting down",
+                );
             } else {
-                scheduler.transition(&handle_for_task, OperationStatus::Running, "Operation started");
+                scheduler.transition(
+                    &handle_for_task,
+                    OperationStatus::Running,
+                    "Operation started",
+                );
                 match execute(handle_for_task.clone()).await {
-                    Ok(()) => scheduler.transition(&handle_for_task, OperationStatus::Succeeded, "Operation completed"),
+                    Ok(()) => scheduler.transition(
+                        &handle_for_task,
+                        OperationStatus::Succeeded,
+                        "Operation completed",
+                    ),
                     Err(error) => {
                         let message = format!("Operation failed: {}", error.message);
                         handle_for_task.lock().unwrap().error = Some(error);
@@ -284,7 +389,9 @@ impl OperationScheduler {
             // `if (this.queues.get(target) === current)` guard.
             {
                 let mut active = scheduler.active_targets.lock().unwrap();
-                if active.get(&target_for_task).map(String::as_str) == Some(operation_id_for_task.as_str()) {
+                if active.get(&target_for_task).map(String::as_str)
+                    == Some(operation_id_for_task.as_str())
+                {
                     active.remove(&target_for_task);
                 }
             }
@@ -300,7 +407,10 @@ impl OperationScheduler {
             let mut op = handle.lock().unwrap();
             op.updated_at = now();
             let at = op.updated_at.clone();
-            op.trace.push(OperationTraceEntry { at, message: message.to_string() });
+            op.trace.push(OperationTraceEntry {
+                at,
+                message: message.to_string(),
+            });
             (op.id.clone(), op.service_id.clone(), op.status)
         };
         // The operation's REAL status, not a hardcoded `Running` — a trace entry appended while an
@@ -315,7 +425,10 @@ impl OperationScheduler {
             op.status = status;
             op.updated_at = now();
             let at = op.updated_at.clone();
-            op.trace.push(OperationTraceEntry { at, message: message.to_string() });
+            op.trace.push(OperationTraceEntry {
+                at,
+                message: message.to_string(),
+            });
             (op.id.clone(), op.service_id.clone())
         };
         self.publish_updated(&id, status, &service_id);
@@ -323,9 +436,18 @@ impl OperationScheduler {
 
     fn publish_updated(&self, id: &str, status: OperationStatus, service_id: &Option<ServiceId>) {
         let mut event_data = serde_json::Map::new();
-        event_data.insert("operationId".to_string(), serde_json::Value::String(id.to_string()));
+        event_data.insert(
+            "operationId".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
         event_data.insert("status".to_string(), serde_json::to_value(status).unwrap());
-        event_data.insert("serviceId".to_string(), service_id.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        event_data.insert(
+            "serviceId".to_string(),
+            service_id
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
         self.events.publish("operation.updated", event_data);
     }
 }
@@ -335,15 +457,29 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn service_input(request_id: &str, service_id: &str, action: ServiceOperationKind) -> OperationInput {
-        OperationInput { request_id: request_id.to_string(), kind: OperationKind::Service, service_id: Some(service_id.to_string()), target_service_ids: None, action: Some(action) }
+    fn service_input(
+        request_id: &str,
+        service_id: &str,
+        action: ServiceOperationKind,
+    ) -> OperationInput {
+        OperationInput {
+            request_id: request_id.to_string(),
+            kind: OperationKind::Service,
+            service_id: Some(service_id.to_string()),
+            target_service_ids: None,
+            action: Some(action),
+        }
     }
 
     #[tokio::test]
     async fn schedule_runs_execute_and_transitions_to_succeeded() {
         let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
         let operation = scheduler
-            .schedule(service_input("req-1", "api", ServiceOperationKind::Start), Box::new(|_handle| Box::pin(async { Ok(()) })), None)
+            .schedule(
+                service_input("req-1", "api", ServiceOperationKind::Start),
+                Box::new(|_handle| Box::pin(async { Ok(()) })),
+                None,
+            )
             .unwrap();
         assert_eq!(operation.status, OperationStatus::Queued);
         scheduler.wait(&operation).await;
@@ -378,13 +514,22 @@ mod tests {
             )
             .unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(!started.load(Ordering::SeqCst), "the worker must not run before release");
-        assert_eq!(scheduler.get(&operation.id).unwrap().status, OperationStatus::Queued);
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "the worker must not run before release"
+        );
+        assert_eq!(
+            scheduler.get(&operation.id).unwrap().status,
+            OperationStatus::Queued
+        );
         drop(release);
         scheduler.wait(&operation).await;
         assert!(!started.load(Ordering::SeqCst));
         assert!(rejected.load(Ordering::SeqCst));
-        assert_eq!(scheduler.get(&operation.id).unwrap().status, OperationStatus::Failed);
+        assert_eq!(
+            scheduler.get(&operation.id).unwrap().status,
+            OperationStatus::Failed
+        );
 
         let started = Arc::new(AtomicBool::new(false));
         let started_flag = started.clone();
@@ -404,7 +549,10 @@ mod tests {
         release.expect("a new operation is held").send(()).unwrap();
         scheduler.wait(&operation).await;
         assert!(started.load(Ordering::SeqCst));
-        assert_eq!(scheduler.get(&operation.id).unwrap().status, OperationStatus::Succeeded);
+        assert_eq!(
+            scheduler.get(&operation.id).unwrap().status,
+            OperationStatus::Succeeded
+        );
     }
 
     #[tokio::test]
@@ -413,7 +561,14 @@ mod tests {
         let operation = scheduler
             .schedule(
                 service_input("req-1", "api", ServiceOperationKind::Start),
-                Box::new(|_handle| Box::pin(async { Err(OperationError { code: "boom".to_string(), message: "it broke".to_string() }) })),
+                Box::new(|_handle| {
+                    Box::pin(async {
+                        Err(OperationError {
+                            code: "boom".to_string(),
+                            message: "it broke".to_string(),
+                        })
+                    })
+                }),
                 None,
             )
             .unwrap();
@@ -426,16 +581,35 @@ mod tests {
     #[tokio::test]
     async fn duplicate_request_id_returns_the_existing_operation() {
         let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
-        let first = scheduler.schedule(service_input("req-1", "api", ServiceOperationKind::Start), Box::new(|_h| Box::pin(async { Ok(()) })), None).unwrap();
-        let second = scheduler.schedule(service_input("req-1", "api", ServiceOperationKind::Start), Box::new(|_h| Box::pin(async { Ok(()) })), None).unwrap();
+        let first = scheduler
+            .schedule(
+                service_input("req-1", "api", ServiceOperationKind::Start),
+                Box::new(|_h| Box::pin(async { Ok(()) })),
+                None,
+            )
+            .unwrap();
+        let second = scheduler
+            .schedule(
+                service_input("req-1", "api", ServiceOperationKind::Start),
+                Box::new(|_h| Box::pin(async { Ok(()) })),
+                None,
+            )
+            .unwrap();
         assert_eq!(first.id, second.id);
     }
 
     #[tokio::test]
     async fn same_request_id_with_different_action_conflicts() {
         let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
-        scheduler.schedule(service_input("req-1", "api", ServiceOperationKind::Start), Box::new(|_h| Box::pin(async { Ok(()) })), None).unwrap();
-        let err = scheduler.resolve_request(&service_input("req-1", "api", ServiceOperationKind::Stop));
+        scheduler
+            .schedule(
+                service_input("req-1", "api", ServiceOperationKind::Start),
+                Box::new(|_h| Box::pin(async { Ok(()) })),
+                None,
+            )
+            .unwrap();
+        let err =
+            scheduler.resolve_request(&service_input("req-1", "api", ServiceOperationKind::Stop));
         assert!(err.is_err());
     }
 
@@ -477,13 +651,23 @@ mod tests {
             .unwrap();
 
         // Both should start without waiting on each other (different targets).
-        tokio::time::timeout(Duration::from_millis(500), started_a.notified()).await.expect("op a should start promptly");
-        tokio::time::timeout(Duration::from_millis(500), started_b.notified()).await.expect("op b should start promptly");
+        tokio::time::timeout(Duration::from_millis(500), started_a.notified())
+            .await
+            .expect("op a should start promptly");
+        tokio::time::timeout(Duration::from_millis(500), started_b.notified())
+            .await
+            .expect("op b should start promptly");
         release.notify_waiters();
         scheduler.wait(&op_a).await;
         scheduler.wait(&op_b).await;
-        assert_eq!(scheduler.get(&op_a.id).unwrap().status, OperationStatus::Succeeded);
-        assert_eq!(scheduler.get(&op_b.id).unwrap().status, OperationStatus::Succeeded);
+        assert_eq!(
+            scheduler.get(&op_a.id).unwrap().status,
+            OperationStatus::Succeeded
+        );
+        assert_eq!(
+            scheduler.get(&op_b.id).unwrap().status,
+            OperationStatus::Succeeded
+        );
     }
 
     #[tokio::test]
@@ -552,7 +736,16 @@ mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let gate2 = gate.clone();
         let operation = scheduler
-            .schedule(service_input("req-1", "api", ServiceOperationKind::Start), Box::new(move |_h| Box::pin(async move { gate2.notified().await; Ok(()) })), None)
+            .schedule(
+                service_input("req-1", "api", ServiceOperationKind::Start),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        gate2.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
             .unwrap();
         assert!(scheduler.is_queued(&operation));
         gate.notify_one();
@@ -566,22 +759,48 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..(MAX_SETTLED_OPERATIONS + 2) {
             let operation = scheduler
-                .schedule(service_input(&format!("req-{n}"), "api", ServiceOperationKind::Status), Box::new(|_h| Box::pin(async { Ok(()) })), None)
+                .schedule(
+                    service_input(&format!("req-{n}"), "api", ServiceOperationKind::Status),
+                    Box::new(|_h| Box::pin(async { Ok(()) })),
+                    None,
+                )
                 .unwrap();
             scheduler.wait(&operation).await;
             ids.push(operation.id);
         }
         // `wait` returns on the done signal, just before `settle` runs; wait for the last settle.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while scheduler.settled.lock().unwrap().back().map(|(_, id)| id.as_str()) != Some(ids.last().unwrap().as_str()) {
-            assert!(Instant::now() < deadline, "the last operation never settled");
+        while scheduler
+            .settled
+            .lock()
+            .unwrap()
+            .back()
+            .map(|(_, id)| id.as_str())
+            != Some(ids.last().unwrap().as_str())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the last operation never settled"
+            );
             tokio::task::yield_now().await;
         }
-        assert!(scheduler.get(&ids[0]).is_none(), "the oldest settled operation is evicted");
-        assert!(scheduler.get(ids.last().unwrap()).is_some(), "the newest is kept");
+        assert!(
+            scheduler.get(&ids[0]).is_none(),
+            "the oldest settled operation is evicted"
+        );
+        assert!(
+            scheduler.get(ids.last().unwrap()).is_some(),
+            "the newest is kept"
+        );
         assert!(scheduler.operations.lock().unwrap().len() <= MAX_SETTLED_OPERATIONS);
         assert!(scheduler.request_ids.lock().unwrap().len() <= MAX_SETTLED_OPERATIONS);
-        assert!(scheduler.resolve_request(&service_input("req-0", "api", ServiceOperationKind::Status)).unwrap().is_none(), "an evicted request id is free again");
+        assert!(
+            scheduler
+                .resolve_request(&service_input("req-0", "api", ServiceOperationKind::Status))
+                .unwrap()
+                .is_none(),
+            "an evicted request id is free again"
+        );
     }
 
     #[tokio::test]

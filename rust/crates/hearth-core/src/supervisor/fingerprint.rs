@@ -28,9 +28,10 @@ fn collapse_whitespace(text: &str) -> String {
 pub fn command_argv(spec: &CommandSpec) -> (Vec<String>, bool) {
     match spec {
         CommandSpec::Argv { argv } => (argv.clone(), false),
-        CommandSpec::Shell { shell, exec } => {
-            (vec!["sh".to_string(), "-c".to_string(), shell.clone()], exec.unwrap_or(false))
-        }
+        CommandSpec::Shell { shell, exec } => (
+            vec!["sh".to_string(), "-c".to_string(), shell.clone()],
+            exec.unwrap_or(false),
+        ),
     }
 }
 
@@ -67,7 +68,9 @@ mod tests {
 
     fn argv_command(argv: &[&str]) -> ServiceCommand {
         ServiceCommand {
-            command: CommandSpec::Argv { argv: argv.iter().map(|s| s.to_string()).collect() },
+            command: CommandSpec::Argv {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+            },
             cwd: ".".to_string(),
             environment: None,
             container_name: None,
@@ -77,7 +80,10 @@ mod tests {
 
     fn shell_command(shell: &str, exec: Option<bool>) -> ServiceCommand {
         ServiceCommand {
-            command: CommandSpec::Shell { shell: shell.to_string(), exec },
+            command: CommandSpec::Shell {
+                shell: shell.to_string(),
+                exec,
+            },
             cwd: ".".to_string(),
             environment: None,
             container_name: None,
@@ -121,7 +127,9 @@ mod tests {
 
     #[test]
     fn a_ps_wrapper_line_is_still_the_shell_even_with_an_octal_newline() {
-        assert!(is_shell_wrapper_command("/bin/sh -c sleep 2\\012exec nginx"));
+        assert!(is_shell_wrapper_command(
+            "/bin/sh -c sleep 2\\012exec nginx"
+        ));
         assert!(is_shell_wrapper_command("sh -lc echo hi"));
         assert!(!is_shell_wrapper_command("nginx: master process nginx"));
     }
@@ -136,16 +144,27 @@ mod tests {
 
     #[test]
     fn command_argv_resolves_shell_via_sh_dash_c() {
-        let (argv, exec) = command_argv(&CommandSpec::Shell { shell: "echo hi".to_string(), exec: Some(true) });
-        assert_eq!(argv, vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()]);
+        let (argv, exec) = command_argv(&CommandSpec::Shell {
+            shell: "echo hi".to_string(),
+            exec: Some(true),
+        });
+        assert_eq!(
+            argv,
+            vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
         assert!(exec);
     }
 
     #[test]
     fn command_argv_defaults_exec_to_false() {
-        let (_, exec) = command_argv(&CommandSpec::Shell { shell: "echo hi".to_string(), exec: None });
+        let (_, exec) = command_argv(&CommandSpec::Shell {
+            shell: "echo hi".to_string(),
+            exec: None,
+        });
         assert!(!exec);
-        let (_, exec) = command_argv(&CommandSpec::Argv { argv: vec!["x".to_string()] });
+        let (_, exec) = command_argv(&CommandSpec::Argv {
+            argv: vec!["x".to_string()],
+        });
         assert!(!exec);
     }
 

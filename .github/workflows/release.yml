@@ -2,10 +2,8 @@ name: Release
 
 # Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. The tag push
 # runs CI (ci.yml) first; this workflow starts when that CI run completes and only publishes if it
-# succeeded, so a tag whose tests or clippy fail never gets a release asset. It builds the
-# ad-hoc-signed Hearth.app, signs that zip with Sparkle's EdDSA key, and attaches it to the GitHub
-# Release. The appcast Sparkle checks is then published to GitHub Pages
-# (https://ngosangns.github.io/hearth/appcast.xml), the same shape as xmannv/xkey.
+# succeeded, so a tag whose tests or clippy fail never gets a release asset. It builds the release
+# `hearthd` binary and attaches it to the GitHub Release.
 #
 # `workflow_run` always runs this file from the default branch, and `github.ref*` there describe
 # that branch — the tag and commit come from `github.event.workflow_run` instead.
@@ -18,7 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  macos-app:
+  hearthd:
     # For a tag push, `head_branch` is the tag name. CI's other push trigger is `main`, and PR runs
     # are excluded by the event check.
     if: >-
@@ -26,88 +24,38 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: [self-hosted, macmini]
+    defaults:
+      run:
+        working-directory: rust
     env:
       RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
-      APP_ZIP: Hearth-${{ github.event.workflow_run.head_branch }}-macos.zip
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-      # `gh` (used in the publish step) lives in Homebrew's bin dir, which the runner service's
-      # PATH lacks as well as cargo's.
+      # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as cargo's.
       - uses: ./.github/actions/toolchain-path
         with:
-          tools: cargo swift gh
-      - name: Package Hearth.app
-        run: apps/macos/scripts/build-app.sh release
-      # ditto, not zip(1): preserves the symlinks and resource forks a signed .app needs.
-      # --sequesterRsrc is the form Sparkle documents for a zip enclosure.
-      - name: Zip the app bundle
-        working-directory: apps/macos/.build
+          tools: cargo gh node npm
+      - name: Build web UI
+        working-directory: rust/crates/hearth-web/ui
+        run: npm ci && npm run build
+      - name: Build hearthd
         run: |
           set -euo pipefail
-          rm -f "$APP_ZIP"
-          ditto -c -k --sequesterRsrc --keepParent Hearth.app "$APP_ZIP"
-          shasum -a 256 "$APP_ZIP"
-      - name: Sign the update
-        working-directory: apps/macos/.build
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]; then
-            echo "error: SPARKLE_ED_PRIVATE_KEY is not set; refusing to publish an update Sparkle cannot verify" >&2
-            exit 1
-          fi
-          tmp="$(mktemp -d)"
-          curl -fsSL -o "$tmp/Sparkle.tar.xz" \
-            https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz
-          tar -xf "$tmp/Sparkle.tar.xz" -C "$tmp"
-          # The key stays on stdin. -p prints only the signature, which is the signature.txt asset.
-          printf '%s\n' "$SPARKLE_ED_PRIVATE_KEY" | "$tmp/bin/sign_update" --ed-key-file - -p "$APP_ZIP" > signature.txt
-          rm -rf "$tmp"
+          cargo build --release -p hearthd
+          # Ad-hoc sign after the copy-equivalent link, or macOS kills the binary on launch.
+          codesign --sign - --force target/release/hearthd
+          cp target/release/hearthd "hearthd-${RELEASE_TAG}"
       - name: Publish GitHub Release
-        working-directory: apps/macos/.build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Idempotent so a re-run of a failed/partial release job still lands the assets.
+          # Idempotent so a re-run of a failed/partial release job still lands the asset.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$APP_ZIP" signature.txt --clobber
+            gh release upload "$RELEASE_TAG" "hearthd-${RELEASE_TAG}" --clobber
           else
-            gh release create "$RELEASE_TAG" "$APP_ZIP" signature.txt \
+            gh release create "$RELEASE_TAG" "hearthd-${RELEASE_TAG}" \
               --title "$RELEASE_TAG" --generate-notes --verify-tag
           fi
-      - name: Write the appcast
-        working-directory: apps/macos/.build
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ngosangns/hearth
-        run: |
-          set -euo pipefail
-          gh release view "$RELEASE_TAG" --json body,publishedAt --jq .body > notes.txt
-          published="$(gh release view "$RELEASE_TAG" --json publishedAt --jq .publishedAt)"
-          length="$(stat -f %z "$APP_ZIP")"
-          python3 "$GITHUB_WORKSPACE/.github/scripts/generate_appcast.py" \
-            --repo "$GITHUB_REPOSITORY" \
-            --tag "$RELEASE_TAG" \
-            --asset-name "$APP_ZIP" \
-            --length "$length" \
-            --signature-file signature.txt \
-            --notes-file notes.txt \
-            --published-at "$published" \
-            --output appcast.xml
-          mkdir -p appcast-deploy
-          cp appcast.xml appcast-deploy/appcast.xml
-      - name: Deploy the appcast
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: apps/macos/.build/appcast-deploy
-          publish_branch: gh-pages
-          keep_files: false
-          enable_jekyll: false
-          user_name: github-actions[bot]
-          user_email: github-actions[bot]@users.noreply.github.com
-          commit_message: "Update appcast.xml from ${{ github.event.workflow_run.head_branch }}"

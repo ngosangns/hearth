@@ -13,6 +13,7 @@ hearth-core = { path = "../../crates/hearth-core" }
 hearth-cli = { path = "../../crates/hearth-cli" }
 hearth-tui = { path = "../../crates/hearth-tui" }
 hearth-mcp = { path = "../../crates/hearth-mcp" }
+hearth-web = { path = "../../crates/hearth-web" }
 tokio = { workspace = true }
 rmcp = { workspace = true }
 

@@ -52,7 +52,10 @@ pub fn raw_log_path(runtime_directory: &Path, service_id: &str) -> PathBuf {
 /// Where a service's `artifact:` tarball extracts to — versioned so an upgrade installs into a
 /// fresh directory and never mutates a running install.
 pub fn install_dir(runtime_directory: &Path, service_id: &str, version: &str) -> PathBuf {
-    runtime_directory.join("installs").join(service_id).join(version)
+    runtime_directory
+        .join("installs")
+        .join(service_id)
+        .join(version)
 }
 
 /// A service's persistent data dir — survives reinstalls and is not the install dir.
@@ -92,7 +95,10 @@ mod tests {
         let runtime = PathBuf::from("/proj/.hearth/runtime-v1");
         assert_eq!(lock_dir(&runtime), runtime.join("manager.lock"));
         assert_eq!(token_path(&runtime), runtime.join("manager.lock/token"));
-        assert_eq!(metadata_path(&runtime), runtime.join("manager.lock/metadata.json"));
+        assert_eq!(
+            metadata_path(&runtime),
+            runtime.join("manager.lock/metadata.json")
+        );
         assert_eq!(state_path(&runtime), runtime.join("state.json"));
         assert_eq!(logs_dir(&runtime), runtime.join("logs"));
         assert_eq!(log_path(&runtime, "api"), runtime.join("logs/api.log"));

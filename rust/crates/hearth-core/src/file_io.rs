@@ -70,7 +70,11 @@ fn write_durably(file: &mut fs::File, content: &str) -> Result<()> {
 
 fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
-    name.push(format!(".tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     PathBuf::from(name)
 }
 
@@ -105,7 +109,9 @@ impl FileIo for PlainFileIo {
     }
 
     fn is_private_directory(&self, path: &Path) -> bool {
-        fs::symlink_metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+        fs::symlink_metadata(path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
     }
 
     fn read_file(&self, path: &Path) -> Result<Option<String>> {
@@ -193,7 +199,10 @@ fn is_private_mode(mode: u32) -> bool {
 }
 
 fn is_private_regular(metadata: &fs::Metadata) -> bool {
-    metadata.is_file() && !metadata.file_type().is_symlink() && is_private_mode(metadata.mode()) && metadata.nlink() == 1
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && is_private_mode(metadata.mode())
+        && metadata.nlink() == 1
 }
 
 fn identity(path: &Path) -> Result<Option<Identity>> {
@@ -202,7 +211,10 @@ fn identity(path: &Path) -> Result<Option<Identity>> {
             if !is_private_regular(&metadata) {
                 return Err(unsafe_file(path));
             }
-            Ok(Some(Identity { dev: metadata.dev(), ino: metadata.ino() }))
+            Ok(Some(Identity {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -211,7 +223,10 @@ fn identity(path: &Path) -> Result<Option<Identity>> {
 
 fn validate_handle(path: &Path, file: &fs::File, expected: Option<Identity>) -> Result<Identity> {
     let metadata = file.metadata()?;
-    let found = Identity { dev: metadata.dev(), ino: metadata.ino() };
+    let found = Identity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
     let ok = is_private_regular(&metadata) && expected.map(|e| e == found).unwrap_or(true);
     if !ok {
         return Err(unsafe_file(path));
@@ -222,7 +237,10 @@ fn validate_handle(path: &Path, file: &fs::File, expected: Option<Identity>) -> 
 fn open_existing(path: &Path, write: bool) -> Result<fs::File> {
     let before = identity(path)?.ok_or_else(|| unsafe_file(path))?;
     let mut options = fs::OpenOptions::new();
-    options.read(true).write(write).custom_flags(libc::O_NOFOLLOW);
+    options
+        .read(true)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW);
     let file = options.open(path)?;
     validate_handle(path, &file, Some(before))?;
     Ok(file)
@@ -260,7 +278,11 @@ fn open_regular(path: &Path, write: bool, create: bool) -> Result<fs::File> {
 
 fn is_private_directory_guarded(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink() && is_private_mode(metadata.mode()),
+        Ok(metadata) => {
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && is_private_mode(metadata.mode())
+        }
         Err(_) => false,
     }
 }
@@ -310,18 +332,21 @@ impl FileIo for GuardedFileIo {
             guarded_ensure_directory(parent)?;
         }
         let temp = temp_path(path);
-        let written = open_regular(&temp, true, true).and_then(|mut file| write_durably(&mut file, content));
+        let written =
+            open_regular(&temp, true, true).and_then(|mut file| write_durably(&mut file, content));
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
-        let result = fs::rename(&temp, path).map_err(FileIoError::from).and_then(|()| {
-            if identity(path)?.is_none() {
-                Err(unsafe_file(path))
-            } else {
-                Ok(())
-            }
-        });
+        let result = fs::rename(&temp, path)
+            .map_err(FileIoError::from)
+            .and_then(|()| {
+                if identity(path)?.is_none() {
+                    Err(unsafe_file(path))
+                } else {
+                    Ok(())
+                }
+            });
         if result.is_err() {
             let _ = fs::remove_file(&temp);
         }

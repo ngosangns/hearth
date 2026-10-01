@@ -31,7 +31,8 @@ fn parse_env_block(text: &str) -> HashMap<String, String> {
 fn split_key_value(line: &str) -> Option<(String, String)> {
     let eq = line.find('=')?;
     let key = &line[..eq];
-    if key.is_empty() || !key.chars().next().unwrap().is_ascii_alphabetic() && !key.starts_with('_') {
+    if key.is_empty() || !key.chars().next().unwrap().is_ascii_alphabetic() && !key.starts_with('_')
+    {
         return None;
     }
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -52,7 +53,12 @@ fn run_login_shell_env(shell: &str, timeout: Duration) -> Option<HashMap<String,
     let script = format!("printf '%s' '{START_MARKER}'; env -0; printf '%s' '{END_MARKER}'");
     let attempt = (|| -> std::io::Result<Option<HashMap<String, String>>> {
         let mut command = Command::new(shell);
-        command.arg("-ilc").arg(&script).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command
+            .arg("-ilc")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         // Its own process group, so the timeout can kill everything the rc files started — a
         // grandchild (an agent, an `nvm` helper) that inherits stdout would otherwise keep
         // `wait_with_output` blocked long past the timeout, stalling daemon startup.
@@ -81,7 +87,9 @@ fn run_login_shell_env(shell: &str, timeout: Duration) -> Option<HashMap<String,
         let start = stdout.find(START_MARKER);
         let end = stdout.find(END_MARKER);
         match (start, end) {
-            (Some(s), Some(e)) if e >= s => Ok(Some(parse_env_block(&stdout[s + START_MARKER.len()..e]))),
+            (Some(s), Some(e)) if e >= s => {
+                Ok(Some(parse_env_block(&stdout[s + START_MARKER.len()..e])))
+            }
             _ => Ok(None),
         }
     })();
@@ -90,35 +98,50 @@ fn run_login_shell_env(shell: &str, timeout: Duration) -> Option<HashMap<String,
 
 /// Directories where the tools this daemon itself invokes (`docker`, `tailscale`, `bun`, `ps`) are
 /// installed on a typical macOS dev machine, beyond launchd's bare default.
-pub const KNOWN_TOOL_DIRECTORIES: [&str; 3] = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"];
+pub const KNOWN_TOOL_DIRECTORIES: [&str; 3] =
+    ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"];
 
 /// `path` with every directory in `KNOWN_TOOL_DIRECTORIES` (plus `~/.bun/bin` and `~/.cargo/bin`)
 /// appended if it is not already present.
 ///
-/// `hearthd` is routinely spawned by the macOS app, and a Dock/Finder-launched GUI process inherits
-/// launchd's bare `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) — which the daemon it spawns then
-/// inherits too. Every tool the daemon calls by name (`docker compose` for container services,
+/// `hearthd` is often started outside a login shell, and that process inherits launchd's bare
+/// `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) — which the daemon it spawns then inherits too. Every tool the daemon calls by name (`docker compose` for container services,
 /// `tailscale serve status` for tailnet readiness, `tailscale status` for `{tailnetHost}` URLs)
 /// would then fail to spawn, even though all of them work from a terminal. Appending rather than
 /// prepending keeps any explicit ordering in the inherited `PATH` authoritative.
 ///
 /// This covers the daemon's *own* subprocesses only. The environment of the services it runs is
 /// resolved separately, from the login shell, by `resolve_base_environment`.
-pub fn with_known_tool_directories(path: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
-    let mut entries: Vec<std::path::PathBuf> = path.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
-    let home_dirs = home.map(std::path::PathBuf::from).into_iter().flat_map(|h| [h.join(".bun/bin"), h.join(".cargo/bin")]);
-    for dir in KNOWN_TOOL_DIRECTORIES.iter().map(std::path::PathBuf::from).chain(home_dirs) {
+pub fn with_known_tool_directories(
+    path: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> std::ffi::OsString {
+    let mut entries: Vec<std::path::PathBuf> = path
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let home_dirs = home
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .flat_map(|h| [h.join(".bun/bin"), h.join(".cargo/bin")]);
+    for dir in KNOWN_TOOL_DIRECTORIES
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(home_dirs)
+    {
         if !entries.contains(&dir) {
             entries.push(dir);
         }
     }
-    std::env::join_paths(entries).unwrap_or_else(|_| path.map(std::ffi::OsStr::to_owned).unwrap_or_default())
+    std::env::join_paths(entries)
+        .unwrap_or_else(|_| path.map(std::ffi::OsStr::to_owned).unwrap_or_default())
 }
-
 
 /// Cached per shell path — spawning an interactive login shell is expensive (can run a user's full
 /// `.zshrc`), and a daemon only needs this resolved once at startup.
-pub fn resolve_login_shell_env(shell: Option<&str>, timeout: Option<Duration>) -> HashMap<String, String> {
+pub fn resolve_login_shell_env(
+    shell: Option<&str>,
+    timeout: Option<Duration>,
+) -> HashMap<String, String> {
     let shell = shell
         .map(|s| s.to_string())
         .or_else(|| std::env::var("SHELL").ok())
@@ -159,7 +182,10 @@ pub fn load_env_file(path: &Path) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let rest = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+        let rest = line
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(line);
         let Some(eq) = rest.find('=') else { continue };
         let key = &rest[..eq];
         if key.is_empty()
@@ -222,7 +248,11 @@ pub fn resolve_base_environment(options: BaseEnvironmentOptions) -> HashMap<Stri
         let path = if env_file.is_absolute() {
             env_file.clone()
         } else {
-            options.root.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()).join(env_file)
+            options
+                .root
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+                .join(env_file)
         };
         base.extend(load_env_file(&path));
     }
@@ -263,7 +293,10 @@ mod tests {
     #[test]
     fn nonexistent_shell_resolves_to_empty_never_panics() {
         clear_login_shell_env_cache_for_tests();
-        let env = resolve_login_shell_env(Some("/definitely/not/a/shell"), Some(Duration::from_millis(500)));
+        let env = resolve_login_shell_env(
+            Some("/definitely/not/a/shell"),
+            Some(Duration::from_millis(500)),
+        );
         assert!(env.is_empty());
     }
 
@@ -294,11 +327,18 @@ mod tests {
         assert_eq!(first.get("FOO").map(String::as_str), Some("bar"));
         std::fs::write(&good, "#!/bin/sh\nexit 1\n").unwrap();
         let second = resolve_login_shell_env(Some(good_path), Some(Duration::from_secs(2)));
-        assert_eq!(second.get("FOO").map(String::as_str), Some("bar"), "a captured env stays cached");
+        assert_eq!(
+            second.get("FOO").map(String::as_str),
+            Some("bar"),
+            "a captured env stays cached"
+        );
 
         let bad_path = bad.to_str().unwrap();
         assert!(resolve_login_shell_env(Some(bad_path), Some(Duration::from_secs(2))).is_empty());
-        assert!(!login_shell_env_cache().lock().unwrap().contains_key(bad_path));
+        assert!(!login_shell_env_cache()
+            .lock()
+            .unwrap()
+            .contains_key(bad_path));
     }
 
     #[test]
@@ -316,7 +356,11 @@ mod tests {
     fn loads_a_dotenv_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".env");
-        std::fs::write(&path, "# comment\nexport FOO=bar\nBAZ=\"qux\"\nQUOTED='single'\n\nEMPTY_LINE_ABOVE=1\n").unwrap();
+        std::fs::write(
+            &path,
+            "# comment\nexport FOO=bar\nBAZ=\"qux\"\nQUOTED='single'\n\nEMPTY_LINE_ABOVE=1\n",
+        )
+        .unwrap();
         let env = load_env_file(&path);
         assert_eq!(env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(env.get("BAZ"), Some(&"qux".to_string()));
@@ -348,8 +392,14 @@ mod tests {
             extra: Some(extra),
         });
 
-        assert_eq!(resolved.get("LS_TEST_LAYER"), Some(&"from-extra".to_string()));
-        assert_eq!(resolved.get("LS_TEST_LAYER_BASE_ONLY"), Some(&"from-process-env".to_string()));
+        assert_eq!(
+            resolved.get("LS_TEST_LAYER"),
+            Some(&"from-extra".to_string())
+        );
+        assert_eq!(
+            resolved.get("LS_TEST_LAYER_BASE_ONLY"),
+            Some(&"from-process-env".to_string())
+        );
         std::env::remove_var("LS_TEST_LAYER_BASE_ONLY");
     }
 

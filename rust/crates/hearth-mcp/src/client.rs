@@ -300,7 +300,7 @@ mod tests {
     /// viclass/infra's shared nginx passes `attachArgs`, which land after the instance id.
     #[test]
     fn resolves_the_instance_id_even_when_attach_args_follow_it() {
-        let exe = Path::new("/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd");
+        let exe = Path::new("hearthd");
         let with_args = hearth_core::shared::synthesize::project_service_entry("nginx".to_string(), "nginx@1.27", exe, None, vec!["--conf".to_string(), "/tmp/conf".to_string()], None);
         assert_eq!(resolve_shared_instance_id(&catalog_with(with_args), "nginx").unwrap(), "nginx@1.27");
         let bare = hearth_core::shared::synthesize::project_service_entry("postgres".to_string(), "postgres@16.4", exe, None, Vec::new(), None);

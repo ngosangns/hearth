@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     /// A failed service must not print as "stopped" — that made a crash indistinguishable from a
-    /// service nobody started, while every other surface (TUI, macOS app, MCP) reported it failed.
+    /// service nobody started, while every other surface (TUI, web, MCP) reported it failed.
     #[test]
     fn text_state_never_hides_a_failure_as_stopped() {
         use hearth_core::state::{DesiredServiceState, ServiceReadiness};

@@ -68,7 +68,11 @@ pub fn parse_ps_tree_rows(stdout: &str) -> Vec<PsTreeRow> {
 /// Returns an empty tree (refusing to walk anything) unless the OS table's row for `leader_pid`
 /// still shows `leader_start_identity` — a caller-supplied pid that no longer matches must never
 /// pull an unrelated live tree (pid reuse) into a signal or into the wait-for-death loop.
-pub fn build_process_tree(rows: &[PsTreeRow], leader_pid: i64, leader_start_identity: &str) -> Vec<ProcessTreeEntry> {
+pub fn build_process_tree(
+    rows: &[PsTreeRow],
+    leader_pid: i64,
+    leader_start_identity: &str,
+) -> Vec<ProcessTreeEntry> {
     let leader_matches = rows
         .iter()
         .find(|row| row.pid == leader_pid)
@@ -89,7 +93,11 @@ pub fn build_process_tree(rows: &[PsTreeRow], leader_pid: i64, leader_start_iden
     let mut queue: VecDeque<i64> = VecDeque::from([leader_pid]);
     while let Some(pid) = queue.pop_front() {
         if let Some(row) = by_pid.get(&pid) {
-            tree.push(ProcessTreeEntry { pid: row.pid, pgid: row.pgid, start_identity: row.start_identity.clone() });
+            tree.push(ProcessTreeEntry {
+                pid: row.pid,
+                pgid: row.pgid,
+                start_identity: row.start_identity.clone(),
+            });
         }
         for child in by_parent.get(&pid).into_iter().flatten() {
             if seen.insert(child.pid) {
@@ -111,7 +119,9 @@ pub fn parse_ps_alive_rows(stdout: &str) -> HashMap<i64, String> {
         .split('\n')
         .filter_map(|line| {
             let trimmed = line.trim_start();
-            alive_row_re().captures(trimmed).map(|c| (c[1].parse().unwrap(), c[2].trim().to_string()))
+            alive_row_re()
+                .captures(trimmed)
+                .map(|c| (c[1].parse().unwrap(), c[2].trim().to_string()))
         })
         .collect()
 }
@@ -122,14 +132,18 @@ pub fn process_tree_alive(tree: &[ProcessTreeEntry], alive: &HashMap<i64, String
     if tree.is_empty() {
         return false;
     }
-    tree.iter().any(|entry| alive.get(&entry.pid) == Some(&entry.start_identity))
+    tree.iter()
+        .any(|entry| alive.get(&entry.pid) == Some(&entry.start_identity))
 }
 
 /// Groups tree members by pgid, excluding the leader's own pgid and any pgid `<= 1` — the leader
 /// itself is signalled separately by the caller; this is only the "other pgids in the tree" set that
 /// `signal_process_tree` needs to separately re-verify before signalling (the `air`-forks-into-its-
 /// own-pgid case).
-pub fn secondary_process_groups(tree: &[ProcessTreeEntry], leader_pgid: i64) -> HashMap<i64, Vec<ProcessTreeEntry>> {
+pub fn secondary_process_groups(
+    tree: &[ProcessTreeEntry],
+    leader_pgid: i64,
+) -> HashMap<i64, Vec<ProcessTreeEntry>> {
     let mut groups: HashMap<i64, Vec<ProcessTreeEntry>> = HashMap::new();
     for entry in tree {
         if entry.pgid == leader_pgid || entry.pgid <= 1 {
@@ -148,14 +162,22 @@ mod tests {
     const LSTART_B: &str = "Sun Sep 20 10:00:01 2026";
 
     fn row(pid: i64, ppid: i64, pgid: i64, start: &str) -> PsTreeRow {
-        PsTreeRow { pid, ppid, pgid, start_identity: start.to_string() }
+        PsTreeRow {
+            pid,
+            ppid,
+            pgid,
+            start_identity: start.to_string(),
+        }
     }
 
     #[test]
     fn parses_ps_tree_rows() {
         let stdout = format!("  100     1   100 {LSTART_A}\n  101   100   101 {LSTART_B}\n");
         let rows = parse_ps_tree_rows(&stdout);
-        assert_eq!(rows, vec![row(100, 1, 100, LSTART_A), row(101, 100, 101, LSTART_B)]);
+        assert_eq!(
+            rows,
+            vec![row(100, 1, 100, LSTART_A), row(101, 100, 101, LSTART_B)]
+        );
     }
 
     #[test]
@@ -167,8 +189,16 @@ mod tests {
         assert_eq!(
             tree,
             vec![
-                ProcessTreeEntry { pid: 100, pgid: 100, start_identity: LSTART_A.to_string() },
-                ProcessTreeEntry { pid: 101, pgid: 101, start_identity: LSTART_B.to_string() },
+                ProcessTreeEntry {
+                    pid: 100,
+                    pgid: 100,
+                    start_identity: LSTART_A.to_string()
+                },
+                ProcessTreeEntry {
+                    pid: 101,
+                    pgid: 101,
+                    start_identity: LSTART_B.to_string()
+                },
             ]
         );
     }
@@ -192,14 +222,22 @@ mod tests {
     fn deduplicates_a_diamond_shaped_process_tree() {
         // Not a realistic process tree (pids don't fork-join like this) but exercises the `seen` set
         // guard against infinite loops / duplicate entries regardless.
-        let rows = vec![row(100, 1, 100, LSTART_A), row(101, 100, 100, LSTART_A), row(102, 100, 100, LSTART_A)];
+        let rows = vec![
+            row(100, 1, 100, LSTART_A),
+            row(101, 100, 100, LSTART_A),
+            row(102, 100, 100, LSTART_A),
+        ];
         let tree = build_process_tree(&rows, 100, LSTART_A);
         assert_eq!(tree.len(), 3);
     }
 
     #[test]
     fn process_tree_alive_true_when_any_member_still_matches() {
-        let tree = vec![ProcessTreeEntry { pid: 100, pgid: 100, start_identity: LSTART_A.to_string() }];
+        let tree = vec![ProcessTreeEntry {
+            pid: 100,
+            pgid: 100,
+            start_identity: LSTART_A.to_string(),
+        }];
         let mut alive = HashMap::new();
         alive.insert(100, LSTART_A.to_string());
         assert!(process_tree_alive(&tree, &alive));
@@ -207,7 +245,11 @@ mod tests {
 
     #[test]
     fn process_tree_alive_false_when_pid_was_reused() {
-        let tree = vec![ProcessTreeEntry { pid: 100, pgid: 100, start_identity: LSTART_A.to_string() }];
+        let tree = vec![ProcessTreeEntry {
+            pid: 100,
+            pgid: 100,
+            start_identity: LSTART_A.to_string(),
+        }];
         let mut alive = HashMap::new();
         alive.insert(100, "a different lstart value...".to_string());
         assert!(!process_tree_alive(&tree, &alive));
@@ -221,9 +263,21 @@ mod tests {
     #[test]
     fn secondary_process_groups_excludes_the_leader_pgid_and_pgid_zero_or_one() {
         let tree = vec![
-            ProcessTreeEntry { pid: 100, pgid: 100, start_identity: LSTART_A.to_string() },
-            ProcessTreeEntry { pid: 101, pgid: 101, start_identity: LSTART_B.to_string() },
-            ProcessTreeEntry { pid: 102, pgid: 1, start_identity: LSTART_B.to_string() },
+            ProcessTreeEntry {
+                pid: 100,
+                pgid: 100,
+                start_identity: LSTART_A.to_string(),
+            },
+            ProcessTreeEntry {
+                pid: 101,
+                pgid: 101,
+                start_identity: LSTART_B.to_string(),
+            },
+            ProcessTreeEntry {
+                pid: 102,
+                pgid: 1,
+                start_identity: LSTART_B.to_string(),
+            },
         ];
         let groups = secondary_process_groups(&tree, 100);
         assert_eq!(groups.len(), 1);
@@ -244,11 +298,25 @@ mod os_level_regression {
     use std::time::{Duration, Instant};
 
     fn run_ps_tree_snapshot() -> String {
-        String::from_utf8(Command::new("ps").args(["-Ao", "pid=,ppid=,pgid=,lstart="]).output().unwrap().stdout).unwrap()
+        String::from_utf8(
+            Command::new("ps")
+                .args(["-Ao", "pid=,ppid=,pgid=,lstart="])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
     }
 
     fn run_ps_alive_snapshot() -> String {
-        String::from_utf8(Command::new("ps").args(["-Ao", "pid=,lstart="]).output().unwrap().stdout).unwrap()
+        String::from_utf8(
+            Command::new("ps")
+                .args(["-Ao", "pid=,lstart="])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
     }
 
     fn is_process_alive(pid: i32) -> bool {
@@ -264,7 +332,11 @@ mod os_level_regression {
         // cargo-test process group instead of just the subtree under test.
         // `set -m` turns on job control so `sleep 60 &` gets its own process group distinct from the
         // shell's — exactly the shape `air` produces for its managed server child.
-        let mut child = Command::new("sh").args(["-c", "set -m; sleep 60 & wait"]).process_group(0).spawn().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "set -m; sleep 60 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let leader_pid = child.id() as i64;
 
         // Wait for the backgrounded `sleep` to actually land in its own process group before
@@ -273,20 +345,36 @@ mod os_level_regression {
         let mut child_pid: Option<i64> = None;
         while Instant::now() < deadline {
             let rows = parse_ps_tree_rows(&run_ps_tree_snapshot());
-            if let Some(sleep_row) = rows.iter().find(|r| r.ppid == leader_pid && r.pgid != leader_pid) {
+            if let Some(sleep_row) = rows
+                .iter()
+                .find(|r| r.ppid == leader_pid && r.pgid != leader_pid)
+            {
                 child_pid = Some(sleep_row.pid);
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let child_pid = child_pid.expect("backgrounded sleep never landed in its own process group");
+        let child_pid =
+            child_pid.expect("backgrounded sleep never landed in its own process group");
 
         let leader_rows = parse_ps_tree_rows(&run_ps_tree_snapshot());
-        let leader_start_identity = leader_rows.iter().find(|r| r.pid == leader_pid).unwrap().start_identity.clone();
+        let leader_start_identity = leader_rows
+            .iter()
+            .find(|r| r.pid == leader_pid)
+            .unwrap()
+            .start_identity
+            .clone();
         let tree = build_process_tree(&leader_rows, leader_pid, &leader_start_identity);
-        assert!(tree.iter().any(|e| e.pid == child_pid), "tree walk should have found the backgrounded child");
+        assert!(
+            tree.iter().any(|e| e.pid == child_pid),
+            "tree walk should have found the backgrounded child"
+        );
 
-        let leader_pgid = leader_rows.iter().find(|r| r.pid == leader_pid).unwrap().pgid;
+        let leader_pgid = leader_rows
+            .iter()
+            .find(|r| r.pid == leader_pid)
+            .unwrap()
+            .pgid;
 
         // Signal the leader's own pgid (as `signal_process_tree` does)...
         unsafe {
@@ -297,7 +385,9 @@ mod os_level_regression {
         for (pgid, members) in secondary_process_groups(&tree, leader_pgid) {
             let alive = run_ps_alive_snapshot();
             let alive_rows = parse_ps_alive_rows(&alive);
-            let still_ours = members.iter().any(|m| alive_rows.get(&m.pid) == Some(&m.start_identity));
+            let still_ours = members
+                .iter()
+                .any(|m| alive_rows.get(&m.pid) == Some(&m.start_identity));
             if still_ours {
                 unsafe {
                     libc::killpg(pgid as libc::pid_t, libc::SIGTERM);
@@ -307,6 +397,9 @@ mod os_level_regression {
 
         let _ = child.wait();
         thread::sleep(Duration::from_millis(200));
-        assert!(!is_process_alive(child_pid as i32), "the backgrounded child (own process group) must not survive");
+        assert!(
+            !is_process_alive(child_pid as i32),
+            "the backgrounded child (own process group) must not survive"
+        );
     }
 }

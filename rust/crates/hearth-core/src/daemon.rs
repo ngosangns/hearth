@@ -8,7 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use crate::manager::{bootstrap, BootstrapError, ClaimLockError, HearthManager, HearthManagerOptions};
+use crate::manager::{
+    bootstrap, BootstrapError, ClaimLockError, HearthManager, HearthManagerOptions,
+};
 use crate::paths::metadata_path;
 
 const DAEMON_LOG_MAX_BYTES: u64 = 512 * 1024;
@@ -18,7 +20,10 @@ const LOCK_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 pub type DaemonLog = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn now() -> String {
-    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     crate::supervisor::types::format_iso8601_millis(millis)
 }
 
@@ -37,7 +42,11 @@ pub fn create_daemon_log(runtime_directory: &Path) -> DaemonLog {
                 std::fs::rename(&path, &rotated).ok()?;
             }
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -58,7 +67,13 @@ pub fn read_lock_instance_id(runtime_directory: &Path) -> Option<String> {
         Err(_) => return None,
     };
     match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(value) => Some(value.get("instanceId").and_then(|v| v.as_str()).unwrap_or("").to_string()),
+        Ok(value) => Some(
+            value
+                .get("instanceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
         Err(_) => None,
     }
 }
@@ -76,8 +91,20 @@ pub struct LockOwnershipWatch {
 }
 
 impl LockOwnershipWatch {
-    pub fn new(runtime_directory: PathBuf, instance_id: String, on_lock_lost: Arc<dyn Fn() + Send + Sync>, interval: Option<Duration>) -> Arc<Self> {
-        Arc::new(Self { runtime_directory, instance_id, on_lock_lost, interval: interval.unwrap_or(LOCK_WATCH_INTERVAL), stopped: AtomicBool::new(false), task: Mutex::new(None) })
+    pub fn new(
+        runtime_directory: PathBuf,
+        instance_id: String,
+        on_lock_lost: Arc<dyn Fn() + Send + Sync>,
+        interval: Option<Duration>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            runtime_directory,
+            instance_id,
+            on_lock_lost,
+            interval: interval.unwrap_or(LOCK_WATCH_INTERVAL),
+            stopped: AtomicBool::new(false),
+            task: Mutex::new(None),
+        })
     }
 
     pub fn start(self: &Arc<Self>) {
@@ -143,7 +170,11 @@ pub struct DaemonLifecycle<M: ShutdownManager + 'static> {
 
 impl<M: ShutdownManager + 'static> DaemonLifecycle<M> {
     pub fn new(manager: Arc<M>, stop_services: bool) -> Self {
-        Self { manager, stop_services, once: tokio::sync::OnceCell::new() }
+        Self {
+            manager,
+            stop_services,
+            once: tokio::sync::OnceCell::new(),
+        }
     }
 
     /// Triggered by SIGINT/SIGTERM. Default mode (`stop_services: false`) leaves already-running
@@ -153,7 +184,9 @@ impl<M: ShutdownManager + 'static> DaemonLifecycle<M> {
     pub async fn shutdown(&self) {
         let manager = self.manager.clone();
         let stop_services = self.stop_services;
-        self.once.get_or_init(|| async move { manager.shutdown(stop_services).await }).await;
+        self.once
+            .get_or_init(|| async move { manager.shutdown(stop_services).await })
+            .await;
     }
 
     pub async fn wait_for_manager_shutdown(&self) {
@@ -178,7 +211,10 @@ pub fn install_panic_log(log: DaemonLog) {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let thread = std::thread::current();
-            log(&format!("panic in thread '{}': {info}", thread.name().unwrap_or("<unnamed>")));
+            log(&format!(
+                "panic in thread '{}': {info}",
+                thread.name().unwrap_or("<unnamed>")
+            ));
             previous(info);
         }));
     });
@@ -192,8 +228,13 @@ pub fn install_panic_log(log: DaemonLog) {
 /// daemon is a normal, successful outcome (`true`) — that daemon is now serving this root.
 #[cfg(unix)]
 pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> bool {
-    let root = options.root.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
-    let runtime_directory = options.runtime_directory.clone().unwrap_or_else(|| crate::paths::resolve_runtime_directory(&root, options.catalog.runtime_directory.as_deref()));
+    let root = options
+        .root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let runtime_directory = options.runtime_directory.clone().unwrap_or_else(|| {
+        crate::paths::resolve_runtime_directory(&root, options.catalog.runtime_directory.as_deref())
+    });
     let log = create_daemon_log(&runtime_directory);
     install_panic_log(log.clone());
 
@@ -208,11 +249,17 @@ pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> b
             return false;
         }
     };
-    log(&format!("listening on 127.0.0.1:{}, root={}", manager.info().port, root.display()));
+    log(&format!(
+        "listening on 127.0.0.1:{}, root={}",
+        manager.info().port,
+        root.display()
+    ));
 
     let lifecycle = Arc::new(DaemonLifecycle::new(manager.clone(), stop_services));
 
-    let lock_watch = (read_lock_instance_id(&runtime_directory).as_deref() == Some(manager.instance_id.as_str())).then(|| {
+    let lock_watch = (read_lock_instance_id(&runtime_directory).as_deref()
+        == Some(manager.instance_id.as_str()))
+    .then(|| {
         let lifecycle_for_watch = lifecycle.clone();
         let log_for_watch = log.clone();
         let watch = LockOwnershipWatch::new(
@@ -234,8 +281,12 @@ pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> b
         let lock_watch_for_signal = lock_watch.clone();
         let log_for_signal = log.clone();
         tokio::spawn(async move {
-            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("failed to install SIGINT handler");
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
             tokio::select! {
                 _ = sigint.recv() => {}
                 _ = sigterm.recv() => {}
@@ -251,7 +302,10 @@ pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> b
     // hangup should never reach it — but an explicit ignore means a stray SIGHUP can never fall back
     // to the default terminate-the-process behavior either.
     tokio::spawn(async move {
-        let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
+        let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
         loop {
             sighup.recv().await;
         }
@@ -284,7 +338,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(metadata_path(dir.path()).parent().unwrap()).unwrap();
         std::fs::write(metadata_path(dir.path()), r#"{"instanceId":"abc-123"}"#).unwrap();
-        assert_eq!(read_lock_instance_id(dir.path()), Some("abc-123".to_string()));
+        assert_eq!(
+            read_lock_instance_id(dir.path()),
+            Some("abc-123".to_string())
+        );
     }
 
     #[test]
@@ -301,7 +358,10 @@ mod tests {
         assert!(dir.path().join("daemon.log.1").exists());
         let content = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
         assert!(content.contains("after rotation"));
-        assert!(!content.contains('x'), "the rotated content should not still be in the active log");
+        assert!(
+            !content.contains('x'),
+            "the rotated content should not still be in the active log"
+        );
     }
 
     #[test]
@@ -311,12 +371,27 @@ mod tests {
         std::fs::write(metadata_path(dir.path()), r#"{"instanceId":"me"}"#).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls_clone = calls.clone();
-        let watch = LockOwnershipWatch::new(dir.path().to_path_buf(), "me".to_string(), Arc::new(move || { calls_clone.fetch_add(1, Ordering::SeqCst); }), None);
+        let watch = LockOwnershipWatch::new(
+            dir.path().to_path_buf(),
+            "me".to_string(),
+            Arc::new(move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            None,
+        );
 
         watch.check();
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "still owns the lock — should not report");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "still owns the lock — should not report"
+        );
 
-        std::fs::write(metadata_path(dir.path()), r#"{"instanceId":"someone-else"}"#).unwrap();
+        std::fs::write(
+            metadata_path(dir.path()),
+            r#"{"instanceId":"someone-else"}"#,
+        )
+        .unwrap();
         watch.check();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -333,7 +408,14 @@ mod tests {
         std::fs::write(metadata_path(dir.path()), r#"{"instanceId":"me"}"#).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls_clone = calls.clone();
-        let watch = LockOwnershipWatch::new(dir.path().to_path_buf(), "me".to_string(), Arc::new(move || { calls_clone.fetch_add(1, Ordering::SeqCst); }), None);
+        let watch = LockOwnershipWatch::new(
+            dir.path().to_path_buf(),
+            "me".to_string(),
+            Arc::new(move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            None,
+        );
 
         std::fs::remove_file(metadata_path(dir.path())).unwrap();
         watch.check();
@@ -347,11 +429,22 @@ mod tests {
         std::fs::write(metadata_path(dir.path()), r#"{"instanceId":"me"}"#).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls_clone = calls.clone();
-        let watch = LockOwnershipWatch::new(dir.path().to_path_buf(), "me".to_string(), Arc::new(move || { calls_clone.fetch_add(1, Ordering::SeqCst); }), None);
+        let watch = LockOwnershipWatch::new(
+            dir.path().to_path_buf(),
+            "me".to_string(),
+            Arc::new(move || {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+            None,
+        );
 
         std::fs::write(metadata_path(dir.path()), "not json at all").unwrap();
         watch.check();
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "an unreadable (not missing) lock file must not be treated as lost");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unreadable (not missing) lock file must not be treated as lost"
+        );
     }
 
     #[tokio::test]
@@ -371,11 +464,18 @@ mod tests {
             }
         }
         let (tx, _rx) = watch::channel(false);
-        let manager = Arc::new(CountingManager { calls: std::sync::atomic::AtomicU32::new(0), done: tx });
+        let manager = Arc::new(CountingManager {
+            calls: std::sync::atomic::AtomicU32::new(0),
+            done: tx,
+        });
         let lifecycle = DaemonLifecycle::new(manager.clone(), false);
         lifecycle.shutdown().await;
         lifecycle.shutdown().await;
-        assert_eq!(manager.calls.load(Ordering::SeqCst), 1, "concurrent/repeated shutdown calls must only actually shut down once");
+        assert_eq!(
+            manager.calls.load(Ordering::SeqCst),
+            1,
+            "concurrent/repeated shutdown calls must only actually shut down once"
+        );
         lifecycle.wait_for_manager_shutdown().await;
     }
 }

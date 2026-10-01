@@ -198,7 +198,16 @@ impl ReadinessKind {
         }
     }
 
-    pub const ALL: [Self; 8] = [Self::Process, Self::Tcp, Self::Http, Self::Container, Self::Tailnet, Self::Command, Self::Exit, Self::Custom];
+    pub const ALL: [Self; 8] = [
+        Self::Process,
+        Self::Tcp,
+        Self::Http,
+        Self::Container,
+        Self::Tailnet,
+        Self::Command,
+        Self::Exit,
+        Self::Custom,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,13 +455,28 @@ mod tests {
 
     #[test]
     fn manager_metadata_and_info_serialize_camel_case() {
-        let metadata = ManagerMetadata { version: 1, protocol_version: 1, instance_id: "x".to_string(), pid: 1, port: 8080, started_at: "2024-01-01T00:00:00.000Z".to_string() };
+        let metadata = ManagerMetadata {
+            version: 1,
+            protocol_version: 1,
+            instance_id: "x".to_string(),
+            pid: 1,
+            port: 8080,
+            started_at: "2024-01-01T00:00:00.000Z".to_string(),
+        };
         let json = serde_json::to_value(&metadata).unwrap();
         assert!(json.get("protocolVersion").is_some(), "{json:?}");
         assert!(json.get("instanceId").is_some(), "{json:?}");
         assert!(json.get("startedAt").is_some(), "{json:?}");
 
-        let info = ManagerInfo { protocol_version: 1, instance_id: "x".to_string(), pid: 1, port: 8080, started_at: "2024-01-01T00:00:00.000Z".to_string(), metadata_version: 1, runtime_directory: "/tmp".to_string() };
+        let info = ManagerInfo {
+            protocol_version: 1,
+            instance_id: "x".to_string(),
+            pid: 1,
+            port: 8080,
+            started_at: "2024-01-01T00:00:00.000Z".to_string(),
+            metadata_version: 1,
+            runtime_directory: "/tmp".to_string(),
+        };
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("runtimeDirectory").is_some(), "{json:?}");
         assert!(json.get("metadataVersion").is_some(), "{json:?}");
@@ -460,7 +484,15 @@ mod tests {
 
     #[test]
     fn log_slice_serializes_camel_case() {
-        let slice = LogSlice { service_id: "api".to_string(), generation: 1, cursor: 0, next_cursor: 10, data: "hi".to_string(), reset: false, truncated: false };
+        let slice = LogSlice {
+            service_id: "api".to_string(),
+            generation: 1,
+            cursor: 0,
+            next_cursor: 10,
+            data: "hi".to_string(),
+            reset: false,
+            truncated: false,
+        };
         let json = serde_json::to_value(&slice).unwrap();
         assert!(json.get("nextCursor").is_some(), "{json:?}");
         assert!(json.get("serviceId").is_some(), "{json:?}");
@@ -500,7 +532,11 @@ mod tests {
     fn wire_encoding_matches_serde_for_every_readiness_kind() {
         for kind in ReadinessKind::ALL {
             let serde_form = serde_json::to_value(kind).expect("serializable");
-            assert_eq!(serde_form.as_str().expect("a string"), kind.as_wire_str(), "as_wire_str drifted from serde for {kind:?}");
+            assert_eq!(
+                serde_form.as_str().expect("a string"),
+                kind.as_wire_str(),
+                "as_wire_str drifted from serde for {kind:?}"
+            );
         }
     }
 
@@ -508,7 +544,11 @@ mod tests {
     fn wire_encoding_matches_serde_for_every_service_readiness() {
         for readiness in ServiceReadiness::ALL {
             let serde_form = serde_json::to_value(readiness).expect("serializable");
-            assert_eq!(serde_form.as_str().expect("a string"), readiness.as_wire_str(), "as_wire_str drifted from serde for {readiness:?}");
+            assert_eq!(
+                serde_form.as_str().expect("a string"),
+                readiness.as_wire_str(),
+                "as_wire_str drifted from serde for {readiness:?}"
+            );
         }
     }
 
@@ -516,7 +556,11 @@ mod tests {
     fn wire_encoding_matches_serde_for_every_service_operation_kind() {
         for kind in ServiceOperationKind::ALL {
             let serde_form = serde_json::to_value(kind).expect("serializable");
-            assert_eq!(serde_form.as_str().expect("a string"), kind.as_wire_str(), "as_wire_str drifted from serde for {kind:?}");
+            assert_eq!(
+                serde_form.as_str().expect("a string"),
+                kind.as_wire_str(),
+                "as_wire_str drifted from serde for {kind:?}"
+            );
         }
     }
 
@@ -524,7 +568,11 @@ mod tests {
     fn wire_encoding_matches_serde_for_every_operation_status() {
         for status in OperationStatus::ALL {
             let serde_form = serde_json::to_value(status).expect("serializable");
-            assert_eq!(serde_form.as_str().expect("a string"), status.as_wire_str(), "as_wire_str drifted from serde for {status:?}");
+            assert_eq!(
+                serde_form.as_str().expect("a string"),
+                status.as_wire_str(),
+                "as_wire_str drifted from serde for {status:?}"
+            );
         }
     }
 
@@ -532,7 +580,13 @@ mod tests {
     fn debug_formatting_is_not_a_usable_wire_encoding() {
         // Pins the reason `as_wire_str` exists: the `format!("{:?}", ..).to_lowercase()` shortcut
         // silently produces a string no client matches, for exactly the multi-word variants.
-        assert_eq!(ActualServiceState::QueuedStart.as_wire_str(), "queued-start");
-        assert_eq!(format!("{:?}", ActualServiceState::QueuedStart).to_lowercase(), "queuedstart");
+        assert_eq!(
+            ActualServiceState::QueuedStart.as_wire_str(),
+            "queued-start"
+        );
+        assert_eq!(
+            format!("{:?}", ActualServiceState::QueuedStart).to_lowercase(),
+            "queuedstart"
+        );
     }
 }

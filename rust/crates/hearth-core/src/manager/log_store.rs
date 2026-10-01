@@ -72,7 +72,13 @@ pub struct CursorLogStore {
 }
 
 impl CursorLogStore {
-    pub fn new(io: Arc<dyn FileIo>, directory: PathBuf, latest_tail_bytes: Option<u64>, max_bytes: Option<u64>, rotation_count: Option<usize>) -> Self {
+    pub fn new(
+        io: Arc<dyn FileIo>,
+        directory: PathBuf,
+        latest_tail_bytes: Option<u64>,
+        max_bytes: Option<u64>,
+        rotation_count: Option<usize>,
+    ) -> Self {
         let stream_state_path = directory.join("streams.json");
         Self {
             io,
@@ -103,7 +109,10 @@ impl CursorLogStore {
         }
         // Appends bypass FileIo (which always rewrites atomically) — an append-in-place is safe here
         // because only this store's own serialized per-service queue ever writes this path.
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -113,23 +122,42 @@ impl CursorLogStore {
         Ok(())
     }
 
-    pub async fn read(&self, service_id: &ServiceId, cursor: Option<u64>, limit: Option<u64>, lifecycle_generation: u64, requested_generation: Option<u64>) -> LogSlice {
+    pub async fn read(
+        &self,
+        service_id: &ServiceId,
+        cursor: Option<u64>,
+        limit: Option<u64>,
+        lifecycle_generation: u64,
+        requested_generation: Option<u64>,
+    ) -> LogSlice {
         let _guard = self.append_queues.lock(service_id).await;
         self.ensure_loaded().await;
         let path = self.path_for(service_id);
-        let safe_limit = limit.unwrap_or(self.latest_tail_bytes).clamp(1, self.latest_tail_bytes);
+        let safe_limit = limit
+            .unwrap_or(self.latest_tail_bytes)
+            .clamp(1, self.latest_tail_bytes);
         // Clients echo `generation` back. Fold the rotation counter into that same number so a
         // rotation resets a follower the same way a process restart does. A bare lifecycle number
         // from an older client mismatches once, then the client echoes the composite.
-        let rotation = *self.rotation_generations.lock().unwrap().get(service_id).unwrap_or(&1);
+        let rotation = *self
+            .rotation_generations
+            .lock()
+            .unwrap()
+            .get(service_id)
+            .unwrap_or(&1);
         let generation = log_cursor_generation(lifecycle_generation, rotation);
         let stale_generation = requested_generation.is_some_and(|g| g != generation);
         // One handle for the whole request: the cursor check, and a single window read. Appends and
         // rotations hold this same per-service lock, so its view of the file cannot shift. The tail
         // used to be located by re-opening the file once per byte it stepped over.
         let mut file = std::fs::File::open(&path).ok();
-        let size = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
-        let invalid_cursor = cursor.is_some_and(|c| c > size || !is_utf8_boundary(file.as_mut(), c, size));
+        let size = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let invalid_cursor =
+            cursor.is_some_and(|c| c > size || !is_utf8_boundary(file.as_mut(), c, size));
         let reset = stale_generation || invalid_cursor;
         let (start, data, bytes_read) = match (cursor, file.as_mut()) {
             (Some(c), Some(file)) if !reset && c < size => {
@@ -159,8 +187,12 @@ impl CursorLogStore {
         match self.io.read_file(&self.stream_state_path) {
             Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
                 Ok(value) => {
-                    if value.get("version").and_then(Value::as_u64) == Some(LOG_STREAM_STATE_VERSION as u64) {
-                        if let Some(generations) = value.get("generations").and_then(Value::as_object) {
+                    if value.get("version").and_then(Value::as_u64)
+                        == Some(LOG_STREAM_STATE_VERSION as u64)
+                    {
+                        if let Some(generations) =
+                            value.get("generations").and_then(Value::as_object)
+                        {
                             let mut map = self.rotation_generations.lock().unwrap();
                             for (k, v) in generations {
                                 if let Some(n) = v.as_u64() {
@@ -182,7 +214,10 @@ impl CursorLogStore {
 
     async fn reconcile_rotation_journals(&self) {
         let entries = match std::fs::read_dir(&self.directory) {
-            Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect::<Vec<_>>(),
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(_) => return,
         };
@@ -190,10 +225,19 @@ impl CursorLogStore {
         let mut journals_to_delete = Vec::new();
         for entry in entries.iter().filter(|e| e.ends_with(".log.rotation.json")) {
             let path = self.directory.join(entry);
-            let journal: Option<LogRotationJournal> = self.io.read_file(&path).ok().flatten().and_then(|raw| serde_json::from_str(&raw).ok());
+            let journal: Option<LogRotationJournal> = self
+                .io
+                .read_file(&path)
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok());
             match journal {
                 Some(journal) if journal.version == LOG_STREAM_STATE_VERSION => {
-                    let rotated_path = format!("{}.{}", self.path_for(&journal.service_id).display(), journal.from_generation);
+                    let rotated_path = format!(
+                        "{}.{}",
+                        self.path_for(&journal.service_id).display(),
+                        journal.from_generation
+                    );
                     let renamed = Path::new(&rotated_path).exists();
                     if journal.phase == "committed" || renamed {
                         let mut map = self.rotation_generations.lock().unwrap();
@@ -220,14 +264,20 @@ impl CursorLogStore {
 
     fn write_stream_state(&self) {
         let generations = self.rotation_generations.lock().unwrap().clone();
-        if let Ok(json) = serde_json::to_string(&LogStreamState { version: LOG_STREAM_STATE_VERSION, generations }) {
+        if let Ok(json) = serde_json::to_string(&LogStreamState {
+            version: LOG_STREAM_STATE_VERSION,
+            generations,
+        }) {
             let _ = self.io.write_file(&self.stream_state_path, &json);
         }
     }
 
     async fn save_generation_after_rotation(&self, service_id: &ServiceId, generation: u64) {
         let _guard = self.metadata_serial.lock().await;
-        self.rotation_generations.lock().unwrap().insert(service_id.clone(), generation);
+        self.rotation_generations
+            .lock()
+            .unwrap()
+            .insert(service_id.clone(), generation);
         self.write_stream_state();
     }
 
@@ -241,11 +291,23 @@ impl CursorLogStore {
 
     async fn rotate(&self, service_id: &ServiceId) -> Result<(), LogStoreError> {
         let path = self.path_for(service_id);
-        let from_generation = *self.rotation_generations.lock().unwrap().get(service_id).unwrap_or(&1);
+        let from_generation = *self
+            .rotation_generations
+            .lock()
+            .unwrap()
+            .get(service_id)
+            .unwrap_or(&1);
         let journal_path = PathBuf::from(format!("{}.rotation.json", path.display()));
-        let journal = LogRotationJournal { version: LOG_STREAM_STATE_VERSION, service_id: service_id.clone(), from_generation, to_generation: from_generation + 1, phase: "pending".to_string() };
+        let journal = LogRotationJournal {
+            version: LOG_STREAM_STATE_VERSION,
+            service_id: service_id.clone(),
+            from_generation,
+            to_generation: from_generation + 1,
+            phase: "pending".to_string(),
+        };
         let rotated_path = PathBuf::from(format!("{}.{}", path.display(), from_generation));
-        self.io.write_file(&journal_path, &serde_json::to_string(&journal).unwrap())?;
+        self.io
+            .write_file(&journal_path, &serde_json::to_string(&journal).unwrap())?;
         // A second writer (another daemon sharing this runtime directory) may have rotated the same
         // file first; the log is simply already gone, so appending recreates it. Throwing here would
         // reject the append that triggered the rotation.
@@ -254,10 +316,20 @@ impl CursorLogStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let committed = LogRotationJournal { phase: "committed".to_string(), ..journal.clone() };
-        self.io.write_file(&journal_path, &serde_json::to_string(&committed).unwrap())?;
+        let committed = LogRotationJournal {
+            phase: "committed".to_string(),
+            ..journal.clone()
+        };
+        self.io
+            .write_file(&journal_path, &serde_json::to_string(&committed).unwrap())?;
 
-        let prefix = format!("{}.", self.path_for(service_id).file_name().unwrap().to_string_lossy());
+        let prefix = format!(
+            "{}.",
+            self.path_for(service_id)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
         let mut rotated: Vec<String> = std::fs::read_dir(&self.directory)?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -267,12 +339,18 @@ impl CursorLogStore {
         // `<service>.log.<generation>`, so a plain string sort orders them `.1, .10, .11, .2, …` —
         // and since the pruning below drops the *front* of this list, that deleted the newest
         // generations and kept the oldest as soon as a service passed 9 rotations.
-        rotated.sort_by_key(|name| name.rsplit('.').next().and_then(|suffix| suffix.parse::<u64>().ok()).unwrap_or(0));
+        rotated.sort_by_key(|name| {
+            name.rsplit('.')
+                .next()
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
         let excess = rotated.len().saturating_sub(self.rotation_count);
         for name in &rotated[..excess] {
             let _ = self.io.remove_file(&self.directory.join(name));
         }
-        self.save_generation_after_rotation(service_id, journal.to_generation).await;
+        self.save_generation_after_rotation(service_id, journal.to_generation)
+            .await;
         let _ = self.io.remove_file(&journal_path);
         Ok(())
     }
@@ -312,7 +390,10 @@ fn read_tail(file: &mut std::fs::File, size: u64, limit: u64) -> (u64, String, u
     let window_start = size.saturating_sub(limit);
     let mut buffer = vec![0u8; (size - window_start) as usize];
     let read = read_at(file, window_start, &mut buffer);
-    let skip = buffer[..read].iter().take_while(|byte| is_utf8_continuation(**byte)).count();
+    let skip = buffer[..read]
+        .iter()
+        .take_while(|byte| is_utf8_continuation(**byte))
+        .count();
     let data = String::from_utf8_lossy(&buffer[skip..read]).into_owned();
     (window_start + skip as u64, data, (read - skip) as u64)
 }
@@ -351,7 +432,16 @@ mod tests {
     fn store(tail: u64, max: u64, rotation_count: usize) -> (CursorLogStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let io: Arc<dyn FileIo> = Arc::from(create_file_io(false));
-        (CursorLogStore::new(io, dir.path().join("logs"), Some(tail), Some(max), Some(rotation_count)), dir)
+        (
+            CursorLogStore::new(
+                io,
+                dir.path().join("logs"),
+                Some(tail),
+                Some(max),
+                Some(rotation_count),
+            ),
+            dir,
+        )
     }
 
     #[tokio::test]
@@ -372,7 +462,9 @@ mod tests {
         store.append(&"api".to_string(), "hello ").await.unwrap();
         let first = store.read(&"api".to_string(), None, None, 0, None).await;
         store.append(&"api".to_string(), "world").await.unwrap();
-        let second = store.read(&"api".to_string(), Some(first.next_cursor), None, 0, None).await;
+        let second = store
+            .read(&"api".to_string(), Some(first.next_cursor), None, 0, None)
+            .await;
         assert_eq!(second.data, "world");
         assert!(!second.reset);
     }
@@ -381,7 +473,9 @@ mod tests {
     async fn stale_generation_forces_a_reset() {
         let (store, _dir) = store(1024, 4096, 2);
         store.append(&"api".to_string(), "hello").await.unwrap();
-        let slice = store.read(&"api".to_string(), Some(0), None, 5, Some(3)).await;
+        let slice = store
+            .read(&"api".to_string(), Some(0), None, 5, Some(3))
+            .await;
         assert!(slice.reset);
         assert_eq!(slice.data, "hello");
         assert_eq!(slice.generation, log_cursor_generation(5, 1));
@@ -391,14 +485,18 @@ mod tests {
     async fn out_of_range_cursor_forces_a_reset() {
         let (store, _dir) = store(1024, 4096, 2);
         store.append(&"api".to_string(), "hello").await.unwrap();
-        let slice = store.read(&"api".to_string(), Some(9999), None, 0, None).await;
+        let slice = store
+            .read(&"api".to_string(), Some(9999), None, 0, None)
+            .await;
         assert!(slice.reset);
     }
 
     #[tokio::test]
     async fn an_unstarted_service_echoes_the_initial_rotation_generation() {
         let (store, _dir) = store(1024, 4096, 2);
-        let slice = store.read(&"never-started".to_string(), None, None, 0, None).await;
+        let slice = store
+            .read(&"never-started".to_string(), None, None, 0, None)
+            .await;
         // No state row is lifecycle 0. The live file is rotation 1 until it rolls, so the echoed
         // cursor is 1 — an older client that stored a bare `0` resets once, then follows this.
         assert_eq!(slice.generation, log_cursor_generation(0, 1));
@@ -409,15 +507,40 @@ mod tests {
     #[tokio::test]
     async fn rotation_resets_a_follower_that_echoes_the_previous_generation() {
         let (store, _dir) = store(1024, 20, 2);
-        store.append(&"api".to_string(), "0123456789").await.unwrap();
+        store
+            .append(&"api".to_string(), "0123456789")
+            .await
+            .unwrap();
         let first = store.read(&"api".to_string(), None, None, 4, None).await;
         assert_eq!(first.generation, log_cursor_generation(4, 1));
-        store.append(&"api".to_string(), "0123456789").await.unwrap();
+        store
+            .append(&"api".to_string(), "0123456789")
+            .await
+            .unwrap();
         store.append(&"api".to_string(), "x").await.unwrap();
-        let followed = store.read(&"api".to_string(), Some(first.next_cursor), None, 4, Some(first.generation)).await;
-        assert!(followed.reset, "a rotation must invalidate the cursor the client is echoing");
+        let followed = store
+            .read(
+                &"api".to_string(),
+                Some(first.next_cursor),
+                None,
+                4,
+                Some(first.generation),
+            )
+            .await;
+        assert!(
+            followed.reset,
+            "a rotation must invalidate the cursor the client is echoing"
+        );
         assert_eq!(followed.generation, log_cursor_generation(4, 2));
-        let resumed = store.read(&"api".to_string(), Some(followed.next_cursor), None, 4, Some(followed.generation)).await;
+        let resumed = store
+            .read(
+                &"api".to_string(),
+                Some(followed.next_cursor),
+                None,
+                4,
+                Some(followed.generation),
+            )
+            .await;
         assert!(!resumed.reset);
         assert_eq!(resumed.generation, followed.generation);
     }
@@ -425,19 +548,34 @@ mod tests {
     #[tokio::test]
     async fn append_over_the_max_size_is_rejected() {
         let (store, _dir) = store(1024, 10, 2);
-        let err = store.append(&"api".to_string(), "this is definitely longer than ten bytes").await.unwrap_err();
+        let err = store
+            .append(
+                &"api".to_string(),
+                "this is definitely longer than ten bytes",
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, LogStoreError::TooLarge(_)));
     }
 
     #[tokio::test]
     async fn rotation_triggers_when_appending_would_exceed_max_bytes() {
         let (store, dir) = store(1024, 20, 2);
-        store.append(&"api".to_string(), "0123456789").await.unwrap(); // 10 bytes, under max
-        store.append(&"api".to_string(), "0123456789").await.unwrap(); // would be 20, still fits exactly? 10+10=20 not > 20, no rotate yet
+        store
+            .append(&"api".to_string(), "0123456789")
+            .await
+            .unwrap(); // 10 bytes, under max
+        store
+            .append(&"api".to_string(), "0123456789")
+            .await
+            .unwrap(); // would be 20, still fits exactly? 10+10=20 not > 20, no rotate yet
         store.append(&"api".to_string(), "x").await.unwrap(); // 21 > 20 now -> rotates first
         let logs_dir = dir.path().join("logs");
         let rotated = logs_dir.join("api.log.1");
-        assert!(rotated.exists(), "expected a rotated generation-1 file to exist");
+        assert!(
+            rotated.exists(),
+            "expected a rotated generation-1 file to exist"
+        );
         let current = std::fs::read_to_string(logs_dir.join("api.log")).unwrap();
         assert_eq!(current, "x");
     }
@@ -449,8 +587,15 @@ mod tests {
             store.append(&"api".to_string(), chunk).await.unwrap();
         }
         let logs_dir = dir.path().join("logs");
-        let entries: Vec<String> = std::fs::read_dir(&logs_dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
-        let rotated_generations: Vec<&String> = entries.iter().filter(|e| e.starts_with("api.log.") && !e.ends_with(".rotation.json")).collect();
+        let entries: Vec<String> = std::fs::read_dir(&logs_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let rotated_generations: Vec<&String> = entries
+            .iter()
+            .filter(|e| e.starts_with("api.log.") && !e.ends_with(".rotation.json"))
+            .collect();
         assert!(rotated_generations.len() <= 1, "{rotated_generations:?}");
     }
 
@@ -466,14 +611,29 @@ mod tests {
         std::fs::create_dir_all(&logs_dir).unwrap();
         std::fs::write(logs_dir.join("api.log"), "current generation 2 content").unwrap();
         std::fs::write(logs_dir.join("api.log.1"), "old generation 1 content").unwrap();
-        let journal = LogRotationJournal { version: 1, service_id: "api".to_string(), from_generation: 1, to_generation: 2, phase: "committed".to_string() };
-        std::fs::write(logs_dir.join("api.log.rotation.json"), serde_json::to_string(&journal).unwrap()).unwrap();
+        let journal = LogRotationJournal {
+            version: 1,
+            service_id: "api".to_string(),
+            from_generation: 1,
+            to_generation: 2,
+            phase: "committed".to_string(),
+        };
+        std::fs::write(
+            logs_dir.join("api.log.rotation.json"),
+            serde_json::to_string(&journal).unwrap(),
+        )
+        .unwrap();
 
         let slice = store.read(&"api".to_string(), None, None, 0, None).await;
         assert!(!slice.reset);
         assert_eq!(slice.data, "current generation 2 content");
-        assert!(!logs_dir.join("api.log.rotation.json").exists(), "the journal should be cleaned up after reconciliation");
-        let streams: Value = serde_json::from_str(&std::fs::read_to_string(logs_dir.join("streams.json")).unwrap()).unwrap();
+        assert!(
+            !logs_dir.join("api.log.rotation.json").exists(),
+            "the journal should be cleaned up after reconciliation"
+        );
+        let streams: Value =
+            serde_json::from_str(&std::fs::read_to_string(logs_dir.join("streams.json")).unwrap())
+                .unwrap();
         assert_eq!(streams["generations"]["api"], 2);
     }
 
@@ -486,11 +646,23 @@ mod tests {
         std::fs::create_dir_all(&logs_dir).unwrap();
         std::fs::write(logs_dir.join("api.log"), "current").unwrap();
         std::fs::write(logs_dir.join("api.log.1"), "old").unwrap();
-        let journal = LogRotationJournal { version: 1, service_id: "api".to_string(), from_generation: 1, to_generation: 2, phase: "pending".to_string() };
-        std::fs::write(logs_dir.join("api.log.rotation.json"), serde_json::to_string(&journal).unwrap()).unwrap();
+        let journal = LogRotationJournal {
+            version: 1,
+            service_id: "api".to_string(),
+            from_generation: 1,
+            to_generation: 2,
+            phase: "pending".to_string(),
+        };
+        std::fs::write(
+            logs_dir.join("api.log.rotation.json"),
+            serde_json::to_string(&journal).unwrap(),
+        )
+        .unwrap();
 
         let _ = store.read(&"api".to_string(), None, None, 0, None).await;
-        let streams: Value = serde_json::from_str(&std::fs::read_to_string(logs_dir.join("streams.json")).unwrap()).unwrap();
+        let streams: Value =
+            serde_json::from_str(&std::fs::read_to_string(logs_dir.join("streams.json")).unwrap())
+                .unwrap();
         assert_eq!(streams["generations"]["api"], 2, "the renamed file's existence alone should be enough to trust generation 2 even though the journal never reached committed");
         assert!(!logs_dir.join("api.log.rotation.json").exists());
     }
@@ -498,12 +670,16 @@ mod tests {
     #[tokio::test]
     async fn multi_byte_utf8_at_the_tail_boundary_is_never_split() {
         let (store, _dir) = store(5, 4096, 2); // a tiny tail window forces the boundary math to kick in
-        // "héllo" — the 'é' is a 2-byte UTF-8 sequence; a naive byte-offset tail of the last 5 bytes
-        // would land mid-character.
+                                               // "héllo" — the 'é' is a 2-byte UTF-8 sequence; a naive byte-offset tail of the last 5 bytes
+                                               // would land mid-character.
         store.append(&"api".to_string(), "héllo").await.unwrap();
         let slice = store.read(&"api".to_string(), None, None, 0, None).await;
         assert!(String::from_utf8(slice.data.clone().into_bytes()).is_ok());
-        assert!(!slice.data.contains('\u{FFFD}'), "must not contain a UTF-8 replacement character: {:?}", slice.data);
+        assert!(
+            !slice.data.contains('\u{FFFD}'),
+            "must not contain a UTF-8 replacement character: {:?}",
+            slice.data
+        );
     }
 
     #[tokio::test]

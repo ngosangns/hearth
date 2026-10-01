@@ -13,7 +13,10 @@ use crate::supervisor::types::format_iso8601_millis;
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 
 fn now() -> String {
-    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     format_iso8601_millis(millis)
 }
 
@@ -44,14 +47,28 @@ impl ManagerEventStore {
         Arc::new(Self {
             capacity: capacity.unwrap_or(DEFAULT_EVENT_CAPACITY),
             epoch: epoch.unwrap_or_else(|| Uuid::new_v4().to_string()),
-            inner: Mutex::new(Inner { next_sequence: 1, events: VecDeque::new(), listeners: HashMap::new(), next_listener_id: 0 }),
+            inner: Mutex::new(Inner {
+                next_sequence: 1,
+                events: VecDeque::new(),
+                listeners: HashMap::new(),
+                next_listener_id: 0,
+            }),
         })
     }
 
-    pub fn publish(&self, event_type: &str, data: serde_json::Map<String, serde_json::Value>) -> ManagerEvent {
+    pub fn publish(
+        &self,
+        event_type: &str,
+        data: serde_json::Map<String, serde_json::Value>,
+    ) -> ManagerEvent {
         let (event, listeners) = {
             let mut inner = self.inner.lock().unwrap();
-            let event = ManagerEvent { sequence: inner.next_sequence, at: now(), event_type: event_type.to_string(), data };
+            let event = ManagerEvent {
+                sequence: inner.next_sequence,
+                at: now(),
+                event_type: event_type.to_string(),
+                data,
+            };
             inner.next_sequence += 1;
             // A `VecDeque` so evicting the oldest event is O(1), not a shift of the whole buffer on
             // every publish once it is full.
@@ -81,7 +98,13 @@ impl ManagerEventStore {
     /// in the snapshot. Registering after releasing the lock would drop an event that is in
     /// neither. A reset (or any rejected snapshot) does not subscribe — the caller resynchronizes
     /// from the returned buffer instead.
-    pub fn subscribe_and_replay(self: &Arc<Self>, after_sequence: Option<u64>, epoch: Option<&str>, listener: EventListener, subscribe_if: impl FnOnce(&Replay) -> bool) -> (Replay, Option<Box<dyn FnOnce() + Send>>) {
+    pub fn subscribe_and_replay(
+        self: &Arc<Self>,
+        after_sequence: Option<u64>,
+        epoch: Option<&str>,
+        listener: EventListener,
+        subscribe_if: impl FnOnce(&Replay) -> bool,
+    ) -> (Replay, Option<Box<dyn FnOnce() + Send>>) {
         let mut inner = self.inner.lock().unwrap();
         let replay = Self::replay_locked(&self.epoch, &inner, after_sequence, epoch);
         if !subscribe_if(&replay) {
@@ -92,9 +115,12 @@ impl ManagerEventStore {
         inner.listeners.insert(id, listener);
         drop(inner);
         let store = self.clone();
-        (replay, Some(Box::new(move || {
-            store.inner.lock().unwrap().listeners.remove(&id);
-        })))
+        (
+            replay,
+            Some(Box::new(move || {
+                store.inner.lock().unwrap().listeners.remove(&id);
+            })),
+        )
     }
 
     #[cfg(test)]
@@ -107,8 +133,17 @@ impl ManagerEventStore {
         Self::replay_locked(&self.epoch, &inner, after_sequence, epoch)
     }
 
-    fn replay_locked(epoch: &str, inner: &Inner, after_sequence: Option<u64>, cursor_epoch: Option<&str>) -> Replay {
-        let oldest_sequence = inner.events.front().map(|e| e.sequence).unwrap_or(inner.next_sequence);
+    fn replay_locked(
+        epoch: &str,
+        inner: &Inner,
+        after_sequence: Option<u64>,
+        cursor_epoch: Option<&str>,
+    ) -> Replay {
+        let oldest_sequence = inner
+            .events
+            .front()
+            .map(|e| e.sequence)
+            .unwrap_or(inner.next_sequence);
         let latest_sequence = inner.next_sequence.saturating_sub(1);
         let epoch_mismatch = cursor_epoch.is_some_and(|e| e != epoch);
         let out_of_range = after_sequence.is_some_and(|after| {
@@ -120,10 +155,20 @@ impl ManagerEventStore {
         // is the full snapshot it needs to resynchronize from. Returning an empty vec left a
         // client with a stale cursor no way to recover — it saw `reset: true` and no events.
         let events = match after_sequence {
-            Some(after) if !reset => inner.events.iter().filter(|e| e.sequence > after).cloned().collect(),
+            Some(after) if !reset => inner
+                .events
+                .iter()
+                .filter(|e| e.sequence > after)
+                .cloned()
+                .collect(),
             _ => inner.events.iter().cloned().collect(),
         };
-        Replay { epoch: epoch.to_string(), reset, events, latest_sequence }
+        Replay {
+            epoch: epoch.to_string(),
+            reset,
+            events,
+            latest_sequence,
+        }
     }
 }
 
@@ -179,7 +224,11 @@ mod tests {
         store.publish("b", data());
         let replay = store.replay(None, Some("epoch-b"));
         assert!(replay.reset);
-        assert_eq!(replay.events.len(), 2, "a reset must return the full snapshot, not an empty list");
+        assert_eq!(
+            replay.events.len(),
+            2,
+            "a reset must return the full snapshot, not an empty list"
+        );
     }
 
     #[test]
@@ -190,7 +239,11 @@ mod tests {
         }
         let replay = store.replay(Some(1), None);
         assert!(replay.reset);
-        assert_eq!(replay.events.len(), 2, "everything still buffered, so the client can resynchronize");
+        assert_eq!(
+            replay.events.len(),
+            2,
+            "everything still buffered, so the client can resynchronize"
+        );
     }
 
     #[test]
@@ -246,13 +299,29 @@ mod tests {
         store.publish("a", data());
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
-        let (replay, unsubscribe) = store.subscribe_and_replay(None, None, Arc::new(move |event: &ManagerEvent| {
-            received_clone.lock().unwrap().push(event.sequence);
-        }), |replay| !replay.reset);
+        let (replay, unsubscribe) = store.subscribe_and_replay(
+            None,
+            None,
+            Arc::new(move |event: &ManagerEvent| {
+                received_clone.lock().unwrap().push(event.sequence);
+            }),
+            |replay| !replay.reset,
+        );
         let unsubscribe = unsubscribe.expect("an in-range snapshot subscribes");
-        assert_eq!(replay.events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         store.publish("b", data());
-        assert_eq!(*received.lock().unwrap(), vec![2], "the snapshot event must not be delivered again");
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![2],
+            "the snapshot event must not be delivered again"
+        );
         unsubscribe();
         store.publish("c", data());
         assert_eq!(*received.lock().unwrap(), vec![2]);
@@ -264,12 +333,21 @@ mod tests {
         store.publish("a", data());
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
-        let (replay, unsubscribe) = store.subscribe_and_replay(None, Some("epoch-b"), Arc::new(move |event: &ManagerEvent| {
-            received_clone.lock().unwrap().push(event.sequence);
-        }), |replay| !replay.reset);
+        let (replay, unsubscribe) = store.subscribe_and_replay(
+            None,
+            Some("epoch-b"),
+            Arc::new(move |event: &ManagerEvent| {
+                received_clone.lock().unwrap().push(event.sequence);
+            }),
+            |replay| !replay.reset,
+        );
         assert!(replay.reset);
         assert!(unsubscribe.is_none());
-        assert_eq!(replay.events.len(), 1, "a reset still returns the whole buffer");
+        assert_eq!(
+            replay.events.len(),
+            1,
+            "a reset still returns the whole buffer"
+        );
         store.publish("b", data());
         assert!(received.lock().unwrap().is_empty());
         assert_eq!(store.subscriber_count(), 0);

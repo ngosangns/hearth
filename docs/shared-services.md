@@ -253,7 +253,7 @@ catalog needed.
 ## CLI — `hearthd shared …` (no project catalog required)
 
 `ensure --json` (the `manager ensure --json` contract for smp — prints the `ManagerConnection`
-for `~/.hearth/shared`, used by the macOS app) · `list [--json]` (remote registry, no daemon
+for `~/.hearth/shared`, used by `hearthd web`) · `list [--json]` (remote registry, no daemon
 needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attach|detach|probe
 <name@ver>` · `install <name@ver>` · `remove <name@ver>`.
 
@@ -263,15 +263,12 @@ needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attac
 directly via its lock-dir token). The skill doc (`hearthd skill install`) documents the flow:
 read `shared:` in `hearth.yaml` → attach happens on `start` → query connection info via MCP.
 
-## macOS app
+## Web GUI
 
-`Shared Services` is a singleton `Window` scene (menu bar item + Window menu) driven by an
-app-level `SharedServicesController` — not per workspace. It connects via `DaemonConnection
-.ensureShared()` (`hearthd shared ensure --json`) and the same `ManagerClient`/`SharedAPI`
-surface, so instance state streams over smp's `/v1/events/stream` exactly like a project
-daemon's. The catalog UI shows registered instances (state, port, attached projects +
-copyable connection info) and installable `name@version` entries; install/start/stop/remove
-are the only mutations — attach/detach stay project-side via `shared:` + `start`.
+`hearthd web` has a Shared services page. It connects to smp the same way `hearthd shared ensure`
+does. The page lists registered instances (state, port, attached projects, copyable connection
+info) and installable `name@version` entries. Install, start, stop, restart, and remove are the
+mutations. Attach and detach stay project-side via `shared:` plus start.
 
 ## Edge cases
 

@@ -25,12 +25,17 @@ use crate::catalog::{is_container_command, CommandSpec, ServiceCommand, ServiceI
 use crate::paths::{logs_dir, raw_log_path, resolve_runtime_directory};
 use crate::state::ProcessIdentity;
 
-use super::fingerprint::{command_argv, is_shell_wrapper_command, normalize_observed_command_fingerprint};
-use super::process_tree::{build_process_tree, parse_ps_alive_rows, parse_ps_tree_rows, ProcessTreeSnapshot};
+use super::fingerprint::{
+    command_argv, is_shell_wrapper_command, normalize_observed_command_fingerprint,
+};
+use super::process_tree::{
+    build_process_tree, parse_ps_alive_rows, parse_ps_tree_rows, ProcessTreeSnapshot,
+};
 use super::types::{
-    DockerContainerRecord, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, PortHolder, PosixProcessRecord,
-    ProbeAdapter, ProcessAdapter, ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock,
-    SupervisorError, SupervisorOptions, SystemClock,
+    DockerContainerRecord, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource,
+    OutputTail, PortHolder, PosixProcessRecord, ProbeAdapter, ProcessAdapter, ProcessRecord,
+    ProcessSignal, RunBuild, SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,
+    SystemClock,
 };
 
 const RAW_LOG_POLL_MS: u64 = 200;
@@ -54,7 +59,10 @@ fn to_nix_signal(signal: ProcessSignal) -> nix::sys::signal::Signal {
 }
 
 fn send_signal(pid: i64, signal: ProcessSignal) {
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), to_nix_signal(signal));
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        to_nix_signal(signal),
+    );
 }
 
 /// A negative pid is POSIX shorthand for "the whole process group". pgid 0 is the caller's own
@@ -63,7 +71,10 @@ fn send_signal_to_group(pgid: i64, signal: ProcessSignal) {
     if pgid <= 1 {
         return;
     }
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-(pgid as i32)), to_nix_signal(signal));
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-(pgid as i32)),
+        to_nix_signal(signal),
+    );
 }
 
 /// Runs an observational command and returns `(exit code, stdout)`; `-1` means it could not be
@@ -80,8 +91,14 @@ async fn capture_command_output(argv: &[&str]) -> (i32, String, String) {
         return (-1, String::new(), String::new());
     }
     let mut cmd = Command::new(argv[0]);
-    cmd.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
-    let Ok(mut child) = cmd.spawn() else { return (-1, String::new(), String::new()) };
+    cmd.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let Ok(mut child) = cmd.spawn() else {
+        return (-1, String::new(), String::new());
+    };
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let read_stdout = async move {
@@ -98,7 +115,10 @@ async fn capture_command_output(argv: &[&str]) -> (i32, String, String) {
         }
         buf
     };
-    let finished = tokio::time::timeout(PROBE_COMMAND_TIMEOUT, async { tokio::join!(read_stdout, read_stderr, child.wait()) }).await;
+    let finished = tokio::time::timeout(PROBE_COMMAND_TIMEOUT, async {
+        tokio::join!(read_stdout, read_stderr, child.wait())
+    })
+    .await;
     match finished {
         Ok((out, err, Ok(status))) => (
             status.code().unwrap_or(-1),
@@ -141,9 +161,14 @@ fn ps_observed_re() -> &'static Regex {
 /// to a person (the port-holder kill prompt) needs the text itself. `Err` means the probe itself
 /// failed (spawn/timeout — exit `-1`, or unparseable output): the caller must not read it as
 /// "process gone".
-async fn observed_system_process_with_command(pid: i64) -> Result<Option<(PosixProcessRecord, String)>, ()> {
+async fn observed_system_process_with_command(
+    pid: i64,
+) -> Result<Option<(PosixProcessRecord, String)>, ()> {
     let pid_str = pid.to_string();
-    let (code, stdout) = capture_command(&["ps", "-o", "pid=", "-o", "pgid=", "-o", "lstart=", "-o", "command=", "-p", &pid_str]).await;
+    let (code, stdout) = capture_command(&[
+        "ps", "-o", "pid=", "-o", "pgid=", "-o", "lstart=", "-o", "command=", "-p", &pid_str,
+    ])
+    .await;
     if code == -1 {
         return Err(());
     }
@@ -156,12 +181,25 @@ async fn observed_system_process_with_command(pid: i64) -> Result<Option<(PosixP
     let start_identity = caps[3].trim().to_string();
     let command_line = caps[4].trim().to_string();
     let command_fingerprint = normalize_observed_command_fingerprint(&caps[4]);
-    Ok(Some((PosixProcessRecord { pid: observed_pid, pgid, start_identity, command_fingerprint }, command_line)))
+    Ok(Some((
+        PosixProcessRecord {
+            pid: observed_pid,
+            pgid,
+            start_identity,
+            command_fingerprint,
+        },
+        command_line,
+    )))
 }
 
 async fn observed_system_process(pid: i64) -> Result<Option<ObservedProcess>, ()> {
-    let Some((record, _)) = observed_system_process_with_command(pid).await? else { return Ok(None) };
-    Ok(Some(ObservedProcess { record: ProcessRecord::Posix(record), alive: true }))
+    let Some((record, _)) = observed_system_process_with_command(pid).await? else {
+        return Ok(None);
+    };
+    Ok(Some(ObservedProcess {
+        record: ProcessRecord::Posix(record),
+        alive: true,
+    }))
 }
 
 /// Whether `ps` can inspect processes at all. Only a success is cached: `ps` does not disappear,
@@ -188,7 +226,11 @@ async fn system_process_tree(leader_pid: i64, leader_start_identity: &str) -> Pr
     if code != 0 {
         return ProcessTreeSnapshot::Unknown;
     }
-    let tree = build_process_tree(&parse_ps_tree_rows(&stdout), leader_pid, leader_start_identity);
+    let tree = build_process_tree(
+        &parse_ps_tree_rows(&stdout),
+        leader_pid,
+        leader_start_identity,
+    );
     if tree.is_empty() {
         ProcessTreeSnapshot::Absent
     } else {
@@ -204,7 +246,14 @@ async fn system_live_start_identities() -> Option<HashMap<i64, String>> {
 }
 
 async fn container_running(container_name: &str) -> Result<bool, ()> {
-    let (code, stdout, stderr) = capture_command_output(&["docker", "inspect", "-f", "{{.State.Running}}", container_name]).await;
+    let (code, stdout, stderr) = capture_command_output(&[
+        "docker",
+        "inspect",
+        "-f",
+        "{{.State.Running}}",
+        container_name,
+    ])
+    .await;
     if !docker_inspect_answered(code, &stderr) {
         return Err(());
     }
@@ -213,8 +262,18 @@ async fn container_running(container_name: &str) -> Result<bool, ()> {
 
 /// `Err` when the probe itself failed (spawn/timeout, or a daemon that cannot be reached): a
 /// wedged Docker Desktop must not read as "container gone". "No such container" is `Ok(None)`.
-async fn container_record(container_name: &str, command_fingerprint: &str) -> Result<Option<DockerContainerRecord>, ()> {
-    let (code, stdout, stderr) = capture_command_output(&["docker", "inspect", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}", container_name]).await;
+async fn container_record(
+    container_name: &str,
+    command_fingerprint: &str,
+) -> Result<Option<DockerContainerRecord>, ()> {
+    let (code, stdout, stderr) = capture_command_output(&[
+        "docker",
+        "inspect",
+        "-f",
+        "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}",
+        container_name,
+    ])
+    .await;
     if !docker_inspect_answered(code, &stderr) {
         return Err(());
     }
@@ -235,7 +294,14 @@ async fn container_record(container_name: &str, command_fingerprint: &str) -> Re
 /// `docker inspect`. `None` when docker could not be asked at all (a missing id is simply absent
 /// from the map, which is how a stopped container is reported).
 async fn running_containers(container_ids: &[String]) -> Option<HashMap<String, String>> {
-    let mut argv = vec!["docker", "inspect", "--type", "container", "-f", "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}"];
+    let mut argv = vec![
+        "docker",
+        "inspect",
+        "--type",
+        "container",
+        "-f",
+        "{{.Id}}\t{{.State.Running}}\t{{.State.StartedAt}}",
+    ];
     argv.extend(container_ids.iter().map(String::as_str));
     let (code, stdout, stderr) = capture_command_output(&argv).await;
     if !docker_inspect_answered(code, &stderr) {
@@ -246,7 +312,8 @@ async fn running_containers(container_ids: &[String]) -> Option<HashMap<String, 
             .lines()
             .filter_map(|line| {
                 let parts: Vec<&str> = line.trim().split('\t').collect();
-                (parts.len() == 3 && parts[1] == "true").then(|| (parts[0].to_string(), parts[2].to_string()))
+                (parts.len() == 3 && parts[1] == "true")
+                    .then(|| (parts[0].to_string(), parts[2].to_string()))
             })
             .collect(),
     )
@@ -290,16 +357,26 @@ impl ContainerWatcher {
                     state.polling = false;
                     return;
                 }
-                state.watches.iter().map(|(record, _)| record.container_id.clone()).collect()
+                state
+                    .watches
+                    .iter()
+                    .map(|(record, _)| record.container_id.clone())
+                    .collect()
             };
-            let Some(running) = running_containers(&ids).await else { continue };
+            let Some(running) = running_containers(&ids).await else {
+                continue;
+            };
             // Only containers this tick actually asked about can be declared gone — a watch added
             // while `docker inspect` ran is absent from `running` without having exited.
             let gone: Vec<oneshot::Sender<i32>> = {
                 let mut state = self.state.lock().unwrap();
-                let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.watches).into_iter().partition(|(record, _)| {
-                    ids.contains(&record.container_id) && running.get(&record.container_id) != Some(&record.container_started_at)
-                });
+                let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.watches)
+                    .into_iter()
+                    .partition(|(record, _)| {
+                        ids.contains(&record.container_id)
+                            && running.get(&record.container_id)
+                                != Some(&record.container_started_at)
+                    });
                 state.watches = kept;
                 gone.into_iter().map(|(_, exited)| exited).collect()
             };
@@ -310,9 +387,16 @@ impl ContainerWatcher {
     }
 }
 
-fn same_container_instance(expected: &DockerContainerRecord, observed: Option<&DockerContainerRecord>) -> bool {
+fn same_container_instance(
+    expected: &DockerContainerRecord,
+    observed: Option<&DockerContainerRecord>,
+) -> bool {
     observed
-        .map(|o| o.container_name == expected.container_name && o.container_id == expected.container_id && o.container_started_at == expected.container_started_at)
+        .map(|o| {
+            o.container_name == expected.container_name
+                && o.container_id == expected.container_id
+                && o.container_started_at == expected.container_started_at
+        })
         .unwrap_or(false)
 }
 
@@ -323,13 +407,23 @@ async fn tailnet_serving() -> bool {
     }
     serde_json::from_str::<serde_json::Value>(&stdout)
         .ok()
-        .and_then(|v| v.get("Web").and_then(|w| w.as_object()).map(|o| !o.is_empty()))
+        .and_then(|v| {
+            v.get("Web")
+                .and_then(|w| w.as_object())
+                .map(|o| !o.is_empty())
+        })
         .unwrap_or(false)
 }
 
 async fn tcp_probe(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
-    tokio::time::timeout(Duration::from_millis(250), tokio::net::TcpStream::connect(&addr)).await.map(|r| r.is_ok()).unwrap_or(false)
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
 }
 
 /// The pids listening on `port` per `lsof`, each resolved through `ps` so a holder carries the same
@@ -348,18 +442,29 @@ async fn port_holders(port: u16) -> Option<Vec<PortHolder>> {
     }
     let mut holders = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for pid in stdout.split_whitespace().filter_map(|line| line.parse::<i64>().ok()) {
+    for pid in stdout
+        .split_whitespace()
+        .filter_map(|line| line.parse::<i64>().ok())
+    {
         if !seen.insert(pid) {
             continue;
         }
         if let Ok(Some((record, command_line))) = observed_system_process_with_command(pid).await {
-            holders.push(PortHolder { pid, pgid: record.pgid, start_identity: record.start_identity, command: command_line });
+            holders.push(PortHolder {
+                pid,
+                pgid: record.pgid,
+                start_identity: record.start_identity,
+                command: command_line,
+            });
         }
     }
     Some(holders)
 }
 
-async fn forward_stream<R: tokio::io::AsyncRead + Unpin>(stream: Option<R>, on_output: Option<OnOutput>) {
+async fn forward_stream<R: tokio::io::AsyncRead + Unpin>(
+    stream: Option<R>,
+    on_output: Option<OnOutput>,
+) {
     let Some(mut stream) = stream else { return };
     let mut buf = [0u8; 8192];
     loop {
@@ -392,12 +497,23 @@ impl Drop for KillGroupOnDrop {
 
 /// Spawns `argv` (cwd/env applied, own process group), forwards both stdout and stderr to
 /// `on_output`, and returns its exit code (`-1` if it couldn't even be spawned).
-async fn run_command(argv: &[String], cwd: &Path, env: &HashMap<String, String>, on_output: Option<OnOutput>) -> i32 {
+async fn run_command(
+    argv: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    on_output: Option<OnOutput>,
+) -> i32 {
     if argv.is_empty() {
         return -1;
     }
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]).current_dir(cwd).env_clear().envs(env).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    cmd.args(&argv[1..])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return -1,
@@ -442,31 +558,44 @@ async fn stop_unverified_child(child: &mut tokio::process::Child) {
 /// later `inspect` comparisons are made against `ps` output. So an observation is accepted when it
 /// already equals what we spawned, or when it repeats identically across two polls — which a
 /// transient mid-exec placeholder does not.
-pub(crate) fn accepts_spawn_observation(current: &PosixProcessRecord, expected_fingerprint: &str, previous: Option<&PosixProcessRecord>) -> bool {
+pub(crate) fn accepts_spawn_observation(
+    current: &PosixProcessRecord,
+    expected_fingerprint: &str,
+    previous: Option<&PosixProcessRecord>,
+) -> bool {
     if current.command_fingerprint == expected_fingerprint {
         return true;
     }
     match previous {
         Some(previous) => {
-            previous.pid == current.pid && previous.pgid == current.pgid && previous.start_identity == current.start_identity && previous.command_fingerprint == current.command_fingerprint
+            previous.pid == current.pid
+                && previous.pgid == current.pgid
+                && previous.start_identity == current.start_identity
+                && previous.command_fingerprint == current.command_fingerprint
         }
         None => false,
     }
 }
 
-
 /// Exec fingerprint settling loop — port of `observedStableExecProcess`. A shell wrapper's own
 /// fingerprint (the `sh -c ...` line as `ps` shows it *before* exec) differs from the execed
 /// program's; this polls until it observes the SAME non-wrapper fingerprint twice in a row, with a
 /// settle-check delay between, before trusting it.
-async fn observed_stable_exec_process(child: &mut tokio::process::Child, expected_fingerprint: &str) -> Result<PosixProcessRecord, SupervisorError> {
-    let pid = child.id().ok_or_else(|| SupervisorError("child has no pid".to_string()))? as i64;
+async fn observed_stable_exec_process(
+    child: &mut tokio::process::Child,
+    expected_fingerprint: &str,
+) -> Result<PosixProcessRecord, SupervisorError> {
+    let pid = child
+        .id()
+        .ok_or_else(|| SupervisorError("child has no pid".to_string()))? as i64;
     let mut candidate: Option<PosixProcessRecord> = None;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(25)).await;
         let observed = observed_system_process_with_command(pid).await;
         let posix = match observed {
-            Ok(Some((record, command_line))) if !is_shell_wrapper_command(&command_line) => Some(record),
+            Ok(Some((record, command_line))) if !is_shell_wrapper_command(&command_line) => {
+                Some(record)
+            }
             _ => None,
         };
         let Some(rec) = posix else {
@@ -495,7 +624,9 @@ async fn observed_stable_exec_process(child: &mut tokio::process::Child, expecte
         candidate = None;
     }
     stop_unverified_child(child).await;
-    Err(SupervisorError("Unable to establish stable POSIX exec process identity".to_string()))
+    Err(SupervisorError(
+        "Unable to establish stable POSIX exec process identity".to_string(),
+    ))
 }
 
 /// Non-exec shell identity. The first `ps` row of `sh -c` already hashes to the logical command,
@@ -503,14 +634,21 @@ async fn observed_stable_exec_process(child: &mut tokio::process::Child, expecte
 /// the live process. Wait until the same row is still there after `EXEC_IDENTITY_SETTLE_MS`. A
 /// wrapper that never execs stays `sh -c` for the whole window and is accepted. A line that
 /// changes restarts the window on the new row.
-async fn observed_stable_shell_process(child: &mut tokio::process::Child) -> Result<PosixProcessRecord, SupervisorError> {
-    let pid = child.id().ok_or_else(|| SupervisorError("child has no pid".to_string()))? as i64;
+async fn observed_stable_shell_process(
+    child: &mut tokio::process::Child,
+) -> Result<PosixProcessRecord, SupervisorError> {
+    let pid = child
+        .id()
+        .ok_or_else(|| SupervisorError("child has no pid".to_string()))? as i64;
     let mut candidate: Option<PosixProcessRecord> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
         let rec = match observed_system_process(pid).await {
-            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(rec), .. })) => Some(rec),
+            Ok(Some(ObservedProcess {
+                record: ProcessRecord::Posix(rec),
+                ..
+            })) => Some(rec),
             _ => None,
         };
         let Some(rec) = rec else {
@@ -523,15 +661,23 @@ async fn observed_stable_shell_process(child: &mut tokio::process::Child) -> Res
         }
         tokio::time::sleep(Duration::from_millis(EXEC_IDENTITY_SETTLE_MS)).await;
         match observed_system_process(pid).await {
-            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(settled), .. })) if Some(&settled) == candidate.as_ref() => {
+            Ok(Some(ObservedProcess {
+                record: ProcessRecord::Posix(settled),
+                ..
+            })) if Some(&settled) == candidate.as_ref() => {
                 return Ok(settled);
             }
-            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(settled), .. })) => candidate = Some(settled),
+            Ok(Some(ObservedProcess {
+                record: ProcessRecord::Posix(settled),
+                ..
+            })) => candidate = Some(settled),
             _ => candidate = None,
         }
     }
     stop_unverified_child(child).await;
-    Err(SupervisorError("Unable to establish stable POSIX shell process identity".to_string()))
+    Err(SupervisorError(
+        "Unable to establish stable POSIX shell process identity".to_string(),
+    ))
 }
 
 /// The longest prefix of `bytes` that does not end mid-way through a UTF-8 sequence, so a chunked
@@ -591,7 +737,13 @@ fn drain_raw_log_once(path: &Path, offset: &AtomicU64, on_output: &OnOutput) {
 /// store on every re-attach. The returned stop handle cancels the follow task, which kills the
 /// `docker logs` child; the task also ends on its own when the container stops, since
 /// `docker logs --follow` exits with it.
-fn tail_container_logs(container_name: String, since: Option<String>, tail: Option<u64>, env: HashMap<String, String>, on_output: OnOutput) -> OutputTail {
+fn tail_container_logs(
+    container_name: String,
+    since: Option<String>,
+    tail: Option<u64>,
+    env: HashMap<String, String>,
+    on_output: OnOutput,
+) -> OutputTail {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let done = Arc::new(AtomicBool::new(false));
@@ -605,12 +757,18 @@ fn tail_container_logs(container_name: String, since: Option<String>, tail: Opti
         if let Some(tail) = tail {
             cmd.arg("--tail").arg(tail.to_string());
         }
-        cmd.arg(&container_name).env_clear().envs(&env).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+        cmd.arg(&container_name)
+            .env_clear()
+            .envs(&env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(_) => return,
         };
-        let stdout_task = tokio::spawn(forward_stream(child.stdout.take(), Some(on_output.clone())));
+        let stdout_task =
+            tokio::spawn(forward_stream(child.stdout.take(), Some(on_output.clone())));
         let stderr_task = tokio::spawn(forward_stream(child.stderr.take(), Some(on_output)));
         tokio::select! {
             _ = task_cancel.cancelled() => {
@@ -632,7 +790,11 @@ fn tail_file(path: PathBuf, skip_backlog: bool, on_output: OnOutput) -> OutputTa
     let stopped = Arc::new(AtomicBool::new(false));
     // Adopted processes keep the previous daemon's raw capture file: everything before this
     // offset was already forwarded, so re-reading it would replay old output into the log store.
-    let offset = Arc::new(AtomicU64::new(if skip_backlog { std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) } else { 0 }));
+    let offset = Arc::new(AtomicU64::new(if skip_backlog {
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    }));
     let task_path = path.clone();
     let task_output = on_output.clone();
     let task_offset = offset.clone();
@@ -640,8 +802,11 @@ fn tail_file(path: PathBuf, skip_backlog: bool, on_output: OnOutput) -> OutputTa
     let handle = tokio::spawn(async move {
         while !task_stopped.load(Ordering::SeqCst) {
             // Synchronous file I/O — kept off the async workers.
-            let (path, offset, output) = (task_path.clone(), task_offset.clone(), task_output.clone());
-            let _ = tokio::task::spawn_blocking(move || drain_raw_log_once(&path, &offset, &output)).await;
+            let (path, offset, output) =
+                (task_path.clone(), task_offset.clone(), task_output.clone());
+            let _ =
+                tokio::task::spawn_blocking(move || drain_raw_log_once(&path, &offset, &output))
+                    .await;
             tokio::time::sleep(Duration::from_millis(RAW_LOG_POLL_MS)).await;
         }
     });
@@ -656,7 +821,10 @@ fn tail_file(path: PathBuf, skip_backlog: bool, on_output: OnOutput) -> OutputTa
     )
 }
 
-fn merged_environment(base: &HashMap<String, String>, command_env: &Option<HashMap<String, String>>) -> HashMap<String, String> {
+fn merged_environment(
+    base: &HashMap<String, String>,
+    command_env: &Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
     let mut env = base.clone();
     if let Some(extra) = command_env {
         env.extend(extra.clone());
@@ -673,7 +841,11 @@ pub struct DefaultProcessAdapter {
 
 #[async_trait]
 impl ProcessAdapter for DefaultProcessAdapter {
-    async fn spawn(&self, input: SpawnInput, on_output: OnOutput) -> Result<ManagedProcess, SupervisorError> {
+    async fn spawn(
+        &self,
+        input: SpawnInput,
+        on_output: OnOutput,
+    ) -> Result<ManagedProcess, SupervisorError> {
         let env = merged_environment(&self.base_environment, &input.command.environment);
 
         if is_container_command(&input.command) {
@@ -681,17 +853,26 @@ impl ProcessAdapter for DefaultProcessAdapter {
             let cwd = self.root.join(&input.command.cwd);
             let code = run_command(&argv, &cwd, &env, Some(on_output)).await;
             if code != 0 {
-                return Err(SupervisorError(format!("Docker service command exited with {code}")));
+                return Err(SupervisorError(format!(
+                    "Docker service command exited with {code}"
+                )));
             }
             let container_name = input.command.container_name.clone().unwrap();
             let record = container_record(&container_name, &input.command_fingerprint)
                 .await
                 .ok()
                 .flatten()
-                .ok_or_else(|| SupervisorError(format!("Docker container {container_name} is not running after start")))?;
+                .ok_or_else(|| {
+                    SupervisorError(format!(
+                        "Docker container {container_name} is not running after start"
+                    ))
+                })?;
             let (tx, rx) = oneshot::channel();
             self.containers.watch(record.clone(), tx);
-            return Ok(ManagedProcess { record: ProcessRecord::Docker(record), exited: rx });
+            return Ok(ManagedProcess {
+                record: ProcessRecord::Docker(record),
+                exited: rx,
+            });
         }
 
         if !process_inspection_available().await {
@@ -707,9 +888,19 @@ impl ProcessAdapter for DefaultProcessAdapter {
             .await
             .map_err(|e| SupervisorError(format!("failed to create logs directory: {e}")))?;
         let raw = raw_log_path(&self.runtime_directory, &input.service_id);
-        std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&raw).map_err(|e| SupervisorError(e.to_string()))?;
-        let stdout_file = std::fs::OpenOptions::new().append(true).open(&raw).map_err(|e| SupervisorError(e.to_string()))?;
-        let stderr_file = stdout_file.try_clone().map_err(|e| SupervisorError(e.to_string()))?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&raw)
+            .map_err(|e| SupervisorError(e.to_string()))?;
+        let stdout_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&raw)
+            .map_err(|e| SupervisorError(e.to_string()))?;
+        let stderr_file = stdout_file
+            .try_clone()
+            .map_err(|e| SupervisorError(e.to_string()))?;
 
         let cwd = self.root.join(&input.command.cwd);
         let mut cmd = Command::new(&argv[0]);
@@ -720,8 +911,13 @@ impl ProcessAdapter for DefaultProcessAdapter {
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
             .process_group(0);
-        let mut child = cmd.spawn().map_err(|e| SupervisorError(format!("Service process failed to start: {e}")))?;
-        let pid = child.id().ok_or_else(|| SupervisorError("spawned child reported no pid".to_string()))? as i64;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SupervisorError(format!("Service process failed to start: {e}")))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| SupervisorError("spawned child reported no pid".to_string()))?
+            as i64;
 
         let record = if exec {
             observed_stable_exec_process(&mut child, &input.command_fingerprint).await?
@@ -745,8 +941,16 @@ impl ProcessAdapter for DefaultProcessAdapter {
             let mut observed = None;
             let mut previous: Option<PosixProcessRecord> = None;
             for attempt in 0..8 {
-                if let Ok(Some(ObservedProcess { record: ProcessRecord::Posix(current), .. })) = observed_system_process(pid).await {
-                    if accepts_spawn_observation(&current, &input.command_fingerprint, previous.as_ref()) {
+                if let Ok(Some(ObservedProcess {
+                    record: ProcessRecord::Posix(current),
+                    ..
+                })) = observed_system_process(pid).await
+                {
+                    if accepts_spawn_observation(
+                        &current,
+                        &input.command_fingerprint,
+                        previous.as_ref(),
+                    ) {
                         observed = Some(current);
                         break;
                     }
@@ -762,7 +966,10 @@ impl ProcessAdapter for DefaultProcessAdapter {
                 Some(r) => r,
                 None => {
                     stop_unverified_child(&mut child).await;
-                    return Err(SupervisorError("Unable to establish POSIX process ownership identity after 8 inspections".to_string()));
+                    return Err(SupervisorError(
+                        "Unable to establish POSIX process ownership identity after 8 inspections"
+                            .to_string(),
+                    ));
                 }
             }
         };
@@ -773,32 +980,45 @@ impl ProcessAdapter for DefaultProcessAdapter {
             let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
             let _ = tx.send(code);
         });
-        Ok(ManagedProcess { record: ProcessRecord::Posix(record), exited: rx })
+        Ok(ManagedProcess {
+            record: ProcessRecord::Posix(record),
+            exited: rx,
+        })
     }
 
     async fn inspect(&self, identity: &ProcessIdentity) -> Inspection {
         match identity {
-            ProcessIdentity::Docker(id) => match container_record(&id.container_name, &id.command_fingerprint).await {
-                Err(()) => Inspection::Unknown,
-                Ok(None) => Inspection::Gone,
-                Ok(Some(record)) => {
-                    let expected = DockerContainerRecord {
-                        container_name: id.container_name.clone(),
-                        container_id: id.container_id.clone(),
-                        container_started_at: id.container_started_at.clone(),
-                        command_fingerprint: id.command_fingerprint.clone(),
-                    };
-                    if same_container_instance(&expected, Some(&record)) {
-                        Inspection::Observed(ObservedProcess { record: ProcessRecord::Docker(record), alive: true })
-                    } else {
-                        Inspection::Gone
+            ProcessIdentity::Docker(id) => {
+                match container_record(&id.container_name, &id.command_fingerprint).await {
+                    Err(()) => Inspection::Unknown,
+                    Ok(None) => Inspection::Gone,
+                    Ok(Some(record)) => {
+                        let expected = DockerContainerRecord {
+                            container_name: id.container_name.clone(),
+                            container_id: id.container_id.clone(),
+                            container_started_at: id.container_started_at.clone(),
+                            command_fingerprint: id.command_fingerprint.clone(),
+                        };
+                        if same_container_instance(&expected, Some(&record)) {
+                            Inspection::Observed(ObservedProcess {
+                                record: ProcessRecord::Docker(record),
+                                alive: true,
+                            })
+                        } else {
+                            Inspection::Gone
+                        }
                     }
                 }
-            },
+            }
             ProcessIdentity::Posix(id) => {
                 if id.pid == 0 {
                     return Inspection::Observed(ObservedProcess {
-                        record: ProcessRecord::Posix(PosixProcessRecord { pid: 0, pgid: 0, start_identity: String::new(), command_fingerprint: id.command_fingerprint.clone() }),
+                        record: ProcessRecord::Posix(PosixProcessRecord {
+                            pid: 0,
+                            pgid: 0,
+                            start_identity: String::new(),
+                            command_fingerprint: id.command_fingerprint.clone(),
+                        }),
                         alive: false,
                     });
                 }
@@ -815,7 +1035,11 @@ impl ProcessAdapter for DefaultProcessAdapter {
         send_signal_to_group(pgid, signal);
     }
 
-    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
+    async fn process_tree(
+        &self,
+        leader_pid: i64,
+        leader_start_identity: &str,
+    ) -> ProcessTreeSnapshot {
         system_process_tree(leader_pid, leader_start_identity).await
     }
 
@@ -829,28 +1053,66 @@ impl ProcessAdapter for DefaultProcessAdapter {
         }
         // The lstart the caller resolved is compared again at signal time — a squatter that died
         // and had its pid recycled between resolve and kill must never take the signal.
-        if let Ok(Some(ObservedProcess { record: ProcessRecord::Posix(record), alive: true })) = observed_system_process(pid).await {
+        if let Ok(Some(ObservedProcess {
+            record: ProcessRecord::Posix(record),
+            alive: true,
+        })) = observed_system_process(pid).await
+        {
             if record.start_identity == expected_start_identity {
                 send_signal(pid, signal);
             }
         }
     }
 
-    async fn stop_container(&self, command: &ServiceCommand, on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
-        let default_stop = CommandSpec::Argv { argv: vec!["docker".to_string(), "compose".to_string(), "stop".to_string()] };
-        let (argv, _) = command_argv(command.docker_stop_command.as_ref().unwrap_or(&default_stop));
+    async fn stop_container(
+        &self,
+        command: &ServiceCommand,
+        on_output: OnOutput,
+    ) -> Option<Result<(), SupervisorError>> {
+        let default_stop = CommandSpec::Argv {
+            argv: vec![
+                "docker".to_string(),
+                "compose".to_string(),
+                "stop".to_string(),
+            ],
+        };
+        let (argv, _) = command_argv(
+            command
+                .docker_stop_command
+                .as_ref()
+                .unwrap_or(&default_stop),
+        );
         // Compose is cwd- and env-sensitive (`COMPOSE_FILE`, `COMPOSE_PROJECT_NAME`). Stop has to
         // use the same directory and merged environment the start used, or it targets a different project.
         let cwd = self.root.join(&command.cwd);
         let env = merged_environment(&self.base_environment, &command.environment);
         let code = run_command(&argv, &cwd, &env, Some(on_output)).await;
-        Some(if code != 0 { Err(SupervisorError(format!("Docker service stop exited with {code}"))) } else { Ok(()) })
+        Some(if code != 0 {
+            Err(SupervisorError(format!(
+                "Docker service stop exited with {code}"
+            )))
+        } else {
+            Ok(())
+        })
     }
 
-    fn attach_output(&self, service_id: &ServiceId, source: OutputSource<'_>, on_output: OnOutput) -> Option<OutputTail> {
+    fn attach_output(
+        &self,
+        service_id: &ServiceId,
+        source: OutputSource<'_>,
+        on_output: OnOutput,
+    ) -> Option<OutputTail> {
         match source {
-            OutputSource::Process { skip_backlog } => Some(tail_file(raw_log_path(&self.runtime_directory, service_id), skip_backlog, on_output)),
-            OutputSource::Container { container_name, since, tail } => Some(tail_container_logs(
+            OutputSource::Process { skip_backlog } => Some(tail_file(
+                raw_log_path(&self.runtime_directory, service_id),
+                skip_backlog,
+                on_output,
+            )),
+            OutputSource::Container {
+                container_name,
+                since,
+                tail,
+            } => Some(tail_container_logs(
                 container_name.to_string(),
                 since.map(str::to_string),
                 tail,
@@ -873,7 +1135,9 @@ impl ProbeAdapter for DefaultProbeAdapter {
         tcp_probe(port).await
     }
     async fn http(&self, url: &str) -> bool {
-        match tokio::time::timeout(Duration::from_millis(250), self.http_client.get(url).send()).await {
+        match tokio::time::timeout(Duration::from_millis(250), self.http_client.get(url).send())
+            .await
+        {
             Ok(Ok(response)) => response.status().is_success(),
             _ => false,
         }
@@ -904,7 +1168,12 @@ pub struct DefaultRunBuild {
 
 #[async_trait]
 impl RunBuild for DefaultRunBuild {
-    async fn run(&self, command: &ServiceCommand, on_output: OnOutput, cancel: CancellationToken) -> Result<(), SupervisorError> {
+    async fn run(
+        &self,
+        command: &ServiceCommand,
+        on_output: OnOutput,
+        cancel: CancellationToken,
+    ) -> Result<(), SupervisorError> {
         if cancel.is_cancelled() {
             return Err(SupervisorError("Build cancelled".to_string()));
         }
@@ -912,8 +1181,16 @@ impl RunBuild for DefaultRunBuild {
         let env = merged_environment(&self.base_environment, &command.environment);
         let cwd = self.root.join(&command.cwd);
         let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]).current_dir(&cwd).env_clear().envs(&env).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
-        let mut child = cmd.spawn().map_err(|e| SupervisorError(format!("Build command failed to start: {e}")))?;
+        cmd.args(&argv[1..])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SupervisorError(format!("Build command failed to start: {e}")))?;
         let pid = child.id().map(|p| p as i64);
         // If this future is dropped mid-cancel (a caller racing its own select against `run`),
         // the group is still killed. Cleared once the child has been reaped.
@@ -956,23 +1233,38 @@ pub struct DefaultArtifactInstaller {
 
 #[async_trait]
 impl super::types::ArtifactInstaller for DefaultArtifactInstaller {
-    async fn install(&self, service: &crate::catalog::ServiceDefinition, on_output: OnOutput) -> Result<(), SupervisorError> {
+    async fn install(
+        &self,
+        service: &crate::catalog::ServiceDefinition,
+        on_output: OnOutput,
+    ) -> Result<(), SupervisorError> {
         let artifact = service
             .artifact
             .clone()
             .ok_or_else(|| SupervisorError(format!("{}: no artifact declared", service.id)))?;
-        crate::shared::install::install_service_artifact(&self.root, &self.runtime_directory, service, &artifact, &|line| on_output(line))
-            .await
-            .map(|_| ())
-            .map_err(|e| SupervisorError(e.0))
+        crate::shared::install::install_service_artifact(
+            &self.root,
+            &self.runtime_directory,
+            service,
+            &artifact,
+            &|line| on_output(line),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| SupervisorError(e.0))
     }
 }
 
 /// `base_environment` should come from `crate::env::resolve_base_environment` for a daemon that
 /// might be launched from a GUI (bare `PATH`, no login-shell customization) — defaults to the
 /// current process's own environment, i.e. whatever spawned the daemon.
-pub fn default_supervisor_options(root: PathBuf, runtime_directory: Option<PathBuf>, base_environment: Option<HashMap<String, String>>) -> SupervisorOptions {
-    let runtime_directory = runtime_directory.unwrap_or_else(|| resolve_runtime_directory(&root, None));
+pub fn default_supervisor_options(
+    root: PathBuf,
+    runtime_directory: Option<PathBuf>,
+    base_environment: Option<HashMap<String, String>>,
+) -> SupervisorOptions {
+    let runtime_directory =
+        runtime_directory.unwrap_or_else(|| resolve_runtime_directory(&root, None));
     let base_environment = base_environment.unwrap_or_else(|| std::env::vars().collect());
     let http_client = reqwest::Client::new();
     let clock: Arc<dyn SupervisorClock> = Arc::new(SystemClock);
@@ -983,9 +1275,19 @@ pub fn default_supervisor_options(root: PathBuf, runtime_directory: Option<PathB
             base_environment: base_environment.clone(),
             containers: Arc::default(),
         }),
-        run_build: Arc::new(DefaultRunBuild { root: root.clone(), base_environment: base_environment.clone() }),
-        artifact_installer: Some(Arc::new(DefaultArtifactInstaller { root: root.clone(), runtime_directory })),
-        probes: Arc::new(DefaultProbeAdapter { root, base_environment, http_client }),
+        run_build: Arc::new(DefaultRunBuild {
+            root: root.clone(),
+            base_environment: base_environment.clone(),
+        }),
+        artifact_installer: Some(Arc::new(DefaultArtifactInstaller {
+            root: root.clone(),
+            runtime_directory,
+        })),
+        probes: Arc::new(DefaultProbeAdapter {
+            root,
+            base_environment,
+            http_client,
+        }),
         preparation: None,
         clock,
         readiness_timeout_ms: 10_000,
@@ -1005,11 +1307,16 @@ mod tests {
         assert!(docker_inspect_answered(1, "Error: No such container: api"));
         assert!(docker_inspect_answered(1, "Error: No such object: abc"));
         assert!(!docker_inspect_answered(-1, ""));
-        assert!(!docker_inspect_answered(1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"));
+        assert!(!docker_inspect_answered(
+            1,
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+        ));
         assert!(!docker_inspect_answered(1, ""));
     }
     use crate::catalog::{ServiceCatalog, ServiceDefinition, StartFailurePolicy};
-    use crate::state::{ActualServiceState, DesiredServiceState, ServiceLifecycleState, ServiceReadiness};
+    use crate::state::{
+        ActualServiceState, DesiredServiceState, ServiceLifecycleState, ServiceReadiness,
+    };
     use crate::supervisor::{Host, ProcessSupervisor};
     use std::collections::HashMap as Map;
     use std::sync::Mutex as StdMutex;
@@ -1032,7 +1339,11 @@ mod tests {
                 start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
                 private_file_guard: None,
             };
-            Arc::new(Self { instance_id, catalog: Arc::new(catalog), states: StdMutex::new(Map::new()) })
+            Arc::new(Self {
+                instance_id,
+                catalog: Arc::new(catalog),
+                states: StdMutex::new(Map::new()),
+            })
         }
     }
 
@@ -1070,7 +1381,10 @@ mod tests {
                 .collect()
         }
         async fn set_service_state(&self, next: ServiceLifecycleState) {
-            self.states.lock().unwrap().insert(next.service_id.clone(), next);
+            self.states
+                .lock()
+                .unwrap()
+                .insert(next.service_id.clone(), next);
         }
         async fn append_log(&self, _service_id: &str, _data: &str) {}
         fn publish(&self, _event_type: &str, _data: serde_json::Value) {}
@@ -1094,12 +1408,19 @@ mod tests {
 
     #[tokio::test]
     async fn observed_system_process_finds_a_real_spawned_process() {
-        let mut child = Command::new("sh").args(["-c", "sleep 5"]).process_group(0).spawn().unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let pid = child.id().unwrap() as i64;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let observed = observed_system_process(pid).await;
         match observed {
-            Ok(Some(ObservedProcess { record: ProcessRecord::Posix(rec), alive })) => {
+            Ok(Some(ObservedProcess {
+                record: ProcessRecord::Posix(rec),
+                alive,
+            })) => {
                 assert!(alive);
                 assert_eq!(rec.pid, pid);
             }
@@ -1111,22 +1432,42 @@ mod tests {
 
     #[tokio::test]
     async fn observed_system_process_returns_none_for_an_implausible_pid() {
-        assert!(matches!(observed_system_process(i32::MAX as i64).await, Ok(None)));
+        assert!(matches!(
+            observed_system_process(i32::MAX as i64).await,
+            Ok(None)
+        ));
     }
 
     #[tokio::test]
     async fn run_command_captures_exit_code_and_forwards_output() {
         let output: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
         let output_for_cb = output.clone();
-        let on_output: OnOutput = Arc::new(move |data: &str| output_for_cb.lock().unwrap().push_str(data));
-        let code = run_command(&["sh".to_string(), "-c".to_string(), "echo hello-from-run-command".to_string()], Path::new("/tmp"), &Map::new(), Some(on_output)).await;
+        let on_output: OnOutput =
+            Arc::new(move |data: &str| output_for_cb.lock().unwrap().push_str(data));
+        let code = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hello-from-run-command".to_string(),
+            ],
+            Path::new("/tmp"),
+            &Map::new(),
+            Some(on_output),
+        )
+        .await;
         assert_eq!(code, 0);
         assert!(output.lock().unwrap().contains("hello-from-run-command"));
     }
 
     #[tokio::test]
     async fn run_command_reports_a_nonzero_exit_code() {
-        let code = run_command(&["sh".to_string(), "-c".to_string(), "exit 7".to_string()], Path::new("/tmp"), &Map::new(), None).await;
+        let code = run_command(
+            &["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+            Path::new("/tmp"),
+            &Map::new(),
+            None,
+        )
+        .await;
         assert_eq!(code, 7);
     }
 
@@ -1137,7 +1478,10 @@ mod tests {
     /// this is the one test proving the real adapters work end-to-end together.
     #[tokio::test]
     async fn real_process_supervisor_starts_and_stops_a_real_tcp_service() {
-        use crate::catalog::{CommandSpec as Spec, ReadinessSpec, ServiceCommand as Cmd, ServiceKind, ServiceProfiles, ServiceRunProfile};
+        use crate::catalog::{
+            CommandSpec as Spec, ReadinessSpec, ServiceCommand as Cmd, ServiceKind,
+            ServiceProfiles, ServiceRunProfile,
+        };
 
         // A tiny real TCP server: `nc -l <port>` (or, portably, a short Python-free shell one-liner
         // using /dev/tcp is bash-only) — use `sh -c` piping to a listening `nc`, but simplest and
@@ -1152,7 +1496,6 @@ mod tests {
             port
         };
 
-
         let service = ServiceDefinition {
             id: "nc-server".to_string(),
             label: None,
@@ -1162,7 +1505,10 @@ mod tests {
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: Cmd {
-                        command: Spec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) },
+                        command: Spec::Shell {
+                            shell: format!("exec nc -lk {port}"),
+                            exec: Some(true),
+                        },
                         cwd: "/tmp".to_string(),
                         environment: None,
                         container_name: None,
@@ -1181,20 +1527,37 @@ mod tests {
         };
         let host = TestHost::new("real-adapter-test", service);
 
-        let runtime_dir = std::env::temp_dir().join(format!("hearth-core-real-adapter-test-{}", uuid::Uuid::new_v4()));
-        let options = default_supervisor_options(PathBuf::from("/tmp"), Some(runtime_dir.clone()), None);
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "hearth-core-real-adapter-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let options =
+            default_supervisor_options(PathBuf::from("/tmp"), Some(runtime_dir.clone()), None);
         let supervisor = ProcessSupervisor::new(host.clone(), options);
 
-        supervisor.start(&"nc-server".to_string(), None).await.expect("real nc-backed service should start and become ready");
-        let state = host.service_states().into_iter().find(|s| s.service_id == "nc-server").unwrap();
+        supervisor
+            .start(&"nc-server".to_string(), None)
+            .await
+            .expect("real nc-backed service should start and become ready");
+        let state = host
+            .service_states()
+            .into_iter()
+            .find(|s| s.service_id == "nc-server")
+            .unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Ready);
         let pid = match state.identity.unwrap() {
             ProcessIdentity::Posix(p) => p.pid,
             _ => panic!("expected a posix identity"),
         };
-        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok(), "the real OS process should be alive");
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok(),
+            "the real OS process should be alive"
+        );
 
-        supervisor.stop(&"nc-server".to_string(), None).await.expect("stop should succeed");
+        supervisor
+            .stop(&"nc-server".to_string(), None)
+            .await
+            .expect("stop should succeed");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err(),
@@ -1216,12 +1579,18 @@ mod tests {
     /// follows the same convention rather than adding a first skip-if-missing guard.
     #[tokio::test]
     async fn real_process_supervisor_starts_and_stops_a_real_docker_compose_service() {
-        use crate::catalog::{CommandSpec as Spec, ReadinessSpec, ServiceCommand as Cmd, ServiceKind, ServiceProfiles, ServiceRunProfile};
-
+        use crate::catalog::{
+            CommandSpec as Spec, ReadinessSpec, ServiceCommand as Cmd, ServiceKind,
+            ServiceProfiles, ServiceRunProfile,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let compose_path = dir.path().join("docker-compose.yml");
-        std::fs::write(&compose_path, "services:\n  app:\n    image: alpine:latest\n    command: [\"sleep\", \"3600\"]\n").unwrap();
+        std::fs::write(
+            &compose_path,
+            "services:\n  app:\n    image: alpine:latest\n    command: [\"sleep\", \"3600\"]\n",
+        )
+        .unwrap();
         // Unique per test run so concurrent/repeated runs never collide on a project name, and
         // lowercase-hex-only so it's always a valid Compose project name.
         let project = format!("hearth-core-test-{}", uuid::Uuid::new_v4().simple());
@@ -1256,15 +1625,30 @@ mod tests {
         };
         let host = TestHost::new("real-docker-adapter-test", service);
 
-        let runtime_dir = std::env::temp_dir().join(format!("hearth-core-real-docker-adapter-test-{}", uuid::Uuid::new_v4()));
-        let options = default_supervisor_options(dir.path().to_path_buf(), Some(runtime_dir.clone()), None);
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "hearth-core-real-docker-adapter-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let options =
+            default_supervisor_options(dir.path().to_path_buf(), Some(runtime_dir.clone()), None);
         let supervisor = ProcessSupervisor::new(host.clone(), options);
 
         let start_result = supervisor.start(&"docker-app".to_string(), None).await;
         // Always clean up the compose project, whether start succeeded or not, so a failed
         // assertion never leaves a real container running on the test machine.
         let cleanup = || {
-            let _ = std::process::Command::new("docker").args(["compose", "-p", &project, "-f", &compose_path_str, "down", "--timeout", "1"]).output();
+            let _ = std::process::Command::new("docker")
+                .args([
+                    "compose",
+                    "-p",
+                    &project,
+                    "-f",
+                    &compose_path_str,
+                    "down",
+                    "--timeout",
+                    "1",
+                ])
+                .output();
         };
         if let Err(error) = &start_result {
             cleanup();
@@ -1272,19 +1656,29 @@ mod tests {
             panic!("real docker-backed service should start and become ready: {error:?}");
         }
 
-        let state = host.service_states().into_iter().find(|s| s.service_id == "docker-app").unwrap();
+        let state = host
+            .service_states()
+            .into_iter()
+            .find(|s| s.service_id == "docker-app")
+            .unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Ready);
         match &state.identity {
             Some(ProcessIdentity::Docker(id)) => assert_eq!(id.container_name, container_name),
             other => panic!("expected a docker identity, got {other:?}"),
         }
-        assert!(container_running(&container_name).await.unwrap_or(false), "the real container should be running per `docker inspect`");
+        assert!(
+            container_running(&container_name).await.unwrap_or(false),
+            "the real container should be running per `docker inspect`"
+        );
 
         let stop_result = supervisor.stop(&"docker-app".to_string(), None).await;
         cleanup();
         let _ = std::fs::remove_dir_all(&runtime_dir);
         stop_result.expect("stop should succeed");
-        assert!(!container_running(&container_name).await.unwrap_or(false), "the real container must be stopped/removed after stop()");
+        assert!(
+            !container_running(&container_name).await.unwrap_or(false),
+            "the real container must be stopped/removed after stop()"
+        );
     }
 
     /// Real end-to-end test of the declarative `preparation_command` (the JSON-serializable
@@ -1297,8 +1691,10 @@ mod tests {
     /// run command starts.
     #[tokio::test]
     async fn real_process_supervisor_runs_a_real_preparation_command_before_starting_the_service() {
-        use crate::catalog::{CommandSpec as Spec, PreparationCommand, ReadinessSpec, ServiceCommand as Cmd, ServiceKind, ServiceProfiles, ServiceRunProfile};
-
+        use crate::catalog::{
+            CommandSpec as Spec, PreparationCommand, ReadinessSpec, ServiceCommand as Cmd,
+            ServiceKind, ServiceProfiles, ServiceRunProfile,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("prepared.marker");
@@ -1317,11 +1713,27 @@ mod tests {
             disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
-                    command: Cmd { command: Spec::Shell { shell: format!("exec nc -lk {port}"), exec: Some(true) }, cwd: "/tmp".to_string(), environment: None, container_name: None, docker_stop_command: None },
+                    command: Cmd {
+                        command: Spec::Shell {
+                            shell: format!("exec nc -lk {port}"),
+                            exec: Some(true),
+                        },
+                        cwd: "/tmp".to_string(),
+                        environment: None,
+                        container_name: None,
+                        docker_stop_command: None,
+                    },
                     readiness: ReadinessSpec::Tcp { port },
                     readiness_timeout_ms: Some(5_000),
                     preparation: None,
-                    preparation_command: Some(PreparationCommand { command: Spec::Shell { shell: format!("touch '{}'", marker.display()), exec: None }, cwd: None, serialization_key: None }),
+                    preparation_command: Some(PreparationCommand {
+                        command: Spec::Shell {
+                            shell: format!("touch '{}'", marker.display()),
+                            exec: None,
+                        },
+                        cwd: None,
+                        serialization_key: None,
+                    }),
                 },
                 build: None,
             },
@@ -1331,16 +1743,39 @@ mod tests {
         };
         let host = TestHost::new("real-preparation-command-test", service);
 
-        let runtime_dir = std::env::temp_dir().join(format!("hearth-core-real-preparation-command-test-{}", uuid::Uuid::new_v4()));
-        let options = default_supervisor_options(PathBuf::from("/tmp"), Some(runtime_dir.clone()), None);
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "hearth-core-real-preparation-command-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let options =
+            default_supervisor_options(PathBuf::from("/tmp"), Some(runtime_dir.clone()), None);
         let supervisor = ProcessSupervisor::new(host.clone(), options);
 
-        assert!(!marker.exists(), "sanity check: the marker must not exist before start()");
-        supervisor.start(&"prepped-server".to_string(), None).await.expect("real service with a real preparation command should start and become ready");
-        assert!(marker.exists(), "the real preparation command should have run before the service started");
-        assert_eq!(host.service_states().into_iter().find(|s| s.service_id == "prepped-server").unwrap().actual_state, ActualServiceState::Ready);
+        assert!(
+            !marker.exists(),
+            "sanity check: the marker must not exist before start()"
+        );
+        supervisor
+            .start(&"prepped-server".to_string(), None)
+            .await
+            .expect("real service with a real preparation command should start and become ready");
+        assert!(
+            marker.exists(),
+            "the real preparation command should have run before the service started"
+        );
+        assert_eq!(
+            host.service_states()
+                .into_iter()
+                .find(|s| s.service_id == "prepped-server")
+                .unwrap()
+                .actual_state,
+            ActualServiceState::Ready
+        );
 
-        supervisor.stop(&"prepped-server".to_string(), None).await.expect("stop should succeed");
+        supervisor
+            .stop(&"prepped-server".to_string(), None)
+            .await
+            .expect("stop should succeed");
         let _ = std::fs::remove_dir_all(&runtime_dir);
     }
 
@@ -1353,10 +1788,21 @@ mod tests {
         let name = format!("hearth-core-logtail-{}", uuid::Uuid::new_v4().simple());
         let marker = format!("logtail-marker-{}", uuid::Uuid::new_v4().simple());
         let run = std::process::Command::new("docker")
-            .args(["run", "-d", "--name", &name, "alpine:latest", "sh", "-c", &format!("echo {marker}; sleep 300")])
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &name,
+                "alpine:latest",
+                "sh",
+                "-c",
+                &format!("echo {marker}; sleep 300"),
+            ])
             .output();
         let cleanup = || {
-            let _ = std::process::Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &name])
+                .output();
         };
         match run {
             Ok(output) if output.status.success() => {}
@@ -1373,10 +1819,18 @@ mod tests {
             }
         };
 
-        let captured: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(String::new()));
         let captured_for_cb = captured.clone();
-        let on_output: OnOutput = Arc::new(move |data: &str| captured_for_cb.lock().unwrap().push_str(data));
-        let stop = tail_container_logs(name.clone(), Some(started_at), None, std::env::vars().collect(), on_output);
+        let on_output: OnOutput =
+            Arc::new(move |data: &str| captured_for_cb.lock().unwrap().push_str(data));
+        let stop = tail_container_logs(
+            name.clone(),
+            Some(started_at),
+            None,
+            std::env::vars().collect(),
+            on_output,
+        );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while std::time::Instant::now() < deadline {
@@ -1387,7 +1841,11 @@ mod tests {
         }
         stop.stop();
         cleanup();
-        assert!(captured.lock().unwrap().contains(&marker), "container stdout must flow through the tail: {:?}", captured.lock().unwrap());
+        assert!(
+            captured.lock().unwrap().contains(&marker),
+            "container stdout must flow through the tail: {:?}",
+            captured.lock().unwrap()
+        );
     }
 
     /// Real (read-only) test of `tailnet_serving`/`DefaultProbeAdapter::tailnet` against whatever
@@ -1401,12 +1859,24 @@ mod tests {
     /// configuration ever changes.
     #[tokio::test]
     async fn tailnet_serving_agrees_with_the_real_tailscale_serve_status() {
-        let output = match std::process::Command::new("tailscale").args(["serve", "status", "--json"]).output() {
+        let output = match std::process::Command::new("tailscale")
+            .args(["serve", "status", "--json"])
+            .output()
+        {
             Ok(output) => output,
-            Err(error) => panic!("`tailscale` must be installed and on PATH to run this test: {error}"),
+            Err(error) => {
+                panic!("`tailscale` must be installed and on PATH to run this test: {error}")
+            }
         };
         let expected = output.status.success()
-            && serde_json::from_slice::<serde_json::Value>(&output.stdout).ok().and_then(|v| v.get("Web").and_then(|w| w.as_object()).map(|o| !o.is_empty())).unwrap_or(false);
+            && serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|v| {
+                    v.get("Web")
+                        .and_then(|w| w.as_object())
+                        .map(|o| !o.is_empty())
+                })
+                .unwrap_or(false);
         assert_eq!(tailnet_serving().await, expected);
     }
 
@@ -1417,15 +1887,24 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let holders = port_holders(port).await.expect("lsof must be available");
-        let me = holders.iter().find(|h| h.pid == std::process::id() as i64).expect("this test process holds the port");
+        let me = holders
+            .iter()
+            .find(|h| h.pid == std::process::id() as i64)
+            .expect("this test process holds the port");
         assert!(!me.command.is_empty());
-        assert!(!(me.command.len() == 64 && me.command.chars().all(|c| c.is_ascii_hexdigit())), "a fingerprint hash, not a command line: {}", me.command);
+        assert!(
+            !(me.command.len() == 64 && me.command.chars().all(|c| c.is_ascii_hexdigit())),
+            "a fingerprint hash, not a command line: {}",
+            me.command
+        );
         drop(listener);
     }
 
     #[tokio::test]
     async fn live_start_identities_include_this_process() {
-        let alive = system_live_start_identities().await.expect("ps must be readable");
+        let alive = system_live_start_identities()
+            .await
+            .expect("ps must be readable");
         assert!(alive.contains_key(&(std::process::id() as i64)));
     }
 
@@ -1433,7 +1912,11 @@ mod tests {
     fn a_chunk_never_ends_inside_a_multi_byte_character() {
         let text = "ab\u{00e9}".as_bytes(); // `é` is two bytes
         assert_eq!(utf8_complete_prefix(text), text.len());
-        assert_eq!(utf8_complete_prefix(&text[..3]), 2, "a trailing partial character is held back");
+        assert_eq!(
+            utf8_complete_prefix(&text[..3]),
+            2,
+            "a trailing partial character is held back"
+        );
     }
 
     #[test]
@@ -1441,20 +1924,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("svc.raw");
         std::fs::write(&path, "line one\nline two\n").unwrap();
-        let captured: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(String::new()));
         let sink = captured.clone();
         let on_output: OnOutput = Arc::new(move |data: &str| sink.lock().unwrap().push_str(data));
         let offset = AtomicU64::new(0);
         drain_raw_log_once(&path, &offset, &on_output);
         assert_eq!(*captured.lock().unwrap(), "line one\nline two\n");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 18, "below the threshold the file is left alone");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            18,
+            "below the threshold the file is left alone"
+        );
         assert_eq!(offset.load(Ordering::SeqCst), 18);
         drain_raw_log_once(&path, &offset, &on_output);
-        assert_eq!(*captured.lock().unwrap(), "line one\nline two\n", "nothing is forwarded twice");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            "line one\nline two\n",
+            "nothing is forwarded twice"
+        );
     }
 
     fn record(pid: i64, fingerprint: &str) -> PosixProcessRecord {
-        PosixProcessRecord { pid, pgid: pid, start_identity: "Mon Jan  1 00:00:00 2026".to_string(), command_fingerprint: fingerprint.to_string() }
+        PosixProcessRecord {
+            pid,
+            pgid: pid,
+            start_identity: "Mon Jan  1 00:00:00 2026".to_string(),
+            command_fingerprint: fingerprint.to_string(),
+        }
     }
 
     /// Regression, stated as the decision rather than as a race: right after spawning, the child
@@ -1479,7 +1976,11 @@ mod tests {
     #[test]
     fn an_observation_matching_what_we_spawned_is_accepted_immediately() {
         let observed = record(42, "expected-fingerprint");
-        assert!(accepts_spawn_observation(&observed, "expected-fingerprint", None));
+        assert!(accepts_spawn_observation(
+            &observed,
+            "expected-fingerprint",
+            None
+        ));
     }
 
     /// An argv command legitimately observes differently from the logical fingerprint (`ps` reports
@@ -1489,8 +1990,16 @@ mod tests {
     fn a_stable_mismatch_is_accepted_after_repeating_identically() {
         let first = record(42, "resolved-path-fingerprint");
         let second = record(42, "resolved-path-fingerprint");
-        assert!(!accepts_spawn_observation(&first, "expected-fingerprint", None));
-        assert!(accepts_spawn_observation(&second, "expected-fingerprint", Some(&first)));
+        assert!(!accepts_spawn_observation(
+            &first,
+            "expected-fingerprint",
+            None
+        ));
+        assert!(accepts_spawn_observation(
+            &second,
+            "expected-fingerprint",
+            Some(&first)
+        ));
     }
 
     /// Two different readings are not stability — this is what separates a settled argv path from
@@ -1499,7 +2008,11 @@ mod tests {
     fn a_changing_observation_is_not_accepted() {
         let first = record(42, "fingerprint-of-(sh)");
         let second = record(42, "some-other-fingerprint");
-        assert!(!accepts_spawn_observation(&second, "expected-fingerprint", Some(&first)));
+        assert!(!accepts_spawn_observation(
+            &second,
+            "expected-fingerprint",
+            Some(&first)
+        ));
     }
 
     /// A reused pid must not let a stale reading vouch for a new process.
@@ -1508,6 +2021,10 @@ mod tests {
         let first = record(42, "same-fingerprint");
         let mut second = record(42, "same-fingerprint");
         second.start_identity = "Tue Jan  2 00:00:00 2026".to_string();
-        assert!(!accepts_spawn_observation(&second, "expected-fingerprint", Some(&first)));
+        assert!(!accepts_spawn_observation(
+            &second,
+            "expected-fingerprint",
+            Some(&first)
+        ));
     }
 }

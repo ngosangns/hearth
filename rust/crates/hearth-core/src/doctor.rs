@@ -6,7 +6,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::catalog::ServiceCatalog;
-use crate::platform::{current_platform, is_supported_hearth_platform, unsupported_platform_message};
+use crate::platform::{
+    current_platform, is_supported_hearth_platform, unsupported_platform_message,
+};
 use crate::validate_catalog;
 
 #[derive(Debug, Clone)]
@@ -48,14 +50,23 @@ impl DoctorAdapter for DefaultDoctorAdapter {
     fn command(&self, command: &str, args: &[String]) -> CommandResult {
         // `command -v`-style checks must see the daemon's own PATH — the caller's bare launchd
         // PATH lacks the tool dirs `env::with_known_tool_directories` appends.
-        let path = crate::env::with_known_tool_directories(std::env::var_os("PATH").as_deref(), std::env::var_os("HOME").as_deref());
+        let path = crate::env::with_known_tool_directories(
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
         match Command::new(command).args(args).env("PATH", path).output() {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                CommandResult { ok: output.status.success(), output: format!("{stdout}\n{stderr}").trim().to_string() }
+                CommandResult {
+                    ok: output.status.success(),
+                    output: format!("{stdout}\n{stderr}").trim().to_string(),
+                }
             }
-            Err(_) => CommandResult { ok: false, output: String::new() },
+            Err(_) => CommandResult {
+                ok: false,
+                output: String::new(),
+            },
         }
     }
 
@@ -100,23 +111,43 @@ pub struct DoctorChecks {
     pub ports: Vec<DoctorPortCheck>,
 }
 
-pub fn run_doctor(catalog: &ServiceCatalog, checks: &DoctorChecks, adapter: &dyn DoctorAdapter) -> DoctorReport {
+pub fn run_doctor(
+    catalog: &ServiceCatalog,
+    checks: &DoctorChecks,
+    adapter: &dyn DoctorAdapter,
+) -> DoctorReport {
     let platform = adapter.platform();
     let platform_ok = is_supported_hearth_platform(&platform);
     let mut results = vec![DoctorCheckResult {
         name: "platform".to_string(),
         ok: platform_ok,
-        detail: if platform_ok { platform.clone() } else { unsupported_platform_message(&platform) },
+        detail: if platform_ok {
+            platform.clone()
+        } else {
+            unsupported_platform_message(&platform)
+        },
     }];
 
     for check in &checks.commands {
         let result = adapter.command(&check.command, &check.args);
         let ok = check.ok.as_ref().map(|f| f(&result)).unwrap_or(result.ok);
-        let detail = check.detail.as_ref().map(|f| f(&result)).unwrap_or_else(|| check.command.clone());
-        results.push(DoctorCheckResult { name: check.name.clone(), ok, detail });
+        let detail = check
+            .detail
+            .as_ref()
+            .map(|f| f(&result))
+            .unwrap_or_else(|| check.command.clone());
+        results.push(DoctorCheckResult {
+            name: check.name.clone(),
+            ok,
+            detail,
+        });
     }
     for check in &checks.paths {
-        results.push(DoctorCheckResult { name: check.name.clone(), ok: adapter.path(&check.path), detail: check.path.clone() });
+        results.push(DoctorCheckResult {
+            name: check.name.clone(),
+            ok: adapter.path(&check.path),
+            detail: check.path.clone(),
+        });
     }
     for check in &checks.ports {
         results.push(DoctorCheckResult {
@@ -127,8 +158,12 @@ pub fn run_doctor(catalog: &ServiceCatalog, checks: &DoctorChecks, adapter: &dyn
     }
 
     let validation = validate_catalog(catalog);
-    let unresolved_profiles: Vec<String> =
-        validation.warnings.iter().filter(|w| w.contains("command is unresolved")).cloned().collect();
+    let unresolved_profiles: Vec<String> = validation
+        .warnings
+        .iter()
+        .filter(|w| w.contains("command is unresolved"))
+        .cloned()
+        .collect();
 
     DoctorReport {
         ok: results.iter().all(|c| c.ok) && validation.errors.is_empty(),
@@ -140,7 +175,9 @@ pub fn run_doctor(catalog: &ServiceCatalog, checks: &DoctorChecks, adapter: &dyn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ServiceDefinition, ServiceProfiles, ServiceRunProfile, StartFailurePolicy};
+    use crate::catalog::{
+        ServiceDefinition, ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
+    };
     use std::collections::HashMap;
 
     struct FakeAdapter {
@@ -151,7 +188,10 @@ mod tests {
 
     impl DoctorAdapter for FakeAdapter {
         fn command(&self, _command: &str, _args: &[String]) -> CommandResult {
-            CommandResult { ok: self.command_ok, output: "output".to_string() }
+            CommandResult {
+                ok: self.command_ok,
+                output: "output".to_string(),
+            }
         }
         fn path(&self, _path: &str) -> bool {
             self.path_ok
@@ -178,11 +218,27 @@ mod tests {
 
     #[test]
     fn ok_report_when_every_check_passes() {
-        let adapter = FakeAdapter { command_ok: true, path_ok: true, port_ok: true };
+        let adapter = FakeAdapter {
+            command_ok: true,
+            path_ok: true,
+            port_ok: true,
+        };
         let checks = DoctorChecks {
-            commands: vec![DoctorCommandCheck { name: "docker".to_string(), command: "docker".to_string(), args: vec![], ok: None, detail: None }],
-            paths: vec![DoctorPathCheck { name: "bin".to_string(), path: "/usr/bin".to_string() }],
-            ports: vec![DoctorPortCheck { name: "db".to_string(), port: 5432 }],
+            commands: vec![DoctorCommandCheck {
+                name: "docker".to_string(),
+                command: "docker".to_string(),
+                args: vec![],
+                ok: None,
+                detail: None,
+            }],
+            paths: vec![DoctorPathCheck {
+                name: "bin".to_string(),
+                path: "/usr/bin".to_string(),
+            }],
+            ports: vec![DoctorPortCheck {
+                name: "db".to_string(),
+                port: 5432,
+            }],
         };
         let report = run_doctor(&empty_catalog(), &checks, &adapter);
         assert!(report.ok);
@@ -191,9 +247,19 @@ mod tests {
 
     #[test]
     fn not_ok_when_a_check_fails() {
-        let adapter = FakeAdapter { command_ok: false, path_ok: true, port_ok: true };
+        let adapter = FakeAdapter {
+            command_ok: false,
+            path_ok: true,
+            port_ok: true,
+        };
         let checks = DoctorChecks {
-            commands: vec![DoctorCommandCheck { name: "docker".to_string(), command: "docker".to_string(), args: vec![], ok: None, detail: None }],
+            commands: vec![DoctorCommandCheck {
+                name: "docker".to_string(),
+                command: "docker".to_string(),
+                args: vec![],
+                ok: None,
+                detail: None,
+            }],
             paths: vec![],
             ports: vec![],
         };
@@ -203,7 +269,11 @@ mod tests {
 
     #[test]
     fn reports_unresolved_profiles() {
-        let adapter = FakeAdapter { command_ok: true, path_ok: true, port_ok: true };
+        let adapter = FakeAdapter {
+            command_ok: true,
+            path_ok: true,
+            port_ok: true,
+        };
         let catalog = ServiceCatalog {
             services: vec![ServiceDefinition {
                 id: "wip".to_string(),
@@ -212,7 +282,12 @@ mod tests {
                 ownership: None,
                 disabled: false,
                 profiles: ServiceProfiles {
-                    run: ServiceRunProfile::Unresolved { readiness: crate::catalog::ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
+                    run: ServiceRunProfile::Unresolved {
+                        readiness: crate::catalog::ReadinessSpec::Process,
+                        readiness_timeout_ms: None,
+                        preparation: None,
+                        preparation_command: None,
+                    },
                     build: None,
                 },
                 ports: None,
@@ -227,6 +302,9 @@ mod tests {
             private_file_guard: None,
         };
         let report = run_doctor(&catalog, &DoctorChecks::default(), &adapter);
-        assert_eq!(report.unresolved_profiles, vec!["wip:run command is unresolved".to_string()]);
+        assert_eq!(
+            report.unresolved_profiles,
+            vec!["wip:run command is unresolved".to_string()]
+        );
     }
 }

@@ -30,22 +30,39 @@ services:
 }
 
 fn run_lsd(root: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(lsd_bin()).arg("--root").arg(root).args(args).output().expect("failed to spawn hearthd");
-    (output.status.code().unwrap_or(-1), String::from_utf8_lossy(&output.stdout).to_string(), String::from_utf8_lossy(&output.stderr).to_string())
+    let output = Command::new(lsd_bin())
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("failed to spawn hearthd");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
 }
 
 #[test]
 fn ad_hoc_signed_binary_runs_without_being_killed() {
     // Phase 0 answered GO for a trivial hello-world binary; this reconfirms it for the actual
     // multi-thousand-line `hearthd` binary, ad-hoc signed exactly the way a real packaging step would.
-    let status = Command::new("codesign").args(["--force", "--sign", "-", lsd_bin()]).status();
+    let status = Command::new("codesign")
+        .args(["--force", "--sign", "-", lsd_bin()])
+        .status();
     if let Ok(status) = status {
         assert!(status.success(), "ad-hoc codesign should succeed");
     }
-    let output = Command::new(lsd_bin()).arg("--help-does-not-exist-but-should-still-run").output().expect("the ad-hoc-signed binary must still execute, not be killed on launch");
+    let output = Command::new(lsd_bin())
+        .arg("--help-does-not-exist-but-should-still-run")
+        .output()
+        .expect("the ad-hoc-signed binary must still execute, not be killed on launch");
     // We don't care what it prints for a bogus command (a usage error is expected) — only that the
     // OS actually ran it and it exited normally rather than being terminated by a signal.
-    assert!(output.status.code().is_some(), "process should exit normally, not be killed: {output:?}");
+    assert!(
+        output.status.code().is_some(),
+        "process should exit normally, not be killed: {output:?}"
+    );
 }
 
 #[test]
@@ -54,15 +71,19 @@ fn full_lifecycle_over_the_real_compiled_binary() {
     let port = free_port();
     write_config(dir.path(), port);
 
-    // `manager ensure --json` — this is exactly the contract apps/macos's SidecarLocator
+    // `manager ensure --json` — this is the connection contract a client uses to find the daemon.
     // depends on: it must spawn a detached daemon and print {instanceId, port, token,
     // protocolVersion, runtimeDirectory, root} as its sole stdout.
     let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    let ensure_response: serde_json::Value = serde_json::from_str(stdout.trim()).expect("manager ensure --json must print exactly one JSON object");
+    let ensure_response: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("manager ensure --json must print exactly one JSON object");
     assert!(ensure_response["port"].as_u64().unwrap() > 0);
     assert!(ensure_response["token"].as_str().unwrap().len() > 10);
-    assert_eq!(ensure_response["protocolVersion"].as_u64(), Some(u64::from(hearth_core::state::PROTOCOL_VERSION)));
+    assert_eq!(
+        ensure_response["protocolVersion"].as_u64(),
+        Some(u64::from(hearth_core::state::PROTOCOL_VERSION))
+    );
 
     // `start api --wait --json` — waits for the real nc-backed service to become ready.
     let (code, stdout, stderr) = run_lsd(dir.path(), &["start", "api", "--wait", "--json"]);
@@ -75,7 +96,9 @@ fn full_lifecycle_over_the_real_compiled_binary() {
     assert_eq!(code, 0);
     let status_response: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(status_response["services"][0]["state"], "ready");
-    let pid = status_response["services"][0]["pid"].as_i64().expect("a ready service should report a pid");
+    let pid = status_response["services"][0]["pid"]
+        .as_i64()
+        .expect("a ready service should report a pid");
     assert!(pid > 0);
 
     // `logs api` — should return without error (content is incidental for this test).
@@ -110,7 +133,10 @@ fn full_lifecycle_over_the_real_compiled_binary() {
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert_ne!(second_ensure["instanceId"], ensure_response["instanceId"], "expected a fresh daemon instance after the previous one was stopped");
+    assert_ne!(
+        second_ensure["instanceId"], ensure_response["instanceId"],
+        "expected a fresh daemon instance after the previous one was stopped"
+    );
 
     // Final cleanup so this test doesn't leave a daemon running.
     let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
@@ -136,22 +162,35 @@ fn manager_restart_replaces_the_daemon_and_keeps_services_running() {
     assert_eq!(code, 0, "stderr: {stderr}");
     let before: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(before["services"][0]["state"], "ready");
-    let pid = before["services"][0]["pid"].as_i64().expect("a ready service should report a pid");
+    let pid = before["services"][0]["pid"]
+        .as_i64()
+        .expect("a ready service should report a pid");
 
     // `manager restart --json` prints the same payload `manager ensure --json` does — the new
-    // daemon's connection, which is what a client (the macOS app) reconnects with.
+    // daemon's connection, which is what a client reconnects with.
     let (code, stdout, stderr) = run_lsd(dir.path(), &["manager", "restart", "--json"]);
     assert_eq!(code, 0, "stdout: {stdout}, stderr: {stderr}");
-    let restarted: serde_json::Value = serde_json::from_str(stdout.trim()).expect("manager restart --json must print exactly one JSON object");
-    assert_ne!(restarted["instanceId"], first["instanceId"], "restart must produce a new daemon instance");
+    let restarted: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("manager restart --json must print exactly one JSON object");
+    assert_ne!(
+        restarted["instanceId"], first["instanceId"],
+        "restart must produce a new daemon instance"
+    );
     assert!(restarted["port"].as_u64().unwrap() > 0);
     assert!(restarted["token"].as_str().unwrap().len() > 10);
 
     let (code, stdout, stderr) = run_lsd(dir.path(), &["status", "--json"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let after: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(after["services"][0]["state"], "ready", "the service must be re-adopted, not stopped");
-    assert_eq!(after["services"][0]["pid"].as_i64().unwrap(), pid, "the same process must still be serving");
+    assert_eq!(
+        after["services"][0]["state"], "ready",
+        "the service must be re-adopted, not stopped"
+    );
+    assert_eq!(
+        after["services"][0]["pid"].as_i64().unwrap(),
+        pid,
+        "the same process must still be serving"
+    );
 
     let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
 }
@@ -161,7 +200,10 @@ fn missing_config_file_reports_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
     let (code, _, stderr) = run_lsd(dir.path(), &["status"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("could not load a service catalog"), "{stderr}");
+    assert!(
+        stderr.contains("could not load a service catalog"),
+        "{stderr}"
+    );
 }
 
 /// Real end-to-end test of `hearthd mcp`: spawns the actual compiled binary as a child process over
@@ -184,21 +226,52 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
     write_config(dir.path(), port);
 
     // A running daemon isn't required for `mcp` to start serving tools — but `status` needs one to
-    // actually answer, so ensure one's up first (same contract apps/macos's SidecarLocator relies on).
+    // actually answer, so ensure one's up first.
     let (code, _, stderr) = run_lsd(dir.path(), &["manager", "ensure", "--json"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let mut command = tokio::process::Command::new(lsd_bin());
     command.arg("--root").arg(dir.path()).arg("mcp");
     let transport = TokioChildProcess::new(command).expect("should spawn `hearthd mcp`");
-    let client = NoopClientHandler.serve(transport).await.expect("mcp client should initialize");
+    let client = NoopClientHandler
+        .serve(transport)
+        .await
+        .expect("mcp client should initialize");
 
-    let tools = client.list_all_tools().await.expect("list_tools should succeed");
-    let names: Vec<String> = tools.into_iter().map(|tool| tool.name.to_string()).collect();
-    assert_eq!(names, vec!["local_services_status", "local_services_logs", "local_services_trace", "local_services_events", "local_services_manage", "local_services_restart_daemon", "local_services_stop_daemon", "local_services_shared_list", "local_services_shared_status", "local_services_shared_connection"]);
+    let tools = client
+        .list_all_tools()
+        .await
+        .expect("list_tools should succeed");
+    let names: Vec<String> = tools
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "local_services_status",
+            "local_services_logs",
+            "local_services_trace",
+            "local_services_events",
+            "local_services_manage",
+            "local_services_restart_daemon",
+            "local_services_stop_daemon",
+            "local_services_shared_list",
+            "local_services_shared_status",
+            "local_services_shared_connection"
+        ]
+    );
 
-    let response = client.call_tool(CallToolRequestParams::new("local_services_status")).await.expect("status tool call should succeed");
-    assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+    let response = client
+        .call_tool(CallToolRequestParams::new("local_services_status"))
+        .await
+        .expect("status tool call should succeed");
+    assert_ne!(
+        response.is_error,
+        Some(true),
+        "{:?}",
+        response.content.first()
+    );
     let text = response.content[0].as_text().unwrap().text.clone();
     let status: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(status["services"]["services"][0]["serviceId"], "api");
@@ -216,24 +289,46 @@ fn mcp_install_writes_the_real_compiled_binarys_own_path() {
     let dir = tempfile::tempdir().unwrap();
     write_config(dir.path(), free_port());
     let config_path = dir.path().join(".mcp.json");
-    let (code, stdout, stderr) = run_lsd(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]);
+    let (code, stdout, stderr) = run_lsd(
+        dir.path(),
+        &["mcp", "install", config_path.to_str().unwrap()],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("installed mcp server \"hearth\""), "{stdout}");
+    assert!(
+        stdout.contains("installed mcp server \"hearth\""),
+        "{stdout}"
+    );
 
-    let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     let entry = &written["mcpServers"]["hearth"];
     assert_eq!(entry["command"], serde_json::json!(lsd_bin()));
-    let expected_root = std::fs::canonicalize(dir.path()).unwrap().to_string_lossy().to_string();
-    assert_eq!(entry["args"], serde_json::json!(["--root", expected_root, "mcp"]));
+    let expected_root = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        entry["args"],
+        serde_json::json!(["--root", expected_root, "mcp"])
+    );
 
     // Merging again (as a re-install would) must not disturb an unrelated sibling entry.
-    let mut existing: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    existing["mcpServers"]["other"] = serde_json::json!({ "command": "node", "args": ["other.mjs"] });
+    let mut existing: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    existing["mcpServers"]["other"] =
+        serde_json::json!({ "command": "node", "args": ["other.mjs"] });
     std::fs::write(&config_path, existing.to_string()).unwrap();
-    let (code, _, stderr) = run_lsd(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]);
+    let (code, _, stderr) = run_lsd(
+        dir.path(),
+        &["mcp", "install", config_path.to_str().unwrap()],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
-    let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    assert_eq!(written["mcpServers"]["other"]["command"], serde_json::json!("node"));
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        written["mcpServers"]["other"]["command"],
+        serde_json::json!("node")
+    );
 }
 
 #[test]
@@ -255,12 +350,27 @@ fn skill_install_writes_the_real_binarys_generic_skill_doc() {
 fn help_and_version_work_outside_a_project() {
     let empty = tempfile::tempdir().unwrap();
     for args in [vec!["--help"], vec!["-h"], vec![]] {
-        let output = std::process::Command::new(lsd_bin()).args(&args).current_dir(empty.path()).output().unwrap();
-        assert!(output.status.success(), "hearthd {args:?} failed outside a project: {}", String::from_utf8_lossy(&output.stderr));
+        let output = std::process::Command::new(lsd_bin())
+            .args(&args)
+            .current_dir(empty.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hearthd {args:?} failed outside a project: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("usage: hearthd"), "hearthd {args:?} printed no usage: {stdout}");
+        assert!(
+            stdout.contains("usage: hearthd"),
+            "hearthd {args:?} printed no usage: {stdout}"
+        );
     }
-    let version = std::process::Command::new(lsd_bin()).arg("--version").current_dir(empty.path()).output().unwrap();
+    let version = std::process::Command::new(lsd_bin())
+        .arg("--version")
+        .current_dir(empty.path())
+        .output()
+        .unwrap();
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).starts_with("hearthd "));
 }

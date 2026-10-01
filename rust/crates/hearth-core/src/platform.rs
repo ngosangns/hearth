@@ -50,7 +50,11 @@ pub fn terminate_pid(pid: i64) -> bool {
     if pid <= 0 {
         return false;
     }
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM).is_ok()
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .is_ok()
 }
 
 #[cfg(not(unix))]
@@ -97,13 +101,20 @@ mod tests {
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         assert!(!terminate_pid(0), "a non-positive pid is never signalled");
         // Its own process group, so nothing here can signal the test harness itself.
-        let mut child = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let pid = child.id() as i64;
         assert!(is_pid_alive(pid));
         assert!(terminate_pid(pid));
         // `wait` reaps it and reports the signal it died from.
         let status = child.wait().unwrap();
-        assert_eq!(status.signal(), Some(nix::sys::signal::Signal::SIGTERM as i32));
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGTERM as i32)
+        );
         assert!(!is_pid_alive(pid));
     }
 }

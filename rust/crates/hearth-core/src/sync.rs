@@ -23,19 +23,26 @@ impl<K: Eq + Hash + Clone> Default for KeyedLock<K> {
 
 impl<K: Eq + Hash + Clone> KeyedLock<K> {
     pub fn new() -> Self {
-        Self { locks: Mutex::new(HashMap::new()) }
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The map only ever holds `Arc`s, so a panic elsewhere while it was locked cannot have left it
     /// half-updated — recover the guard rather than turning one panic into a panic on every later
     /// lock of every key.
     fn map(&self) -> MutexGuard<'_, HashMap<K, Arc<tokio::sync::Mutex<()>>>> {
-        self.locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The lock for `key`; hold its guard across the critical section.
     pub fn get(&self, key: &K) -> Arc<tokio::sync::Mutex<()>> {
-        self.map().entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        self.map()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Waits for `key`'s lock. Dropping the guard releases it and prunes the entry when nobody else
@@ -43,7 +50,12 @@ impl<K: Eq + Hash + Clone> KeyedLock<K> {
     pub async fn lock(&self, key: &K) -> KeyedLockGuard<'_, K> {
         let mutex = self.get(key);
         let guard = mutex.clone().lock_owned().await;
-        KeyedLockGuard { owner: self, key: key.clone(), mutex, guard: Some(guard) }
+        KeyedLockGuard {
+            owner: self,
+            key: key.clone(),
+            mutex,
+            guard: Some(guard),
+        }
     }
 
     /// Runs `work` while holding `key`'s lock.
@@ -75,7 +87,11 @@ impl<K: Eq + Hash + Clone> Drop for KeyedLockGuard<'_, K> {
         let mut map = self.owner.map();
         // Two references left means the map's and ours: no holder, no waiter (a waiter holds its own
         // clone from `get`, and `get` needs this same map lock to take one).
-        if map.get(&self.key).is_some_and(|entry| Arc::ptr_eq(entry, &self.mutex)) && Arc::strong_count(&self.mutex) == 2 {
+        if map
+            .get(&self.key)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.mutex))
+            && Arc::strong_count(&self.mutex) == 2
+        {
             map.remove(&self.key);
         }
     }
@@ -117,7 +133,8 @@ mod tests {
         let locks: Arc<KeyedLock<String>> = Arc::new(KeyedLock::new());
         let key = "a".to_string();
         let guard = locks.lock(&key).await;
-        let blocked = tokio::time::timeout(std::time::Duration::from_millis(20), locks.lock(&key)).await;
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(20), locks.lock(&key)).await;
         assert!(blocked.is_err(), "a second lock of a held key must wait");
         drop(guard);
         let _second = locks.lock(&key).await;

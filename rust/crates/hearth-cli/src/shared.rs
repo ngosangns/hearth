@@ -133,7 +133,7 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
     let rest = rest.as_slice();
     match subcommand.as_str() {
         // The `manager ensure --json` contract for smp — find-or-start the shared daemon and print
-        // the connection a client (the macOS app) needs to talk to it directly.
+        // the connection a client needs to talk to it directly.
         "ensure" => {
             let client = ensure_smp(spawn_smp).await?;
             (io.out)(&crate::print_value(&crate::ensure_payload(&client), flags.json));

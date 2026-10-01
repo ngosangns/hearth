@@ -9,20 +9,23 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::{
-    is_container_command, CommandSpec, ReadinessSpec, ServiceCatalog, ServiceCommand, ServiceDefinition, ServiceId,
-    ServiceOwnership, ServiceRunProfile,
+    is_container_command, CommandSpec, ReadinessSpec, ServiceCatalog, ServiceCommand,
+    ServiceDefinition, ServiceId, ServiceOwnership, ServiceRunProfile,
 };
 use crate::state::{
-    ActualServiceState, DesiredServiceState, ProcessIdentity, ReadinessKind, ServiceLifecycleState, ServiceReadiness,
+    ActualServiceState, DesiredServiceState, ProcessIdentity, ReadinessKind, ServiceLifecycleState,
+    ServiceReadiness,
 };
 
 use crate::sync::KeyedLock;
 
 use super::fingerprint::normalize_command_fingerprint;
-use super::process_tree::{process_tree_alive, secondary_process_groups, ProcessTreeEntry, ProcessTreeSnapshot};
+use super::process_tree::{
+    process_tree_alive, secondary_process_groups, ProcessTreeEntry, ProcessTreeSnapshot,
+};
 use super::types::{
-    Host, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail, ProcessRecord, ProcessSignal, SpawnInput,
-    StartOptions, SupervisorError, SupervisorOptions,
+    Host, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail,
+    ProcessRecord, ProcessSignal, SpawnInput, StartOptions, SupervisorError, SupervisorOptions,
 };
 
 /// `Running` is never produced (see its doc), but a persisted `state.json` may still carry it — it
@@ -62,7 +65,10 @@ fn is_task_command(readiness: &ReadinessSpec) -> bool {
 /// external+command combination is treated this way — a daemon-owned service with `command`
 /// readiness still runs a real long-lived process.
 fn is_external_task(definition: Option<&ServiceDefinition>, profile: &VerifiedProfile) -> bool {
-    matches!(definition.and_then(|d| d.ownership), Some(ServiceOwnership::External)) && matches!(profile.readiness, ReadinessSpec::Command { .. })
+    matches!(
+        definition.and_then(|d| d.ownership),
+        Some(ServiceOwnership::External)
+    ) && matches!(profile.readiness, ReadinessSpec::Command { .. })
 }
 
 fn readiness_kind_of(readiness: &ReadinessSpec) -> ReadinessKind {
@@ -77,10 +83,19 @@ fn readiness_kind_of(readiness: &ReadinessSpec) -> ReadinessKind {
     }
 }
 
-fn profile_for(catalog: &ServiceCatalog, service_id: &str) -> Result<VerifiedProfile, SupervisorError> {
+fn profile_for(
+    catalog: &ServiceCatalog,
+    service_id: &str,
+) -> Result<VerifiedProfile, SupervisorError> {
     let service = catalog.services.iter().find(|s| s.id == service_id);
     match service.map(|s| &s.profiles.run) {
-        Some(ServiceRunProfile::Verified { command, readiness, readiness_timeout_ms, preparation, preparation_command }) => Ok(VerifiedProfile {
+        Some(ServiceRunProfile::Verified {
+            command,
+            readiness,
+            readiness_timeout_ms,
+            preparation,
+            preparation_command,
+        }) => Ok(VerifiedProfile {
             command: command.clone(),
             readiness: readiness.clone(),
             readiness_timeout_ms: *readiness_timeout_ms,
@@ -91,7 +106,10 @@ fn profile_for(catalog: &ServiceCatalog, service_id: &str) -> Result<VerifiedPro
     }
 }
 
-fn definition_for<'a>(catalog: &'a ServiceCatalog, service_id: &str) -> Option<&'a ServiceDefinition> {
+fn definition_for<'a>(
+    catalog: &'a ServiceCatalog,
+    service_id: &str,
+) -> Option<&'a ServiceDefinition> {
     catalog.services.iter().find(|s| s.id == service_id)
 }
 
@@ -210,19 +228,37 @@ impl ProcessSupervisor {
     // Public API
     // ---------------------------------------------------------------------------------------
 
-    pub async fn start(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
-        self.start_with_options(service_id, operation_id, StartOptions::default()).await
+    pub async fn start(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        self.start_with_options(service_id, operation_id, StartOptions::default())
+            .await
     }
 
     /// `StartOptions::kill_unowned` is the wire-level echo of a user's explicit "yes, kill the
     /// process holding my port" — it must only ever come from a confirmed client request.
-    pub async fn start_with_options(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>, options: StartOptions) -> Result<(), SupervisorError> {
+    pub async fn start_with_options(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        operation_id: Option<String>,
+        options: StartOptions,
+    ) -> Result<(), SupervisorError> {
         let sup = self.clone();
         let id = service_id.clone();
-        self.queues.run(service_id, || async move { sup.start_locked(&id, operation_id, options).await }).await
+        self.queues
+            .run(service_id, || async move {
+                sup.start_locked(&id, operation_id, options).await
+            })
+            .await
     }
 
-    pub async fn restart(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
+    pub async fn restart(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
         self.cancel(service_id);
         self.abort_build(service_id);
         let sup = self.clone();
@@ -236,15 +272,27 @@ impl ProcessSupervisor {
             .await
     }
 
-    pub async fn stop(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
+    pub async fn stop(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
         self.cancel(service_id);
         self.abort_build(service_id);
         let sup = self.clone();
         let id = service_id.clone();
-        self.queues.run(service_id, || async move { sup.stop_locked(&id, operation_id).await }).await
+        self.queues
+            .run(service_id, || async move {
+                sup.stop_locked(&id, operation_id).await
+            })
+            .await
     }
 
-    pub async fn start_group(self: &Arc<Self>, group: &str, operation_id: Option<String>) -> Result<(), SupervisorError> {
+    pub async fn start_group(
+        self: &Arc<Self>,
+        group: &str,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
         let members = self
             .host
             .catalog()
@@ -259,7 +307,8 @@ impl ProcessSupervisor {
     }
 
     pub fn begin_shutdown(&self) {
-        let mut ids: std::collections::HashSet<ServiceId> = self.tokens.lock().unwrap().keys().cloned().collect();
+        let mut ids: std::collections::HashSet<ServiceId> =
+            self.tokens.lock().unwrap().keys().cloned().collect();
         ids.extend(self.build_aborts.lock().unwrap().keys().cloned());
         ids.extend(self.host.service_states().into_iter().map(|s| s.service_id));
         for id in ids {
@@ -294,25 +343,44 @@ impl ProcessSupervisor {
         // actualState says "externally-owned" (e.g. a port conflict was detected at last start) —
         // the pass above skips it since that state isn't "active", but a lingering owned process
         // must still be reaped on shutdown so it never leaks past this manager's lifetime.
-        let to_reap: Vec<ServiceId> =
-            self.host.service_states().into_iter().filter(|s| daemon_owned.contains(&s.service_id)).map(|s| s.service_id).collect();
+        let to_reap: Vec<ServiceId> = self
+            .host
+            .service_states()
+            .into_iter()
+            .filter(|s| daemon_owned.contains(&s.service_id))
+            .map(|s| s.service_id)
+            .collect();
         for id in to_reap {
             let sup = self.clone();
             let sid = id.clone();
-            self.queues.run(&id, || async move { sup.reap_persisted_posix_identity(&sid).await }).await;
+            self.queues
+                .run(&id, || async move {
+                    sup.reap_persisted_posix_identity(&sid).await
+                })
+                .await;
         }
 
         // Container log followers are real child processes (`docker logs -f`) in their own process
         // group — they would outlive the daemon as orphans streaming to a dead pipe.
-        let tails: Vec<OutputTail> = self.output_tails.lock().unwrap().drain().map(|(_, tail)| tail).collect();
+        let tails: Vec<OutputTail> = self
+            .output_tails
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, tail)| tail)
+            .collect();
         for tail in tails {
             tail.stop();
         }
     }
 
     async fn reap_persisted_posix_identity(self: &Arc<Self>, service_id: &ServiceId) {
-        let Some(state) = self.state(service_id) else { return };
-        let Some(identity) = &state.identity else { return };
+        let Some(state) = self.state(service_id) else {
+            return;
+        };
+        let Some(identity) = &state.identity else {
+            return;
+        };
         if matches!(identity, ProcessIdentity::Docker(_)) || !self.identity_matches_state(&state) {
             return;
         }
@@ -324,9 +392,17 @@ impl ProcessSupervisor {
         if self.observed_matches(identity).await != Some(true) {
             return;
         }
-        let ProcessIdentity::Posix(posix) = identity else { return };
-        if let Err(error) = self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid).await {
-            self.host.record_background_error("supervisor.terminate", &format!("{}: {}", posix.service_id, error.0));
+        let ProcessIdentity::Posix(posix) = identity else {
+            return;
+        };
+        if let Err(error) = self
+            .terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid)
+            .await
+        {
+            self.host.record_background_error(
+                "supervisor.terminate",
+                &format!("{}: {}", posix.service_id, error.0),
+            );
         }
     }
 
@@ -335,7 +411,9 @@ impl ProcessSupervisor {
         let id = service_id.clone();
         self.queues
             .run(service_id, || async move {
-                let Some(state) = sup.state(&id) else { return Ok(()) };
+                let Some(state) = sup.state(&id) else {
+                    return Ok(());
+                };
                 if state.identity.is_none() || !is_active_state(state.actual_state) {
                     return Ok(());
                 }
@@ -345,7 +423,10 @@ impl ProcessSupervisor {
                     return Ok(());
                 }
                 let profile = profile_for(&sup.host.catalog(), &id)?;
-                if matches!(profile.readiness, ReadinessSpec::Process | ReadinessSpec::Exit) {
+                if matches!(
+                    profile.readiness,
+                    ReadinessSpec::Process | ReadinessSpec::Exit
+                ) {
                     return Ok(());
                 }
                 if !sup.probe(&profile.readiness, &id).await {
@@ -356,7 +437,9 @@ impl ProcessSupervisor {
                         ServiceReadiness::NotReady,
                         Changes {
                             readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
-                            readiness_detail: Patch::Set("Readiness probe is currently unavailable".to_string()),
+                            readiness_detail: Patch::Set(
+                                "Readiness probe is currently unavailable".to_string(),
+                            ),
                             ..Default::default()
                         },
                     )
@@ -399,16 +482,23 @@ impl ProcessSupervisor {
                             // marking a live service failed here would spawn a duplicate.
                             return;
                         }
-                        Inspection::Gone | Inspection::Observed(ObservedProcess { alive: false, .. }) => {
-                            let next_state =
-                                if state.desired_state == DesiredServiceState::Running { ActualServiceState::Failed } else { ActualServiceState::Stopped };
+                        Inspection::Gone
+                        | Inspection::Observed(ObservedProcess { alive: false, .. }) => {
+                            let next_state = if state.desired_state == DesiredServiceState::Running
+                            {
+                                ActualServiceState::Failed
+                            } else {
+                                ActualServiceState::Stopped
+                            };
                             sup.transition(
                                 &service_id,
                                 state.generation,
                                 next_state,
                                 ServiceReadiness::Failed,
                                 Changes {
-                                    error: Patch::Set("Managed process is no longer alive".to_string()),
+                                    error: Patch::Set(
+                                        "Managed process is no longer alive".to_string(),
+                                    ),
                                     exited_at: Patch::Set(sup.options.clock.now()),
                                     ..Default::default()
                                 },
@@ -438,7 +528,11 @@ impl ProcessSupervisor {
                         state.generation,
                         ActualServiceState::RunningUnready,
                         ServiceReadiness::NotReady,
-                        Changes { identity: Patch::Set(updated_identity.clone()), error: Patch::Clear, ..Default::default() },
+                        Changes {
+                            identity: Patch::Set(updated_identity.clone()),
+                            error: Patch::Clear,
+                            ..Default::default()
+                        },
                     )
                     .await;
                     // Guard on a live tail rather than attaching unconditionally: `reconcile` runs
@@ -447,13 +541,31 @@ impl ProcessSupervisor {
                     if !sup.has_live_output_tail(&service_id) {
                         sup.attach_output(&service_id, output_source(&updated_identity, true));
                     }
-                    let Ok(profile) = profile_for(&sup.host.catalog(), &service_id) else { return };
+                    let Ok(profile) = profile_for(&sup.host.catalog(), &service_id) else {
+                        return;
+                    };
                     let token = sup.current_token(&service_id);
                     // A spawned service already has an exit watcher. An adopted one (this daemon
                     // just attached to a live pid) does not — without one, a later crash stays
                     // `ready` until the next restart.
-                    sup.arm_adopted_watch(&service_id, updated_identity.clone(), profile.command.clone(), state.generation, token);
-                    let _ = sup.readiness_with_adopted(&service_id, &profile, state.generation, Some(updated_identity), token, None, true).await;
+                    sup.arm_adopted_watch(
+                        &service_id,
+                        updated_identity.clone(),
+                        profile.command.clone(),
+                        state.generation,
+                        token,
+                    );
+                    let _ = sup
+                        .readiness_with_adopted(
+                            &service_id,
+                            &profile,
+                            state.generation,
+                            Some(updated_identity),
+                            token,
+                            None,
+                            true,
+                        )
+                        .await;
                 })
                 .await;
         }
@@ -482,10 +594,22 @@ impl ProcessSupervisor {
                         return;
                     }
                     let state = sup.state(&service_id);
-                    let ServiceRunProfile::Verified { command, readiness, .. } = &service.profiles.run else { return };
+                    let ServiceRunProfile::Verified {
+                        command, readiness, ..
+                    } = &service.profiles.run
+                    else {
+                        return;
+                    };
                     let ready = sup.probe(readiness, &service_id).await;
                     let actual = state.as_ref().map(|s| s.actual_state);
-                    if ready && matches!(actual, Some(ActualServiceState::Stopped) | Some(ActualServiceState::Failed) | None) {
+                    if ready
+                        && matches!(
+                            actual,
+                            Some(ActualServiceState::Stopped)
+                                | Some(ActualServiceState::Failed)
+                                | None
+                        )
+                    {
                         let generation = state.as_ref().map(|s| s.generation).unwrap_or(0) + 1;
                         sup.transition(
                             &service_id,
@@ -494,7 +618,9 @@ impl ProcessSupervisor {
                             ServiceReadiness::Ready,
                             Changes {
                                 readiness_kind: Patch::Set(readiness_kind_of(readiness)),
-                                readiness_detail: Patch::Set("adopted from external state".to_string()),
+                                readiness_detail: Patch::Set(
+                                    "adopted from external state".to_string(),
+                                ),
                                 desired_state: Some(DesiredServiceState::Running),
                                 error: Patch::Clear,
                                 exit_code: Patch::Clear,
@@ -515,12 +641,19 @@ impl ProcessSupervisor {
                                     &service_id,
                                     // Backlog capped: an external container may have been running
                                     // for days before this daemon ever adopted it.
-                                    OutputSource::Container { container_name, since: None, tail: Some(EXTERNAL_LOG_BACKLOG_LINES) },
+                                    OutputSource::Container {
+                                        container_name,
+                                        since: None,
+                                        tail: Some(EXTERNAL_LOG_BACKLOG_LINES),
+                                    },
                                 );
                             }
                         }
                     } else if let Some(state) = &state {
-                        if matches!(state.actual_state, ActualServiceState::Ready | ActualServiceState::RunningUnready) {
+                        if matches!(
+                            state.actual_state,
+                            ActualServiceState::Ready | ActualServiceState::RunningUnready
+                        ) {
                             sup.transition(
                                 &service_id,
                                 state.generation,
@@ -549,7 +682,12 @@ impl ProcessSupervisor {
     // Locked start/stop
     // ---------------------------------------------------------------------------------------
 
-    async fn start_locked(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>, options: StartOptions) -> Result<(), SupervisorError> {
+    async fn start_locked(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        operation_id: Option<String>,
+        options: StartOptions,
+    ) -> Result<(), SupervisorError> {
         if (self.options.is_closing)() {
             return Ok(());
         }
@@ -557,12 +695,17 @@ impl ProcessSupervisor {
         let current = self.state(service_id);
         let existing_stopped = {
             let active = self.active.lock().unwrap();
-            active.get(service_id).map(|a| (a.stopped, a.exited.load(Ordering::SeqCst)))
+            active
+                .get(service_id)
+                .map(|a| (a.stopped, a.exited.load(Ordering::SeqCst)))
         };
         if let Some((stopped, exited)) = existing_stopped {
             // `exited` is set by the watcher before it can take this queue. A start that still
             // holds the queue would otherwise report success over a process that is already dead.
-            if !stopped && !exited && current.as_ref().map(|s| s.actual_state) != Some(ActualServiceState::Failed) {
+            if !stopped
+                && !exited
+                && current.as_ref().map(|s| s.actual_state) != Some(ActualServiceState::Failed)
+            {
                 return Ok(());
             }
         }
@@ -570,14 +713,21 @@ impl ProcessSupervisor {
             self.finalize(service_id, true).await;
         }
         if let Some(current) = &current {
-            if current.identity.is_some() && is_active_state(current.actual_state) && self.owns(current).await == Some(true) {
+            if current.identity.is_some()
+                && is_active_state(current.actual_state)
+                && self.owns(current).await == Some(true)
+            {
                 return Ok(());
             }
         }
         let retained_identity = match &current {
             Some(state) if self.identity_matches_state(state) => match &state.identity {
                 Some(ProcessIdentity::Posix(_)) => {
-                    if self.observed_matches(state.identity.as_ref().unwrap()).await == Some(true) {
+                    if self
+                        .observed_matches(state.identity.as_ref().unwrap())
+                        .await
+                        == Some(true)
+                    {
                         state.identity.clone()
                     } else {
                         None
@@ -602,7 +752,10 @@ impl ProcessSupervisor {
                 ServiceReadiness::NotReady,
                 Changes {
                     desired_state: Some(DesiredServiceState::Running),
-                    current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep),
+                    current_operation_id: operation_id
+                        .clone()
+                        .map(Patch::Set)
+                        .unwrap_or(Patch::Keep),
                     identity: Patch::Set(identity.clone()),
                     error: Patch::Clear,
                     exit_code: Patch::Clear,
@@ -613,10 +766,25 @@ impl ProcessSupervisor {
             .await;
             self.attach_output(service_id, output_source(&identity, true));
             // An adopted identity is only worth keeping while it still answers its readiness probe.
-            let outcome = self.await_readiness(service_id, &profile, generation, Some(identity.clone()), token, true).await;
+            let outcome = self
+                .await_readiness(
+                    service_id,
+                    &profile,
+                    generation,
+                    Some(identity.clone()),
+                    token,
+                    true,
+                )
+                .await;
             match outcome {
                 ReadinessOutcome::Ready => {
-                    self.arm_adopted_watch(service_id, identity, profile.command.clone(), generation, token);
+                    self.arm_adopted_watch(
+                        service_id,
+                        identity,
+                        profile.command.clone(),
+                        generation,
+                        token,
+                    );
                     return Ok(());
                 }
                 ReadinessOutcome::Superseded => return Ok(()),
@@ -632,20 +800,30 @@ impl ProcessSupervisor {
                         generation,
                         ActualServiceState::Failed,
                         ServiceReadiness::Failed,
-                        Changes { error: Patch::Set(error.0.clone()), identity: Patch::Set(identity), ..Default::default() },
+                        Changes {
+                            error: Patch::Set(error.0.clone()),
+                            identity: Patch::Set(identity),
+                            ..Default::default()
+                        },
                     )
                     .await;
                     return Err(error);
                 }
                 Ok(()) => {
                     if self.owns_identity(&identity).await != Some(false) {
-                        let error = SupervisorError(format!("{service_id} was not replaced: the adopted process is still alive"));
+                        let error = SupervisorError(format!(
+                            "{service_id} was not replaced: the adopted process is still alive"
+                        ));
                         self.transition(
                             service_id,
                             generation,
                             ActualServiceState::Failed,
                             ServiceReadiness::Failed,
-                            Changes { error: Patch::Set(error.0.clone()), identity: Patch::Set(identity.clone()), ..Default::default() },
+                            Changes {
+                                error: Patch::Set(error.0.clone()),
+                                identity: Patch::Set(identity.clone()),
+                                ..Default::default()
+                            },
                         )
                         .await;
                         return Err(error);
@@ -689,7 +867,8 @@ impl ProcessSupervisor {
                         }
                     });
                     if let Err(error) = installer.install(def, on_output).await {
-                        if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+                        if !self.valid(service_id, generation, token) || (self.options.is_closing)()
+                        {
                             return Ok(());
                         }
                         self.transition_if_current(
@@ -698,7 +877,14 @@ impl ProcessSupervisor {
                             token,
                             ActualServiceState::Failed,
                             ServiceReadiness::Failed,
-                            Changes { error: Patch::Set(format!("Install failed: {}", error.0)), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+                            Changes {
+                                error: Patch::Set(format!("Install failed: {}", error.0)),
+                                current_operation_id: operation_id
+                                    .clone()
+                                    .map(Patch::Set)
+                                    .unwrap_or(Patch::Keep),
+                                ..Default::default()
+                            },
                         )
                         .await;
                         return Err(error);
@@ -711,10 +897,21 @@ impl ProcessSupervisor {
                         token,
                         ActualServiceState::Failed,
                         ServiceReadiness::Failed,
-                        Changes { error: Patch::Set("artifact installs are not supported by this host".to_string()), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+                        Changes {
+                            error: Patch::Set(
+                                "artifact installs are not supported by this host".to_string(),
+                            ),
+                            current_operation_id: operation_id
+                                .clone()
+                                .map(Patch::Set)
+                                .unwrap_or(Patch::Keep),
+                            ..Default::default()
+                        },
                     )
                     .await;
-                    return Err(SupervisorError(format!("{service_id}: artifact installs are not supported by this host")));
+                    return Err(SupervisorError(format!(
+                        "{service_id}: artifact installs are not supported by this host"
+                    )));
                 }
             }
         }
@@ -743,8 +940,20 @@ impl ProcessSupervisor {
         if !preparation_failed {
             if let Some(prep_command) = &profile.preparation_command {
                 let ok = match &prep_command.serialization_key {
-                    Some(key) => self.serialized_preparation_command(key, &prep_command.command, prep_command.cwd.as_deref()).await,
-                    None => self.options.probes.command(&prep_command.command, prep_command.cwd.as_deref()).await,
+                    Some(key) => {
+                        self.serialized_preparation_command(
+                            key,
+                            &prep_command.command,
+                            prep_command.cwd.as_deref(),
+                        )
+                        .await
+                    }
+                    None => {
+                        self.options
+                            .probes
+                            .command(&prep_command.command, prep_command.cwd.as_deref())
+                            .await
+                    }
                 };
                 if ok != Some(true) {
                     preparation_failed = true;
@@ -758,17 +967,27 @@ impl ProcessSupervisor {
                 token,
                 ActualServiceState::Failed,
                 ServiceReadiness::Failed,
-                Changes { error: Patch::Set("Preparation failed".to_string()), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+                Changes {
+                    error: Patch::Set("Preparation failed".to_string()),
+                    current_operation_id: operation_id
+                        .clone()
+                        .map(Patch::Set)
+                        .unwrap_or(Patch::Keep),
+                    ..Default::default()
+                },
             )
             .await;
-            return Err(SupervisorError(format!("Preparation failed for {service_id}")));
+            return Err(SupervisorError(format!(
+                "Preparation failed for {service_id}"
+            )));
         }
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
             return Ok(());
         }
         if let Some(def) = &definition {
             if def.profiles.build.is_some() {
-                self.build(service_id, def, generation, token, operation_id.clone()).await?;
+                self.build(service_id, def, generation, token, operation_id.clone())
+                    .await?;
             }
         }
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
@@ -791,7 +1010,10 @@ impl ProcessSupervisor {
                             generation,
                             ActualServiceState::ExternallyOwned,
                             ServiceReadiness::Failed,
-                            Changes { error: Patch::Set(format!("Port {port} is held by {held_by}")), ..Default::default() },
+                            Changes {
+                                error: Patch::Set(format!("Port {port} is held by {held_by}")),
+                                ..Default::default()
+                            },
                         )
                         .await;
                         return Err(SupervisorError(format!("Port {port} is externally owned")));
@@ -803,7 +1025,10 @@ impl ProcessSupervisor {
                             generation,
                             ActualServiceState::ExternallyOwned,
                             ServiceReadiness::Failed,
-                            Changes { error: Patch::Set(error.0.clone()), ..Default::default() },
+                            Changes {
+                                error: Patch::Set(error.0.clone()),
+                                ..Default::default()
+                            },
                         )
                         .await;
                         return Err(error);
@@ -811,7 +1036,8 @@ impl ProcessSupervisor {
                 }
             }
         }
-        self.spawn_and_wait(service_id, &profile, generation, token, operation_id).await
+        self.spawn_and_wait(service_id, &profile, generation, token, operation_id)
+            .await
     }
 
     /// Human-readable "pid 91600 (node dist/main)" for the refusal error and the client-side kill
@@ -847,7 +1073,10 @@ impl ProcessSupervisor {
         for signal in [ProcessSignal::Sigterm, ProcessSignal::Sigkill] {
             if let Some(holders) = self.options.probes.port_holders(port).await {
                 for holder in holders {
-                    self.options.process.signal_pid(holder.pid, &holder.start_identity, signal).await;
+                    self.options
+                        .process
+                        .signal_pid(holder.pid, &holder.start_identity, signal)
+                        .await;
                 }
             }
             let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
@@ -858,14 +1087,26 @@ impl ProcessSupervisor {
                 if self.options.clock.now_millis() >= deadline {
                     break;
                 }
-                self.options.clock.sleep(self.options.readiness_backoff_ms).await;
+                self.options
+                    .clock
+                    .sleep(self.options.readiness_backoff_ms)
+                    .await;
             }
         }
-        Err(SupervisorError(format!("Port {port} is still held by {} after SIGKILL", self.describe_port_holders(port).await)))
+        Err(SupervisorError(format!(
+            "Port {port} is still held by {} after SIGKILL",
+            self.describe_port_holders(port).await
+        )))
     }
 
-    async fn stop_locked(self: &Arc<Self>, service_id: &ServiceId, operation_id: Option<String>) -> Result<(), SupervisorError> {
-        let Some(state) = self.state(service_id) else { return Ok(()) };
+    async fn stop_locked(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        let Some(state) = self.state(service_id) else {
+            return Ok(());
+        };
         if state.actual_state == ActualServiceState::Stopped {
             return Ok(());
         }
@@ -883,7 +1124,12 @@ impl ProcessSupervisor {
             // Only a start still in flight has nothing to stop yet. This used to also cover every
             // identity-less service while the daemon was closing — recording a `Ready` tailnet task
             // as stopped without running anything.
-            if matches!(state.actual_state, ActualServiceState::QueuedStart | ActualServiceState::Preparing | ActualServiceState::Starting) {
+            if matches!(
+                state.actual_state,
+                ActualServiceState::QueuedStart
+                    | ActualServiceState::Preparing
+                    | ActualServiceState::Starting
+            ) {
                 self.transition(
                     service_id,
                     state.generation,
@@ -915,9 +1161,15 @@ impl ProcessSupervisor {
                 // The probe could not answer — concluding "dead" would record `stopped` over a
                 // possibly-still-running process, and concluding "not ours" would orphan a live
                 // one. Fail the stop instead.
-                return Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified")));
+                return Err(SupervisorError(format!(
+                    "{service_id} cannot be stopped: the process's liveness could not be verified"
+                )));
             }
-            let inspection = self.options.process.inspect(state.identity.as_ref().unwrap()).await;
+            let inspection = self
+                .options
+                .process
+                .inspect(state.identity.as_ref().unwrap())
+                .await;
             match inspection {
                 Inspection::Unknown => {
                     return Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified")));
@@ -930,11 +1182,15 @@ impl ProcessSupervisor {
                     let (tree, leader_pgid) = {
                         let mut active = self.active.lock().unwrap();
                         let entry = active.remove(service_id);
-                        let tree = entry.as_ref().map(|active| active.last_tree.lock().unwrap().clone()).unwrap_or_default();
-                        let leader_pgid = entry.as_ref().and_then(|active| match &active.identity {
-                            ProcessIdentity::Posix(posix) => Some(posix.pgid),
-                            ProcessIdentity::Docker(_) => None,
-                        });
+                        let tree = entry
+                            .as_ref()
+                            .map(|active| active.last_tree.lock().unwrap().clone())
+                            .unwrap_or_default();
+                        let leader_pgid =
+                            entry.as_ref().and_then(|active| match &active.identity {
+                                ProcessIdentity::Posix(posix) => Some(posix.pgid),
+                                ProcessIdentity::Docker(_) => None,
+                            });
                         (tree, leader_pgid)
                     };
                     if let Some(pgid) = leader_pgid {
@@ -973,7 +1229,11 @@ impl ProcessSupervisor {
             state.generation,
             ActualServiceState::Stopping,
             state.readiness,
-            Changes { desired_state: Some(DesiredServiceState::Stopped), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+            Changes {
+                desired_state: Some(DesiredServiceState::Stopped),
+                current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep),
+                ..Default::default()
+            },
         )
         .await;
         if has_active {
@@ -982,7 +1242,8 @@ impl ProcessSupervisor {
             }
         }
         let profile = profile_for(&self.host.catalog(), service_id)?;
-        self.terminate(state.identity.as_ref().unwrap(), &profile.command).await?;
+        self.terminate(state.identity.as_ref().unwrap(), &profile.command)
+            .await?;
         if has_active {
             self.active.lock().unwrap().remove(service_id);
         }
@@ -991,7 +1252,13 @@ impl ProcessSupervisor {
             state.generation,
             ActualServiceState::Stopped,
             ServiceReadiness::Unknown,
-            Changes { desired_state: Some(DesiredServiceState::Stopped), exited_at: Patch::Set(self.options.clock.now()), error: Patch::Clear, exit_code: Patch::Clear, ..Default::default() },
+            Changes {
+                desired_state: Some(DesiredServiceState::Stopped),
+                exited_at: Patch::Set(self.options.clock.now()),
+                error: Patch::Clear,
+                exit_code: Patch::Clear,
+                ..Default::default()
+            },
         )
         .await;
         Ok(())
@@ -1002,19 +1269,33 @@ impl ProcessSupervisor {
     /// does not own. The catalog's `stop:` command is the only lever that exists for those, so it is
     /// what runs; with no such command, refusing loudly is the honest answer. Reporting success
     /// without stopping anything is what made Stop look broken in the app.
-    async fn stop_unowned(self: &Arc<Self>, service_id: &ServiceId, state: &ServiceLifecycleState, operation_id: Option<String>) -> Result<(), SupervisorError> {
+    async fn stop_unowned(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        state: &ServiceLifecycleState,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
         let profile = profile_for(&self.host.catalog(), service_id)?;
         if profile.command.docker_stop_command.is_none() {
             let reason = match state.actual_state {
-                ActualServiceState::ExternallyOwned => state.error.clone().unwrap_or_else(|| "its port is held by a process this manager does not own".to_string()),
+                ActualServiceState::ExternallyOwned => state.error.clone().unwrap_or_else(|| {
+                    "its port is held by a process this manager does not own".to_string()
+                }),
                 _ => "it is owned externally".to_string(),
             };
             return Err(SupervisorError(format!("{service_id} cannot be stopped: {reason}, and its catalog declares no `stop` command")));
         }
         let sink: OnOutput = Arc::new(|_| {});
-        match self.options.process.stop_container(&profile.command, sink).await {
+        match self
+            .options
+            .process
+            .stop_container(&profile.command, sink)
+            .await
+        {
             Some(result) => result?,
-            None => return Err(SupervisorError(format!("{service_id} cannot be stopped: this process adapter has no stop command support"))),
+            None => return Err(SupervisorError(format!(
+                "{service_id} cannot be stopped: this process adapter has no stop command support"
+            ))),
         }
         // An adopted container carries a `docker logs --follow` tail; the container is gone now, so
         // the follower must not be left streaming into a dead pipe.
@@ -1050,7 +1331,12 @@ impl ProcessSupervisor {
             generation,
             ActualServiceState::Starting,
             ServiceReadiness::NotReady,
-            Changes { desired_state: Some(DesiredServiceState::Running), current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep), identity: Patch::Clear, ..Default::default() },
+            Changes {
+                desired_state: Some(DesiredServiceState::Running),
+                current_operation_id: operation_id.clone().map(Patch::Set).unwrap_or(Patch::Keep),
+                identity: Patch::Clear,
+                ..Default::default()
+            },
         )
         .await;
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
@@ -1064,7 +1350,11 @@ impl ProcessSupervisor {
                 sup.append_output(&sid, data);
             }
         });
-        let input = SpawnInput { command: profile.command.clone(), command_fingerprint: fingerprint, service_id: service_id.clone() };
+        let input = SpawnInput {
+            command: profile.command.clone(),
+            command_fingerprint: fingerprint,
+            service_id: service_id.clone(),
+        };
         let is_container = is_container_command(&profile.command);
         let spawn_result = if is_container {
             let _guard = self.compose_start_tail.lock().await;
@@ -1084,7 +1374,12 @@ impl ProcessSupervisor {
                     token,
                     ActualServiceState::Failed,
                     ServiceReadiness::Failed,
-                    Changes { error: Patch::Set(error.0.clone()), current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep), identity: Patch::Clear, ..Default::default() },
+                    Changes {
+                        error: Patch::Set(error.0.clone()),
+                        current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
+                        identity: Patch::Clear,
+                        ..Default::default()
+                    },
                 )
                 .await;
                 return Err(error);
@@ -1093,9 +1388,13 @@ impl ProcessSupervisor {
 
         let catalog = self.host.catalog();
         let definition = definition_for(&catalog, service_id);
-        if (is_task_command(&profile.readiness) || is_external_task(definition, profile)) && !app.record.is_docker() {
+        if (is_task_command(&profile.readiness) || is_external_task(definition, profile))
+            && !app.record.is_docker()
+        {
             let ProcessRecord::Posix(record) = &app.record else {
-                return Err(SupervisorError(format!("{service_id} task did not spawn a process")));
+                return Err(SupervisorError(format!(
+                    "{service_id} task did not spawn a process"
+                )));
             };
             // Not stored on the service: the run command is the one-shot trigger, not the service
             // process. It is kept only so a failed readiness can still stop this process.
@@ -1114,15 +1413,26 @@ impl ProcessSupervisor {
                 generation,
                 ActualServiceState::RunningUnready,
                 ServiceReadiness::NotReady,
-                Changes { identity: Patch::Clear, ..Default::default() },
+                Changes {
+                    identity: Patch::Clear,
+                    ..Default::default()
+                },
             )
             .await;
-            let result = self.readiness(service_id, profile, generation, None, token, operation_id).await;
+            let result = self
+                .readiness(service_id, profile, generation, None, token, operation_id)
+                .await;
             if result.is_err() || !self.valid(service_id, generation, token) {
                 if let Err(error) = self.terminate(&task_identity, &profile.command).await {
-                    self.report_terminate_failure(service_id, Err(SupervisorError(error.0.clone())));
+                    self.report_terminate_failure(
+                        service_id,
+                        Err(SupervisorError(error.0.clone())),
+                    );
                     if let Err(ready) = result {
-                        return Err(SupervisorError(format!("{}; the task process could not be stopped: {}", ready.0, error.0)));
+                        return Err(SupervisorError(format!(
+                            "{}; the task process could not be stopped: {}",
+                            ready.0, error.0
+                        )));
                     }
                     return Err(error);
                 }
@@ -1131,35 +1441,67 @@ impl ProcessSupervisor {
         }
 
         let identity = match &app.record {
-            ProcessRecord::Docker(record) => ProcessIdentity::Docker(crate::state::DockerContainerIdentity {
-                manager_instance_id: self.host.instance_id(),
-                service_id: service_id.clone(),
-                generation,
-                started_at: self.options.clock.now(),
-                container_name: record.container_name.clone(),
-                container_id: record.container_id.clone(),
-                container_started_at: record.container_started_at.clone(),
-                command_fingerprint: record.command_fingerprint.clone(),
-            }),
-            ProcessRecord::Posix(record) => ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
-                manager_instance_id: self.host.instance_id(),
-                service_id: service_id.clone(),
-                generation,
-                started_at: self.options.clock.now(),
-                pid: record.pid,
-                pgid: record.pgid,
-                start_identity: record.start_identity.clone(),
-                command_fingerprint: record.command_fingerprint.clone(),
-            }),
+            ProcessRecord::Docker(record) => {
+                ProcessIdentity::Docker(crate::state::DockerContainerIdentity {
+                    manager_instance_id: self.host.instance_id(),
+                    service_id: service_id.clone(),
+                    generation,
+                    started_at: self.options.clock.now(),
+                    container_name: record.container_name.clone(),
+                    container_id: record.container_id.clone(),
+                    container_started_at: record.container_started_at.clone(),
+                    command_fingerprint: record.command_fingerprint.clone(),
+                })
+            }
+            ProcessRecord::Posix(record) => {
+                ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+                    manager_instance_id: self.host.instance_id(),
+                    service_id: service_id.clone(),
+                    generation,
+                    started_at: self.options.clock.now(),
+                    pid: record.pid,
+                    pgid: record.pgid,
+                    start_identity: record.start_identity.clone(),
+                    command_fingerprint: record.command_fingerprint.clone(),
+                })
+            }
         };
         if !self.valid(service_id, generation, token) {
-            self.report_terminate_failure(service_id, self.terminate(&identity, &profile.command).await);
+            self.report_terminate_failure(
+                service_id,
+                self.terminate(&identity, &profile.command).await,
+            );
             return Ok(());
         }
-        self.track_spawned(service_id, profile.command.clone(), identity.clone(), generation, token, app.exited);
+        self.track_spawned(
+            service_id,
+            profile.command.clone(),
+            identity.clone(),
+            generation,
+            token,
+            app.exited,
+        );
         self.attach_output(service_id, output_source(&identity, false));
-        self.transition(service_id, generation, ActualServiceState::RunningUnready, ServiceReadiness::NotReady, Changes { identity: Patch::Set(identity), ..Default::default() }).await;
-        self.readiness(service_id, profile, generation, self.state(service_id).and_then(|s| s.identity), token, operation_id).await
+        self.transition(
+            service_id,
+            generation,
+            ActualServiceState::RunningUnready,
+            ServiceReadiness::NotReady,
+            Changes {
+                identity: Patch::Set(identity),
+                ..Default::default()
+            },
+        )
+        .await;
+        self.readiness(
+            service_id,
+            profile,
+            generation,
+            self.state(service_id).and_then(|s| s.identity),
+            token,
+            operation_id,
+        )
+        .await
     }
 
     async fn readiness(
@@ -1171,7 +1513,16 @@ impl ProcessSupervisor {
         token: u64,
         operation_id: Option<String>,
     ) -> Result<(), SupervisorError> {
-        self.readiness_with_adopted(service_id, profile, generation, identity, token, operation_id, false).await
+        self.readiness_with_adopted(
+            service_id,
+            profile,
+            generation,
+            identity,
+            token,
+            operation_id,
+            false,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)] // the full per-start context; bundling it would only move the list
@@ -1185,22 +1536,54 @@ impl ProcessSupervisor {
         operation_id: Option<String>,
         adopted: bool,
     ) -> Result<(), SupervisorError> {
-        let outcome = self.await_readiness(service_id, profile, generation, identity.clone(), token, adopted).await;
+        let outcome = self
+            .await_readiness(
+                service_id,
+                profile,
+                generation,
+                identity.clone(),
+                token,
+                adopted,
+            )
+            .await;
         match outcome {
             ReadinessOutcome::Ready | ReadinessOutcome::Superseded => Ok(()),
             ReadinessOutcome::Exited { message } => {
                 // `await_exit` already recorded `failed` for a command whose exit it observed.
                 // `fail` again would terminate a process that is already gone and drop the code.
                 let already_settled = self.state(service_id).is_some_and(|s| {
-                    matches!(s.actual_state, ActualServiceState::Failed | ActualServiceState::Succeeded | ActualServiceState::Stopped)
+                    matches!(
+                        s.actual_state,
+                        ActualServiceState::Failed
+                            | ActualServiceState::Succeeded
+                            | ActualServiceState::Stopped
+                    )
                 });
                 if !already_settled {
-                    self.fail(service_id, generation, token, identity, &message, operation_id, None).await;
+                    self.fail(
+                        service_id,
+                        generation,
+                        token,
+                        identity,
+                        &message,
+                        operation_id,
+                        None,
+                    )
+                    .await;
                 }
                 Err(SupervisorError(message))
             }
             ReadinessOutcome::Timeout { message, detail } => {
-                self.fail(service_id, generation, token, identity, &message, operation_id, Some((readiness_kind_of(&profile.readiness), detail))).await;
+                self.fail(
+                    service_id,
+                    generation,
+                    token,
+                    identity,
+                    &message,
+                    operation_id,
+                    Some((readiness_kind_of(&profile.readiness), detail)),
+                )
+                .await;
                 Err(SupervisorError(message))
             }
         }
@@ -1218,7 +1601,9 @@ impl ProcessSupervisor {
         adopted: bool,
     ) -> ReadinessOutcome {
         if matches!(profile.readiness, ReadinessSpec::Exit) {
-            return self.await_exit(service_id, profile, generation, identity, token, adopted).await;
+            return self
+                .await_exit(service_id, profile, generation, identity, token, adopted)
+                .await;
         }
         if matches!(profile.readiness, ReadinessSpec::Process) {
             if !self.valid(service_id, generation, token) {
@@ -1227,7 +1612,9 @@ impl ProcessSupervisor {
             if let Some(identity) = &identity {
                 if self.owns_identity(identity).await == Some(false) {
                     return if self.valid(service_id, generation, token) {
-                        ReadinessOutcome::Exited { message: "Process exited before liveness check".to_string() }
+                        ReadinessOutcome::Exited {
+                            message: "Process exited before liveness check".to_string(),
+                        }
                     } else {
                         ReadinessOutcome::Superseded
                     };
@@ -1249,7 +1636,10 @@ impl ProcessSupervisor {
             .await;
             return ReadinessOutcome::Ready;
         }
-        let timeout = profile.readiness_timeout_ms.map(|v| v as i64).unwrap_or(self.options.readiness_timeout_ms);
+        let timeout = profile
+            .readiness_timeout_ms
+            .map(|v| v as i64)
+            .unwrap_or(self.options.readiness_timeout_ms);
         let deadline = self.options.clock.now_millis() + timeout;
         loop {
             if self.options.clock.now_millis() > deadline {
@@ -1261,7 +1651,9 @@ impl ProcessSupervisor {
             if let Some(identity) = &identity {
                 if !self.still_running(service_id, identity, adopted).await {
                     return if self.valid(service_id, generation, token) {
-                        ReadinessOutcome::Exited { message: "Process exited before readiness".to_string() }
+                        ReadinessOutcome::Exited {
+                            message: "Process exited before readiness".to_string(),
+                        }
                     } else {
                         ReadinessOutcome::Superseded
                     };
@@ -1277,7 +1669,11 @@ impl ProcessSupervisor {
                     Changes {
                         identity: identity.clone().map(Patch::Set).unwrap_or(Patch::Keep),
                         readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
-                        readiness_detail: Patch::Set(if adopted { "adopted readiness verified".to_string() } else { "readiness verified".to_string() }),
+                        readiness_detail: Patch::Set(if adopted {
+                            "adopted readiness verified".to_string()
+                        } else {
+                            "readiness verified".to_string()
+                        }),
                         error: Patch::Clear,
                         ..Default::default()
                     },
@@ -1285,11 +1681,18 @@ impl ProcessSupervisor {
                 .await;
                 return ReadinessOutcome::Ready;
             }
-            self.options.clock.sleep(self.options.readiness_backoff_ms).await;
+            self.options
+                .clock
+                .sleep(self.options.readiness_backoff_ms)
+                .await;
         }
         ReadinessOutcome::Timeout {
             message: "Readiness timed out".to_string(),
-            detail: format!("Readiness {} probe timed out after {}ms", readiness_kind_of(&profile.readiness).as_wire_str(), timeout),
+            detail: format!(
+                "Readiness {} probe timed out after {}ms",
+                readiness_kind_of(&profile.readiness).as_wire_str(),
+                timeout
+            ),
         }
     }
 
@@ -1326,7 +1729,9 @@ impl ProcessSupervisor {
             },
         )
         .await;
-        let deadline = profile.readiness_timeout_ms.map(|ms| self.options.clock.now_millis() + ms as i64);
+        let deadline = profile
+            .readiness_timeout_ms
+            .map(|ms| self.options.clock.now_millis() + ms as i64);
         loop {
             if !self.valid(service_id, generation, token) {
                 return ReadinessOutcome::Superseded;
@@ -1337,7 +1742,8 @@ impl ProcessSupervisor {
                 }
             } else if let Some(identity) = &identity {
                 if self.owns_identity(identity).await == Some(false) {
-                    let message = "Command exited while the daemon was down; exit code unknown".to_string();
+                    let message =
+                        "Command exited while the daemon was down; exit code unknown".to_string();
                     self.transition_if_current(
                         service_id,
                         generation,
@@ -1367,7 +1773,10 @@ impl ProcessSupervisor {
                     };
                 }
             }
-            self.options.clock.sleep(self.options.readiness_backoff_ms).await;
+            self.options
+                .clock
+                .sleep(self.options.readiness_backoff_ms)
+                .await;
         }
     }
 
@@ -1380,14 +1789,28 @@ impl ProcessSupervisor {
         Some(active.exit_code.load(Ordering::SeqCst))
     }
 
-    async fn finish_exit(self: &Arc<Self>, service_id: &ServiceId, generation: u64, token: u64, code: i32) -> ReadinessOutcome {
+    async fn finish_exit(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        generation: u64,
+        token: u64,
+        code: i32,
+    ) -> ReadinessOutcome {
         if !self.valid(service_id, generation, token) {
             return ReadinessOutcome::Superseded;
         }
         let (actual, readiness, message) = if code == 0 {
-            (ActualServiceState::Succeeded, ServiceReadiness::Ready, "exited 0".to_string())
+            (
+                ActualServiceState::Succeeded,
+                ServiceReadiness::Ready,
+                "exited 0".to_string(),
+            )
         } else {
-            (ActualServiceState::Failed, ServiceReadiness::Failed, format!("Process exited with code {code}"))
+            (
+                ActualServiceState::Failed,
+                ServiceReadiness::Failed,
+                format!("Process exited with code {code}"),
+            )
         };
         self.transition_if_current(
             service_id,
@@ -1399,7 +1822,11 @@ impl ProcessSupervisor {
                 desired_state: Some(DesiredServiceState::Stopped),
                 exit_code: Patch::Set(code),
                 exited_at: Patch::Set(self.options.clock.now()),
-                error: if code == 0 { Patch::Clear } else { Patch::Set(message.clone()) },
+                error: if code == 0 {
+                    Patch::Clear
+                } else {
+                    Patch::Set(message.clone())
+                },
                 identity: Patch::Clear,
                 readiness_kind: Patch::Set(ReadinessKind::Exit),
                 readiness_detail: Patch::Set(message.clone()),
@@ -1414,7 +1841,10 @@ impl ProcessSupervisor {
         // settlement with `failed`.
         {
             let mut active = self.active.lock().unwrap();
-            if active.get(service_id).is_some_and(|entry| entry.identity.generation() == generation) {
+            if active
+                .get(service_id)
+                .is_some_and(|entry| entry.identity.generation() == generation)
+            {
                 active.remove(service_id);
             }
         }
@@ -1433,22 +1863,37 @@ impl ProcessSupervisor {
     /// code. `Ok(false)` falls through to a real stop. `Err` is an unverifiable probe — stop must
     /// not report success over a process that may still be running (a timed-out exit job whose
     /// terminate failed).
-    async fn exit_command_is_idle(&self, service_id: &ServiceId, state: &ServiceLifecycleState) -> Result<bool, SupervisorError> {
-        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else { return Ok(false) };
+    async fn exit_command_is_idle(
+        &self,
+        service_id: &ServiceId,
+        state: &ServiceLifecycleState,
+    ) -> Result<bool, SupervisorError> {
+        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else {
+            return Ok(false);
+        };
         if !matches!(profile.readiness, ReadinessSpec::Exit) {
             return Ok(false);
         }
-        if !matches!(state.actual_state, ActualServiceState::Succeeded | ActualServiceState::Failed) {
+        if !matches!(
+            state.actual_state,
+            ActualServiceState::Succeeded | ActualServiceState::Failed
+        ) {
             return Ok(false);
         }
-        let Some(identity) = &state.identity else { return Ok(true) };
+        let Some(identity) = &state.identity else {
+            return Ok(true);
+        };
         match self.owns_identity(identity).await {
             Some(true) => Ok(false),
-            None => Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified"))),
+            None => Err(SupervisorError(format!(
+                "{service_id} cannot be stopped: the process's liveness could not be verified"
+            ))),
             Some(false) => match self.options.process.inspect(identity).await {
                 // Alive, but not ours. Fall through so stop refuses instead of reporting success.
                 Inspection::Observed(ObservedProcess { alive: true, .. }) => Ok(false),
-                Inspection::Unknown => Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified"))),
+                Inspection::Unknown => Err(SupervisorError(format!(
+                    "{service_id} cannot be stopped: the process's liveness could not be verified"
+                ))),
                 Inspection::Gone | Inspection::Observed(_) => Ok(true),
             },
         }
@@ -1468,7 +1913,9 @@ impl ProcessSupervisor {
         if !self.valid(service_id, generation, token) {
             return;
         }
-        let exit_command = profile_for(&self.host.catalog(), service_id).ok().is_some_and(|profile| matches!(profile.readiness, ReadinessSpec::Exit));
+        let exit_command = profile_for(&self.host.catalog(), service_id)
+            .ok()
+            .is_some_and(|profile| matches!(profile.readiness, ReadinessSpec::Exit));
         self.transition_if_current(
             service_id,
             generation,
@@ -1476,24 +1923,44 @@ impl ProcessSupervisor {
             ActualServiceState::Failed,
             ServiceReadiness::Failed,
             Changes {
-                desired_state: if exit_command { Some(DesiredServiceState::Stopped) } else { None },
+                desired_state: if exit_command {
+                    Some(DesiredServiceState::Stopped)
+                } else {
+                    None
+                },
                 identity: identity.clone().map(Patch::Set).unwrap_or(Patch::Keep),
                 error: Patch::Set(error.to_string()),
                 current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
-                readiness_kind: readiness_change.as_ref().map(|(k, _)| Patch::Set(*k)).unwrap_or(Patch::Keep),
-                readiness_detail: readiness_change.map(|(_, d)| Patch::Set(d)).unwrap_or(Patch::Keep),
+                readiness_kind: readiness_change
+                    .as_ref()
+                    .map(|(k, _)| Patch::Set(*k))
+                    .unwrap_or(Patch::Keep),
+                readiness_detail: readiness_change
+                    .map(|(_, d)| Patch::Set(d))
+                    .unwrap_or(Patch::Keep),
                 ..Default::default()
             },
         )
         .await;
         self.cancel(service_id);
-        let active_generation = self.active.lock().unwrap().get(service_id).map(|a| a.identity.generation());
+        let active_generation = self
+            .active
+            .lock()
+            .unwrap()
+            .get(service_id)
+            .map(|a| a.identity.generation());
         if active_generation == Some(generation) {
             self.finalize(service_id, true).await;
         }
     }
 
-    async fn on_exit(self: &Arc<Self>, service_id: &ServiceId, generation: u64, token: u64, code: i32) {
+    async fn on_exit(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        generation: u64,
+        token: u64,
+        code: i32,
+    ) {
         let sup = self.clone();
         let sid = service_id.clone();
         self.queues
@@ -1502,7 +1969,14 @@ impl ProcessSupervisor {
                     return;
                 }
                 let Some(state) = sup.state(&sid) else { return };
-                let active_matches = { sup.active.lock().unwrap().get(&sid).map(|a| !a.stopped).unwrap_or(false) };
+                let active_matches = {
+                    sup.active
+                        .lock()
+                        .unwrap()
+                        .get(&sid)
+                        .map(|a| !a.stopped)
+                        .unwrap_or(false)
+                };
                 if state.generation != generation || !active_matches {
                     return;
                 }
@@ -1513,10 +1987,16 @@ impl ProcessSupervisor {
                 // start is not stuck behind it.
                 if matches!(
                     state.actual_state,
-                    ActualServiceState::Succeeded | ActualServiceState::Stopped | ActualServiceState::Stopping | ActualServiceState::Failed
+                    ActualServiceState::Succeeded
+                        | ActualServiceState::Stopped
+                        | ActualServiceState::Stopping
+                        | ActualServiceState::Failed
                 ) {
                     let mut active = sup.active.lock().unwrap();
-                    if active.get(&sid).is_some_and(|a| a.identity.generation() == generation) {
+                    if active
+                        .get(&sid)
+                        .is_some_and(|a| a.identity.generation() == generation)
+                    {
                         active.remove(&sid);
                     }
                     return;
@@ -1527,11 +2007,19 @@ impl ProcessSupervisor {
                     token,
                     ActualServiceState::Failed,
                     ServiceReadiness::Failed,
-                    Changes { exit_code: Patch::Set(code), exited_at: Patch::Set(sup.options.clock.now()), error: Patch::Set(format!("Process exited with code {code}")), ..Default::default() },
+                    Changes {
+                        exit_code: Patch::Set(code),
+                        exited_at: Patch::Set(sup.options.clock.now()),
+                        error: Patch::Set(format!("Process exited with code {code}")),
+                        ..Default::default()
+                    },
                 )
                 .await;
                 let mut active = sup.active.lock().unwrap();
-                if active.get(&sid).is_some_and(|a| a.identity.generation() == generation) {
+                if active
+                    .get(&sid)
+                    .is_some_and(|a| a.identity.generation() == generation)
+                {
                     active.remove(&sid);
                 }
             })
@@ -1544,7 +2032,10 @@ impl ProcessSupervisor {
             // `unwrap_or(true)`: when liveness can't be verified `terminate` runs anyway and
             // reports its own failure, rather than skipping the stop over a wedged probe.
             if terminate && self.owns_identity(&active.identity).await.unwrap_or(true) {
-                self.report_terminate_failure(active.identity.service_id(), self.terminate(&active.identity, &active.command).await);
+                self.report_terminate_failure(
+                    active.identity.service_id(),
+                    self.terminate(&active.identity, &active.command).await,
+                );
             }
         }
     }
@@ -1554,20 +2045,31 @@ impl ProcessSupervisor {
     /// service as stopped while its container is still running — the exact state drift this whole
     /// daemon exists to prevent. An adapter that has no `stop_container` at all is likewise an
     /// error (matching the TS source's `Docker container stop is unavailable`), not a silent no-op.
-    async fn terminate(self: &Arc<Self>, identity: &ProcessIdentity, command: &ServiceCommand) -> Result<(), SupervisorError> {
+    async fn terminate(
+        self: &Arc<Self>,
+        identity: &ProcessIdentity,
+        command: &ServiceCommand,
+    ) -> Result<(), SupervisorError> {
         match self.owns_identity(identity).await {
             Some(true) => {}
             Some(false) => return Ok(()),
             // Returning `Ok` here would record `stopped` over a process that may still be
             // running — the one outcome the whole stop path exists to prevent.
-            None => return Err(SupervisorError("the process's liveness could not be verified; refusing to report it stopped".to_string())),
+            None => {
+                return Err(SupervisorError(
+                    "the process's liveness could not be verified; refusing to report it stopped"
+                        .to_string(),
+                ))
+            }
         }
         match identity {
             ProcessIdentity::Docker(docker) => {
                 let sink: OnOutput = Arc::new(|_| {});
                 let result = match self.options.process.stop_container(command, sink).await {
                     Some(result) => result,
-                    None => Err(SupervisorError("Docker container stop is unavailable".to_string())),
+                    None => Err(SupervisorError(
+                        "Docker container stop is unavailable".to_string(),
+                    )),
                 };
                 // Stop the `docker logs` follower only after the stop command has run — its last
                 // chunk carries the container's own shutdown output.
@@ -1576,7 +2078,8 @@ impl ProcessSupervisor {
             }
             ProcessIdentity::Posix(posix) => {
                 self.detach_output(&posix.service_id);
-                self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid).await?;
+                self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid)
+                    .await?;
             }
         }
         Ok(())
@@ -1586,14 +2089,28 @@ impl ProcessSupervisor {
     /// while abandoning a superseded start, or while finalizing). They still must not drop it
     /// silently — this codebase's rule is that fire-and-forget work reports through
     /// `Host::record_background_error` rather than vanishing.
-    fn report_terminate_failure(&self, service_id: &ServiceId, result: Result<(), SupervisorError>) {
+    fn report_terminate_failure(
+        &self,
+        service_id: &ServiceId,
+        result: Result<(), SupervisorError>,
+    ) {
         if let Err(error) = result {
-            self.host.record_background_error("supervisor.terminate", &format!("{service_id}: {}", error.0));
+            self.host.record_background_error(
+                "supervisor.terminate",
+                &format!("{service_id}: {}", error.0),
+            );
         }
     }
 
-    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
-        self.options.process.process_tree(leader_pid, leader_start_identity).await
+    async fn process_tree(
+        &self,
+        leader_pid: i64,
+        leader_start_identity: &str,
+    ) -> ProcessTreeSnapshot {
+        self.options
+            .process
+            .process_tree(leader_pid, leader_start_identity)
+            .await
     }
 
     /// `None` when the live table could not be read. An empty snapshot is dead (`Some(false)`).
@@ -1605,13 +2122,22 @@ impl ProcessSupervisor {
         Some(process_tree_alive(tree, &alive))
     }
 
-    async fn secondary_groups_alive(&self, tree: &[ProcessTreeEntry], leader_pgid: i64) -> Option<bool> {
+    async fn secondary_groups_alive(
+        &self,
+        tree: &[ProcessTreeEntry],
+        leader_pgid: i64,
+    ) -> Option<bool> {
         let groups = secondary_process_groups(tree, leader_pgid);
         if groups.is_empty() {
             return Some(false);
         }
         let alive = self.options.process.live_start_identities().await?;
-        Some(groups.values().flatten().any(|member| alive.get(&member.pid) == Some(&member.start_identity)))
+        Some(
+            groups
+                .values()
+                .flatten()
+                .any(|member| alive.get(&member.pid) == Some(&member.start_identity)),
+        )
     }
 
     /// Signals the leader's group, then every other process group in the snapshot — the `air`
@@ -1619,25 +2145,52 @@ impl ProcessSupervisor {
     /// Nothing is signalled when the snapshot is missing or the fresh table cannot be read, and a
     /// group is signalled only while one of its snapshotted members still shows the same start
     /// identity, so a recycled pgid is never signalled.
-    async fn signal_process_tree(&self, snapshot: &ProcessTreeSnapshot, leader_pgid: i64, signal: ProcessSignal) {
-        let ProcessTreeSnapshot::Present(tree) = snapshot else { return };
-        self.signal_verified_members(tree, leader_pgid, signal, true).await;
+    async fn signal_process_tree(
+        &self,
+        snapshot: &ProcessTreeSnapshot,
+        leader_pgid: i64,
+        signal: ProcessSignal,
+    ) {
+        let ProcessTreeSnapshot::Present(tree) = snapshot else {
+            return;
+        };
+        self.signal_verified_members(tree, leader_pgid, signal, true)
+            .await;
     }
 
-    async fn signal_secondary_groups(&self, tree: &[ProcessTreeEntry], leader_pgid: i64, signal: ProcessSignal) {
-        self.signal_verified_members(tree, leader_pgid, signal, false).await;
+    async fn signal_secondary_groups(
+        &self,
+        tree: &[ProcessTreeEntry],
+        leader_pgid: i64,
+        signal: ProcessSignal,
+    ) {
+        self.signal_verified_members(tree, leader_pgid, signal, false)
+            .await;
     }
 
-    async fn signal_verified_members(&self, tree: &[ProcessTreeEntry], leader_pgid: i64, signal: ProcessSignal, include_leader: bool) {
-        let Some(alive) = self.options.process.live_start_identities().await else { return };
+    async fn signal_verified_members(
+        &self,
+        tree: &[ProcessTreeEntry],
+        leader_pgid: i64,
+        signal: ProcessSignal,
+        include_leader: bool,
+    ) {
+        let Some(alive) = self.options.process.live_start_identities().await else {
+            return;
+        };
         if include_leader {
-            let leader_live = tree.iter().any(|member| member.pgid == leader_pgid && alive.get(&member.pid) == Some(&member.start_identity));
+            let leader_live = tree.iter().any(|member| {
+                member.pgid == leader_pgid && alive.get(&member.pid) == Some(&member.start_identity)
+            });
             if leader_live {
                 self.options.process.signal_group(leader_pgid, signal).await;
             }
         }
         for (pgid, members) in secondary_process_groups(tree, leader_pgid) {
-            if members.iter().any(|member| alive.get(&member.pid) == Some(&member.start_identity)) {
+            if members
+                .iter()
+                .any(|member| alive.get(&member.pid) == Some(&member.start_identity))
+            {
                 self.options.process.signal_group(pgid, signal).await;
             }
         }
@@ -1645,16 +2198,24 @@ impl ProcessSupervisor {
 
     /// SIGTERM, wait, SIGKILL — but only from a snapshot that still names our leader. `Unknown`
     /// fails the stop. `Absent` (leader gone or pid reused) signals nothing and succeeds.
-    async fn terminate_posix_tree(&self, pid: i64, start_identity: &str, pgid: i64) -> Result<(), SupervisorError> {
+    async fn terminate_posix_tree(
+        &self,
+        pid: i64,
+        start_identity: &str,
+        pgid: i64,
+    ) -> Result<(), SupervisorError> {
         let snapshot = self.process_tree(pid, start_identity).await;
         let tree = match &snapshot {
             ProcessTreeSnapshot::Unknown => {
-                return Err(SupervisorError("the process tree could not be read; refusing to report it stopped".to_string()));
+                return Err(SupervisorError(
+                    "the process tree could not be read; refusing to report it stopped".to_string(),
+                ));
             }
             ProcessTreeSnapshot::Absent => return Ok(()),
             ProcessTreeSnapshot::Present(tree) => tree.clone(),
         };
-        self.signal_process_tree(&snapshot, pgid, ProcessSignal::Sigterm).await;
+        self.signal_process_tree(&snapshot, pgid, ProcessSignal::Sigterm)
+            .await;
         let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
         loop {
             if self.options.clock.now_millis() >= deadline {
@@ -1662,15 +2223,31 @@ impl ProcessSupervisor {
             }
             match self.process_tree_alive(&tree).await {
                 Some(false) => return Ok(()),
-                Some(true) => self.options.clock.sleep(self.options.readiness_backoff_ms).await,
-                None => return Err(SupervisorError("the process's liveness could not be verified; refusing to report it stopped".to_string())),
+                Some(true) => {
+                    self.options
+                        .clock
+                        .sleep(self.options.readiness_backoff_ms)
+                        .await
+                }
+                None => return Err(SupervisorError(
+                    "the process's liveness could not be verified; refusing to report it stopped"
+                        .to_string(),
+                )),
             }
         }
         match self.process_tree_alive(&tree).await {
             Some(false) => Ok(()),
-            None => Err(SupervisorError("the process's liveness could not be verified; refusing to report it stopped".to_string())),
+            None => Err(SupervisorError(
+                "the process's liveness could not be verified; refusing to report it stopped"
+                    .to_string(),
+            )),
             Some(true) => {
-                self.signal_process_tree(&ProcessTreeSnapshot::Present(tree), pgid, ProcessSignal::Sigkill).await;
+                self.signal_process_tree(
+                    &ProcessTreeSnapshot::Present(tree),
+                    pgid,
+                    ProcessSignal::Sigkill,
+                )
+                .await;
                 Ok(())
             }
         }
@@ -1682,19 +2259,26 @@ impl ProcessSupervisor {
         if secondary_process_groups(tree, leader_pgid).is_empty() {
             return;
         }
-        self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigterm).await;
+        self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigterm)
+            .await;
         let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
         loop {
             if self.options.clock.now_millis() >= deadline {
                 break;
             }
             match self.secondary_groups_alive(tree, leader_pgid).await {
-                Some(true) => self.options.clock.sleep(self.options.readiness_backoff_ms).await,
+                Some(true) => {
+                    self.options
+                        .clock
+                        .sleep(self.options.readiness_backoff_ms)
+                        .await
+                }
                 Some(false) | None => return,
             }
         }
         if self.secondary_groups_alive(tree, leader_pgid).await == Some(true) {
-            self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigkill).await;
+            self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigkill)
+                .await;
         }
     }
 
@@ -1703,7 +2287,11 @@ impl ProcessSupervisor {
         service_id: &ServiceId,
         command: ServiceCommand,
         identity: ProcessIdentity,
-    ) -> (Arc<AtomicBool>, Arc<AtomicI32>, Arc<Mutex<Vec<ProcessTreeEntry>>>) {
+    ) -> (
+        Arc<AtomicBool>,
+        Arc<AtomicI32>,
+        Arc<Mutex<Vec<ProcessTreeEntry>>>,
+    ) {
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(AtomicI32::new(0));
         let last_tree = Arc::new(Mutex::new(Vec::new()));
@@ -1721,8 +2309,16 @@ impl ProcessSupervisor {
         (exited, exit_code, last_tree)
     }
 
-    fn spawn_tree_sampler(self: &Arc<Self>, service_id: ServiceId, identity: ProcessIdentity, last_tree: Arc<Mutex<Vec<ProcessTreeEntry>>>, exited: Arc<AtomicBool>) {
-        let ProcessIdentity::Posix(posix) = &identity else { return };
+    fn spawn_tree_sampler(
+        self: &Arc<Self>,
+        service_id: ServiceId,
+        identity: ProcessIdentity,
+        last_tree: Arc<Mutex<Vec<ProcessTreeEntry>>>,
+        exited: Arc<AtomicBool>,
+    ) {
+        let ProcessIdentity::Posix(posix) = &identity else {
+            return;
+        };
         let pid = posix.pid;
         let start_identity = posix.start_identity.clone();
         let sup = self.clone();
@@ -1733,12 +2329,16 @@ impl ProcessSupervisor {
                 }
                 let still = {
                     let active = sup.active.lock().unwrap();
-                    active.get(&service_id).is_some_and(|entry| !entry.stopped && Arc::ptr_eq(&entry.last_tree, &last_tree))
+                    active.get(&service_id).is_some_and(|entry| {
+                        !entry.stopped && Arc::ptr_eq(&entry.last_tree, &last_tree)
+                    })
                 };
                 if !still {
                     return;
                 }
-                if let ProcessTreeSnapshot::Present(tree) = sup.options.process.process_tree(pid, &start_identity).await {
+                if let ProcessTreeSnapshot::Present(tree) =
+                    sup.options.process.process_tree(pid, &start_identity).await
+                {
                     *last_tree.lock().unwrap() = tree;
                 }
                 tokio::time::sleep(TREE_SAMPLE_INTERVAL).await;
@@ -1755,8 +2355,14 @@ impl ProcessSupervisor {
         token: u64,
         exited_rx: tokio::sync::oneshot::Receiver<i32>,
     ) {
-        let (exited_flag, exit_code, last_tree) = self.insert_active(service_id, command, identity.clone());
-        self.spawn_tree_sampler(service_id.clone(), identity.clone(), last_tree.clone(), exited_flag.clone());
+        let (exited_flag, exit_code, last_tree) =
+            self.insert_active(service_id, command, identity.clone());
+        self.spawn_tree_sampler(
+            service_id.clone(),
+            identity.clone(),
+            last_tree.clone(),
+            exited_flag.clone(),
+        );
         let sup = self.clone();
         let sid = service_id.clone();
         tokio::spawn(async move {
@@ -1777,11 +2383,19 @@ impl ProcessSupervisor {
 
     /// Adopted processes have no child handle. Poll `inspect` until the process is gone (`Unknown`
     /// keeps waiting) and sample the tree while it is alive so exit can reap secondary groups.
-    fn arm_adopted_watch(self: &Arc<Self>, service_id: &ServiceId, identity: ProcessIdentity, command: ServiceCommand, generation: u64, token: u64) {
+    fn arm_adopted_watch(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        identity: ProcessIdentity,
+        command: ServiceCommand,
+        generation: u64,
+        token: u64,
+    ) {
         if self.active.lock().unwrap().contains_key(service_id) {
             return;
         }
-        let (exited, exit_code, last_tree) = self.insert_active(service_id, command, identity.clone());
+        let (exited, exit_code, last_tree) =
+            self.insert_active(service_id, command, identity.clone());
         let sup = self.clone();
         let sid = service_id.clone();
         tokio::spawn(async move {
@@ -1791,14 +2405,17 @@ impl ProcessSupervisor {
                 }
                 let still = {
                     let active = sup.active.lock().unwrap();
-                    active.get(&sid).is_some_and(|entry| !entry.stopped && Arc::ptr_eq(&entry.last_tree, &last_tree))
+                    active.get(&sid).is_some_and(|entry| {
+                        !entry.stopped && Arc::ptr_eq(&entry.last_tree, &last_tree)
+                    })
                 };
                 if !still {
                     return;
                 }
                 match sup.options.process.inspect(&identity).await {
                     Inspection::Unknown => {}
-                    Inspection::Gone | Inspection::Observed(ObservedProcess { alive: false, .. }) => {
+                    Inspection::Gone
+                    | Inspection::Observed(ObservedProcess { alive: false, .. }) => {
                         let tree = last_tree.lock().unwrap().clone();
                         let leader_pgid = match &identity {
                             ProcessIdentity::Posix(posix) => Some(posix.pgid),
@@ -1814,7 +2431,12 @@ impl ProcessSupervisor {
                     }
                     Inspection::Observed(_) => {
                         if let ProcessIdentity::Posix(posix) = &identity {
-                            if let ProcessTreeSnapshot::Present(tree) = sup.options.process.process_tree(posix.pid, &posix.start_identity).await {
+                            if let ProcessTreeSnapshot::Present(tree) = sup
+                                .options
+                                .process
+                                .process_tree(posix.pid, &posix.start_identity)
+                                .await
+                            {
                                 *last_tree.lock().unwrap() = tree;
                             }
                         }
@@ -1835,7 +2457,10 @@ impl ProcessSupervisor {
     ) -> Result<(), SupervisorError> {
         let build = definition.profiles.build.clone().unwrap();
         let cancel = CancellationToken::new();
-        self.build_aborts.lock().unwrap().insert(service_id.clone(), cancel.clone());
+        self.build_aborts
+            .lock()
+            .unwrap()
+            .insert(service_id.clone(), cancel.clone());
         let timeout_ms = build.timeout_ms.unwrap_or(15 * 60_000);
         let sup = self.clone();
         let sid = service_id.clone();
@@ -1855,9 +2480,13 @@ impl ProcessSupervisor {
         });
 
         let result = if let Some(key) = &build.serialization_key {
-            self.serialized_build(key, cancel.clone(), &build.command, on_output).await
+            self.serialized_build(key, cancel.clone(), &build.command, on_output)
+                .await
         } else {
-            self.options.run_build.run(&build.command, on_output, cancel.clone()).await
+            self.options
+                .run_build
+                .run(&build.command, on_output, cancel.clone())
+                .await
         };
         timeout_task.abort();
         self.build_aborts.lock().unwrap().remove(service_id);
@@ -1883,7 +2512,11 @@ impl ProcessSupervisor {
                     token,
                     ActualServiceState::Failed,
                     ServiceReadiness::Failed,
-                    Changes { error: Patch::Set(message.to_string()), current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+                    Changes {
+                        error: Patch::Set(message.to_string()),
+                        current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
+                        ..Default::default()
+                    },
                 )
                 .await;
                 Err(error)
@@ -1916,11 +2549,20 @@ impl ProcessSupervisor {
     /// other in-flight preparation command sharing the same `key` — the preparation analogue of
     /// `serialized_build`, minus the cancellation plumbing (unlike a build, nothing today cancels an
     /// in-flight preparation command).
-    async fn serialized_preparation_command(&self, key: &str, command: &CommandSpec, cwd: Option<&str>) -> Option<bool> {
+    async fn serialized_preparation_command(
+        &self,
+        key: &str,
+        command: &CommandSpec,
+        cwd: Option<&str>,
+    ) -> Option<bool> {
         let probes = self.options.probes.clone();
         let command = command.clone();
         let cwd = cwd.map(str::to_string);
-        self.preparation_serials.run(&key.to_string(), || async move { probes.command(&command, cwd.as_deref()).await }).await
+        self.preparation_serials
+            .run(&key.to_string(), || async move {
+                probes.command(&command, cwd.as_deref()).await
+            })
+            .await
     }
 
     fn abort_build(&self, service_id: &ServiceId) {
@@ -1938,11 +2580,18 @@ impl ProcessSupervisor {
             // per-service lock and would otherwise make the service unstoppable. Dropping the
             // probe future kills its process group (see `default_adapters::run_command`).
             ReadinessSpec::Command { command, cwd } => {
-                let budget = Duration::from_millis(self.readiness_timeout_ms(service_id).max(1) as u64);
-                tokio::time::timeout(budget, self.options.probes.command(command, cwd.as_deref())).await.ok().flatten().unwrap_or(false)
+                let budget =
+                    Duration::from_millis(self.readiness_timeout_ms(service_id).max(1) as u64);
+                tokio::time::timeout(budget, self.options.probes.command(command, cwd.as_deref()))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false)
             }
             ReadinessSpec::Container => {
-                let Ok(profile) = profile_for(&self.host.catalog(), service_id) else { return false };
+                let Ok(profile) = profile_for(&self.host.catalog(), service_id) else {
+                    return false;
+                };
                 match profile.command.container_name {
                     Some(name) => self.options.probes.container(&name).await,
                     None => false,
@@ -1971,8 +2620,15 @@ impl ProcessSupervisor {
                 this.append_output(&sid, data);
             })
         };
-        if let Some(tail) = self.options.process.attach_output(service_id, source, on_output) {
-            self.output_tails.lock().unwrap().insert(service_id.clone(), tail);
+        if let Some(tail) = self
+            .options
+            .process
+            .attach_output(service_id, source, on_output)
+        {
+            self.output_tails
+                .lock()
+                .unwrap()
+                .insert(service_id.clone(), tail);
         }
     }
 
@@ -1986,7 +2642,12 @@ impl ProcessSupervisor {
     }
 
     fn has_live_output_tail(&self, service_id: &ServiceId) -> bool {
-        self.output_tails.lock().unwrap().get(service_id).map(|tail| !tail.is_done()).unwrap_or(false)
+        self.output_tails
+            .lock()
+            .unwrap()
+            .get(service_id)
+            .map(|tail| !tail.is_done())
+            .unwrap_or(false)
     }
 
     /// Log forwarding is fire-and-forget by design: a failure must never propagate into the caller.
@@ -2000,7 +2661,12 @@ impl ProcessSupervisor {
                 // Spawned outside the map lock, so a spawn failure can't poison it. A racing
                 // caller's forwarder loses the insert below and ends once its sender is dropped.
                 let created = self.spawn_log_forwarder(service_id);
-                self.log_forwarders.lock().unwrap().entry(service_id.clone()).or_insert(created).clone()
+                self.log_forwarders
+                    .lock()
+                    .unwrap()
+                    .entry(service_id.clone())
+                    .or_insert(created)
+                    .clone()
             }
         };
         if forwarder.sender.try_send(data.to_string()).is_err() {
@@ -2042,11 +2708,14 @@ impl ProcessSupervisor {
     }
 
     fn valid(&self, service_id: &ServiceId, generation: u64, token: u64) -> bool {
-        self.current_token(service_id) == token && self.state(service_id).map(|s| s.generation) == Some(generation)
+        self.current_token(service_id) == token
+            && self.state(service_id).map(|s| s.generation) == Some(generation)
     }
 
     fn identity_matches_state(&self, state: &ServiceLifecycleState) -> bool {
-        state.identity.as_ref().is_some_and(|identity| identity.service_id() == &state.service_id && identity.generation() == state.generation)
+        state.identity.as_ref().is_some_and(|identity| {
+            identity.service_id() == &state.service_id && identity.generation() == state.generation
+        })
     }
 
     /// `Some(bool)` is a definitive answer; `None` means the probe could not run (a wedged
@@ -2064,14 +2733,20 @@ impl ProcessSupervisor {
             Inspection::Gone => return Some(false),
             Inspection::Unknown => return None,
         };
-        if !observed.alive || observed.record.command_fingerprint() != identity.command_fingerprint() {
+        if !observed.alive
+            || observed.record.command_fingerprint() != identity.command_fingerprint()
+        {
             return Some(false);
         }
         Some(match (identity, &observed.record) {
             (ProcessIdentity::Docker(id), ProcessRecord::Docker(rec)) => {
-                rec.container_name == id.container_name && rec.container_id == id.container_id && rec.container_started_at == id.container_started_at
+                rec.container_name == id.container_name
+                    && rec.container_id == id.container_id
+                    && rec.container_started_at == id.container_started_at
             }
-            (ProcessIdentity::Posix(id), ProcessRecord::Posix(rec)) => rec.pid == id.pid && rec.pgid == id.pgid && rec.start_identity == id.start_identity,
+            (ProcessIdentity::Posix(id), ProcessRecord::Posix(rec)) => {
+                rec.pid == id.pid && rec.pgid == id.pgid && rec.start_identity == id.start_identity
+            }
             _ => false,
         })
     }
@@ -2086,7 +2761,12 @@ impl ProcessSupervisor {
     /// The readiness loop's liveness check. A process this manager spawned has an exit watcher, so
     /// its flag answers without a shell-out; an adopted identity (or one with no live `Active`
     /// entry) has none, and falls back to a full `ps`/`docker inspect` ownership check.
-    async fn still_running(&self, service_id: &ServiceId, identity: &ProcessIdentity, adopted: bool) -> bool {
+    async fn still_running(
+        &self,
+        service_id: &ServiceId,
+        identity: &ProcessIdentity,
+        adopted: bool,
+    ) -> bool {
         if !adopted {
             let exited = self
                 .active
@@ -2109,7 +2789,11 @@ impl ProcessSupervisor {
             state.generation,
             ActualServiceState::Orphaned,
             ServiceReadiness::Failed,
-            Changes { error: Patch::Set("Process ownership identity no longer matches".to_string()), current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep), ..Default::default() },
+            Changes {
+                error: Patch::Set("Process ownership identity no longer matches".to_string()),
+                current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
+                ..Default::default()
+            },
         )
         .await;
     }
@@ -2124,28 +2808,60 @@ impl ProcessSupervisor {
         changes: Changes,
     ) {
         if self.valid(service_id, generation, token) {
-            self.transition(service_id, generation, actual, readiness, changes).await;
+            self.transition(service_id, generation, actual, readiness, changes)
+                .await;
         }
     }
 
-    async fn transition(&self, service_id: &ServiceId, generation: u64, actual_state: ActualServiceState, readiness: ServiceReadiness, changes: Changes) {
+    async fn transition(
+        &self,
+        service_id: &ServiceId,
+        generation: u64,
+        actual_state: ActualServiceState,
+        readiness: ServiceReadiness,
+        changes: Changes,
+    ) {
         let previous = self.state(service_id);
         let now = self.options.clock.now();
         let next = ServiceLifecycleState {
             service_id: service_id.clone(),
-            desired_state: changes.desired_state.unwrap_or_else(|| previous.as_ref().map(|p| p.desired_state).unwrap_or(DesiredServiceState::Running)),
+            desired_state: changes.desired_state.unwrap_or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|p| p.desired_state)
+                    .unwrap_or(DesiredServiceState::Running)
+            }),
             actual_state,
             readiness,
             generation,
-            created_at: previous.as_ref().map(|p| p.created_at.clone()).unwrap_or_else(|| now.clone()),
+            created_at: previous
+                .as_ref()
+                .map(|p| p.created_at.clone())
+                .unwrap_or_else(|| now.clone()),
             updated_at: now.clone(),
-            identity: changes.identity.apply(previous.as_ref().and_then(|p| p.identity.clone())),
-            readiness_kind: changes.readiness_kind.apply(previous.as_ref().and_then(|p| p.readiness_kind)),
-            readiness_detail: changes.readiness_detail.apply(previous.as_ref().and_then(|p| p.readiness_detail.clone())),
-            exited_at: changes.exited_at.apply(previous.as_ref().and_then(|p| p.exited_at.clone())),
-            exit_code: changes.exit_code.apply(previous.as_ref().and_then(|p| p.exit_code)),
-            error: changes.error.apply(previous.as_ref().and_then(|p| p.error.clone())),
-            current_operation_id: changes.current_operation_id.apply(previous.as_ref().and_then(|p| p.current_operation_id.clone())),
+            identity: changes
+                .identity
+                .apply(previous.as_ref().and_then(|p| p.identity.clone())),
+            readiness_kind: changes
+                .readiness_kind
+                .apply(previous.as_ref().and_then(|p| p.readiness_kind)),
+            readiness_detail: changes
+                .readiness_detail
+                .apply(previous.as_ref().and_then(|p| p.readiness_detail.clone())),
+            exited_at: changes
+                .exited_at
+                .apply(previous.as_ref().and_then(|p| p.exited_at.clone())),
+            exit_code: changes
+                .exit_code
+                .apply(previous.as_ref().and_then(|p| p.exit_code)),
+            error: changes
+                .error
+                .apply(previous.as_ref().and_then(|p| p.error.clone())),
+            current_operation_id: changes.current_operation_id.apply(
+                previous
+                    .as_ref()
+                    .and_then(|p| p.current_operation_id.clone()),
+            ),
         };
         // `Host::set_service_state` publishes the one `service.lifecycle` event for this change;
         // publishing here too doubled every transition's SSE frames and event-buffer use.
@@ -2153,7 +2869,9 @@ impl ProcessSupervisor {
         let updated_at = next.updated_at.clone();
         self.host.set_service_state(next).await;
         if let Some(error) = &error {
-            self.host.append_log(service_id, &format!("{updated_at} {error}\n")).await;
+            self.host
+                .append_log(service_id, &format!("{updated_at} {error}\n"))
+                .await;
         }
     }
 }
@@ -2189,16 +2907,17 @@ fn output_source(identity: &ProcessIdentity, skip_backlog: bool) -> OutputSource
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::process_tree::ProcessTreeSnapshot;
     use crate::catalog::{
-        CommandSpec, ReadinessSpec, ServiceBuildProfile, ServiceCommand, ServiceDefinition, ServiceKind, ServiceOwnership,
-        ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
+        CommandSpec, ReadinessSpec, ServiceBuildProfile, ServiceCommand, ServiceDefinition,
+        ServiceKind, ServiceOwnership, ServiceProfiles, ServiceRunProfile, StartFailurePolicy,
     };
     use crate::state::{DesiredServiceState, PosixProcessIdentity, ServiceReadiness};
+    use crate::supervisor::process_tree::ProcessTreeSnapshot;
     use crate::supervisor::types::{
-        DockerContainerRecord, Host, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail,
-        PortHolder, PosixProcessRecord, PreparationAdapter, ProbeAdapter, ProcessAdapter, ProcessRecord, RunBuild,
-        SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,
+        DockerContainerRecord, Host, ManagedProcess, ObservedProcess, OnOutput, OutputSource,
+        OutputTail, PortHolder, PosixProcessRecord, PreparationAdapter, ProbeAdapter,
+        ProcessAdapter, ProcessRecord, RunBuild, SpawnInput, SupervisorClock, SupervisorError,
+        SupervisorOptions,
     };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -2211,7 +2930,9 @@ mod tests {
     }
     impl FakeClock {
         fn new() -> Arc<Self> {
-            Arc::new(Self { millis: AtomicI64::new(1_700_000_000_000) })
+            Arc::new(Self {
+                millis: AtomicI64::new(1_700_000_000_000),
+            })
         }
     }
     #[async_trait]
@@ -2253,7 +2974,12 @@ mod tests {
     }
     impl FakeProcessAdapter {
         fn new() -> Arc<Self> {
-            Arc::new(Self { state: Arc::new(Mutex::new(FakeProcessAdapterState { next_pid: 900_001, ..Default::default() })) })
+            Arc::new(Self {
+                state: Arc::new(Mutex::new(FakeProcessAdapterState {
+                    next_pid: 900_001,
+                    ..Default::default()
+                })),
+            })
         }
         fn attach_calls(&self) -> Vec<(ServiceId, &'static str)> {
             self.state.lock().unwrap().attach_output_calls.clone()
@@ -2266,16 +2992,29 @@ mod tests {
             }
         }
         fn tail_was_stopped(&self, service_id: &str) -> bool {
-            self.state.lock().unwrap().tails_stopped.iter().any(|id| id == service_id)
+            self.state
+                .lock()
+                .unwrap()
+                .tails_stopped
+                .iter()
+                .any(|id| id == service_id)
         }
         fn stop_container_calls(&self) -> Vec<String> {
             self.state.lock().unwrap().stop_container_calls.clone()
         }
         fn fail_spawn(&self, service_id: &str, message: &str) {
-            self.state.lock().unwrap().spawn_should_fail.insert(service_id.to_string(), message.to_string());
+            self.state
+                .lock()
+                .unwrap()
+                .spawn_should_fail
+                .insert(service_id.to_string(), message.to_string());
         }
         fn register_container(&self, name: &str, record: DockerContainerRecord) {
-            self.state.lock().unwrap().container_records.insert(name.to_string(), record);
+            self.state
+                .lock()
+                .unwrap()
+                .container_records
+                .insert(name.to_string(), record);
         }
         fn signals(&self) -> Vec<(i64, ProcessSignal)> {
             self.state.lock().unwrap().signals.clone()
@@ -2304,7 +3043,15 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             let pid = state.next_pid;
             state.next_pid += 1;
-            state.alive.insert(pid, PosixProcessRecord { pid, pgid: pid, start_identity: format!("Child Jan  1 00:00:{:02} 2024", pid % 60), command_fingerprint: "child".to_string() });
+            state.alive.insert(
+                pid,
+                PosixProcessRecord {
+                    pid,
+                    pgid: pid,
+                    start_identity: format!("Child Jan  1 00:00:{:02} 2024", pid % 60),
+                    command_fingerprint: "child".to_string(),
+                },
+            );
             state.parents.insert(pid, parent);
             pid
         }
@@ -2314,7 +3061,12 @@ mod tests {
         fn insert_alive(&self, pid: i64, fingerprint: &str, start_identity: &str) {
             self.state.lock().unwrap().alive.insert(
                 pid,
-                PosixProcessRecord { pid, pgid: pid, start_identity: start_identity.to_string(), command_fingerprint: fingerprint.to_string() },
+                PosixProcessRecord {
+                    pid,
+                    pgid: pid,
+                    start_identity: start_identity.to_string(),
+                    command_fingerprint: fingerprint.to_string(),
+                },
             );
         }
         fn mutate_fingerprint(&self, pid: i64, new_fingerprint: &str) {
@@ -2325,7 +3077,11 @@ mod tests {
     }
     #[async_trait]
     impl ProcessAdapter for FakeProcessAdapter {
-        async fn spawn(&self, input: SpawnInput, _on_output: OnOutput) -> Result<ManagedProcess, SupervisorError> {
+        async fn spawn(
+            &self,
+            input: SpawnInput,
+            _on_output: OnOutput,
+        ) -> Result<ManagedProcess, SupervisorError> {
             let mut state = self.state.lock().unwrap();
             if let Some(message) = state.spawn_should_fail.get(&input.service_id).cloned() {
                 return Err(SupervisorError(message));
@@ -2343,7 +3099,10 @@ mod tests {
                         command_fingerprint: input.command_fingerprint.clone(),
                     });
                 let (_tx, rx) = oneshot::channel();
-                return Ok(ManagedProcess { record: ProcessRecord::Docker(record), exited: rx });
+                return Ok(ManagedProcess {
+                    record: ProcessRecord::Docker(record),
+                    exited: rx,
+                });
             }
             let pid = state.next_pid;
             state.next_pid += 1;
@@ -2356,7 +3115,10 @@ mod tests {
             state.alive.insert(pid, record.clone());
             let (tx, rx) = oneshot::channel();
             state.exit_senders.insert(pid, tx);
-            Ok(ManagedProcess { record: ProcessRecord::Posix(record), exited: rx })
+            Ok(ManagedProcess {
+                record: ProcessRecord::Posix(record),
+                exited: rx,
+            })
         }
 
         async fn inspect(&self, identity: &ProcessIdentity) -> Inspection {
@@ -2366,13 +3128,23 @@ mod tests {
                     .alive
                     .get(&id.pid)
                     .cloned()
-                    .map(|record| Inspection::Observed(ObservedProcess { record: ProcessRecord::Posix(record), alive: true }))
+                    .map(|record| {
+                        Inspection::Observed(ObservedProcess {
+                            record: ProcessRecord::Posix(record),
+                            alive: true,
+                        })
+                    })
                     .unwrap_or(Inspection::Gone),
                 ProcessIdentity::Docker(id) => state
                     .container_records
                     .get(&id.container_name)
                     .cloned()
-                    .map(|record| Inspection::Observed(ObservedProcess { record: ProcessRecord::Docker(record), alive: true }))
+                    .map(|record| {
+                        Inspection::Observed(ObservedProcess {
+                            record: ProcessRecord::Docker(record),
+                            alive: true,
+                        })
+                    })
                     .unwrap_or(Inspection::Gone),
             }
         }
@@ -2382,16 +3154,29 @@ mod tests {
             state.signals.push((pgid, signal));
             // Every member of the group dies — and only the group: a tree member that moved into a
             // group of its own survives, exactly like the real `air` case.
-            let members: Vec<i64> = state.alive.values().filter(|r| r.pgid == pgid).map(|r| r.pid).collect();
+            let members: Vec<i64> = state
+                .alive
+                .values()
+                .filter(|r| r.pgid == pgid)
+                .map(|r| r.pid)
+                .collect();
             for pid in members {
                 state.alive.remove(&pid);
                 if let Some(tx) = state.exit_senders.remove(&pid) {
-                    let _ = tx.send(if signal == ProcessSignal::Sigterm { 143 } else { 137 });
+                    let _ = tx.send(if signal == ProcessSignal::Sigterm {
+                        143
+                    } else {
+                        137
+                    });
                 }
             }
         }
 
-        async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot {
+        async fn process_tree(
+            &self,
+            leader_pid: i64,
+            leader_start_identity: &str,
+        ) -> ProcessTreeSnapshot {
             let state = self.state.lock().unwrap();
             if state.tree_unknown {
                 return ProcessTreeSnapshot::Unknown;
@@ -2406,7 +3191,11 @@ mod tests {
                     start_identity: r.start_identity.clone(),
                 })
                 .collect();
-            let tree = crate::supervisor::process_tree::build_process_tree(&rows, leader_pid, leader_start_identity);
+            let tree = crate::supervisor::process_tree::build_process_tree(
+                &rows,
+                leader_pid,
+                leader_start_identity,
+            );
             if tree.is_empty() {
                 ProcessTreeSnapshot::Absent
             } else {
@@ -2415,7 +3204,15 @@ mod tests {
         }
 
         async fn live_start_identities(&self) -> Option<HashMap<i64, String>> {
-            Some(self.state.lock().unwrap().alive.values().map(|r| (r.pid, r.start_identity.clone())).collect())
+            Some(
+                self.state
+                    .lock()
+                    .unwrap()
+                    .alive
+                    .values()
+                    .map(|r| (r.pid, r.start_identity.clone()))
+                    .collect(),
+            )
         }
 
         async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal) {
@@ -2423,13 +3220,21 @@ mod tests {
             state.pid_signals.push((pid, signal));
             // Same contract as the real adapter: a pid that no longer presents the resolved lstart
             // is not ours to signal — reclaim can never kill a recycled process in the fake either.
-            let survives = state.unkillable.contains(&pid) || (state.term_immune.contains(&pid) && signal == ProcessSignal::Sigterm);
-            if state.alive.get(&pid).map(|r| r.start_identity.as_str()) == Some(expected_start_identity) && !survives {
+            let survives = state.unkillable.contains(&pid)
+                || (state.term_immune.contains(&pid) && signal == ProcessSignal::Sigterm);
+            if state.alive.get(&pid).map(|r| r.start_identity.as_str())
+                == Some(expected_start_identity)
+                && !survives
+            {
                 state.alive.remove(&pid);
             }
         }
 
-        async fn stop_container(&self, command: &ServiceCommand, _on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
+        async fn stop_container(
+            &self,
+            command: &ServiceCommand,
+            _on_output: OnOutput,
+        ) -> Option<Result<(), SupervisorError>> {
             let name = command.container_name.clone()?;
             let mut state = self.state.lock().unwrap();
             state.stop_container_calls.push(name.clone());
@@ -2437,7 +3242,12 @@ mod tests {
             Some(Ok(()))
         }
 
-        fn attach_output(&self, service_id: &ServiceId, source: OutputSource<'_>, _on_output: OnOutput) -> Option<OutputTail> {
+        fn attach_output(
+            &self,
+            service_id: &ServiceId,
+            source: OutputSource<'_>,
+            _on_output: OnOutput,
+        ) -> Option<OutputTail> {
             let kind = match source {
                 OutputSource::Process { .. } => "process",
                 OutputSource::Container { .. } => "container",
@@ -2477,10 +3287,16 @@ mod tests {
     }
     impl FakeProbeAdapter {
         fn new() -> Arc<Self> {
-            Arc::new(Self { state: Mutex::new(FakeProbeAdapterState::default()), process_state: Arc::new(Mutex::new(FakeProcessAdapterState::default())) })
+            Arc::new(Self {
+                state: Mutex::new(FakeProbeAdapterState::default()),
+                process_state: Arc::new(Mutex::new(FakeProcessAdapterState::default())),
+            })
         }
         fn with_process(process_state: Arc<Mutex<FakeProcessAdapterState>>) -> Arc<Self> {
-            Arc::new(Self { state: Mutex::new(FakeProbeAdapterState::default()), process_state })
+            Arc::new(Self {
+                state: Mutex::new(FakeProbeAdapterState::default()),
+                process_state,
+            })
         }
         fn set_tcp_ready(&self, port: u16, ready: bool) {
             self.state.lock().unwrap().tcp_ready.insert(port, ready);
@@ -2497,7 +3313,12 @@ mod tests {
         fn set_port_holder(&self, port: u16, pid: i64, start_identity: &str, command: &str) {
             self.process_state.lock().unwrap().alive.insert(
                 pid,
-                PosixProcessRecord { pid, pgid: pid, start_identity: start_identity.to_string(), command_fingerprint: command.to_string() },
+                PosixProcessRecord {
+                    pid,
+                    pgid: pid,
+                    start_identity: start_identity.to_string(),
+                    command_fingerprint: command.to_string(),
+                },
             );
             self.state
                 .lock()
@@ -2505,22 +3326,43 @@ mod tests {
                 .port_holders
                 .entry(port)
                 .or_default()
-                .push(PortHolder { pid, pgid: pid, start_identity: start_identity.to_string(), command: command.to_string() });
+                .push(PortHolder {
+                    pid,
+                    pgid: pid,
+                    start_identity: start_identity.to_string(),
+                    command: command.to_string(),
+                });
         }
         fn set_container_ready(&self, name: &str, ready: bool) {
-            self.state.lock().unwrap().container_ready.insert(name.to_string(), ready);
+            self.state
+                .lock()
+                .unwrap()
+                .container_ready
+                .insert(name.to_string(), ready);
         }
     }
     #[async_trait]
     impl ProbeAdapter for FakeProbeAdapter {
         async fn tcp(&self, port: u16) -> bool {
-            self.state.lock().unwrap().tcp_ready.get(&port).copied().unwrap_or(false)
+            self.state
+                .lock()
+                .unwrap()
+                .tcp_ready
+                .get(&port)
+                .copied()
+                .unwrap_or(false)
         }
         async fn http(&self, _url: &str) -> bool {
             false
         }
         async fn container(&self, container_name: &str) -> bool {
-            self.state.lock().unwrap().container_ready.get(container_name).copied().unwrap_or(false)
+            self.state
+                .lock()
+                .unwrap()
+                .container_ready
+                .get(container_name)
+                .copied()
+                .unwrap_or(false)
         }
         async fn tailnet(&self) -> bool {
             self.state.lock().unwrap().tailnet_ready
@@ -2604,7 +3446,10 @@ mod tests {
             }
         }
         async fn command(&self, _command: &CommandSpec, _cwd: Option<&str>) -> Option<bool> {
-            self.timeline.lock().unwrap().push(std::time::Instant::now());
+            self.timeline
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
@@ -2620,10 +3465,17 @@ mod tests {
     }
     impl FakeRunBuild {
         fn new() -> Arc<Self> {
-            Arc::new(Self { should_fail: Mutex::new(Default::default()), started_at: Mutex::new(Vec::new()), hang_until_cancelled: Mutex::new(false) })
+            Arc::new(Self {
+                should_fail: Mutex::new(Default::default()),
+                started_at: Mutex::new(Vec::new()),
+                hang_until_cancelled: Mutex::new(false),
+            })
         }
         fn fail_for(&self, shell_text: &str) {
-            self.should_fail.lock().unwrap().insert(shell_text.to_string());
+            self.should_fail
+                .lock()
+                .unwrap()
+                .insert(shell_text.to_string());
         }
         fn timeline(&self) -> Vec<(String, std::time::Instant)> {
             self.started_at.lock().unwrap().clone()
@@ -2631,12 +3483,20 @@ mod tests {
     }
     #[async_trait]
     impl RunBuild for FakeRunBuild {
-        async fn run(&self, command: &ServiceCommand, _on_output: OnOutput, cancel: CancellationToken) -> Result<(), SupervisorError> {
+        async fn run(
+            &self,
+            command: &ServiceCommand,
+            _on_output: OnOutput,
+            cancel: CancellationToken,
+        ) -> Result<(), SupervisorError> {
             let text = match &command.command {
                 CommandSpec::Shell { shell, .. } => shell.clone(),
                 CommandSpec::Argv { argv } => argv.join(" "),
             };
-            self.started_at.lock().unwrap().push((text.clone(), std::time::Instant::now()));
+            self.started_at
+                .lock()
+                .unwrap()
+                .push((text.clone(), std::time::Instant::now()));
             if *self.hang_until_cancelled.lock().unwrap() {
                 cancel.cancelled().await;
                 return Err(SupervisorError("Build cancelled".to_string()));
@@ -2652,7 +3512,11 @@ mod tests {
     struct NoPreparation;
     #[async_trait]
     impl PreparationAdapter for NoPreparation {
-        async fn prepare(&self, _service_id: &ServiceId, _steps: &[String]) -> Result<(), SupervisorError> {
+        async fn prepare(
+            &self,
+            _service_id: &ServiceId,
+            _steps: &[String],
+        ) -> Result<(), SupervisorError> {
             Ok(())
         }
     }
@@ -2681,7 +3545,10 @@ mod tests {
         /// Seeds a persisted state directly (bypassing the supervisor) — mirrors a test fixture
         /// asserting behavior against a pre-existing `state.json`-style entry.
         fn seed(&self, state: ServiceLifecycleState) {
-            self.states.lock().unwrap().insert(state.service_id.clone(), state);
+            self.states
+                .lock()
+                .unwrap()
+                .insert(state.service_id.clone(), state);
         }
     }
     #[async_trait]
@@ -2700,18 +3567,30 @@ mod tests {
                 .services
                 .iter()
                 .map(|s| {
-                    states.get(&s.id).cloned().unwrap_or_else(|| default_stopped_state(&s.id))
+                    states
+                        .get(&s.id)
+                        .cloned()
+                        .unwrap_or_else(|| default_stopped_state(&s.id))
                 })
                 .collect()
         }
         async fn set_service_state(&self, next: ServiceLifecycleState) {
-            self.states.lock().unwrap().insert(next.service_id.clone(), next);
+            self.states
+                .lock()
+                .unwrap()
+                .insert(next.service_id.clone(), next);
         }
         async fn append_log(&self, service_id: &str, data: &str) {
-            self.logs.lock().unwrap().push((service_id.to_string(), data.to_string()));
+            self.logs
+                .lock()
+                .unwrap()
+                .push((service_id.to_string(), data.to_string()));
         }
         fn publish(&self, event_type: &str, data: serde_json::Value) {
-            self.events.lock().unwrap().push((event_type.to_string(), data));
+            self.events
+                .lock()
+                .unwrap()
+                .push((event_type.to_string(), data));
         }
     }
 
@@ -2746,7 +3625,9 @@ mod tests {
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
-                        command: CommandSpec::Argv { argv: vec![id.to_string()] },
+                        command: CommandSpec::Argv {
+                            argv: vec![id.to_string()],
+                        },
                         cwd: ".".to_string(),
                         environment: None,
                         container_name: None,
@@ -2765,8 +3646,15 @@ mod tests {
         }
     }
 
-    fn with_preparation_command(mut service: ServiceDefinition, prep: crate::catalog::PreparationCommand) -> ServiceDefinition {
-        if let ServiceRunProfile::Verified { preparation_command, .. } = &mut service.profiles.run {
+    fn with_preparation_command(
+        mut service: ServiceDefinition,
+        prep: crate::catalog::PreparationCommand,
+    ) -> ServiceDefinition {
+        if let ServiceRunProfile::Verified {
+            preparation_command,
+            ..
+        } = &mut service.profiles.run
+        {
             *preparation_command = Some(prep);
         }
         service
@@ -2790,7 +3678,8 @@ mod tests {
         process: Arc<FakeProcessAdapter>,
         probes: Arc<FakeProbeAdapter>,
         run_build: Arc<FakeRunBuild>,
-        #[allow(dead_code)] // available for tests that need to fast-forward the virtual clock directly
+        #[allow(dead_code)]
+        // available for tests that need to fast-forward the virtual clock directly
         clock: Arc<FakeClock>,
     }
 
@@ -2808,7 +3697,8 @@ mod tests {
             process: process.clone(),
             run_build: run_build.clone(),
             probes: probes.clone(),
-            preparation: Some(Arc::new(NoPreparation)), artifact_installer: None,
+            preparation: Some(Arc::new(NoPreparation)),
+            artifact_installer: None,
             clock: clock.clone(),
             readiness_timeout_ms,
             readiness_backoff_ms: 5,
@@ -2816,12 +3706,22 @@ mod tests {
             is_closing: Arc::new(|| false),
         };
         let supervisor = ProcessSupervisor::new(host.clone(), options);
-        Harness { supervisor, host, process, probes, run_build, clock }
+        Harness {
+            supervisor,
+            host,
+            process,
+            probes,
+            run_build,
+            clock,
+        }
     }
 
     #[tokio::test]
     async fn starts_a_stopped_service_to_ready_with_tcp_readiness() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let state = h.host.state_of("api").unwrap();
@@ -2832,29 +3732,48 @@ mod tests {
 
     #[tokio::test]
     async fn process_readiness_reports_running_unready_as_the_terminal_state() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Process)));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Process,
+        )));
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::RunningUnready);
-        assert_eq!(state.readiness_detail.as_deref(), Some("process-liveness-only"));
+        assert_eq!(
+            state.readiness_detail.as_deref(),
+            Some("process-liveness-only")
+        );
     }
 
     #[tokio::test]
     async fn restart_stops_then_starts() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let first_pid = match h.host.state_of("api").unwrap().identity.unwrap() {
             ProcessIdentity::Posix(p) => p.pid,
             _ => panic!("expected posix identity"),
         };
-        h.supervisor.restart(&"api".to_string(), None).await.unwrap();
+        h.supervisor
+            .restart(&"api".to_string(), None)
+            .await
+            .unwrap();
         let second_pid = match h.host.state_of("api").unwrap().identity.unwrap() {
             ProcessIdentity::Posix(p) => p.pid,
             _ => panic!("expected posix identity"),
         };
-        assert_ne!(first_pid, second_pid, "restart should spawn a fresh process");
-        assert!(h.process.signals().iter().any(|(pgid, sig)| *pgid == first_pid && *sig == ProcessSignal::Sigterm));
+        assert_ne!(
+            first_pid, second_pid,
+            "restart should spawn a fresh process"
+        );
+        assert!(h
+            .process
+            .signals()
+            .iter()
+            .any(|(pgid, sig)| *pgid == first_pid && *sig == ProcessSignal::Sigterm));
     }
 
     /// The whole-tree stop rule: `air` runs the real server in its own process group, so a stop that
@@ -2863,7 +3782,10 @@ mod tests {
     /// and so never signalled that group at all.
     #[tokio::test]
     async fn stop_signals_a_child_that_moved_into_its_own_process_group() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let leader = match h.host.state_of("api").unwrap().identity.unwrap() {
@@ -2874,21 +3796,42 @@ mod tests {
 
         h.supervisor.stop(&"api".to_string(), None).await.unwrap();
 
-        assert!(h.process.signals().contains(&(leader, ProcessSignal::Sigterm)));
-        assert!(h.process.signals().contains(&(child, ProcessSignal::Sigterm)), "the secondary group must be signalled: {:?}", h.process.signals());
-        assert!(!h.process.is_alive(child), "the child in its own process group must not survive the stop");
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Stopped);
+        assert!(h
+            .process
+            .signals()
+            .contains(&(leader, ProcessSignal::Sigterm)));
+        assert!(
+            h.process
+                .signals()
+                .contains(&(child, ProcessSignal::Sigterm)),
+            "the secondary group must be signalled: {:?}",
+            h.process.signals()
+        );
+        assert!(
+            !h.process.is_alive(child),
+            "the child in its own process group must not survive the stop"
+        );
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Stopped
+        );
     }
 
     #[tokio::test]
     async fn status_upgrades_a_recovered_service_back_to_ready() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
 
         h.probes.set_tcp_ready(8080, false);
         h.supervisor.status(&"api".to_string()).await.unwrap();
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::RunningUnready);
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::RunningUnready
+        );
 
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.status(&"api".to_string()).await.unwrap();
@@ -2899,23 +3842,47 @@ mod tests {
 
     #[tokio::test]
     async fn transitions_leave_the_single_lifecycle_publish_to_the_host() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
-        let published = h.host.events.lock().unwrap().iter().filter(|(event_type, _)| event_type == "service.lifecycle").count();
-        assert_eq!(published, 0, "`Host::set_service_state` owns the service.lifecycle event");
+        let published = h
+            .host
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event_type, _)| event_type == "service.lifecycle")
+            .count();
+        assert_eq!(
+            published, 0,
+            "`Host::set_service_state` owns the service.lifecycle event"
+        );
     }
 
     #[tokio::test]
     async fn stop_on_an_already_stopped_service_is_a_noop() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.supervisor.stop(&"api".to_string(), None).await.unwrap();
         // A true no-op: `stop_locked` returns immediately for an already-stopped service without
         // ever calling `set_service_state`, so nothing is written to the host's state map at all —
         // check the synthesized default via `service_states()` instead of the raw map.
-        let state = h.host.service_states().into_iter().find(|s| s.service_id == "api").unwrap();
+        let state = h
+            .host
+            .service_states()
+            .into_iter()
+            .find(|s| s.service_id == "api")
+            .unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Stopped);
-        assert!(h.host.state_of("api").is_none(), "a true no-op must never write to persisted state");
+        assert!(
+            h.host.state_of("api").is_none(),
+            "a true no-op must never write to persisted state"
+        );
         assert!(h.process.signals().is_empty());
     }
 
@@ -2926,16 +3893,27 @@ mod tests {
     /// looked like in the app.
     #[tokio::test]
     async fn stop_on_an_adopted_external_service_runs_its_stop_command() {
-        let h = build_harness(one_service_catalog(external_container_service("cache", "proj-cache", Some("docker compose stop cache"))));
+        let h = build_harness(one_service_catalog(external_container_service(
+            "cache",
+            "proj-cache",
+            Some("docker compose stop cache"),
+        )));
         h.host.seed(adopted_external_state("cache"));
 
         h.supervisor.stop(&"cache".to_string(), None).await.unwrap();
 
-        assert_eq!(h.process.stop_container_calls(), vec!["proj-cache".to_string()], "the catalog's stop command must actually run");
+        assert_eq!(
+            h.process.stop_container_calls(),
+            vec!["proj-cache".to_string()],
+            "the catalog's stop command must actually run"
+        );
         let state = h.host.state_of("cache").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Stopped);
         assert_eq!(state.desired_state, DesiredServiceState::Stopped);
-        assert!(state.error.is_none(), "a successful stop must not leave the old error behind");
+        assert!(
+            state.error.is_none(),
+            "a successful stop must not leave the old error behind"
+        );
     }
 
     /// The other half of the same bug: a service whose port is held by a process this manager does
@@ -2943,33 +3921,68 @@ mod tests {
     /// report success and change nothing.
     #[tokio::test]
     async fn stop_on_an_externally_owned_service_without_a_stop_command_fails_loudly() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_port_in_use(8080, true);
-        let start_error = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
-        assert!(start_error.0.contains("externally owned"), "{start_error:?}");
+        let start_error = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            start_error.0.contains("externally owned"),
+            "{start_error:?}"
+        );
 
-        let error = h.supervisor.stop(&"api".to_string(), None).await.unwrap_err();
+        let error = h
+            .supervisor
+            .stop(&"api".to_string(), None)
+            .await
+            .unwrap_err();
 
         assert!(error.0.contains("cannot be stopped"), "{error:?}");
-        assert!(error.0.contains("Port 8080 is held by an unowned process"), "{error:?}");
+        assert!(
+            error.0.contains("Port 8080 is held by an unowned process"),
+            "{error:?}"
+        );
         assert!(error.0.contains("no `stop` command"), "{error:?}");
         let state = h.host.state_of("api").unwrap();
-        assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned, "a refused stop must not pretend the service is stopped");
+        assert_eq!(
+            state.actual_state,
+            ActualServiceState::ExternallyOwned,
+            "a refused stop must not pretend the service is stopped"
+        );
     }
 
     /// An external unit with no `stop:` command cannot be stopped by this manager either — the same
     /// loud refusal, not a silent success that leaves the container running.
     #[tokio::test]
     async fn stop_on_an_external_service_without_a_stop_command_fails_loudly() {
-        let h = build_harness(one_service_catalog(external_container_service("cache", "proj-cache", None)));
+        let h = build_harness(one_service_catalog(external_container_service(
+            "cache",
+            "proj-cache",
+            None,
+        )));
         h.host.seed(adopted_external_state("cache"));
 
-        let error = h.supervisor.stop(&"cache".to_string(), None).await.unwrap_err();
+        let error = h
+            .supervisor
+            .stop(&"cache".to_string(), None)
+            .await
+            .unwrap_err();
 
         assert!(error.0.contains("cannot be stopped"), "{error:?}");
         assert!(error.0.contains("owned externally"), "{error:?}");
-        assert!(h.process.stop_container_calls().is_empty(), "nothing may be run when the catalog declares no stop command");
-        assert_eq!(h.host.state_of("cache").unwrap().actual_state, ActualServiceState::Ready);
+        assert!(
+            h.process.stop_container_calls().is_empty(),
+            "nothing may be run when the catalog declares no stop command"
+        );
+        assert_eq!(
+            h.host.state_of("cache").unwrap().actual_state,
+            ActualServiceState::Ready
+        );
     }
 
     /// A stop must never report success for a process it cannot touch: an identity that no longer
@@ -2977,7 +3990,10 @@ mod tests {
     /// killing someone else's process.
     #[tokio::test]
     async fn stop_on_an_orphaned_service_refuses_instead_of_reporting_success() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let pid = match h.host.state_of("api").unwrap().identity.unwrap() {
@@ -2985,106 +4001,198 @@ mod tests {
             _ => panic!("expected a posix identity"),
         };
         // The pid is still alive, but `ps` now reports a different program at it.
-        h.process.mutate_fingerprint(pid, "not-the-same-program-anymore");
+        h.process
+            .mutate_fingerprint(pid, "not-the-same-program-anymore");
 
-        let error = h.supervisor.stop(&"api".to_string(), None).await.unwrap_err();
+        let error = h
+            .supervisor
+            .stop(&"api".to_string(), None)
+            .await
+            .unwrap_err();
 
         assert!(error.0.contains("cannot be stopped"), "{error:?}");
         assert!(error.0.contains(&format!("pid {pid}")), "{error:?}");
-        assert!(h.process.signals().is_empty(), "a process this manager does not own must never be signalled");
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Orphaned);
+        assert!(
+            h.process.signals().is_empty(),
+            "a process this manager does not own must never be signalled"
+        );
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Orphaned
+        );
     }
 
     #[tokio::test]
     async fn readiness_timeout_transitions_to_failed_with_detail() {
-        let h = build_harness_with_timeout(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })), 30);
+        let h = build_harness_with_timeout(
+            one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })),
+            30,
+        );
         // tcp never reports ready — probes.set_tcp_ready is never called for 8080.
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, "Readiness timed out");
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
-        assert!(state.readiness_detail.as_deref().unwrap().contains("timed out"));
+        assert!(state
+            .readiness_detail
+            .as_deref()
+            .unwrap()
+            .contains("timed out"));
     }
 
     #[tokio::test]
     async fn tcp_port_conflict_refuses_to_start() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_port_in_use(8080, true);
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert!(err.0.contains("externally owned"));
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
-        assert!(state.error.as_deref().unwrap().contains("Port 8080 is held"));
-        assert!(h.process.signals().is_empty(), "must never have spawned anything");
+        assert!(state
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Port 8080 is held"));
+        assert!(
+            h.process.signals().is_empty(),
+            "must never have spawned anything"
+        );
     }
 
     /// The refusal error must name the squatter — `pid (command)` — so the client can show the
     /// user exactly what would be killed before they confirm.
     #[tokio::test]
     async fn tcp_port_conflict_names_the_holder_in_the_error() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert!(err.0.contains("externally owned"));
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
-        assert_eq!(state.error.as_deref().unwrap(), "Port 8080 is held by pid 41234 (node dist/main)");
-        assert!(h.process.pid_signals().is_empty(), "without kill_unowned nothing may be signalled");
+        assert_eq!(
+            state.error.as_deref().unwrap(),
+            "Port 8080 is held by pid 41234 (node dist/main)"
+        );
+        assert!(
+            h.process.pid_signals().is_empty(),
+            "without kill_unowned nothing may be signalled"
+        );
     }
 
     /// `killUnowned` is the client's echo of the user's "yes": the squatter gets SIGTERM, the port
     /// frees, and the start continues into the normal spawn/readiness path.
     #[tokio::test]
     async fn start_with_kill_unowned_terminates_the_holder_and_continues() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
         h.probes.set_tcp_ready(8080, true);
         h.supervisor
-            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .start_with_options(
+                &"api".to_string(),
+                None,
+                StartOptions { kill_unowned: true },
+            )
             .await
             .unwrap();
-        assert_eq!(h.process.pid_signals(), vec![(41_234, ProcessSignal::Sigterm)]);
-        assert!(!h.process.state.lock().unwrap().alive.contains_key(&41_234), "the squatter must be dead");
+        assert_eq!(
+            h.process.pid_signals(),
+            vec![(41_234, ProcessSignal::Sigterm)]
+        );
+        assert!(
+            !h.process.state.lock().unwrap().alive.contains_key(&41_234),
+            "the squatter must be dead"
+        );
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Ready);
-        assert!(state.identity.is_some(), "the service itself must have spawned after the port freed");
+        assert!(
+            state.identity.is_some(),
+            "the service itself must have spawned after the port freed"
+        );
     }
 
     /// A squatter that ignores SIGTERM is escalated to SIGKILL on a second pass — holders are
     /// re-resolved, so the kill goes to the still-alive pid, not the stale first-pass record.
     #[tokio::test]
     async fn reclaim_escalates_to_sigkill_for_a_sigterm_immune_holder() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
         h.probes.set_tcp_ready(8080, true);
         h.process.mark_term_immune(41_234);
         h.supervisor
-            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .start_with_options(
+                &"api".to_string(),
+                None,
+                StartOptions { kill_unowned: true },
+            )
             .await
             .unwrap();
         assert_eq!(
             h.process.pid_signals(),
-            vec![(41_234, ProcessSignal::Sigterm), (41_234, ProcessSignal::Sigkill)]
+            vec![
+                (41_234, ProcessSignal::Sigterm),
+                (41_234, ProcessSignal::Sigkill)
+            ]
         );
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Ready
+        );
     }
 
     /// If the holder still owns the port after SIGKILL the start must fail loudly — the service
     /// stays `externally-owned` instead of silently dropping the user's confirmed kill.
     #[tokio::test]
     async fn reclaim_fails_loudly_when_the_holder_survives_sigkill() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
         h.process.mark_unkillable(41_234);
         let err = h
             .supervisor
-            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .start_with_options(
+                &"api".to_string(),
+                None,
+                StartOptions { kill_unowned: true },
+            )
             .await
             .unwrap_err();
         assert!(err.0.contains("still held"), "{err:?}");
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
-        assert!(state.identity.is_none(), "the service must never have spawned");
+        assert!(
+            state.identity.is_none(),
+            "the service must never have spawned"
+        );
     }
 
     /// A pid that no longer presents the resolved lstart is not ours to kill — `signal_pid`
@@ -3092,69 +4200,141 @@ mod tests {
     /// and the start fails closed.
     #[tokio::test]
     async fn reclaim_never_kills_a_holder_whose_start_identity_no_longer_matches() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "original lstart", "node dist/main");
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "original lstart", "node dist/main");
         // The squatter died and its pid was recycled by something else before the signal landed.
-        h.probes.process_state.lock().unwrap().alive.get_mut(&41_234).unwrap().start_identity = "recycled lstart".to_string();
+        h.probes
+            .process_state
+            .lock()
+            .unwrap()
+            .alive
+            .get_mut(&41_234)
+            .unwrap()
+            .start_identity = "recycled lstart".to_string();
         let err = h
             .supervisor
-            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .start_with_options(
+                &"api".to_string(),
+                None,
+                StartOptions { kill_unowned: true },
+            )
             .await
             .unwrap_err();
         assert!(err.0.contains("still held"), "{err:?}");
-        assert!(h.process.pid_signals().iter().all(|(pid, _)| *pid == 41_234));
-        assert!(h.probes.process_state.lock().unwrap().alive.contains_key(&41_234), "a recycled pid must survive reclaim");
+        assert!(h
+            .process
+            .pid_signals()
+            .iter()
+            .all(|(pid, _)| *pid == 41_234));
+        assert!(
+            h.probes
+                .process_state
+                .lock()
+                .unwrap()
+                .alive
+                .contains_key(&41_234),
+            "a recycled pid must survive reclaim"
+        );
     }
 
     #[tokio::test]
     async fn reclaim_terminates_every_holder_of_the_port() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node a");
-        h.probes.set_port_holder(8080, 41_235, "Fake Jan  1 00:00:02 2024", "node b");
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node a");
+        h.probes
+            .set_port_holder(8080, 41_235, "Fake Jan  1 00:00:02 2024", "node b");
         h.probes.set_tcp_ready(8080, true);
         h.supervisor
-            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .start_with_options(
+                &"api".to_string(),
+                None,
+                StartOptions { kill_unowned: true },
+            )
             .await
             .unwrap();
         assert_eq!(
             h.process.pid_signals(),
-            vec![(41_234, ProcessSignal::Sigterm), (41_235, ProcessSignal::Sigterm)]
+            vec![
+                (41_234, ProcessSignal::Sigterm),
+                (41_235, ProcessSignal::Sigterm)
+            ]
         );
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Ready
+        );
     }
 
     /// `port_holders` returning `None` means the adapter cannot resolve who holds the port —
     /// reclaim must fail closed rather than signalling a pid it guessed.
     #[tokio::test]
     async fn reclaim_fails_closed_when_the_probe_cannot_resolve_holders() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_port_in_use(8080, true);
         h.probes.set_port_holders_unsupported();
         let err = h
             .supervisor
-            .start_with_options(&"api".to_string(), None, StartOptions { kill_unowned: true })
+            .start_with_options(
+                &"api".to_string(),
+                None,
+                StartOptions { kill_unowned: true },
+            )
             .await
             .unwrap_err();
-        assert!(err.0.contains("still held by an unowned process"), "{err:?}");
-        assert!(h.process.pid_signals().is_empty(), "an unresolvable holder must never be signalled");
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::ExternallyOwned);
+        assert!(
+            err.0.contains("still held by an unowned process"),
+            "{err:?}"
+        );
+        assert!(
+            h.process.pid_signals().is_empty(),
+            "an unresolvable holder must never be signalled"
+        );
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::ExternallyOwned
+        );
     }
 
     /// Restart always uses default options — it can end up `externally-owned`, but it must never
     /// signal a squatter. Reclaim only ever comes from an explicit `killUnowned` start.
     #[tokio::test]
     async fn restart_never_reclaims_an_occupied_port() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
-        h.probes.set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
-        let err = h.supervisor.restart(&"api".to_string(), None).await.unwrap_err();
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
+        h.probes
+            .set_port_holder(8080, 41_234, "Fake Jan  1 00:00:01 2024", "node dist/main");
+        let err = h
+            .supervisor
+            .restart(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert!(err.0.contains("externally owned"), "{err:?}");
         assert!(h.process.pid_signals().is_empty());
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::ExternallyOwned);
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::ExternallyOwned
+        );
     }
 
     #[tokio::test]
     async fn shutdown_reaps_a_persisted_identity_in_a_non_active_state() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         // Simulate: a prior start spawned pid 900001 (still alive per the process adapter), but the
         // service's *current* actualState is "externally-owned" (e.g. a port conflict was detected
         // on the most recent start attempt) — not one of the "active" states shutdown's first pass
@@ -3174,7 +4354,14 @@ mod tests {
             let mut state = h.process.state.lock().unwrap();
             state.alive.insert(
                 900_001,
-                PosixProcessRecord { pid: 900_001, pgid: 900_001, start_identity: "Fake Jan  1 00:00:01 2024".to_string(), command_fingerprint: normalize_command_fingerprint(&argv_command_for_test("api")) },
+                PosixProcessRecord {
+                    pid: 900_001,
+                    pgid: 900_001,
+                    start_identity: "Fake Jan  1 00:00:01 2024".to_string(),
+                    command_fingerprint: normalize_command_fingerprint(&argv_command_for_test(
+                        "api",
+                    )),
+                },
             );
         }
         h.host.seed(ServiceLifecycleState {
@@ -3197,28 +4384,49 @@ mod tests {
         h.supervisor.shutdown().await;
 
         assert!(
-            h.process.signals().iter().any(|(pgid, sig)| *pgid == 900_001 && *sig == ProcessSignal::Sigterm),
+            h.process
+                .signals()
+                .iter()
+                .any(|(pgid, sig)| *pgid == 900_001 && *sig == ProcessSignal::Sigterm),
             "shutdown's second pass must reap a persisted identity even in a non-active state"
         );
     }
 
     fn argv_command_for_test(id: &str) -> ServiceCommand {
-        ServiceCommand { command: CommandSpec::Argv { argv: vec![id.to_string()] }, cwd: ".".to_string(), environment: None, container_name: None, docker_stop_command: None }
+        ServiceCommand {
+            command: CommandSpec::Argv {
+                argv: vec![id.to_string()],
+            },
+            cwd: ".".to_string(),
+            environment: None,
+            container_name: None,
+            docker_stop_command: None,
+        }
     }
 
     /// An `ownership: external` container unit, shaped like a real one (`viclass`'s mongo/redis/…):
     /// a `docker compose up -d` run command, a container readiness probe, and — optionally — the
     /// `stop:` command that is the only way this manager can stop it.
-    fn external_container_service(id: &str, container: &str, stop: Option<&str>) -> ServiceDefinition {
+    fn external_container_service(
+        id: &str,
+        container: &str,
+        stop: Option<&str>,
+    ) -> ServiceDefinition {
         let mut service = argv_verified(id, ReadinessSpec::Container);
         service.ownership = Some(ServiceOwnership::External);
         service.profiles.run = ServiceRunProfile::Verified {
             command: ServiceCommand {
-                command: CommandSpec::Shell { shell: format!("docker compose up -d {container}"), exec: None },
+                command: CommandSpec::Shell {
+                    shell: format!("docker compose up -d {container}"),
+                    exec: None,
+                },
                 cwd: ".".to_string(),
                 environment: None,
                 container_name: Some(container.to_string()),
-                docker_stop_command: stop.map(|shell| CommandSpec::Shell { shell: shell.to_string(), exec: None }),
+                docker_stop_command: stop.map(|shell| CommandSpec::Shell {
+                    shell: shell.to_string(),
+                    exec: None,
+                }),
             },
             readiness: ReadinessSpec::Container,
             readiness_timeout_ms: None,
@@ -3251,7 +4459,10 @@ mod tests {
 
     #[tokio::test]
     async fn orphans_when_the_observed_fingerprint_no_longer_matches() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let pid = match h.host.state_of("api").unwrap().identity.unwrap() {
@@ -3261,18 +4472,31 @@ mod tests {
         // Simulate a pid-reuse-like scenario: the OS-observed process at this pid now has a
         // different command fingerprint (a different program entirely), so `observed_matches` must
         // fail and the service must be marked orphaned rather than treated as still-ours.
-        h.process.mutate_fingerprint(pid, "not-the-same-program-anymore");
+        h.process
+            .mutate_fingerprint(pid, "not-the-same-program-anymore");
         h.supervisor.status(&"api".to_string()).await.unwrap();
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Orphaned);
-        assert_eq!(state.error.as_deref(), Some("Process ownership identity no longer matches"));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Process ownership identity no longer matches")
+        );
     }
 
     #[tokio::test]
     async fn build_failure_short_circuits_spawn() {
         let mut service = argv_verified("api", ReadinessSpec::Tcp { port: 8080 });
         service.profiles.build = Some(ServiceBuildProfile {
-            command: ServiceCommand { command: CommandSpec::Shell { shell: "build-that-fails".to_string(), exec: None }, cwd: ".".to_string(), environment: None, container_name: None, docker_stop_command: None },
+            command: ServiceCommand {
+                command: CommandSpec::Shell {
+                    shell: "build-that-fails".to_string(),
+                    exec: None,
+                },
+                cwd: ".".to_string(),
+                environment: None,
+                container_name: None,
+                docker_stop_command: None,
+            },
             timeout_ms: None,
             serialization_key: None,
         });
@@ -3280,11 +4504,18 @@ mod tests {
         h.run_build.fail_for("build-that-fails");
         h.probes.set_tcp_ready(8080, true);
 
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, "Build failed");
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
-        assert!(h.process.signals().is_empty(), "spawn must never be attempted after a build failure");
+        assert!(
+            h.process.signals().is_empty(),
+            "spawn must never be attempted after a build failure"
+        );
     }
 
     #[tokio::test]
@@ -3292,14 +4523,26 @@ mod tests {
         fn service_with_build(id: &str, key: &str) -> ServiceDefinition {
             let mut service = argv_verified(id, ReadinessSpec::Tcp { port: 8080 });
             service.profiles.build = Some(ServiceBuildProfile {
-                command: ServiceCommand { command: CommandSpec::Shell { shell: format!("build-{id}"), exec: None }, cwd: ".".to_string(), environment: None, container_name: None, docker_stop_command: None },
+                command: ServiceCommand {
+                    command: CommandSpec::Shell {
+                        shell: format!("build-{id}"),
+                        exec: None,
+                    },
+                    cwd: ".".to_string(),
+                    environment: None,
+                    container_name: None,
+                    docker_stop_command: None,
+                },
                 timeout_ms: None,
                 serialization_key: Some(key.to_string()),
             });
             service
         }
         let catalog = ServiceCatalog {
-            services: vec![service_with_build("a", "shared"), service_with_build("b", "shared")],
+            services: vec![
+                service_with_build("a", "shared"),
+                service_with_build("b", "shared"),
+            ],
             groups: HashMap::new(),
             group_tree: Vec::new(),
             compose_file: None,
@@ -3324,14 +4567,27 @@ mod tests {
         // couple ms of each other. Serialized, the second must start at or after the first's
         // finish, i.e. at least ~5ms after the first started.
         let gap = timeline[1].1.duration_since(timeline[0].1);
-        assert!(gap >= std::time::Duration::from_millis(4), "builds sharing a serializationKey must not overlap, gap was {gap:?}");
+        assert!(
+            gap >= std::time::Duration::from_millis(4),
+            "builds sharing a serializationKey must not overlap, gap was {gap:?}"
+        );
     }
 
     #[tokio::test]
     async fn command_readiness_with_no_adapter_never_throws_times_out_normally() {
-        let readiness = ReadinessSpec::Command { command: CommandSpec::Argv { argv: vec!["check".to_string()] }, cwd: None };
-        let h = build_harness_with_timeout(one_service_catalog(argv_verified("api", readiness)), 20);
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let readiness = ReadinessSpec::Command {
+            command: CommandSpec::Argv {
+                argv: vec!["check".to_string()],
+            },
+            cwd: None,
+        };
+        let h =
+            build_harness_with_timeout(one_service_catalog(argv_verified("api", readiness)), 20);
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, "Readiness timed out");
     }
 
@@ -3339,11 +4595,20 @@ mod tests {
     async fn command_readiness_succeeds_when_the_adapter_reports_ready() {
         let host = FakeHost::new(one_service_catalog(argv_verified(
             "api",
-            ReadinessSpec::Command { command: CommandSpec::Argv { argv: vec!["check".to_string()] }, cwd: None },
+            ReadinessSpec::Command {
+                command: CommandSpec::Argv {
+                    argv: vec!["check".to_string()],
+                },
+                cwd: None,
+            },
         )));
         let process = FakeProcessAdapter::new();
         let inner_probes = FakeProbeAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { inner: Some(inner_probes), result: std::sync::Mutex::new(Some(true)), ..Default::default() });
+        let probes = Arc::new(CommandCapableProbeAdapter {
+            inner: Some(inner_probes),
+            result: std::sync::Mutex::new(Some(true)),
+            ..Default::default()
+        });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
@@ -3352,7 +4617,8 @@ mod tests {
                 process,
                 run_build,
                 probes,
-                preparation: Some(Arc::new(NoPreparation)), artifact_installer: None,
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: None,
                 clock,
                 readiness_timeout_ms: 200,
                 readiness_backoff_ms: 5,
@@ -3361,7 +4627,10 @@ mod tests {
             },
         );
         supervisor.start(&"api".to_string(), None).await.unwrap();
-        assert_eq!(host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+        assert_eq!(
+            host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Ready
+        );
     }
 
     // --- artifact installs ---
@@ -3373,13 +4642,20 @@ mod tests {
 
     impl FakeArtifactInstaller {
         fn ok() -> Self {
-            Self { calls: std::sync::Mutex::new(Vec::new()), result: std::sync::Mutex::new(Ok(())) }
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                result: std::sync::Mutex::new(Ok(())),
+            }
         }
     }
 
     #[async_trait]
     impl crate::supervisor::types::ArtifactInstaller for FakeArtifactInstaller {
-        async fn install(&self, service: &ServiceDefinition, _on_output: OnOutput) -> Result<(), SupervisorError> {
+        async fn install(
+            &self,
+            service: &ServiceDefinition,
+            _on_output: OnOutput,
+        ) -> Result<(), SupervisorError> {
             self.calls.lock().unwrap().push(service.id.clone());
             self.result.lock().unwrap().clone().map_err(SupervisorError)
         }
@@ -3399,7 +4675,10 @@ mod tests {
         service
     }
 
-    fn artifact_harness(service: ServiceDefinition, installer: Option<Arc<FakeArtifactInstaller>>) -> (Arc<ProcessSupervisor>, Arc<FakeHost>) {
+    fn artifact_harness(
+        service: ServiceDefinition,
+        installer: Option<Arc<FakeArtifactInstaller>>,
+    ) -> (Arc<ProcessSupervisor>, Arc<FakeHost>) {
         let host = FakeHost::new(one_service_catalog(service));
         let process = FakeProcessAdapter::new();
         let probes = FakeProbeAdapter::new();
@@ -3412,7 +4691,8 @@ mod tests {
                 run_build,
                 probes,
                 preparation: Some(Arc::new(NoPreparation)),
-                artifact_installer: installer.map(|i| i as Arc<dyn crate::supervisor::types::ArtifactInstaller>),
+                artifact_installer: installer
+                    .map(|i| i as Arc<dyn crate::supervisor::types::ArtifactInstaller>),
                 clock,
                 readiness_timeout_ms: 200,
                 readiness_backoff_ms: 5,
@@ -3428,10 +4708,16 @@ mod tests {
         let installer = Arc::new(FakeArtifactInstaller::ok());
         let (supervisor, host) = artifact_harness(artifact_service("db"), Some(installer.clone()));
         supervisor.start(&"db".to_string(), None).await.unwrap();
-        assert_eq!(installer.calls.lock().unwrap().as_slice(), &["db".to_string()]);
+        assert_eq!(
+            installer.calls.lock().unwrap().as_slice(),
+            &["db".to_string()]
+        );
         // `process` readiness ends the start at running-unready — the proof we want is that the
         // install ran before spawn and nothing failed.
-        assert_eq!(host.state_of("db").unwrap().actual_state, ActualServiceState::RunningUnready);
+        assert_eq!(
+            host.state_of("db").unwrap().actual_state,
+            ActualServiceState::RunningUnready
+        );
     }
 
     #[tokio::test]
@@ -3442,7 +4728,10 @@ mod tests {
         supervisor.start(&"db".to_string(), None).await.unwrap_err();
         let state = host.state_of("db").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
-        assert_eq!(state.error.as_deref(), Some("Install failed: sha256 mismatch"));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("Install failed: sha256 mismatch")
+        );
     }
 
     #[tokio::test]
@@ -3457,7 +4746,13 @@ mod tests {
     fn preparation_catalog() -> ServiceCatalog {
         let service = with_preparation_command(
             argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
-            crate::catalog::PreparationCommand { command: CommandSpec::Argv { argv: vec!["prepare".to_string()] }, cwd: Some("infra".to_string()), serialization_key: None },
+            crate::catalog::PreparationCommand {
+                command: CommandSpec::Argv {
+                    argv: vec!["prepare".to_string()],
+                },
+                cwd: Some("infra".to_string()),
+                serialization_key: None,
+            },
         );
         one_service_catalog(service)
     }
@@ -3468,15 +4763,33 @@ mod tests {
         let process = FakeProcessAdapter::new();
         let inner_probes = FakeProbeAdapter::new();
         inner_probes.set_tcp_ready(8080, true);
-        let probes = Arc::new(CommandCapableProbeAdapter { inner: Some(inner_probes), result: std::sync::Mutex::new(Some(true)), ..Default::default() });
+        let probes = Arc::new(CommandCapableProbeAdapter {
+            inner: Some(inner_probes),
+            result: std::sync::Mutex::new(Some(true)),
+            ..Default::default()
+        });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
             host.clone(),
-            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), artifact_installer: None, clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+            SupervisorOptions {
+                process,
+                run_build,
+                probes,
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: None,
+                clock,
+                readiness_timeout_ms: 200,
+                readiness_backoff_ms: 5,
+                termination_grace_ms: 50,
+                is_closing: Arc::new(|| false),
+            },
         );
         supervisor.start(&"api".to_string(), None).await.unwrap();
-        assert_eq!(host.state_of("api").unwrap().actual_state, ActualServiceState::Ready);
+        assert_eq!(
+            host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Ready
+        );
     }
 
     #[tokio::test]
@@ -3484,14 +4797,32 @@ mod tests {
         let host = FakeHost::new(preparation_catalog());
         let process = FakeProcessAdapter::new();
         let inner_probes = FakeProbeAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { inner: Some(inner_probes), result: std::sync::Mutex::new(Some(false)), ..Default::default() });
+        let probes = Arc::new(CommandCapableProbeAdapter {
+            inner: Some(inner_probes),
+            result: std::sync::Mutex::new(Some(false)),
+            ..Default::default()
+        });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
             host.clone(),
-            SupervisorOptions { process, run_build, probes, preparation: Some(Arc::new(NoPreparation)), artifact_installer: None, clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+            SupervisorOptions {
+                process,
+                run_build,
+                probes,
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: None,
+                clock,
+                readiness_timeout_ms: 200,
+                readiness_backoff_ms: 5,
+                termination_grace_ms: 50,
+                is_closing: Arc::new(|| false),
+            },
         );
-        let err = supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let err = supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, "Preparation failed for api");
         let state = host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
@@ -3504,7 +4835,11 @@ mod tests {
         // preparation command with no way to run it can never succeed by waiting longer, so it
         // fails the start right away instead.
         let h = build_harness_with_timeout(preparation_catalog(), 20);
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, "Preparation failed for api");
     }
 
@@ -3517,11 +4852,20 @@ mod tests {
         fn service_with_prep(id: &str, key: &str) -> ServiceDefinition {
             with_preparation_command(
                 argv_verified(id, ReadinessSpec::Process),
-                crate::catalog::PreparationCommand { command: CommandSpec::Argv { argv: vec!["prepare".to_string()] }, cwd: None, serialization_key: Some(key.to_string()) },
+                crate::catalog::PreparationCommand {
+                    command: CommandSpec::Argv {
+                        argv: vec!["prepare".to_string()],
+                    },
+                    cwd: None,
+                    serialization_key: Some(key.to_string()),
+                },
             )
         }
         let catalog = ServiceCatalog {
-            services: vec![service_with_prep("a", "shared"), service_with_prep("b", "shared")],
+            services: vec![
+                service_with_prep("a", "shared"),
+                service_with_prep("b", "shared"),
+            ],
             groups: HashMap::new(),
             group_tree: Vec::new(),
             compose_file: None,
@@ -3531,12 +4875,27 @@ mod tests {
         };
         let host = FakeHost::new(catalog);
         let process = FakeProcessAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { result: std::sync::Mutex::new(Some(true)), delay_ms: 5, ..Default::default() });
+        let probes = Arc::new(CommandCapableProbeAdapter {
+            result: std::sync::Mutex::new(Some(true)),
+            delay_ms: 5,
+            ..Default::default()
+        });
         let run_build = FakeRunBuild::new();
         let clock = FakeClock::new();
         let supervisor = ProcessSupervisor::new(
             host.clone(),
-            SupervisorOptions { process, run_build, probes: probes.clone(), preparation: Some(Arc::new(NoPreparation)), artifact_installer: None, clock, readiness_timeout_ms: 200, readiness_backoff_ms: 5, termination_grace_ms: 50, is_closing: Arc::new(|| false) },
+            SupervisorOptions {
+                process,
+                run_build,
+                probes: probes.clone(),
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: None,
+                clock,
+                readiness_timeout_ms: 200,
+                readiness_backoff_ms: 5,
+                termination_grace_ms: 50,
+                is_closing: Arc::new(|| false),
+            },
         );
         let sup_a = supervisor.clone();
         let sup_b = supervisor.clone();
@@ -3549,7 +4908,10 @@ mod tests {
         let timeline = probes.timeline.lock().unwrap().clone();
         assert_eq!(timeline.len(), 2);
         let gap = timeline[1].duration_since(timeline[0]);
-        assert!(gap >= std::time::Duration::from_millis(4), "preparation commands sharing a serializationKey must not overlap, gap was {gap:?}");
+        assert!(
+            gap >= std::time::Duration::from_millis(4),
+            "preparation commands sharing a serializationKey must not overlap, gap was {gap:?}"
+        );
     }
 
     #[tokio::test]
@@ -3562,8 +4924,14 @@ mod tests {
         h.supervisor.sync_external_services().await;
         let state = h.host.state_of("cache").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Ready);
-        assert_eq!(state.readiness_detail.as_deref(), Some("adopted from external state"));
-        assert!(state.identity.is_none(), "external services never get a ProcessIdentity");
+        assert_eq!(
+            state.readiness_detail.as_deref(),
+            Some("adopted from external state")
+        );
+        assert!(
+            state.identity.is_none(),
+            "external services never get a ProcessIdentity"
+        );
 
         h.probes.set_tcp_ready(6379, false);
         h.supervisor.sync_external_services().await;
@@ -3576,7 +4944,10 @@ mod tests {
         let mut service = argv_verified("db", ReadinessSpec::Container);
         service.profiles.run = ServiceRunProfile::Verified {
             command: ServiceCommand {
-                command: CommandSpec::Shell { shell: "docker compose up db".to_string(), exec: None },
+                command: CommandSpec::Shell {
+                    shell: "docker compose up db".to_string(),
+                    exec: None,
+                },
                 cwd: ".".to_string(),
                 environment: None,
                 container_name: Some("proj-db".to_string()),
@@ -3595,7 +4966,10 @@ mod tests {
                 container_id: "abc123".to_string(),
                 container_started_at: "2024-01-01T00:00:00.000Z".to_string(),
                 command_fingerprint: normalize_command_fingerprint(&ServiceCommand {
-                    command: CommandSpec::Shell { shell: "docker compose up db".to_string(), exec: None },
+                    command: CommandSpec::Shell {
+                        shell: "docker compose up db".to_string(),
+                        exec: None,
+                    },
                     cwd: ".".to_string(),
                     environment: None,
                     container_name: Some("proj-db".to_string()),
@@ -3612,7 +4986,9 @@ mod tests {
             _ => panic!("expected a docker identity"),
         }
         assert!(
-            h.process.attach_calls().contains(&("db".to_string(), "container")),
+            h.process
+                .attach_calls()
+                .contains(&("db".to_string(), "container")),
             "a container service must get a container log tail, not skip attach_output: {:?}",
             h.process.attach_calls()
         );
@@ -3624,7 +5000,13 @@ mod tests {
         service.ownership = Some(crate::catalog::ServiceOwnership::External);
         service.profiles.run = ServiceRunProfile::Verified {
             command: ServiceCommand {
-                command: CommandSpec::Argv { argv: vec!["docker".to_string(), "compose".to_string(), "up".to_string()] },
+                command: CommandSpec::Argv {
+                    argv: vec![
+                        "docker".to_string(),
+                        "compose".to_string(),
+                        "up".to_string(),
+                    ],
+                },
                 cwd: ".".to_string(),
                 environment: None,
                 container_name: Some("proj-cache".to_string()),
@@ -3639,31 +5021,58 @@ mod tests {
 
         h.probes.set_container_ready("proj-cache", true);
         h.supervisor.sync_external_services().await;
-        assert_eq!(h.host.state_of("cache").unwrap().actual_state, ActualServiceState::Ready);
-        assert_eq!(h.process.attach_calls(), vec![("cache".to_string(), "container")]);
+        assert_eq!(
+            h.host.state_of("cache").unwrap().actual_state,
+            ActualServiceState::Ready
+        );
+        assert_eq!(
+            h.process.attach_calls(),
+            vec![("cache".to_string(), "container")]
+        );
 
         // `sync_external_services` polls on an interval — an already-attached live tail must not be
         // replaced every tick (a container tail replays its backlog on attach, so a naive re-attach
         // would duplicate log lines each poll).
         h.supervisor.sync_external_services().await;
-        assert_eq!(h.process.attach_calls().len(), 1, "a live tail must not be re-attached");
+        assert_eq!(
+            h.process.attach_calls().len(),
+            1,
+            "a live tail must not be re-attached"
+        );
 
         // A follower that ended on its own (container restarted) is re-attached on the next tick.
         h.process.finish_tail("cache");
         h.supervisor.sync_external_services().await;
-        assert_eq!(h.process.attach_calls().len(), 2, "a dead tail must be re-attached");
+        assert_eq!(
+            h.process.attach_calls().len(),
+            2,
+            "a dead tail must be re-attached"
+        );
 
         h.probes.set_container_ready("proj-cache", false);
         h.supervisor.sync_external_services().await;
-        assert_eq!(h.host.state_of("cache").unwrap().actual_state, ActualServiceState::Stopped);
-        assert!(h.process.tail_was_stopped("cache"), "release must stop the log tail");
+        assert_eq!(
+            h.host.state_of("cache").unwrap().actual_state,
+            ActualServiceState::Stopped
+        );
+        assert!(
+            h.process.tail_was_stopped("cache"),
+            "release must stop the log tail"
+        );
     }
 
     #[tokio::test]
     async fn spawn_failure_transitions_to_failed_with_the_adapter_error() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.process.fail_spawn("api", "no such file or directory");
-        let err = h.supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let err = h
+            .supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, "no such file or directory");
         let state = h.host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
@@ -3675,18 +5084,30 @@ mod tests {
     /// service process — the service adopts when the probe reports ready and carries no identity.
     #[tokio::test]
     async fn an_external_command_readiness_service_runs_its_command_as_a_one_shot_task() {
-        let mut service = argv_verified("api", ReadinessSpec::Command { command: CommandSpec::Argv { argv: vec!["attach".to_string()] }, cwd: None });
+        let mut service = argv_verified(
+            "api",
+            ReadinessSpec::Command {
+                command: CommandSpec::Argv {
+                    argv: vec!["attach".to_string()],
+                },
+                cwd: None,
+            },
+        );
         service.ownership = Some(ServiceOwnership::External);
         let host = FakeHost::new(one_service_catalog(service));
         let process = FakeProcessAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { result: std::sync::Mutex::new(Some(true)), ..Default::default() });
+        let probes = Arc::new(CommandCapableProbeAdapter {
+            result: std::sync::Mutex::new(Some(true)),
+            ..Default::default()
+        });
         let supervisor = ProcessSupervisor::new(
             host.clone(),
             SupervisorOptions {
                 process: process.clone(),
                 run_build: FakeRunBuild::new(),
                 probes,
-                preparation: Some(Arc::new(NoPreparation)), artifact_installer: None,
+                preparation: Some(Arc::new(NoPreparation)),
+                artifact_installer: None,
                 clock: FakeClock::new(),
                 readiness_timeout_ms: 200,
                 readiness_backoff_ms: 5,
@@ -3697,13 +5118,22 @@ mod tests {
         supervisor.start(&"api".to_string(), None).await.unwrap();
         let state = host.state_of("api").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Ready);
-        assert!(state.identity.is_none(), "a task run must not track a process identity");
-        assert!(process.state.lock().unwrap().alive.len() == 1, "the attach task must still be spawned once");
+        assert!(
+            state.identity.is_none(),
+            "a task run must not track a process identity"
+        );
+        assert!(
+            process.state.lock().unwrap().alive.len() == 1,
+            "the attach task must still be spawned once"
+        );
     }
 
     #[tokio::test]
     async fn reconcile_marks_an_externally_killed_process_as_failed() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let pid = match h.host.state_of("api").unwrap().identity.unwrap() {
@@ -3727,20 +5157,40 @@ mod tests {
 
     #[tokio::test]
     async fn stop_does_not_signal_when_the_process_tree_cannot_be_read() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         h.process.state.lock().unwrap().tree_unknown = true;
 
-        let error = h.supervisor.stop(&"api".to_string(), None).await.unwrap_err();
-        assert!(error.0.contains("could not be read") || error.0.contains("could not be verified"), "{error:?}");
-        assert!(h.process.signals().is_empty(), "a failed ps must not signal a pgid: {:?}", h.process.signals());
-        assert_ne!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Stopped);
+        let error = h
+            .supervisor
+            .stop(&"api".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.0.contains("could not be read") || error.0.contains("could not be verified"),
+            "{error:?}"
+        );
+        assert!(
+            h.process.signals().is_empty(),
+            "a failed ps must not signal a pgid: {:?}",
+            h.process.signals()
+        );
+        assert_ne!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Stopped
+        );
     }
 
     #[tokio::test]
     async fn a_leader_exit_reaps_a_child_in_its_own_process_group() {
-        let h = build_harness(one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "api",
+            ReadinessSpec::Tcp { port: 8080 },
+        )));
         h.probes.set_tcp_ready(8080, true);
         h.supervisor.start(&"api".to_string(), None).await.unwrap();
         let leader = match h.host.state_of("api").unwrap().identity.unwrap() {
@@ -3756,19 +5206,45 @@ mod tests {
         while tokio::time::Instant::now() < deadline && h.process.is_alive(child) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!h.process.is_alive(child), "the child in its own process group must not survive the leader");
-        assert!(h.process.signals().contains(&(child, ProcessSignal::Sigterm)), "secondary group must be signalled: {:?}", h.process.signals());
-        assert!(!h.process.signals().iter().any(|(pgid, _)| *pgid == leader), "the dead leader pgid must not be signalled");
-        assert_eq!(h.host.state_of("api").unwrap().actual_state, ActualServiceState::Failed);
+        assert!(
+            !h.process.is_alive(child),
+            "the child in its own process group must not survive the leader"
+        );
+        assert!(
+            h.process
+                .signals()
+                .contains(&(child, ProcessSignal::Sigterm)),
+            "secondary group must be signalled: {:?}",
+            h.process.signals()
+        );
+        assert!(
+            !h.process.signals().iter().any(|(pgid, _)| *pgid == leader),
+            "the dead leader pgid must not be signalled"
+        );
+        assert_eq!(
+            h.host.state_of("api").unwrap().actual_state,
+            ActualServiceState::Failed
+        );
     }
 
     #[tokio::test]
     async fn a_failed_one_shot_task_is_stopped_and_the_error_is_returned() {
-        let mut service = argv_verified("api", ReadinessSpec::Command { command: CommandSpec::Argv { argv: vec!["attach".to_string()] }, cwd: None });
+        let mut service = argv_verified(
+            "api",
+            ReadinessSpec::Command {
+                command: CommandSpec::Argv {
+                    argv: vec!["attach".to_string()],
+                },
+                cwd: None,
+            },
+        );
         service.ownership = Some(ServiceOwnership::External);
         let host = FakeHost::new(one_service_catalog(service));
         let process = FakeProcessAdapter::new();
-        let probes = Arc::new(CommandCapableProbeAdapter { result: std::sync::Mutex::new(Some(false)), ..Default::default() });
+        let probes = Arc::new(CommandCapableProbeAdapter {
+            result: std::sync::Mutex::new(Some(false)),
+            ..Default::default()
+        });
         let supervisor = ProcessSupervisor::new(
             host.clone(),
             SupervisorOptions {
@@ -3784,14 +5260,27 @@ mod tests {
                 is_closing: Arc::new(|| false),
             },
         );
-        let error = supervisor.start(&"api".to_string(), None).await.unwrap_err();
+        let error = supervisor
+            .start(&"api".to_string(), None)
+            .await
+            .unwrap_err();
         assert!(error.0.contains("Readiness timed out"), "{error:?}");
-        assert!(process.state.lock().unwrap().alive.is_empty(), "the one-shot process must be stopped when readiness fails");
-        assert!(host.state_of("api").unwrap().identity.is_none(), "a task failure must not persist the trigger process as the service identity");
+        assert!(
+            process.state.lock().unwrap().alive.is_empty(),
+            "the one-shot process must be stopped when readiness fails"
+        );
+        assert!(
+            host.state_of("api").unwrap().identity.is_none(),
+            "a task failure must not persist the trigger process as the service identity"
+        );
     }
 
     fn with_exit_timeout(mut service: ServiceDefinition, timeout_ms: u64) -> ServiceDefinition {
-        if let ServiceRunProfile::Verified { readiness_timeout_ms, .. } = &mut service.profiles.run {
+        if let ServiceRunProfile::Verified {
+            readiness_timeout_ms,
+            ..
+        } = &mut service.profiles.run
+        {
             *readiness_timeout_ms = Some(timeout_ms);
         }
         service
@@ -3799,7 +5288,9 @@ mod tests {
 
     async fn wait_for_posix_pid(host: &FakeHost, service_id: &str) -> i64 {
         loop {
-            if let Some(ProcessIdentity::Posix(posix)) = host.state_of(service_id).and_then(|state| state.identity) {
+            if let Some(ProcessIdentity::Posix(posix)) =
+                host.state_of(service_id).and_then(|state| state.identity)
+            {
                 return posix.pid;
             }
             tokio::task::yield_now().await;
@@ -3808,7 +5299,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_exit_command_that_returns_zero_is_succeeded_and_not_restarted() {
-        let h = build_harness_with_timeout(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)), 30);
+        let h = build_harness_with_timeout(
+            one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)),
+            30,
+        );
         let supervisor = h.supervisor.clone();
         let host = h.host.clone();
         let process = h.process.clone();
@@ -3837,7 +5331,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_exit_command_that_returns_nonzero_is_failed() {
-        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "fe",
+            ReadinessSpec::Exit,
+        )));
         let supervisor = h.supervisor.clone();
         let host = h.host.clone();
         let process = h.process.clone();
@@ -3855,7 +5352,10 @@ mod tests {
 
     #[tokio::test]
     async fn stopping_an_exit_command_mid_run_records_stopped() {
-        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "fe",
+            ReadinessSpec::Exit,
+        )));
         let supervisor = h.supervisor.clone();
         let host = h.host.clone();
         let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
@@ -3870,18 +5370,32 @@ mod tests {
 
     #[tokio::test]
     async fn an_exit_command_times_out_only_when_a_deadline_is_set() {
-        let h = build_harness(one_service_catalog(with_exit_timeout(argv_verified("fe", ReadinessSpec::Exit), 40)));
-        let error = h.supervisor.start(&"fe".to_string(), None).await.unwrap_err();
+        let h = build_harness(one_service_catalog(with_exit_timeout(
+            argv_verified("fe", ReadinessSpec::Exit),
+            40,
+        )));
+        let error = h
+            .supervisor
+            .start(&"fe".to_string(), None)
+            .await
+            .unwrap_err();
         assert_eq!(error.0, "Readiness timed out");
         let state = h.host.state_of("fe").unwrap();
         assert_eq!(state.actual_state, ActualServiceState::Failed);
         assert_eq!(state.desired_state, DesiredServiceState::Stopped);
-        assert!(state.readiness_detail.as_deref().unwrap_or("").contains("did not exit"));
+        assert!(state
+            .readiness_detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("did not exit"));
     }
 
     #[tokio::test]
     async fn stop_on_a_succeeded_exit_command_keeps_succeeded() {
-        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "fe",
+            ReadinessSpec::Exit,
+        )));
         let supervisor = h.supervisor.clone();
         let host = h.host.clone();
         let process = h.process.clone();
@@ -3897,7 +5411,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_adopted_exit_command_that_disappears_is_not_succeeded() {
-        let h = build_harness(one_service_catalog(argv_verified("fe", ReadinessSpec::Exit)));
+        let h = build_harness(one_service_catalog(argv_verified(
+            "fe",
+            ReadinessSpec::Exit,
+        )));
         let start_identity = "Fake Jan  1 00:00:00 2024".to_string();
         h.process.insert_alive(42, "fp", &start_identity);
         h.host.seed(ServiceLifecycleState {
@@ -3937,6 +5454,11 @@ mod tests {
         assert_eq!(state.actual_state, ActualServiceState::Failed);
         assert_ne!(state.actual_state, ActualServiceState::Succeeded);
         let error = state.error.unwrap_or_default();
-        assert!(error.contains("exit code unknown") || error.contains("no longer alive") || error.contains("exited with code"), "{error}");
+        assert!(
+            error.contains("exit code unknown")
+                || error.contains("no longer alive")
+                || error.contains("exited with code"),
+            "{error}"
+        );
     }
 }

@@ -123,7 +123,11 @@ pub enum OutputSource<'a> {
     /// whose raw capture file the previous daemon already forwarded, so a daemon restart does not
     /// replay it all into the log store.
     Process { skip_backlog: bool },
-    Container { container_name: &'a str, since: Option<&'a str>, tail: Option<u64> },
+    Container {
+        container_name: &'a str,
+        since: Option<&'a str>,
+        tail: Option<u64>,
+    },
 }
 
 /// A live output tail from `ProcessAdapter::attach_output`. `is_done` reports whether the tail
@@ -137,7 +141,10 @@ pub struct OutputTail {
 
 impl OutputTail {
     pub fn new(stop: Box<dyn FnOnce() + Send>, done: Arc<AtomicBool>) -> Self {
-        Self { stop: Some(stop), done }
+        Self {
+            stop: Some(stop),
+            done,
+        }
     }
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::SeqCst)
@@ -152,7 +159,11 @@ impl OutputTail {
 
 #[async_trait]
 pub trait ProcessAdapter: Send + Sync {
-    async fn spawn(&self, input: SpawnInput, on_output: OnOutput) -> Result<ManagedProcess, SupervisorError>;
+    async fn spawn(
+        &self,
+        input: SpawnInput,
+        on_output: OnOutput,
+    ) -> Result<ManagedProcess, SupervisorError>;
     async fn inspect(&self, identity: &ProcessIdentity) -> Inspection;
     async fn signal_group(&self, pgid: i64, signal: ProcessSignal);
     /// Signals exactly one pid, and only if the pid still presents `expected_start_identity` —
@@ -165,23 +176,40 @@ pub trait ProcessAdapter: Send + Sync {
     /// stop. `Absent` unless the OS table still shows `leader_start_identity` for the leader — a
     /// reused pid must never pull an unrelated live tree into a signal (see `build_process_tree`).
     /// `Unknown` means the table could not be read; that is not an empty tree.
-    async fn process_tree(&self, leader_pid: i64, leader_start_identity: &str) -> ProcessTreeSnapshot;
+    async fn process_tree(
+        &self,
+        leader_pid: i64,
+        leader_start_identity: &str,
+    ) -> ProcessTreeSnapshot;
     /// One `pid -> start identity` snapshot of every live process, or `None` when the table could
     /// not be read. What tree members are checked against, so a recycled pid never counts as ours.
     async fn live_start_identities(&self) -> Option<HashMap<i64, String>>;
     /// `None` if unsupported by this adapter (the TS "optional" `stopContainer`/`attachOutput`).
-    async fn stop_container(&self, _command: &ServiceCommand, _on_output: OnOutput) -> Option<Result<(), SupervisorError>> {
+    async fn stop_container(
+        &self,
+        _command: &ServiceCommand,
+        _on_output: OnOutput,
+    ) -> Option<Result<(), SupervisorError>> {
         None
     }
     /// Returns a live tail handle if output attachment is supported; `None` otherwise.
-    fn attach_output(&self, _service_id: &ServiceId, _source: OutputSource<'_>, _on_output: OnOutput) -> Option<OutputTail> {
+    fn attach_output(
+        &self,
+        _service_id: &ServiceId,
+        _source: OutputSource<'_>,
+        _on_output: OnOutput,
+    ) -> Option<OutputTail> {
         None
     }
 }
 
 #[async_trait]
 pub trait PreparationAdapter: Send + Sync {
-    async fn prepare(&self, service_id: &ServiceId, steps: &[String]) -> Result<(), SupervisorError>;
+    async fn prepare(
+        &self,
+        service_id: &ServiceId,
+        steps: &[String],
+    ) -> Result<(), SupervisorError>;
 }
 
 /// One process holding a TCP listen socket on a catalog port — what `port_in_use` reports only as
@@ -233,7 +261,10 @@ pub(crate) struct SystemClock;
 #[async_trait]
 impl SupervisorClock for SystemClock {
     fn now_millis(&self) -> i64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
     async fn sleep(&self, millis: i64) {
         tokio::time::sleep(std::time::Duration::from_millis(millis.max(0) as u64)).await;
@@ -319,7 +350,11 @@ pub struct SupervisorOptions {
 /// preparation and build.
 #[async_trait]
 pub trait ArtifactInstaller: Send + Sync {
-    async fn install(&self, service: &crate::catalog::ServiceDefinition, on_output: OnOutput) -> Result<(), SupervisorError>;
+    async fn install(
+        &self,
+        service: &crate::catalog::ServiceDefinition,
+        on_output: OnOutput,
+    ) -> Result<(), SupervisorError>;
 }
 
 #[async_trait]
@@ -345,7 +380,9 @@ pub trait Host: Send + Sync {
     /// allocations per log line on a 30-service catalog. The default implementation preserves that
     /// behaviour for any `Host` that doesn't override it.
     fn service_state(&self, service_id: &ServiceId) -> Option<ServiceLifecycleState> {
-        self.service_states().into_iter().find(|s| &s.service_id == service_id)
+        self.service_states()
+            .into_iter()
+            .find(|s| &s.service_id == service_id)
     }
     async fn set_service_state(&self, next: ServiceLifecycleState);
     async fn append_log(&self, service_id: &str, data: &str);
@@ -370,6 +407,9 @@ mod tests {
     #[test]
     fn iso8601_known_value() {
         // 2024-01-01T00:00:00.000Z
-        assert_eq!(format_iso8601_millis(1_704_067_200_000), "2024-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_iso8601_millis(1_704_067_200_000),
+            "2024-01-01T00:00:00.000Z"
+        );
     }
 }

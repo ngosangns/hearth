@@ -17,14 +17,19 @@ use serde_json::{json, Map, Value};
 use crate::shared::install::ensure_installed;
 use crate::shared::ports::{allocate_ports, bind_all, MAX_SHARED_PORTS};
 use crate::shared::registry::{InstallState, SharedAttachment, SharedInstance};
-use crate::shared::render::{instance_vars, project_vars, render_command_checked, render_connection};
+use crate::shared::render::{
+    instance_vars, project_vars, render_command_checked, render_connection,
+};
 use crate::shared::synthesize::synthesize_catalog;
 use crate::shared::{output_with_timeout, project_id, SharedContext, SharedError};
 use crate::state::ActualServiceState;
 use crate::supervisor::command_argv;
 use crate::supervisor::types::Host;
 
-use super::http::{ensure_not_closing, json_response, now, parse_bool_flag, strict_body, HearthManager, HttpResult, ManagerHttpError};
+use super::http::{
+    ensure_not_closing, json_response, now, parse_bool_flag, strict_body, HearthManager,
+    HttpResult, ManagerHttpError,
+};
 
 const RECIPE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -148,28 +153,49 @@ async fn get_shared(State(manager): State<Arc<HearthManager>>) -> HttpResult<Res
             })
         })
         .collect();
-    Ok(json_response(json!({ "instances": instances }), StatusCode::OK))
+    Ok(json_response(
+        json!({ "instances": instances }),
+        StatusCode::OK,
+    ))
 }
 
 async fn get_shared_catalog(State(manager): State<Arc<HearthManager>>) -> HttpResult<Response> {
     let ctx = shared_ctx(&manager)?;
     let doc = ctx.remote.load(false).await.map_err(shared_err)?;
-    Ok(json_response(json!({ "catalog": doc.as_ref() }), StatusCode::OK))
+    Ok(json_response(
+        json!({ "catalog": doc.as_ref() }),
+        StatusCode::OK,
+    ))
 }
 
 // -----------------------------------------------------------------------------------------
 // Mutations
 // -----------------------------------------------------------------------------------------
 
-async fn post_shared_attach(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
-    Ok(json_response(shared_attach(&manager, &bytes).await?, StatusCode::OK))
+async fn post_shared_attach(
+    State(manager): State<Arc<HearthManager>>,
+    bytes: Bytes,
+) -> HttpResult<Response> {
+    Ok(json_response(
+        shared_attach(&manager, &bytes).await?,
+        StatusCode::OK,
+    ))
 }
 
-async fn post_shared_detach(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
-    Ok(json_response(shared_detach(&manager, &bytes).await?, StatusCode::OK))
+async fn post_shared_detach(
+    State(manager): State<Arc<HearthManager>>,
+    bytes: Bytes,
+) -> HttpResult<Response> {
+    Ok(json_response(
+        shared_detach(&manager, &bytes).await?,
+        StatusCode::OK,
+    ))
 }
 
-async fn post_shared_install(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
+async fn post_shared_install(
+    State(manager): State<Arc<HearthManager>>,
+    bytes: Bytes,
+) -> HttpResult<Response> {
     ensure_not_closing(&manager)?;
     let ctx = shared_ctx(&manager)?;
     let body = strict_body(&bytes, &["service"], &["service"])?;
@@ -188,7 +214,10 @@ async fn post_shared_install(State(manager): State<Arc<HearthManager>>, bytes: B
 /// directory holds every attached project's databases, so an instance with attachments is refused
 /// (409 `shared_service_attached`) unless the caller sends `force: true` after its own explicit
 /// confirmation.
-async fn post_shared_remove(State(manager): State<Arc<HearthManager>>, bytes: Bytes) -> HttpResult<Response> {
+async fn post_shared_remove(
+    State(manager): State<Arc<HearthManager>>,
+    bytes: Bytes,
+) -> HttpResult<Response> {
     ensure_not_closing(&manager)?;
     let ctx = shared_ctx(&manager)?;
     let body = strict_body(&bytes, &["service", "force"], &["service"])?;
@@ -205,7 +234,11 @@ async fn post_shared_remove(State(manager): State<Arc<HearthManager>>, bytes: By
         ));
     };
     if !force && !instance.attachments.is_empty() {
-        let projects: Vec<&str> = instance.attachments.values().map(|a| a.project_root.as_str()).collect();
+        let projects: Vec<&str> = instance
+            .attachments
+            .values()
+            .map(|a| a.project_root.as_str())
+            .collect();
         return Err(ManagerHttpError::new(
             StatusCode::CONFLICT,
             "shared_service_attached",
@@ -223,7 +256,10 @@ async fn post_shared_remove(State(manager): State<Arc<HearthManager>>, bytes: By
         .map_err(|e| shared_err(SharedError(e.0)))?;
     ctx.registry.remove(&id).map_err(shared_err)?;
     sync_catalog(&manager, &ctx).await.map_err(shared_err)?;
-    let (install_dir, data_dir) = (instance.install_dir(&ctx.root), instance.data_dir(&ctx.root));
+    let (install_dir, data_dir) = (
+        instance.install_dir(&ctx.root),
+        instance.data_dir(&ctx.root),
+    );
     let _ = tokio::task::spawn_blocking(move || {
         let _ = crate::file_io::remove_directory(&install_dir);
         let _ = crate::file_io::remove_directory(&data_dir);
@@ -268,7 +304,10 @@ async fn register_instance(
             return Err(ManagerHttpError::new(
                 StatusCode::BAD_REQUEST,
                 "too_many_ports",
-                format!("{id} pins {} ports; the maximum is {MAX_SHARED_PORTS}", recipe.ports.len()),
+                format!(
+                    "{id} pins {} ports; the maximum is {MAX_SHARED_PORTS}",
+                    recipe.ports.len()
+                ),
             ));
         }
         if !bind_all(&recipe.ports).await {
@@ -323,7 +362,12 @@ async fn register_instance(
         .map_err(shared_err)
 }
 
-fn set_install_state(ctx: &SharedContext, id: &str, state: InstallState, error: Option<String>) -> HttpResult<()> {
+fn set_install_state(
+    ctx: &SharedContext,
+    id: &str,
+    state: InstallState,
+    error: Option<String>,
+) -> HttpResult<()> {
     ctx.registry
         .update(|d| {
             if let Some(i) = d.instances.get_mut(id) {
@@ -402,7 +446,10 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     let attach_args: Vec<String> = match body.get("args") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => match v.as_array() {
-            Some(items) if items.iter().all(Value::is_string) => items.iter().filter_map(|s| s.as_str().map(str::to_string)).collect(),
+            Some(items) if items.iter().all(Value::is_string) => items
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect(),
             _ => {
                 return Err(ManagerHttpError::new(
                     StatusCode::BAD_REQUEST,
@@ -458,8 +505,13 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     // provisioning on every attach.
     let mut vars = instance_vars(&instance, &ctx.root);
     project_vars(&mut vars, &pid);
-    vars.insert("projectRoot".to_string(), project_root.display().to_string());
-    let invalid_recipe = |e: SharedError| ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid_recipe", e.0);
+    vars.insert(
+        "projectRoot".to_string(),
+        project_root.display().to_string(),
+    );
+    let invalid_recipe = |e: SharedError| {
+        ManagerHttpError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid_recipe", e.0)
+    };
     let mut commands = Vec::with_capacity(instance.recipe.provision.len());
     for step in &instance.recipe.provision {
         commands.push(render_command_checked(step, &vars, "provision").map_err(invalid_recipe)?);
@@ -481,9 +533,12 @@ async fn shared_attach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
         // attaching project's rendered conf directory as a trailing argument.
         if !attach_args.is_empty() {
             match &mut command {
-                crate::catalog::CommandSpec::Argv { argv } => argv.extend(attach_args.iter().cloned()),
+                crate::catalog::CommandSpec::Argv { argv } => {
+                    argv.extend(attach_args.iter().cloned())
+                }
                 crate::catalog::CommandSpec::Shell { .. } => {
-                    provision_error = Some("attach args require argv provision commands".to_string());
+                    provision_error =
+                        Some("attach args require argv provision commands".to_string());
                     break;
                 }
             }
@@ -573,7 +628,10 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     // template doesn't render is skipped rather than run with a literal `{var}` in it.
     let mut vars = instance_vars(&instance, &ctx.root);
     project_vars(&mut vars, &pid);
-    vars.insert("projectRoot".to_string(), project_root.display().to_string());
+    vars.insert(
+        "projectRoot".to_string(),
+        project_root.display().to_string(),
+    );
     for step in &instance.recipe.deprovision {
         if let Ok(command) = render_command_checked(step, &vars, "deprovision") {
             let _ = run_recipe_command(&command, &instance.data_dir(&ctx.root)).await;
@@ -586,7 +644,11 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
             }
         })
         .map_err(shared_err)?;
-    publish(manager, "shared.detach", json!({ "service": id, "projectId": pid }));
+    publish(
+        manager,
+        "shared.detach",
+        json!({ "service": id, "projectId": pid }),
+    );
     Ok(json!({ "detached": id, "projectId": pid }))
 }
 
@@ -887,7 +949,13 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         let body: Value = refused.json().await.unwrap();
         assert_eq!(body["error"]["code"], json!("shared_service_attached"));
-        assert!(manager.shared.as_ref().unwrap().registry.get("fakesvc@1.0").is_some());
+        assert!(manager
+            .shared
+            .as_ref()
+            .unwrap()
+            .registry
+            .get("fakesvc@1.0")
+            .is_some());
 
         let forced = authed(&http, &manager, reqwest::Method::POST, "/v1/shared/remove")
             .json(&json!({ "service": "fakesvc@1.0", "force": true }))
@@ -895,7 +963,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(forced.status(), StatusCode::OK);
-        assert!(manager.shared.as_ref().unwrap().registry.get("fakesvc@1.0").is_none());
+        assert!(manager
+            .shared
+            .as_ref()
+            .unwrap()
+            .registry
+            .get("fakesvc@1.0")
+            .is_none());
         manager.close().await;
     }
 

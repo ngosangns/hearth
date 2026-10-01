@@ -1,6 +1,7 @@
 *.log
 .DS_Store
 .claude/settings.local.json
-apps/macos/.build/
 rust/target/
 /dist/
+rust/crates/hearth-web/ui/node_modules/
+rust/crates/hearth-web/ui/dist/

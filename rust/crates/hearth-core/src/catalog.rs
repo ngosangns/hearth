@@ -102,7 +102,11 @@ pub struct PreparationCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "commandStatus", rename_all = "lowercase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "commandStatus",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ServiceRunProfile {
     Verified {
         command: ServiceCommand,
@@ -199,8 +203,8 @@ pub struct ServicePort {
     pub requires_running: Option<bool>,
 }
 
-/// A URL where a service can be reached, surfaced by every client (CLI `urls`, TUI, MCP `status`,
-/// the macOS app). `url` may contain placeholders from `SERVICE_URL_PLACEHOLDERS`, resolved by the
+/// A URL where a service can be reached, surfaced by every client (CLI `urls`, TUI, web, MCP
+/// `status`). `url` may contain placeholders from `SERVICE_URL_PLACEHOLDERS`, resolved by the
 /// daemon at request time — `{tailnetHost}` becomes this machine's Tailscale DNS name, so a catalog
 /// shared across machines never hardcodes one machine's hostname. `requires_running: Some(false)`
 /// marks a URL that works even while this service is stopped. Mirrors `ServiceUrl` in the TS source.
@@ -251,15 +255,23 @@ pub fn template_var_spans(text: &str) -> Vec<(usize, &str)> {
         .into_iter()
         .filter(|(start, name)| {
             !text[..*start].ends_with('$')
-                && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
         })
         .collect()
 }
 
 /// Names of every `{name}` template var in `text` — see `template_var_spans`.
 pub fn template_vars(text: &str) -> Vec<&str> {
-    template_var_spans(text).into_iter().map(|(_, name)| name).collect()
+    template_var_spans(text)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect()
 }
 
 /// The first template var in `text` that `is_known` rejects.
@@ -292,7 +304,10 @@ pub struct UnresolvedServiceUrl {
 
 /// Substitutes every placeholder in every service URL, in catalog order. `lookup` answers one
 /// placeholder name; it is injected so this stays testable without a real Tailscale.
-pub fn resolve_service_urls(catalog: &ServiceCatalog, lookup: impl Fn(&str) -> Option<String>) -> (Vec<ResolvedServiceUrl>, Vec<UnresolvedServiceUrl>) {
+pub fn resolve_service_urls(
+    catalog: &ServiceCatalog,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (Vec<ResolvedServiceUrl>, Vec<UnresolvedServiceUrl>) {
     let mut resolved = Vec::new();
     let mut unresolved = Vec::new();
     for service in &catalog.services {
@@ -302,12 +317,21 @@ pub fn resolve_service_urls(catalog: &ServiceCatalog, lookup: impl Fn(&str) -> O
                 match lookup(name) {
                     Some(value) => url = url.replace(&format!("{{{name}}}"), &value),
                     None => {
-                        unresolved.push(UnresolvedServiceUrl { service_id: service.id.clone(), url: entry.url.clone(), placeholder: name.to_string() });
+                        unresolved.push(UnresolvedServiceUrl {
+                            service_id: service.id.clone(),
+                            url: entry.url.clone(),
+                            placeholder: name.to_string(),
+                        });
                         continue 'entries;
                     }
                 }
             }
-            resolved.push(ResolvedServiceUrl { service_id: service.id.clone(), label: entry.label.clone(), url, requires_running: entry.requires_running != Some(false) });
+            resolved.push(ResolvedServiceUrl {
+                service_id: service.id.clone(),
+                label: entry.label.clone(),
+                url,
+                requires_running: entry.requires_running != Some(false),
+            });
         }
     }
     (resolved, unresolved)
@@ -412,7 +436,10 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
     for group_name in group_names {
         for member in &catalog.groups[group_name] {
             if !services.contains_key(member) {
-                errors.push(format!("group {} references unknown service {}", group_name, member));
+                errors.push(format!(
+                    "group {} references unknown service {}",
+                    group_name, member
+                ));
             }
         }
     }
@@ -435,7 +462,8 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
         }
         for (index, entry) in service.urls.iter().flatten().enumerate() {
             let place = format!("{}:urls[{index}]", service.id);
-            let well_formed = (entry.url.starts_with("http://") || entry.url.starts_with("https://"))
+            let well_formed = (entry.url.starts_with("http://")
+                || entry.url.starts_with("https://"))
                 && entry.url.len() > entry.url.find("://").map_or(0, |i| i + 3)
                 && !entry.url.chars().any(char::is_whitespace);
             if !well_formed {
@@ -444,28 +472,47 @@ pub fn validate_catalog(catalog: &ServiceCatalog) -> CatalogValidation {
             }
             for name in service_url_placeholders(&entry.url) {
                 if !SERVICE_URL_PLACEHOLDERS.contains(&name) {
-                    let known = SERVICE_URL_PLACEHOLDERS.iter().map(|k| format!("{{{k}}}")).collect::<Vec<_>>().join(", ");
-                    errors.push(format!("{place} has unknown placeholder {{{name}}} (known: {known})"));
+                    let known = SERVICE_URL_PLACEHOLDERS
+                        .iter()
+                        .map(|k| format!("{{{k}}}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    errors.push(format!(
+                        "{place} has unknown placeholder {{{name}}} (known: {known})"
+                    ));
                 }
             }
-            if entry.label.as_deref().is_some_and(|label| label.trim().is_empty()) {
+            if entry
+                .label
+                .as_deref()
+                .is_some_and(|label| label.trim().is_empty())
+            {
                 errors.push(format!("{place}.label must be a non-empty string"));
             }
         }
         if matches!(profile.readiness(), ReadinessSpec::Exit) {
             if matches!(service.ownership, Some(ServiceOwnership::External)) {
-                errors.push(format!("{}: readiness exit requires a daemon-owned service", service.id));
+                errors.push(format!(
+                    "{}: readiness exit requires a daemon-owned service",
+                    service.id
+                ));
             }
             if let ServiceRunProfile::Verified { command, .. } = profile {
                 if is_container_command(command) {
-                    errors.push(format!("{}: readiness exit cannot run a container command", service.id));
+                    errors.push(format!(
+                        "{}: readiness exit cannot run a container command",
+                        service.id
+                    ));
                 }
             }
         }
         if let ReadinessSpec::Tcp { port } = profile.readiness() {
             if let Some(existing) = verified_ports.get(port) {
                 if *existing != &service.id {
-                    errors.push(format!("port {} is shared by {} and {}", port, existing, service.id));
+                    errors.push(format!(
+                        "port {} is shared by {} and {}",
+                        port, existing, service.id
+                    ));
                 }
             }
             verified_ports.insert(*port, &service.id);
@@ -494,7 +541,9 @@ mod tests {
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
-                        command: CommandSpec::Argv { argv: vec![id.to_string()] },
+                        command: CommandSpec::Argv {
+                            argv: vec![id.to_string()],
+                        },
                         cwd: ".".to_string(),
                         environment: None,
                         container_name: None,
@@ -523,7 +572,9 @@ mod tests {
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
                     command: ServiceCommand {
-                        command: CommandSpec::Argv { argv: vec![id.to_string()] },
+                        command: CommandSpec::Argv {
+                            argv: vec![id.to_string()],
+                        },
                         cwd: ".".to_string(),
                         environment: None,
                         container_name: None,
@@ -547,7 +598,12 @@ mod tests {
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
             groups: groups
                 .iter()
-                .map(|(name, members)| (name.to_string(), members.iter().map(|m| m.to_string()).collect()))
+                .map(|(name, members)| {
+                    (
+                        name.to_string(),
+                        members.iter().map(|m| m.to_string()).collect(),
+                    )
+                })
                 .collect(),
             group_tree: Vec::new(),
             services,
@@ -559,14 +615,25 @@ mod tests {
 
     #[test]
     fn accepts_a_well_formed_catalog_with_services_and_groups() {
-        let c = catalog(vec![argv_service("nginx"), argv_service("api")], &[("all", &["nginx", "api"])]);
-        assert_eq!(validate_catalog(&c), CatalogValidation { errors: vec![], warnings: vec![] });
+        let c = catalog(
+            vec![argv_service("nginx"), argv_service("api")],
+            &[("all", &["nginx", "api"])],
+        );
+        assert_eq!(
+            validate_catalog(&c),
+            CatalogValidation {
+                errors: vec![],
+                warnings: vec![]
+            }
+        );
     }
 
     #[test]
     fn rejects_a_duplicate_service_id() {
         let c = catalog(vec![argv_service("api"), argv_service("api")], &[]);
-        assert!(validate_catalog(&c).errors.contains(&"duplicate service api".to_string()));
+        assert!(validate_catalog(&c)
+            .errors
+            .contains(&"duplicate service api".to_string()));
     }
 
     #[test]
@@ -580,7 +647,9 @@ mod tests {
     #[test]
     fn rejects_two_services_sharing_the_same_tcp_readiness_port() {
         let c = catalog(vec![tcp_service("a", 8080), tcp_service("b", 8080)], &[]);
-        assert!(validate_catalog(&c).errors.contains(&"port 8080 is shared by a and b".to_string()));
+        assert!(validate_catalog(&c)
+            .errors
+            .contains(&"port 8080 is shared by a and b".to_string()));
     }
 
     #[test]
@@ -593,7 +662,12 @@ mod tests {
                 ownership: None,
                 disabled: false,
                 profiles: ServiceProfiles {
-                    run: ServiceRunProfile::Unresolved { readiness: ReadinessSpec::Process, readiness_timeout_ms: None, preparation: None, preparation_command: None },
+                    run: ServiceRunProfile::Unresolved {
+                        readiness: ReadinessSpec::Process,
+                        readiness_timeout_ms: None,
+                        preparation: None,
+                        preparation_command: None,
+                    },
                     build: None,
                 },
                 ports: None,
@@ -604,7 +678,10 @@ mod tests {
         );
         let validation = validate_catalog(&c);
         assert_eq!(validation.errors, Vec::<String>::new());
-        assert_eq!(validation.warnings, vec!["wip:run command is unresolved".to_string()]);
+        assert_eq!(
+            validation.warnings,
+            vec!["wip:run command is unresolved".to_string()]
+        );
     }
 
     #[test]
@@ -612,7 +689,9 @@ mod tests {
         let mut service = argv_service("api");
         service.profiles.build = Some(ServiceBuildProfile {
             command: ServiceCommand {
-                command: CommandSpec::Argv { argv: vec!["build".to_string()] },
+                command: CommandSpec::Argv {
+                    argv: vec!["build".to_string()],
+                },
                 cwd: ".".to_string(),
                 environment: None,
                 container_name: None,
@@ -624,7 +703,9 @@ mod tests {
             serialization_key: None,
         });
         let c = catalog(vec![service], &[]);
-        assert!(validate_catalog(&c).errors.contains(&"api:build has an invalid timeout".to_string()));
+        assert!(validate_catalog(&c)
+            .errors
+            .contains(&"api:build has an invalid timeout".to_string()));
     }
 
     #[test]
@@ -643,15 +724,24 @@ mod tests {
             start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
             private_file_guard: None,
         };
-        assert!(validate_catalog(&catalog).errors.iter().any(|error| error.contains("daemon-owned")));
+        assert!(validate_catalog(&catalog)
+            .errors
+            .iter()
+            .any(|error| error.contains("daemon-owned")));
 
         let mut container = argv_service("job");
-        if let ServiceRunProfile::Verified { command, readiness, .. } = &mut container.profiles.run {
+        if let ServiceRunProfile::Verified {
+            command, readiness, ..
+        } = &mut container.profiles.run
+        {
             command.container_name = Some("job".to_string());
             *readiness = ReadinessSpec::Exit;
         }
         catalog.services = vec![container];
-        assert!(validate_catalog(&catalog).errors.iter().any(|error| error.contains("container")));
+        assert!(validate_catalog(&catalog)
+            .errors
+            .iter()
+            .any(|error| error.contains("container")));
     }
 
     // Wire-format regression — see the equivalent tests in state.rs for why this matters.
@@ -662,7 +752,9 @@ mod tests {
         assert!(json.get("startFailurePolicy").is_some(), "{json:?}");
 
         let command = ServiceCommand {
-            command: CommandSpec::Argv { argv: vec!["x".to_string()] },
+            command: CommandSpec::Argv {
+                argv: vec!["x".to_string()],
+            },
             cwd: ".".to_string(),
             environment: None,
             container_name: Some("proj-db".to_string()),
@@ -671,22 +763,41 @@ mod tests {
         let json = serde_json::to_value(&command).unwrap();
         assert!(json.get("containerName").is_some(), "{json:?}");
 
-        let profile = ServiceRunProfile::Verified { command, readiness: ReadinessSpec::Process, readiness_timeout_ms: Some(1000), preparation: None, preparation_command: None };
+        let profile = ServiceRunProfile::Verified {
+            command,
+            readiness: ReadinessSpec::Process,
+            readiness_timeout_ms: Some(1000),
+            preparation: None,
+            preparation_command: None,
+        };
         let json = serde_json::to_value(&profile).unwrap();
         assert!(json.get("readinessTimeoutMs").is_some(), "{json:?}");
-        assert_eq!(json.get("commandStatus").and_then(|v| v.as_str()), Some("verified"));
+        assert_eq!(
+            json.get("commandStatus").and_then(|v| v.as_str()),
+            Some("verified")
+        );
     }
 
     #[test]
     fn resolves_placeholders_and_reports_the_ones_it_cannot() {
         let mut api = tcp_service("api", 18080);
         api.urls = Some(vec![
-            ServiceUrl { url: "http://127.0.0.1:8080".into(), label: None, requires_running: None },
-            ServiceUrl { url: "https://{tailnetHost}:8443".into(), label: Some("admin".into()), requires_running: Some(false) },
+            ServiceUrl {
+                url: "http://127.0.0.1:8080".into(),
+                label: None,
+                requires_running: None,
+            },
+            ServiceUrl {
+                url: "https://{tailnetHost}:8443".into(),
+                label: Some("admin".into()),
+                requires_running: Some(false),
+            },
         ]);
         let catalog = catalog(vec![api], &[]);
 
-        let (urls, unresolved) = resolve_service_urls(&catalog, |name| (name == "tailnetHost").then(|| "box.tail.ts.net".to_string()));
+        let (urls, unresolved) = resolve_service_urls(&catalog, |name| {
+            (name == "tailnetHost").then(|| "box.tail.ts.net".to_string())
+        });
         assert!(unresolved.is_empty());
         assert_eq!(urls[0].url, "http://127.0.0.1:8080");
         assert!(urls[0].requires_running, "requiresRunning defaults to true");
@@ -697,21 +808,40 @@ mod tests {
         // No Tailscale on this machine: the templated URL is reported, not silently dropped.
         let (urls, unresolved) = resolve_service_urls(&catalog, |_| None);
         assert_eq!(urls.len(), 1);
-        assert_eq!(unresolved, vec![UnresolvedServiceUrl { service_id: "api".into(), url: "https://{tailnetHost}:8443".into(), placeholder: "tailnetHost".into() }]);
+        assert_eq!(
+            unresolved,
+            vec![UnresolvedServiceUrl {
+                service_id: "api".into(),
+                url: "https://{tailnetHost}:8443".into(),
+                placeholder: "tailnetHost".into()
+            }]
+        );
     }
 
     #[test]
     fn extracts_placeholder_names_in_order() {
-        assert_eq!(service_url_placeholders("https://{tailnetHost}:{port}/x"), vec!["tailnetHost", "port"]);
+        assert_eq!(
+            service_url_placeholders("https://{tailnetHost}:{port}/x"),
+            vec!["tailnetHost", "port"]
+        );
         assert!(service_url_placeholders("http://127.0.0.1:1").is_empty());
     }
 
     #[test]
     fn template_vars_scan_every_brace_and_skip_shell_expansions() {
         assert_eq!(template_vars("{a b} {port2}"), vec!["port2"]);
-        assert_eq!(template_vars("cd ${HOME} && awk '{print $1}' {dataDir}"), vec!["dataDir"]);
+        assert_eq!(
+            template_vars("cd ${HOME} && awk '{print $1}' {dataDir}"),
+            vec!["dataDir"]
+        );
         assert_eq!(template_vars("{{installDir}}"), vec!["installDir"]);
-        assert_eq!(unknown_template_var("{port} {projectDB}", |n| n == "port"), Some("projectDB"));
-        assert_eq!(unknown_template_var("${HOME}/{port}", |n| n == "port"), None);
+        assert_eq!(
+            unknown_template_var("{port} {projectDB}", |n| n == "port"),
+            Some("projectDB")
+        );
+        assert_eq!(
+            unknown_template_var("${HOME}/{port}", |n| n == "port"),
+            None
+        );
     }
 }

@@ -1,33 +1,27 @@
 version: "3"
 
 vars:
-  MACOS_DIR: apps/macos
-  APP_NAME: Hearth.app
-  HEARTHD_BIN: "/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd"
+  HEARTHD_BIN: '{{env "HOME"}}/.local/bin/hearthd'
 
 tasks:
-  dev:
-    desc: Build, launch, and watch the app — rebuilds and relaunches on every source change (fswatch)
-    dir: "{{.MACOS_DIR}}"
-    cmds:
-      - ./scripts/dev.sh
-
-  rust:test:
+  test:
     desc: Run the Rust workspace test suite (needs docker running, tailscale, nc, ps, sh)
     dir: rust
     cmds:
       - cargo test --workspace
 
-  rust:clippy:
+  clippy:
     desc: Lint the Rust workspace exactly as CI does (warnings are errors)
     dir: rust
     cmds:
       - cargo clippy --workspace --all-targets -- -D warnings
 
-  rust:install:
-    desc: Build the hearthd binary in release mode and install it into Hearth.app (ad-hoc signed)
+  install:
+    desc: Build release hearthd and install it onto ~/.local/bin (ad-hoc signed)
     dir: rust
     cmds:
+      - npm --prefix crates/hearth-web/ui ci
+      - npm --prefix crates/hearth-web/ui run build
       - cargo build --release -p hearthd
       - mkdir -p "$(dirname "{{.HEARTHD_BIN}}")"
       - cp target/release/hearthd "{{.HEARTHD_BIN}}"
@@ -51,45 +45,7 @@ tasks:
       - scripts/catalog/smoke.sh
 
   ci:
-    desc: Everything CI runs (Rust test + clippy, macOS app build)
+    desc: Everything CI runs (Rust test + clippy)
     cmds:
-      - task: rust:test
-      - task: rust:clippy
-      - task: macos:build
-
-  macos:build:
-    desc: Build the SwiftUI desktop app (debug)
-    dir: "{{.MACOS_DIR}}"
-    cmds:
-      - swift build
-
-  macos:test:
-    desc: Run the SwiftUI app's unit tests (needs a full Xcode install — absent on the CI runner)
-    dir: "{{.MACOS_DIR}}"
-    cmds:
-      - swift test
-
-  macos:icon:
-    desc: Regenerate AppIcon.icns from scripts/make-icon.swift
-    dir: "{{.MACOS_DIR}}"
-    cmds:
-      - ./scripts/generate-icon.sh
-
-  macos:package:
-    desc: Package a local ad-hoc-signed "Hearth.app" (release build)
-    dir: "{{.MACOS_DIR}}"
-    cmds:
-      - ./scripts/build-app.sh release
-
-  macos:install:
-    desc: Package the app and install it into /Applications, replacing any running/existing copy, then launch it
-    deps: [macos:package]
-    dir: "{{.MACOS_DIR}}"
-    cmds:
-      - pkill -f "{{.APP_NAME}}/Contents/MacOS/HearthApp" || true
-      - rm -rf "/Applications/{{.APP_NAME}}"
-      - cp -R ".build/{{.APP_NAME}}" "/Applications/{{.APP_NAME}}"
-      # LaunchServices may not have registered the freshly-copied bundle yet and answers -600 —
-      # give it a beat, then retry once.
-      - open "/Applications/{{.APP_NAME}}" || { sleep 1; open "/Applications/{{.APP_NAME}}"; }
-
+      - task: test
+      - task: clippy

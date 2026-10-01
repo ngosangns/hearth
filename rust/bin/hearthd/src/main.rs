@@ -1,11 +1,14 @@
-//! `hearthd`: the daemon, the CLI, the TUI and the MCP server in one binary. `hearthd daemon` and
-//! `hearthd smp` run a manager in the foreground (and are what `ensure` spawns detached); `tui` and
-//! bare `mcp` are intercepted here because `hearth-cli` cannot depend on `hearth-tui`/`hearth-mcp`;
-//! every other subcommand delegates to `hearth_cli::main`.
+//! `hearthd`: the daemon, the CLI, the TUI, the browser GUI and the MCP server in one binary.
+//! `hearthd daemon` and `hearthd smp` run a manager in the foreground (and are what `ensure` spawns
+//! detached); `tui`, `web` and bare `mcp` are intercepted here because `hearth-cli` cannot depend on
+//! `hearth-tui`/`hearth-mcp`/`hearth-web`; every other subcommand delegates to `hearth_cli::main`.
 use std::path::{Path, PathBuf};
 
 fn report_config_error(root: &Path, errors: &[String]) {
-    eprintln!("hearthd: could not load a service catalog for {}", root.display());
+    eprintln!(
+        "hearthd: could not load a service catalog for {}",
+        root.display()
+    );
     for error in errors {
         eprintln!("  - {error}");
     }
@@ -14,9 +17,22 @@ fn report_config_error(root: &Path, errors: &[String]) {
 /// Runs one manager in the foreground until it shuts down. A bootstrap failure exits non-zero:
 /// the daemon is spawned by `ensure()`, and exiting 0 after failing to start would make a broken
 /// daemon indistinguishable from a healthy one.
-async fn run_manager(root: PathBuf, runtime_directory: PathBuf, catalog: hearth_core::catalog::ServiceCatalog, shared: Option<std::sync::Arc<hearth_core::shared::SharedContext>>) -> i32 {
-    let base_environment = hearth_core::env::resolve_base_environment(hearth_core::env::BaseEnvironmentOptions { root: Some(root.clone()), ..Default::default() });
-    let supervisor = hearth_core::supervisor::default_supervisor_options(root.clone(), Some(runtime_directory.clone()), Some(base_environment));
+async fn run_manager(
+    root: PathBuf,
+    runtime_directory: PathBuf,
+    catalog: hearth_core::catalog::ServiceCatalog,
+    shared: Option<std::sync::Arc<hearth_core::shared::SharedContext>>,
+) -> i32 {
+    let base_environment =
+        hearth_core::env::resolve_base_environment(hearth_core::env::BaseEnvironmentOptions {
+            root: Some(root.clone()),
+            ..Default::default()
+        });
+    let supervisor = hearth_core::supervisor::default_supervisor_options(
+        root.clone(),
+        Some(runtime_directory.clone()),
+        Some(base_environment),
+    );
     let started = hearth_core::daemon::run_daemon(
         hearth_core::manager::HearthManagerOptions {
             runtime_directory: Some(runtime_directory),
@@ -51,7 +67,10 @@ async fn run_daemon_subcommand(root: PathBuf, rest: &[String]) -> i32 {
             return 1;
         }
     };
-    let runtime_directory = hearth_core::paths::resolve_runtime_directory(&root, loaded.catalog.runtime_directory.as_deref());
+    let runtime_directory = hearth_core::paths::resolve_runtime_directory(
+        &root,
+        loaded.catalog.runtime_directory.as_deref(),
+    );
     run_manager(root, runtime_directory, loaded.catalog, None).await
 }
 
@@ -73,7 +92,10 @@ async fn run_smp_subcommand(rest: &[String]) -> i32 {
             return 1;
         }
     };
-    let catalog = match hearth_core::shared::synthesize::synthesize_catalog(&ctx.root, &ctx.registry.list()) {
+    let catalog = match hearth_core::shared::synthesize::synthesize_catalog(
+        &ctx.root,
+        &ctx.registry.list(),
+    ) {
         Ok(catalog) => catalog,
         Err(error) => {
             eprintln!("hearthd smp: cannot synthesize catalog: {error}");
@@ -89,7 +111,11 @@ async fn run_smp_subcommand(rest: &[String]) -> i32 {
 fn spawn_detached(args: &[&str], cwd: Option<&Path>) {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearthd"));
     let mut command = std::process::Command::new(exe);
-    command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -116,11 +142,19 @@ fn spawn_smp(_root: &Path) {
 async fn run_mcp_subcommand(root: PathBuf, catalog: hearth_core::catalog::ServiceCatalog) -> i32 {
     use rmcp::ServiceExt;
     let known_service_ids = catalog.services.iter().map(|s| s.id.clone()).collect();
-    let options = hearth_cli::LocalctlOptions { catalog, spawn_daemon: Box::new(spawn_daemon) };
+    let options = hearth_cli::LocalctlOptions {
+        catalog,
+        spawn_daemon: Box::new(spawn_daemon),
+    };
     let client = hearth_mcp::ManagerApiClient::new(root, options);
     let server = hearth_mcp::create_hearth_mcp_server(
         std::sync::Arc::new(client),
-        hearth_mcp::CreateHearthMcpServerOptions { name: "hearth".to_string(), tool_prefix: "local_services_".to_string(), known_service_ids, ..Default::default() },
+        hearth_mcp::CreateHearthMcpServerOptions {
+            name: "hearth".to_string(),
+            tool_prefix: "local_services_".to_string(),
+            known_service_ids,
+            ..Default::default()
+        },
     );
     let running = match server.serve(rmcp::transport::stdio()).await {
         Ok(running) => running,
@@ -143,7 +177,7 @@ async fn run_mcp_subcommand(root: PathBuf, catalog: hearth_core::catalog::Servic
 /// bad first experience for someone who just installed the binary.
 fn print_help() {
     println!(
-        "hearthd — local dev services daemon, CLI, TUI and MCP server
+        "hearthd — local dev services daemon, CLI, TUI, browser GUI and MCP server
 
 usage: hearthd [--root <path>] <command> [options]
 
@@ -161,6 +195,7 @@ usage: hearthd [--root <path>] <command> [options]
   shared list|installed|status          inspect the shared service registry and smp
   shared attach|detach|probe <id>       attach this project to a shared service (used by hearth.yaml `shared:`)
   shared install|start|stop|remove <id> manage a shared service instance
+  web [--port N] [--no-open]            browser GUI on 127.0.0.1
   tui                                   interactive terminal UI
   mcp                                   serve the MCP tool surface over stdio
   mcp install [--name N] [--key K] <config-file>...
@@ -188,7 +223,27 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
     // project `hearth.yaml` (the project root, when a command needs one for attach/probe identity,
     // is just the cwd).
     if rest.first().map(String::as_str) == Some("shared") {
-        return hearth_cli::shared::run(&root, &rest[1..], &mut hearth_cli::Io { out: &mut |s: &str| println!("{s}"), err: &mut |s: &str| eprintln!("{s}"), confirm: None }, std::sync::Arc::new(spawn_smp)).await;
+        return hearth_cli::shared::run(
+            &root,
+            &rest[1..],
+            &mut hearth_cli::Io {
+                out: &mut |s: &str| println!("{s}"),
+                err: &mut |s: &str| eprintln!("{s}"),
+                confirm: None,
+            },
+            std::sync::Arc::new(spawn_smp),
+        )
+        .await;
+    }
+    // The browser GUI is the app shell: it does not need a hearth.yaml in the current directory.
+    if rest.first().map(String::as_str) == Some("web") {
+        return hearth_web::run(
+            &root,
+            &rest[1..],
+            std::sync::Arc::new(spawn_daemon),
+            std::sync::Arc::new(spawn_smp),
+        )
+        .await;
     }
     let loaded = match hearth_core::config_file::load_catalog(&root) {
         Ok(loaded) => loaded,
@@ -216,7 +271,10 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
     if rest.first().map(String::as_str) == Some("mcp") && rest.len() == 1 {
         return run_mcp_subcommand(root, loaded.catalog).await;
     }
-    let options = hearth_cli::LocalctlOptions { catalog: loaded.catalog, spawn_daemon: Box::new(spawn_daemon) };
+    let options = hearth_cli::LocalctlOptions {
+        catalog: loaded.catalog,
+        spawn_daemon: Box::new(spawn_daemon),
+    };
     let mut out = |s: &str| println!("{s}");
     let mut err = |s: &str| eprintln!("{s}");
     // The port-conflict "kill the holder?" prompt, wired only on an interactive stdin. Scripts,
@@ -234,8 +292,16 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
         use std::io::IsTerminal;
         std::io::stdin().is_terminal()
     };
-    let confirm: Option<&mut dyn FnMut(&str) -> bool> = if interactive { Some(&mut confirm) } else { None };
-    let mut io = hearth_cli::Io { out: &mut out, err: &mut err, confirm };
+    let confirm: Option<&mut dyn FnMut(&str) -> bool> = if interactive {
+        Some(&mut confirm)
+    } else {
+        None
+    };
+    let mut io = hearth_cli::Io {
+        out: &mut out,
+        err: &mut err,
+        confirm,
+    };
     hearth_cli::main(&options, &root, &rest, &mut io).await
 }
 
@@ -244,10 +310,16 @@ fn main() {
     // Needed because a GUI-spawned `hearthd` (and the daemon it spawns) inherits launchd's bare PATH,
     // under which `docker`, `tailscale` and `bun` cannot be found — see
     // `hearth_core::env::with_known_tool_directories`.
-    let path = hearth_core::env::with_known_tool_directories(std::env::var_os("PATH").as_deref(), std::env::var_os("HOME").as_deref());
+    let path = hearth_core::env::with_known_tool_directories(
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
     std::env::set_var("PATH", path);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     let code = runtime.block_on(async {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         // `smp` has its own fixed root, so it is dispatched before `--root` is parsed.

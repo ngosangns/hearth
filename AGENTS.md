@@ -6,53 +6,32 @@ architecture, and sharp edges. Add durable notes here as real work discovers the
 ## Orientation
 
 The product is the compiled `hearthd` binary (`rust/bin/hearthd`, crates `hearth-core` `hearth-cli` `hearth-tui`
-`hearth-mcp`) and the SwiftUI client in `apps/macos`. A project authors `hearth.yaml` (`.yml` /
-`.json`); TypeScript catalogs are not accepted.
+`hearth-mcp` `hearth-web`). `hearthd web` is the browser GUI. A project authors `hearth.yaml`
+(`.yml` / `.json`); TypeScript catalogs are not accepted.
 
-Consumers: `apps/macos`, `infra`, `viclass` — all spawn the app-bundled binary at
-`/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd`.
+Consumers (`infra`, `viclass`) spawn `hearthd` from `~/.local/bin/hearthd` after `task install`.
 
 `hearthd manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
 HTTP+SSE client needs. `env.rs` resolves the daemon's own base environment (login shell + `.env`)
-because a GUI-spawned daemon inherits launchd's bare `PATH`.
-
-`SidecarLocator` (`apps/macos`) finds a compiled `hearthd`: env override, bundled copy,
-`/Applications` install, known locations, this checkout's `cargo build` output, then the login
-shell's PATH. There is no `bun` fallback.
-
-`apps/macos/scripts/build-app.sh` packages an ad-hoc-signed `Hearth.app` with that binary bundled.
-Not notarized — distribution to another machine is the one packaging step still missing. See
-`apps/macos/README.md`.
+because a process started outside a login shell inherits launchd's bare `PATH`.
 
 ## Build, test, release
 
 From `rust/`: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`.
-Also `task rust:test` / `task rust:clippy`.
+Also `task test` / `task clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
-**Installing/refreshing `hearthd`** — `task rust:install`:
-```
-cargo build --release -p hearthd && mkdir -p "/Applications/Hearth.app/Contents/Resources/hearthd/bin" && cp target/release/hearthd "/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd" && codesign --sign - --force "/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd"
-```
-The ad-hoc re-sign is required after every copy on macOS.
-
-**macOS app.** `task macos:build` / `macos:test` / `macos:package` / `macos:install` (+ `dev` for
-the fswatch rebuild loop).
+**Installing/refreshing `hearthd`** — `task install` builds the release binary, copies it to
+`~/.local/bin/hearthd`, and ad-hoc re-signs it. The re-sign is required after every copy on macOS.
+A daemon already running keeps its old `hearthd` until it is restarted.
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags.
-There is no npm publish. The binary is installed by hand or bundled into the macOS app.
-Pushing a `v*.*.*` tag runs CI, and a successful tag CI run triggers `.github/workflows/release.yml`
-(`workflow_run`, so a red tag never publishes; tag/sha come from `github.event.workflow_run`, not
-`github.ref`) on the self-hosted runner: `build-app.sh release` → `ditto` zip → Sparkle
-`sign_update` (secret `SPARKLE_ED_PRIVATE_KEY`; the public half is `SUPublicEDKey`) →
-`gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
-release, including `signature.txt`) → `appcast.xml` on `gh-pages`
-(`https://ngosangns.github.io/hearth/appcast.xml`). The app is still ad-hoc signed, so first launch
-elsewhere needs right-click > Open. Sparkle replaces later builds in place. A daemon already
-running keeps its old `hearthd` until Restart Daemon.
-`apps/macos`'s workflow is `.github/workflows/macos-app.yml` (path-filtered to `apps/macos/**`)
-and runs `swift build` only — its tests need XCTest, which the self-hosted runner lacks.
+There is no npm publish. Pushing a `v*.*.*` tag runs CI, and a successful tag CI run triggers
+`.github/workflows/release.yml` (`workflow_run`, so a red tag never publishes; tag/sha come from
+`github.event.workflow_run`, not `github.ref`) on the self-hosted runner: `cargo build --release
+-p hearthd` → ad-hoc `codesign` → `gh release create --generate-notes` (idempotent — a re-run
+uploads `--clobber` over the existing `hearthd-<tag>` asset).
 
 `PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
 bump there must be treated as breaking for every client.
@@ -66,8 +45,7 @@ from any dev box here, with the same username.
 - **It executes `run:` steps from the runner service's environment, not a login shell**, so a
   toolchain under `~/.cargo/bin` or Homebrew is not on PATH by default. Both workflows add it via
   the composite action `.github/actions/toolchain-path` — keep using it.
-- `ci.yml` and `macos-app.yml` skip fork pull requests: the runner shares a user account with
-  other repos' runners.
+- `ci.yml` skips fork pull requests: the runner shares a user account with other repos' runners.
 - **Its Rust is managed by rustup, whose stable toolchain does not include clippy**, while dev
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
@@ -113,7 +91,7 @@ from any dev box here, with the same username.
   client-supplied flag on `POST /v1/operations` (`action: start` only — every surface rejects it
   otherwise) that must only ever be set after an explicit user confirmation: CLI `--kill-unowned`
   or its TTY `[y/N]` prompt (non-TTY always answers no), TUI's two-keypress arm-then-confirm, the
-  app's "Kill & Start" dialog, MCP's `killUnowned` argument. `ProcessSupervisor::reclaim_port`
+  web GUI's "Kill & Start" dialog, MCP's `killUnowned` argument. `ProcessSupervisor::reclaim_port`
   resolves listeners via `ProbeAdapter::port_holders` (lsof) and signals **individual pids** via
   `ProcessAdapter::signal_pid` — SIGTERM, poll, then a re-resolved SIGKILL pass. Never `killpg` an
   unowned holder: its group membership is untrusted (a shared job can hold innocent siblings; pgid
@@ -184,7 +162,7 @@ from any dev box here, with the same username.
   `/v1/catalog`, `hearthd status`, and both TUIs.
 - `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
   into `ServiceCatalog.groups` for target resolution; the declared membership stays in
-  `group_tree` (`groupTree` on the wire) so the app can group by *direct* membership instead of
+  `group_tree` (`groupTree` on the wire) so a client can group by *direct* membership instead of
   showing a giant `all` section. A member naming both a service and a group resolves as the
   service. Cycles are a load error, not truncation.
 - `disabled: true` rejects direct start/stop/restart (`service_disabled`, `status` still works) and
@@ -253,7 +231,7 @@ from any dev box here, with the same username.
   manager timeout for it (`request_with_timeout` with `None`).
 - `POST /v1/shared/remove` refuses (409) an instance that still has project attachments unless
   `force: true` — it deletes every attached project's data. `hearthd shared remove --force` and the
-  app's attachment-counting confirmation dialog are the sanctioned confirmations, same contract as
+  web GUI's attachment-counting confirmation are the sanctioned confirmations, same contract as
   `killUnowned`. `POST /v1/manager/reload` likewise fails with 409 `stop_failed` and keeps the old
   catalog when a removed-but-active service can't be stopped. `hearthd shared stop`/`start` exit
   non-zero when the operation fails. `hearthd doctor` checks the suite's host tools (docker,
@@ -261,12 +239,12 @@ from any dev box here, with the same username.
 
 **Consumers and the `hearthd` binary**
 
-- Consumer scripts must use the absolute path
-  `/Applications/Hearth.app/Contents/Resources/hearthd/bin/hearthd`.
-- **Never assume tools are on `PATH`**: a Dock/Finder-launched GUI process gets launchd's bare
+- Consumer scripts should call `~/.local/bin/hearthd` (what `task install` writes), not assume
+  a bare `hearthd` on `PATH`.
+- **Never assume tools are on `PATH`**: a process started by launchd gets
   `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon inherits that, so `hearthd` appends Homebrew and
   `~/.bun`/`~/.cargo` bin dirs (`with_known_tool_directories`) — otherwise `docker compose`,
-  `tailscale serve status` and `tailscale status` fail to spawn. Test anything the app spawns under
+  `tailscale serve status` and `tailscale status` fail to spawn. Test anything the daemon spawns under
   `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
 - `serde_json`'s `preserve_order` feature is on workspace-wide and is load-bearing: without it
   `Value`'s object type is a `BTreeMap`, and `hearthd mcp install` silently alphabetizes every key in any
@@ -274,31 +252,25 @@ from any dev box here, with the same username.
 - `hearthd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
-**macOS app (apps/macos)**
+**Web GUI (`hearthd web`)**
 
-- **Single instance is enforced in `AppDelegate`**, not just `LSMultipleInstancesProhibited`:
-  `open -n` and `scripts/dev.sh`'s bare-binary launch bypass LaunchServices. The check matches bundle
-  ID, falling back to executable path when there is no bundle; the loser posts a
-  `DistributedNotificationCenter` show-window notification to the winner and terminates. Reopening a
-  closed main window goes through `MainWindow.open` — the `openWindow` action captured from
-  `ContentView` — driven by `applicationShouldHandleReopen` and that notification.
-
+- The page is a SolidJS app in `rust/crates/hearth-web/ui` (Solid UI components, Lucide icons, Tailwind). `build.rs` runs `npm run build` and the binary embeds `ui/dist`. `task install` and the release workflow build that UI first. Node and npm must be on PATH.
+- Loopback only. `--host 0.0.0.0` is rejected. The printed URL carries a process token; `GET /`
+  trades it for an HttpOnly cookie and redirects. `/api` requires that cookie plus a loopback
+  Host, and a matching Origin on mutations. Static assets are not the session.
+- It is a client of each project's daemon and of smp. An untrusted workspace does not spawn a
+  daemon. Stopping the daemon from the page stays stopped until **Start daemon**. The workspace
+  file stays `~/Library/Application Support/HearthApp/workspaces.json` (ISO-8601 `addedAt`, no
+  fractional seconds) so lists written before the desktop app was removed still load. `hearthd web`
+  is dispatched before catalog load because the current directory does not need a `hearth.yaml`.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
-  catalog reloads and is exempt from the apply-services prune.
-- The app's `displayState` collapse splits in-flight states the CLI's `text_state` does not:
-  `running`/`running-unready` → `running`, `starting`/`preparing` → `starting` (CLI prints both as
-  `running`). `succeeded` stays `succeeded`. `ready` and `running` both count in the "ready/total"
-  summaries — a `kind: process` service sits in `running` forever and must not read as a stuck boot.
-  Finite services (`readiness: exit`, known from the catalog before the first run) stay out of
-  those totals unless `failed`.
+  catalog reloads. `displayState` collapses `running`/`running-unready` → `running` and
+  `starting`/`preparing` → `starting`. `ready` and `running` both count in the ready/total
+  summaries. Finite services (`readiness: exit`) stay out of those totals unless `failed`.
 
 **Testing gotchas**
 
-- The macOS app's controllers take `any ManagerAPI`, not the concrete `ManagerClient`, so
-  `FakeManagerAPI` can drive them without a daemon. Prefer stepping `refresh()`/`fetchOnce()`
-  directly over waiting on the real poll timer. The model is `ManagerOperation`, not `Operation`
-  — the latter shadows `Foundation.Operation`.
 - **A fixed sleep waiting on another process is a flake.** Poll for the actual condition with a
   generous deadline instead.
 - Right after spawning, a child can still be mid-`execve`, and macOS `ps` reports a parenthesized
@@ -331,8 +303,8 @@ from any dev box here, with the same username.
   native addon. The tab width is a fixed 3-space replacement. See `truncate_to_width`'s doc comment.
 - **`hearth-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
   carry a runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
-- **`hearthd mcp` and `hearthd tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
-  `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`.
+- **`hearthd mcp`, `hearthd tui`, and `hearthd web` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
+  `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`. `web` is also before catalog load: it is the app shell.
 - **`state.json` timestamp validation is a non-empty-string check.**
 
 ## Maintaining this file
