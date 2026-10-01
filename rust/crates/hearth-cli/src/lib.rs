@@ -343,8 +343,8 @@ pub async fn require_client_for(root: &Path, catalog: &ServiceCatalog) -> Localc
     }
 }
 
-/// The `manager ensure --json` payload: everything a generic HTTP+SSE client (a desktop app's
-/// connection layer) needs to talk to the daemon directly — the bearer token and runtime directory
+/// The `manager ensure --json` payload: everything a generic HTTP+SSE client needs to talk to the
+/// daemon directly — the bearer token and runtime directory
 /// are no more exposed than the lock directory already is. `pub(crate)` because `hearthd shared
 /// ensure --json` prints the same contract for the smp daemon.
 pub(crate) fn ensure_payload(client: &Client) -> Value {

@@ -48,10 +48,10 @@ through `reload_catalog` — the old-catalog-stop rule applies unchanged.
 ## `catalog.json` (remote registry)
 
 Catalog URL resolution order: `HEARTH_SHARED_CATALOG_URL` → `~/.hearth/shared/catalog-url` → the
-pinned `SHARED_CATALOG_URL` in the binary. The `catalog-url` file exists because a GUI-launched
-`smp` daemon does not inherit a developer's shell environment — write a `file://` (or `https://`)
-URL there to point every daemon at a local/private catalog, including its sibling `script`
-artifacts (`HEARTH_CATALOG_ORIGIN` then resolves to that catalog's own directory).
+pinned `SHARED_CATALOG_URL` in the binary. The `catalog-url` file exists because a daemon started
+outside a login shell does not inherit `HEARTH_SHARED_CATALOG_URL` — write a `file://` (or
+`https://`) URL there to point every daemon at a local/private catalog, including its sibling
+`script` artifacts (`HEARTH_CATALOG_ORIGIN` then resolves to that catalog's own directory).
 
 Tarball `sha256` lives in this file, so the file itself is trusted on TLS alone — fetching anywhere
 else is not supported. The same file is also baked into the binary (`include_str!` in `remote.rs`)
@@ -267,8 +267,10 @@ read `shared:` in `hearth.yaml` → attach happens on `start` → query connecti
 
 `hearthd web` has a Shared services page. It connects to smp the same way `hearthd shared ensure`
 does. The page lists registered instances (state, port, attached projects, copyable connection
-info) and installable `name@version` entries. Install, start, stop, restart, and remove are the
-mutations. Attach and detach stay project-side via `shared:` plus start.
+info) and the installable versions of each recipe. Install follows the version selected in that
+row. Start, stop, and restart act on one instance. Remove asks first; when projects are still
+attached, confirming sends `force: true` and deletes their data. Attach and detach stay
+project-side: a `shared:` entry plus start or stop.
 
 ## Edge cases
 

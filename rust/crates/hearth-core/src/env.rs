@@ -1,9 +1,9 @@
-//! Resolves the environment a daemon should hand to every process it spawns. A daemon started from a GUI (Finder/Dock/LaunchAgent, as a desktop app's sidecar would)
-//! inherits a bare `PATH` — none of the login-shell customization (`nvm`, `asdf`, Homebrew, a
-//! project's own `.env`) that a daemon started from an interactive terminal gets for free. A daemon
-//! spawned from a terminal and one spawned from an app should end up running the exact same
-//! commands with the exact same environment; this module is the one place that difference gets
-//! resolved away.
+//! Resolves the environment a daemon should hand to every process it spawns. A daemon started
+//! outside a login shell (launchd, Finder, Dock, or a LaunchAgent) inherits a bare `PATH` — none
+//! of the login-shell customization (`nvm`, `asdf`, Homebrew, a project's own `.env`) that a
+//! daemon started from an interactive terminal gets for free. A daemon spawned from a terminal
+//! and one spawned by launchd should end up running the exact same commands with the exact same
+//! environment; this module is the one place that difference gets resolved away.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

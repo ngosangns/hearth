@@ -23,7 +23,17 @@ hearthd web
 
 Prints `hearth web: http://127.0.0.1:4730/?token=…` and opens it. The token is only the sign-in
 for that process. `--no-open` skips the browser, `--port` moves the listen port, and
-`--host 0.0.0.0` is rejected. A folder stays untrusted until you confirm it.
+`--host 0.0.0.0` is rejected.
+
+The page is the SolidJS app in `rust/crates/hearth-web/ui` (Tailwind, Lucide icons), built into
+the binary. It lists workspaces, starts and stops services, tails logs, and manages shared
+services. A new folder stays untrusted until you confirm **Trust and start**, and an untrusted
+folder does not spawn a daemon. **Stop daemon** stays stopped until **Start daemon**. Service
+and group actions are icon buttons; the workspace toolbar keeps text labels and shows a spinner
+while the action is in flight. **Kill & Start**, and removing a shared instance that still has
+project attachments, both ask before they run. **Check for updates** opens this repo's GitHub
+Releases page. Add a folder by its absolute path. The workspace list stays in
+`~/Library/Application Support/HearthApp/workspaces.json`.
 
 A project supplies a `hearth.yaml` (`.yml` / `.json` also work) naming its services, how to
 start them, and how to tell when they are ready. TypeScript catalogs are not accepted.
@@ -54,8 +64,8 @@ services:
 
 `groups:` members may also name other groups — `all: [infra, app]` expands depth-first in
 declaration order (deduplicated, cycles rejected at load). A member naming both a service and a
-group resolves as the service. The app groups its service list by direct membership and offers
-per-group start/stop.
+group resolves as the service. The web GUI groups its service list by direct membership and
+offers per-group start and stop.
 
 `disabled: true` on a service keeps it in the catalog but out of every lifecycle action: direct
 start/stop/restart is rejected (`service_disabled`) and group targets expand past it. It does not
@@ -147,7 +157,9 @@ A plain attach gets a
 blocks into the shared instance — `nginx -t` validates before reload, so a bad drop fails the
 attach instead of wedging the singleton. Detach removes the project's confs via `deprovision`.
 
-Install `hearthd` onto `PATH`, then drive a project:
+Install `hearthd` onto `PATH`, then drive a project. `task install` needs Node and npm: it
+builds the web UI, then the release binary, copies it to `~/.local/bin/hearthd`, and ad-hoc
+signs it. A daemon that is already running keeps its old binary until it is restarted.
 
 ```bash
 task install   # release binary → ~/.local/bin/hearthd
@@ -174,3 +186,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 The suite needs a running `docker` daemon, `tailscale`, plus `nc`, `ps`, and `sh`.
 
 See [AGENTS.md](AGENTS.md) for architecture, sharp edges, and how `task install` refreshes the binary.
+Shared services are specified in [docs/shared-services.md](docs/shared-services.md).
+
+## Release
+
+The version string is `rust/bin/hearthd/Cargo.toml`. Pushing a `v*.*.*` tag runs CI
+(`.github/workflows/ci.yml`). A successful tag run starts `.github/workflows/release.yml`, which
+builds the web UI (`npm ci && npm run build` in `rust/crates/hearth-web/ui`), then
+`cargo build --release -p hearthd`, ad-hoc signs the binary, and uploads `hearthd-<tag>` to the
+GitHub Release. A red CI run does not publish.

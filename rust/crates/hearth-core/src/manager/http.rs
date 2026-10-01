@@ -1641,7 +1641,7 @@ async fn get_events_stream(
 
     // On overflow the stream is CLOSED, not silently thinned. A client that merely stops receiving
     // some frames has no way to know it missed them: it keeps applying deltas to state that is now
-    // permanently wrong (the TUI's service list, the app's status). Closing makes it reconnect with
+    // permanently wrong (the TUI's service list, the web GUI's status). Closing makes it reconnect with
     // its cursor and take a `reset` replay, which is the whole point of having a cursor. This
     // mirrors the TS source's `stop()` on a full queue.
     //
@@ -1813,7 +1813,7 @@ fn read_log_tail(path: &std::path::Path, bytes: u64) -> std::io::Result<(u64, St
     file.seek(SeekFrom::Start(start))?;
     let mut raw = Vec::with_capacity((size - start) as usize);
     file.take(bytes).read_to_end(&mut raw)?;
-    // Snap the tail start to a UTF-8 boundary — same rule as the app's LogController trim.
+    // Snap the tail start to a UTF-8 boundary so a split codepoint is not returned as text.
     let skip = if start > 0 {
         raw.iter()
             .take_while(|b| (**b & 0b1100_0000) == 0b1000_0000)

@@ -1268,7 +1268,7 @@ impl ProcessSupervisor {
     /// unit (a docker/tailnet task it only observes), or a service whose port is held by a process it
     /// does not own. The catalog's `stop:` command is the only lever that exists for those, so it is
     /// what runs; with no such command, refusing loudly is the honest answer. Reporting success
-    /// without stopping anything is what made Stop look broken in the app.
+    /// without stopping anything is what made Stop look broken in the GUI.
     async fn stop_unowned(
         self: &Arc<Self>,
         service_id: &ServiceId,
@@ -3890,7 +3890,7 @@ mod tests {
     /// command is the only thing that can stop it. Stop used to fall through to `orphan()` —
     /// recording "Process ownership identity no longer matches" for a service that never had an
     /// identity — while the container kept running: exactly what "I press Stop and nothing happens"
-    /// looked like in the app.
+    /// looked like in the GUI.
     #[tokio::test]
     async fn stop_on_an_adopted_external_service_runs_its_stop_command() {
         let h = build_harness(one_service_catalog(external_container_service(

@@ -22,16 +22,23 @@ Also `task test` / `task clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
-**Installing/refreshing `hearthd`** — `task install` builds the release binary, copies it to
+**Installing/refreshing `hearthd`** — `task install` builds the Solid UI (`npm ci` and `npm run
+build` in `rust/crates/hearth-web/ui`), then the release binary, copies it to
 `~/.local/bin/hearthd`, and ad-hoc re-signs it. The re-sign is required after every copy on macOS.
-A daemon already running keeps its old `hearthd` until it is restarted.
+A daemon already running keeps its old `hearthd` until it is restarted. `hearth-web`'s `build.rs`
+runs `npm ci` only when `node_modules` is missing or `package-lock.json` is newer, and `npm run
+build` only when `ui/dist/index.html` is missing or a UI source is newer. Node and npm must be on
+PATH for any `cargo` build of `hearthd`.
 
-**Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags.
-There is no npm publish. Pushing a `v*.*.*` tag runs CI, and a successful tag CI run triggers
-`.github/workflows/release.yml` (`workflow_run`, so a red tag never publishes; tag/sha come from
-`github.event.workflow_run`, not `github.ref`) on the self-hosted runner: `cargo build --release
--p hearthd` → ad-hoc `codesign` → `gh release create --generate-notes` (idempotent — a re-run
-uploads `--clobber` over the existing `hearthd-<tag>` asset).
+**Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags
+(`timeout-minutes: 90`; tools `cargo`, `node`, `npm`). There is no npm publish. Pushing a
+`v*.*.*` tag runs CI, and a successful tag CI run triggers `.github/workflows/release.yml`
+(`workflow_run`, so a red tag never publishes; tag/sha come from `github.event.workflow_run`, not
+`github.ref`) on the self-hosted runner (`timeout-minutes: 60`): `npm ci && npm run build` in
+`rust/crates/hearth-web/ui` → `cargo build --release -p hearthd` → ad-hoc `codesign` →
+`gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
+`hearthd-<tag>` asset). The version string lives only in `rust/bin/hearthd/Cargo.toml` (and the
+matching `hearthd` entry in `rust/Cargo.lock`).
 
 `PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
 bump there must be treated as breaking for every client.
@@ -46,6 +53,8 @@ from any dev box here, with the same username.
   toolchain under `~/.cargo/bin` or Homebrew is not on PATH by default. Both workflows add it via
   the composite action `.github/actions/toolchain-path` — keep using it.
 - `ci.yml` skips fork pull requests: the runner shares a user account with other repos' runners.
+- Both workflows request `node` and `npm`. `cargo build -p hearthd` runs `hearth-web`'s
+  `build.rs`, which shells out to `npm`.
 - **Its Rust is managed by rustup, whose stable toolchain does not include clippy**, while dev
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
@@ -159,7 +168,7 @@ from any dev box here, with the same username.
   catalog always carries literal paths. Only those var names are substituted — other braces
   (`awk '{print}'`) are legal, and a `{port}` with no declared port fails the load.
 - Service order from a config file is **document order**, not sorted — it's user-visible in
-  `/v1/catalog`, `hearthd status`, and both TUIs.
+  `/v1/catalog`, `hearthd status`, the TUI, and the web GUI.
 - `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
   into `ServiceCatalog.groups` for target resolution; the declared membership stays in
   `group_tree` (`groupTree` on the wire) so a client can group by *direct* membership instead of
@@ -218,8 +227,8 @@ from any dev box here, with the same username.
   survive upstream removal from `catalog.json`. `catalog.json` at the repo root is the registry the pinned
   `SHARED_CATALOG_URL` serves; `HEARTH_SHARED_CATALOG_URL` overrides it for dev/tests (`file://`
   works for both the catalog and artifact URLs). Catalog URL order: env →
-  `~/.hearth/shared/catalog-url` → pinned URL — the file exists because a GUI-launched `smp` daemon
-  doesn't inherit shell env. `remote.rs` also embeds the same `catalog.json` (`include_str!`) as the
+  `~/.hearth/shared/catalog-url` → pinned URL — the file exists because a daemon started outside a
+  login shell does not inherit `HEARTH_SHARED_CATALOG_URL`. `remote.rs` also embeds the same `catalog.json` (`include_str!`) as the
   final fallback — a stale disk cache is topped up with any recipe the embedded catalog has that the
   cache lacks, so recipes added in newer `hearthd` builds still reach machines that cached an old
   `catalog-url`/`file://` document.
@@ -254,7 +263,7 @@ from any dev box here, with the same username.
 
 **Web GUI (`hearthd web`)**
 
-- The page is a SolidJS app in `rust/crates/hearth-web/ui` (Solid UI components, Lucide icons, Tailwind). `build.rs` runs `npm run build` and the binary embeds `ui/dist`. `task install` and the release workflow build that UI first. Node and npm must be on PATH.
+- The page is a SolidJS app in `rust/crates/hearth-web/ui` (Kobalte button, Tailwind tokens, Lucide icons). `build.rs` embeds `ui/dist` with `include_dir`. Service, group, copy, and shared-instance actions are icon buttons; the workspace toolbar keeps text. First load of a workspace, its log, and the shared page shows a skeleton. `ui/node_modules` and `ui/dist` are gitignored; `package-lock.json` is committed.
 - Loopback only. `--host 0.0.0.0` is rejected. The printed URL carries a process token; `GET /`
   trades it for an HttpOnly cookie and redirects. `/api` requires that cookie plus a loopback
   Host, and a matching Origin on mutations. Static assets are not the session.
