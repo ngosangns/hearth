@@ -151,6 +151,10 @@ from any dev box here, with the same username.
   client's cursor is unusable, so the reply is the snapshot it resynchronizes from. The SSE stream
   copies that replay and registers the listener under the same lock, and holds live events until
   the snapshot frames are queued. A reset does not subscribe. Backpressure stays 64 frames.
+- **SSE is invalidation, not the source of truth for service rows.** `GET /v1/services` is
+  authoritative. The TUI treats `service.lifecycle`, `manager.catalog-reloaded`, and
+  `operation.accepted`/`operation.updated` as a nudge to re-fetch that snapshot; `service.log`
+  only refreshes the log cursor. Do not reconstruct full lifecycle state from event payloads alone.
 - The log `generation` clients echo is `lifecycle * 1_000_000 + rotation`, not the lifecycle alone.
   A rotation resets a follower the same way a restart does. Generation 0 is valid (no state row).
 

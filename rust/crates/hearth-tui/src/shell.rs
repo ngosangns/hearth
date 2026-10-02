@@ -738,14 +738,31 @@ impl App {
             WatchEvent::ManagerEvent(event) => {
                 let fence = self.session.as_ref().map(|session| session.fence).unwrap_or_default();
                 let service_id = event.data.get("serviceId").and_then(|value| value.as_str()).map(str::to_string);
-                let applied = self.session.as_mut().is_some_and(|session| session.state.apply_event(fence, &event.event_type, &event.data));
-                if applied {
-                    self.rebuild_from_state();
-                    self.draw();
-                }
-                if event.event_type == "service.log" && service_id.as_deref() == self.selected_service_id().as_deref() {
-                    self.refresh_log().await;
-                    self.draw();
+                if event.event_type == "service.log" {
+                    let connected = self.session.as_mut().is_some_and(|session| session.state.apply_event(fence, &event.event_type, &event.data));
+                    if connected && service_id.as_deref() == self.selected_service_id().as_deref() {
+                        self.refresh_log().await;
+                        self.draw();
+                    }
+                } else if TuiState::event_requires_services_snapshot(&event.event_type) {
+                    let connected = self.session.as_mut().is_some_and(|session| session.state.apply_event(fence, &event.event_type, &event.data));
+                    if !connected {
+                        return;
+                    }
+                    let Some(client) = self.session.as_ref().map(|session| session.client.clone()) else {
+                        return;
+                    };
+                    let gen = self.gen;
+                    match client.snapshot().await {
+                        Ok(services) => {
+                            self.apply_services(gen, &services).await;
+                            self.draw();
+                        }
+                        Err(error) => {
+                            self.desk.notice = format!("Failed to refresh services: {}", safe_message(&error.message));
+                            self.draw();
+                        }
+                    }
                 }
             }
             WatchEvent::Unavailable(message) => {

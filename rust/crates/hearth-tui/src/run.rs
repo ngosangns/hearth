@@ -170,15 +170,40 @@ impl TuiApp {
                 if !self.state.apply_event(*current_fence, &event.event_type, &event.data) {
                     return;
                 }
+                if event.event_type == "service.log" {
+                    self.draw();
+                    if service_id.as_deref() == Some(self.state.selection.selected_name.as_str()) {
+                        let fence = self.state.begin_request();
+                        self.refresh_selected(client, fence).await;
+                    }
+                    return;
+                }
+                if TuiState::event_requires_services_snapshot(&event.event_type) {
+                    match client.snapshot().await {
+                        Ok(services) => {
+                            if self.state.apply_snapshot(*current_fence, &services) {
+                                if self.pending_reclaim.is_none() {
+                                    self.state.notice.clear();
+                                }
+                                self.draw();
+                                let fence = self.state.begin_request();
+                                self.refresh_selected(client, fence).await;
+                                if event.event_type == "operation.updated"
+                                    && service_id.as_deref() == Some(self.state.selection.selected_name.as_str())
+                                {
+                                    let fence = self.state.begin_request();
+                                    self.refresh_operation(client, fence).await;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.state.notice = format!("Failed to refresh services: {}", safe_message(&error.message));
+                            self.draw();
+                        }
+                    }
+                    return;
+                }
                 self.draw();
-                if event.event_type == "service.log" && service_id.as_deref() == Some(self.state.selection.selected_name.as_str()) {
-                    let fence = self.state.begin_request();
-                    self.refresh_selected(client, fence).await;
-                }
-                if event.event_type == "operation.updated" && service_id.as_deref() == Some(self.state.selection.selected_name.as_str()) {
-                    let fence = self.state.begin_request();
-                    self.refresh_operation(client, fence).await;
-                }
             }
             WatchEvent::Unavailable(msg) => {
                 if !self.state.connected(*current_fence) {

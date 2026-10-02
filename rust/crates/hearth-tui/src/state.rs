@@ -262,29 +262,24 @@ impl TuiState {
         true
     }
 
-    pub fn apply_event(&mut self, fence: TuiFence, event_type: &str, data: &serde_json::Map<String, serde_json::Value>) -> bool {
+    /// SSE types that mean service rows may have changed. Clients should treat them as
+    /// invalidation and refresh via `GET /v1/services` (see `ManagerTuiClient::snapshot`).
+    /// `service.log` is intentionally excluded — refresh the log cursor instead.
+    pub fn event_requires_services_snapshot(event_type: &str) -> bool {
+        matches!(
+            event_type,
+            "service.lifecycle" | "manager.catalog-reloaded" | "operation.accepted" | "operation.updated"
+        )
+    }
+
+    /// Formerly patched lifecycle fields from the SSE payload. Authoritative service state now
+    /// comes from `GET /v1/services`; this remains a connection/fence gate for callers that still
+    /// route events through it (returns true when connected so they know to fetch a snapshot).
+    pub fn apply_event(&mut self, fence: TuiFence, event_type: &str, _data: &serde_json::Map<String, serde_json::Value>) -> bool {
         if !self.connected(fence) {
             return false;
         }
-        let service_id = data.get("serviceId").and_then(|v| v.as_str());
-        if let Some(service_id) = service_id {
-            if event_type == "service.lifecycle" {
-                if let Some(service) = self.selection.services.iter_mut().find(|s| s.name == service_id) {
-                    if let Some(actual_state) = data.get("actualState").and_then(|v| serde_json::from_value::<ActualServiceState>(v.clone()).ok()) {
-                        service.state = actual_state;
-                    }
-                    // Lifecycle events carry no `error` today; honour one if a daemon sends it,
-                    // otherwise the next snapshot refreshes it.
-                    if let Some(error) = data.get("error") {
-                        service.error = error.as_str().map(str::to_string);
-                    }
-                    if let Some(generation) = data.get("generation").and_then(|v| v.as_u64()) {
-                        service.generation = Some(generation);
-                    }
-                    service.current_operation_id = data.get("operationId").and_then(|v| v.as_str()).map(str::to_string);
-                }
-            }
-        }
+        let _ = event_type;
         true
     }
 
@@ -397,15 +392,24 @@ mod tests {
     }
 
     #[test]
-    fn shows_running_unready_as_degraded_and_follows_lifecycle_events() {
+    fn shows_running_unready_as_degraded_and_lifecycle_events_require_snapshot() {
         let mut state = TuiState::new(no_service_kind());
         let fence = state.begin_connection();
         let mut s = service();
         s.actual_state = ActualServiceState::RunningUnready;
         state.apply_snapshot(fence, &[s]);
         assert!(state.detail().contains("state=degraded"));
+        assert!(TuiState::event_requires_services_snapshot("service.lifecycle"));
+        assert!(TuiState::event_requires_services_snapshot("manager.catalog-reloaded"));
+        assert!(!TuiState::event_requires_services_snapshot("service.log"));
+        // apply_event no longer patches rows — a fresh snapshot is the source of truth.
         let event = serde_json::json!({ "serviceId": "metadata", "actualState": "externally-owned", "error": "Port 1 is held by pid 2 (nc)" });
         assert!(state.apply_event(fence, "service.lifecycle", event.as_object().unwrap()));
+        assert_eq!(state.selection.selected().unwrap().state, ActualServiceState::RunningUnready);
+        let mut next = service();
+        next.actual_state = ActualServiceState::ExternallyOwned;
+        next.error = Some("Port 1 is held by pid 2 (nc)".to_string());
+        assert!(state.apply_snapshot(fence, &[next]));
         let selected = state.selection.selected().unwrap();
         assert_eq!(selected.state, ActualServiceState::ExternallyOwned);
         assert_eq!(selected.error.as_deref(), Some("Port 1 is held by pid 2 (nc)"));
