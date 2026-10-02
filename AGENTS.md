@@ -16,6 +16,10 @@ Consumers (`infra`, `viclass`) spawn `hearth` from `~/.local/bin/hearth` after `
 HTTP+SSE client needs. `env.rs` resolves the daemon's own base environment (login shell + `.env`)
 because a process started outside a login shell inherits launchd's bare `PATH`.
 
+`hearth-core` manager HTTP surface lives under `rust/crates/hearth-core/src/manager/http/`:
+`mod.rs` owns `HearthManager` / bootstrap / shutdown; `routes.rs` is the axum route table
+(handlers stay a child module so they can use private manager fields without widening crate visibility).
+
 ## Build, test, release
 
 From `rust/`: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`.
