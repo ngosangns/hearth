@@ -1548,7 +1548,7 @@ const HELP: &[&str] = &[
     "              x still stops while a start is running · the first row is the daemon log",
     "Shared       S opens it · [ ] change version · enter installs, or starts and stops an instance",
     "              x stops · r restarts · X removes (twice, and deletes attached project data)",
-    "Log          page up and page down · u opens the releases page · esc cancels · q quits",
+    "Log          page up and page down · u releases page · hearthd update · esc cancels · q quits",
     "A folder stays untrusted until the second enter, and that does not spawn a daemon before then.",
     "Stop daemon stays stopped until you press enter on that workspace again.",
 ];

@@ -22,9 +22,17 @@ Also `task test` / `task clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
-**Installing/refreshing `hearthd`** — `task install` builds the release binary, copies it to
-`~/.local/bin/hearthd`, and ad-hoc re-signs it. The re-sign is required after every copy on macOS.
-A daemon already running keeps its old `hearthd` until it is restarted.
+**Installing/refreshing `hearthd`** — `task install` builds the release binary into
+`~/.local/share/hearth/bin/hearthd-<version>`, ad-hoc signs that file (never the live path), and
+points `~/.local/bin/hearthd` at it with a symlink. `hearthd update` downloads the GitHub asset
+`hearthd-<tag>` into the same layout after checking the tag, asset name, `github.com` download
+URL, size, `sha256` digest, executable bit, and a staged `--version` smoke test. It does not
+re-sign the download: `codesign --force` on a mapped ad-hoc binary SIGKILLs that process, and so
+does writing over its inode. The previous file stays for one generation. A daemon already running
+keeps its old inode until `hearthd --root <project> manager restart` (services stay up); restart
+smp separately. The command refuses any current executable that is not that symlink's regular
+file or a file already in the versioned directory, refuses anything but darwin-arm64, and does
+not replace an equal version unless `--force`. It does not downgrade.
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags
 (`timeout-minutes: 90`; tool `cargo`). Pushing a `v*.*.*` tag runs CI, and a successful tag CI run
@@ -313,7 +321,7 @@ from any dev box here, with the same username.
 - **`hearth-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
   carry a runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
 - **`hearthd mcp` and `hearthd tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
-  `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`. `tui` is dispatched before catalog load: it is an app shell.
+  `hearthd update` is dispatched before catalog load too (the implementation lives in `hearth-cli`). `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`. `tui` is dispatched before catalog load: it is an app shell.
 - **`state.json` timestamp validation is a non-empty-string check.**
 
 ## Maintaining this file

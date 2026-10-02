@@ -24,7 +24,8 @@ The TUI lists workspaces, starts and stops services, tails logs, and manages sha
 A new folder stays untrusted until a second Enter, and an untrusted folder does not spawn a
 daemon. A daemon you stop stays stopped until you press Enter on that workspace again.
 **Kill & Start**, and removing a shared instance that still has project attachments, both take
-a second keypress. Check for updates opens this repo's GitHub Releases page. Add a folder by
+a second keypress. Check for updates opens this repo's GitHub Releases page.
+`hearthd update` installs the latest binary. Add a folder by
 its absolute path. The workspace list stays in
 `~/Library/Application Support/HearthApp/workspaces.json`.
 
@@ -150,14 +151,17 @@ A plain attach gets a
 blocks into the shared instance — `nginx -t` validates before reload, so a bad drop fails the
 attach instead of wedging the singleton. Detach removes the project's confs via `deprovision`.
 
-Install `hearthd` onto `PATH`, then drive a project. `task install` builds the release binary,
-copies it to `~/.local/bin/hearthd`, and ad-hoc signs it. A daemon that is already running keeps
-its old binary until it is restarted.
+Install `hearthd` onto `PATH`, then drive a project. `task install` builds the release binary
+into `~/.local/share/hearth/bin/hearthd-<version>`, ad-hoc signs that file, and points
+`~/.local/bin/hearthd` at it. `hearthd update` installs the latest GitHub release into the same
+layout. A daemon that is already running keeps its old binary until it is restarted.
 
 ```bash
-task install   # release binary → ~/.local/bin/hearthd
+task install          # versioned binary + symlink at ~/.local/bin/hearthd
+hearthd update --check
+hearthd update
 hearthd --root /path/to/project status
-hearthd tui    # workspaces and shared services; works from any directory
+hearthd tui           # workspaces and shared services; works from any directory
 hearthd --root /path/to/project tui   # also adopts that project when it has a catalog
 hearthd --root /path/to/project mcp
 ```
@@ -186,4 +190,4 @@ Shared services are specified in [docs/shared-services.md](docs/shared-services.
 The version string is `rust/bin/hearthd/Cargo.toml`. Pushing a `v*.*.*` tag runs CI
 (`.github/workflows/ci.yml`). A successful tag run starts `.github/workflows/release.yml`, which
 runs `cargo build --release -p hearthd`, ad-hoc signs the binary, and uploads `hearthd-<tag>` to the
-GitHub Release. A red CI run does not publish.
+GitHub Release. A red CI run does not publish. `hearthd update` installs that asset.

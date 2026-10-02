@@ -172,9 +172,9 @@ async fn run_mcp_subcommand(root: PathBuf, catalog: hearth_core::catalog::Servic
     }
 }
 
-/// `--help`/`--version` must work from ANY directory. `tui` and `shared` also run without a
-/// project catalog. Answering "how do I use this?" with "there is no config file here" is a
-/// bad first experience for someone who just installed the binary.
+/// `--help`/`--version` must work from ANY directory. `tui`, `shared`, and `update` also run
+/// without a project catalog. Answering "how do I use this?" with "there is no config file
+/// here" is a bad first experience for someone who just installed the binary.
 fn print_help() {
     println!(
         "hearthd — local dev services daemon, CLI, TUI, and MCP server
@@ -196,12 +196,13 @@ usage: hearthd [--root <path>] <command> [options]
   shared attach|detach|probe <id>       attach this project to a shared service (used by hearth.yaml `shared:`)
   shared install|start|stop|remove <id> manage a shared service instance
   tui                                   terminal UI for workspaces and shared services
+  update [--check] [--json] [--force]   install the latest stable GitHub release
   mcp                                   serve the MCP tool surface over stdio
   mcp install [--name N] [--key K] <config-file>...
                                         register this binary in an MCP client config
   skill install --dest <path>           write the generic MCP skill doc
 
-tui and shared do not need a hearth.yaml in the current directory.
+tui, shared, and update do not need a hearth.yaml in the current directory.
 hearthd --root <project> tui adopts that project when it has a catalog.
 Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json."
@@ -233,6 +234,22 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
                 confirm: None,
             },
             std::sync::Arc::new(spawn_smp),
+        )
+        .await;
+    }
+    // Self-update talks to GitHub, not to a project daemon, and must work in a directory
+    // that has no hearth.yaml.
+    if rest.first().map(String::as_str) == Some("update") {
+        let mut out = |s: &str| println!("{s}");
+        let mut err = |s: &str| eprintln!("{s}");
+        return hearth_cli::update::run(
+            &rest[1..],
+            env!("CARGO_PKG_VERSION"),
+            &mut hearth_cli::Io {
+                out: &mut out,
+                err: &mut err,
+                confirm: None,
+            },
         )
         .await;
     }

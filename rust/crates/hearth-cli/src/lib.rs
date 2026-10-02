@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 pub mod client;
 pub mod shared;
+pub mod update;
 
 pub use client::ManagerClient;
 

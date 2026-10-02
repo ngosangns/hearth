@@ -1110,8 +1110,8 @@ impl App {
 
     fn open_updates(&mut self) {
         self.desk.notice = match std::process::Command::new("open").arg(RELEASES_URL).status() {
-            Ok(status) if status.success() => "opened the releases page".to_string(),
-            _ => RELEASES_URL.to_string(),
+            Ok(status) if status.success() => "opened the releases page — hearthd update installs the latest binary".to_string(),
+            _ => format!("{RELEASES_URL} — hearthd update installs the latest binary"),
         };
         self.draw();
     }

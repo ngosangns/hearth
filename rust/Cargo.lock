@@ -721,9 +721,11 @@ name = "hearth-cli"
 version = "0.1.0"
 dependencies = [
  "hearth-core",
+ "libc",
  "regex",
  "reqwest",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "uuid",

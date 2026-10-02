@@ -11,6 +11,8 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
+sha2 = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
