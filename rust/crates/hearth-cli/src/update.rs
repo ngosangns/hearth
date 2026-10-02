@@ -19,6 +19,17 @@ use crate::Io;
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/ngosangns/hearth/releases/latest";
 const USAGE: &str = "usage: hearthd update [--check] [--json] [--force]";
 const RESTART_NOTE: &str = "running daemons keep the previous binary until `hearthd --root <project> manager restart` (services stay up) and until `hearthd shared` is restarted for smp";
+const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
+const ASSET_ACCEPT: &str = "application/octet-stream";
+/// Exact HTTPS hosts a release request may redirect to. A suffix such as
+/// `github.com.evil.example` is not a release host.
+const RELEASE_REDIRECT_HOSTS: &[&str] = &[
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
 
 #[derive(Clone, Debug)]
 struct Layout {
@@ -283,26 +294,6 @@ async fn run_with(
         Err(error) => return fail(io, flags.json, &report, &error),
     }
 
-    match file_id(&env.layout.link) {
-        Ok(now) if now == inode => {}
-        Ok(_) => {
-            return fail(
-                io,
-                flags.json,
-                &report,
-                "install path changed while updating",
-            )
-        }
-        Err(error) => {
-            return fail(
-                io,
-                flags.json,
-                &report,
-                &format!("cannot stat {}: {error}", env.layout.link.display()),
-            )
-        }
-    }
-
     let final_path = env.layout.versioned(&release.version);
     let previous_file = match rotate_into_place(&partial, &final_path) {
         Ok(previous) => previous,
@@ -311,13 +302,15 @@ async fn run_with(
     let previous_version = std::fs::read_link(&env.layout.link)
         .ok()
         .and_then(|target| version_from_name(&target));
+    let same_version = previous_version.as_deref() == Some(release.version.as_str());
+    // Last look at the link. The swap is next, and a rotated file is put back when this check
+    // or the swap fails.
+    if let Err(error) = ensure_link_unchanged(&env.layout.link, inode) {
+        undo_rotation(&partial, &final_path, &previous_file, same_version);
+        return fail(io, flags.json, &report, &error);
+    }
     if let Err(error) = publish_link(&env.layout, &final_path) {
-        if let Some(backup) = previous_file {
-            let _ = std::fs::rename(&final_path, &partial);
-            let _ = std::fs::rename(&backup, &final_path);
-        } else if previous_version.as_deref() != Some(release.version.as_str()) {
-            let _ = std::fs::remove_file(&final_path);
-        }
+        undo_rotation(&partial, &final_path, &previous_file, same_version);
         return fail(io, flags.json, &report, &error);
     }
 
@@ -600,6 +593,25 @@ fn file_id(path: &Path) -> std::io::Result<Option<FileId>> {
     }
 }
 
+fn ensure_link_unchanged(link: &Path, expected: Option<FileId>) -> Result<(), String> {
+    match file_id(link) {
+        Ok(now) if now == expected => Ok(()),
+        Ok(_) => Err("install path changed while updating".to_string()),
+        Err(error) => Err(format!("cannot stat {}: {error}", link.display())),
+    }
+}
+
+/// Puts a rotated install back. `previous` is the file `rotate_into_place` moved aside; the new
+/// bytes return to `partial` so the partial guard can delete them.
+fn undo_rotation(partial: &Path, dest: &Path, previous: &Option<PathBuf>, same_version: bool) {
+    if let Some(backup) = previous {
+        let _ = std::fs::rename(dest, partial);
+        let _ = std::fs::rename(backup, dest);
+    } else if !same_version {
+        let _ = std::fs::remove_file(dest);
+    }
+}
+
 struct PartialFile(PathBuf);
 
 impl Drop for PartialFile {
@@ -878,7 +890,7 @@ impl GitHubReleaseClient {
     fn new(latest_url: String, token: Option<String>) -> Result<Self, FetchError> {
         let http = reqwest::Client::builder()
             .user_agent("hearthd")
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(reqwest::redirect::Policy::custom(github_redirect))
             .connect_timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| FetchError::Message(format!("cannot build HTTP client: {error}")))?;
@@ -897,7 +909,15 @@ impl ReleaseTransport for GitHubReleaseClient {
     }
 
     async fn download(&self, url: &str, dest: &Path) -> Result<(), FetchError> {
-        let response = self.send(url, Duration::from_secs(600)).await?;
+        let response = self
+            .send(
+                url,
+                Duration::from_secs(600),
+                ASSET_ACCEPT,
+                false,
+                "download failed",
+            )
+            .await?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 FetchError::Message(format!("cannot create {}: {error}", parent.display()))
@@ -927,34 +947,99 @@ impl ReleaseTransport for GitHubReleaseClient {
 
 impl GitHubReleaseClient {
     async fn request_text(&self, url: &str, timeout: Duration) -> Result<String, FetchError> {
-        let response = self.send(url, timeout).await?;
-        response
-            .text()
-            .await
-            .map_err(|error| FetchError::Message(format!("GitHub request failed: {error}")))
+        let response = self
+            .send(
+                url,
+                timeout,
+                GITHUB_API_ACCEPT,
+                true,
+                "GitHub request failed",
+            )
+            .await?;
+        response.text().await.map_err(|error| {
+            FetchError::Message(format!("GitHub request failed: {}", error_chain(&error)))
+        })
     }
 
-    async fn send(&self, url: &str, timeout: Duration) -> Result<reqwest::Response, FetchError> {
+    async fn send(
+        &self,
+        url: &str,
+        timeout: Duration,
+        accept: &str,
+        api_version: bool,
+        failure: &str,
+    ) -> Result<reqwest::Response, FetchError> {
         let mut request = self
             .http
             .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Accept", accept)
             .header("User-Agent", "hearthd")
             .timeout(timeout);
-        if let Some(token) = &self.token {
+        if api_version {
+            request = request.header("X-GitHub-Api-Version", "2022-11-28");
+        }
+        // The token stays on the GitHub API hosts. Reqwest also drops Authorization when a
+        // redirect changes host, so the asset CDN does not receive it.
+        if let Some(token) = bearer_for(url, self.token.as_deref()) {
             request = request.bearer_auth(token);
         }
         let response = request
             .send()
             .await
-            .map_err(|error| FetchError::Message(format!("GitHub request failed: {error}")))?;
+            .map_err(|error| FetchError::Message(format!("{failure}: {}", error_chain(&error))))?;
         let status = response.status();
         if !status.is_success() {
             return Err(FetchError::Status(status.as_u16()));
         }
         Ok(response)
     }
+}
+
+fn release_redirect_allowed(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" || url.port().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    RELEASE_REDIRECT_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+}
+
+fn github_redirect(attempt: reqwest::redirect::Attempt<'_>) -> reqwest::redirect::Action {
+    if attempt.previous().len() > 10 {
+        return attempt.error("too many redirects");
+    }
+    if release_redirect_allowed(attempt.url()) {
+        return attempt.follow();
+    }
+    let url = attempt.url().clone();
+    attempt.error(format!("refusing redirect to {url}"))
+}
+
+fn bearer_for<'a>(url: &str, token: Option<&'a str>) -> Option<&'a str> {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return None;
+    };
+    if release_redirect_allowed(&parsed)
+        && matches!(parsed.host_str(), Some("github.com" | "api.github.com"))
+    {
+        token
+    } else {
+        None
+    }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(next) = source {
+        message.push_str(": ");
+        message.push_str(&next.to_string());
+        source = next.source();
+    }
+    message
 }
 
 fn github_token() -> Option<String> {
@@ -1593,6 +1678,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inode_change_before_publish_restores_the_previous_file() {
+        let world = world();
+        let exe = seed_symlink(&world, "0.16.0", b"old");
+        let bytes = b"new";
+        let transport = Scripted::new(Ok(document("v0.16.0", bytes)), bytes.to_vec());
+        let link = world.layout.link.clone();
+        let smoke = move |_path: &Path| {
+            std::fs::remove_file(&link).unwrap();
+            std::fs::write(&link, b"replaced").unwrap();
+            Ok("0.16.0".to_string())
+        };
+        let argv = args(&["--force"]);
+        let captured = exec(&env(&world, &exe, "0.16.0", &argv), &transport, &smoke).await;
+        assert_eq!(captured.code, 1);
+        assert!(
+            captured
+                .err
+                .iter()
+                .any(|line| line.contains("install path changed while updating")),
+            "{:?}",
+            captured.err
+        );
+        assert_eq!(
+            std::fs::read(world.layout.versioned("0.16.0")).unwrap(),
+            b"old"
+        );
+        assert!(!world.layout.dir.join("hearthd-0.16.0.previous").exists());
+        assert_eq!(std::fs::read(&world.layout.link).unwrap(), b"replaced");
+        let partial = std::fs::read_dir(&world.layout.dir).unwrap().any(|entry| {
+            entry
+                .ok()
+                .is_some_and(|entry| entry.file_name().to_string_lossy().contains("partial"))
+        });
+        assert!(!partial);
+    }
+
+    #[tokio::test]
     async fn prunes_versions_older_than_the_previous_one() {
         let world = world();
         let exe = seed_symlink(&world, "0.15.0", b"previous");
@@ -1716,6 +1838,10 @@ mod tests {
             let headers = request.to_ascii_lowercase();
             assert!(headers.contains("user-agent: hearthd"), "{request}");
             assert!(headers.contains("application/vnd.github+json"), "{request}");
+            assert!(
+                headers.contains("x-github-api-version: 2022-11-28"),
+                "{request}"
+            );
             let body = b"rate limited";
             let response = format!(
                 "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1731,10 +1857,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let payload = b"asset-bytes";
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buffer = [0u8; 2048];
-            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+            let mut buffer = [0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer)
+                .await
+                .unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buffer[..n]).to_string());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 payload.len()
@@ -1753,10 +1883,112 @@ mod tests {
             .download(&format!("http://{address}/hearthd-v0.17.0"), &dest)
             .await
             .unwrap();
+        let request = rx.await.unwrap();
+        let headers = request.to_ascii_lowercase();
+        assert!(headers.contains("user-agent: hearthd"), "{request}");
+        assert!(
+            headers.contains("accept: application/octet-stream"),
+            "{request}"
+        );
+        assert!(
+            !headers.contains("application/vnd.github+json"),
+            "{request}"
+        );
+        assert!(!headers.contains("x-github-api-version"), "{request}");
+        assert!(!headers.contains("authorization"), "{request}");
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
         let sha = hearth_core::shared::hex(&Sha256::digest(payload));
         verify_file(&dest, payload.len() as u64, &sha).unwrap();
         let wrong = verify_file(&dest, payload.len() as u64, &"0".repeat(64)).unwrap_err();
         assert!(wrong.contains("sha256 mismatch"), "{wrong}");
+    }
+
+    #[tokio::test]
+    async fn github_client_refuses_a_redirect_off_release_hosts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+            let response = b"HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response).await;
+        });
+        let client = GitHubReleaseClient::new(
+            format!("http://{address}/latest"),
+            Some("token".to_string()),
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("hearthd");
+        let error = client
+            .download(&format!("http://{address}/hearthd-v0.17.0"), &dest)
+            .await
+            .unwrap_err();
+        let FetchError::Message(message) = error else {
+            panic!("expected a message, got {error:?}");
+        };
+        assert!(
+            message.contains("refusing redirect to https://127.0.0.1/stolen"),
+            "{message}"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn bearer_token_stays_on_github_https() {
+        let token = Some("secret");
+        assert_eq!(
+            bearer_for(
+                "https://api.github.com/repos/ngosangns/hearth/releases/latest",
+                token
+            ),
+            token
+        );
+        assert_eq!(
+            bearer_for(
+                "https://github.com/ngosangns/hearth/releases/download/v0.16.0/hearthd-v0.16.0",
+                token
+            ),
+            token
+        );
+        assert_eq!(
+            bearer_for(
+                "https://release-assets.githubusercontent.com/github-production-release-asset/1",
+                token
+            ),
+            None
+        );
+        assert_eq!(
+            bearer_for(
+                "http://github.com/ngosangns/hearth/releases/download/v0.16.0/hearthd-v0.16.0",
+                token
+            ),
+            None
+        );
+        assert_eq!(bearer_for("https://evil.example/hearthd", token), None);
+        assert_eq!(
+            bearer_for("https://github.com.evil.example/hearthd", token),
+            None
+        );
+        assert!(release_redirect_allowed(
+            &reqwest::Url::parse("https://objects.githubusercontent.com/x").unwrap()
+        ));
+        assert!(release_redirect_allowed(
+            &reqwest::Url::parse("https://github-releases.githubusercontent.com/x").unwrap()
+        ));
+        assert!(release_redirect_allowed(
+            &reqwest::Url::parse("https://api.github.com/repos/ngosangns/hearth/releases/latest")
+                .unwrap()
+        ));
+        assert!(!release_redirect_allowed(
+            &reqwest::Url::parse("https://github.com:8443/ngosangns/hearth").unwrap()
+        ));
+        assert!(!release_redirect_allowed(
+            &reqwest::Url::parse("https://raw.githubusercontent.com/ngosangns/hearth/x").unwrap()
+        ));
+        assert!(!release_redirect_allowed(
+            &reqwest::Url::parse("http://release-assets.githubusercontent.com/x").unwrap()
+        ));
     }
 }

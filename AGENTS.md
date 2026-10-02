@@ -26,9 +26,14 @@ The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`
 `~/.local/share/hearth/bin/hearthd-<version>`, ad-hoc signs that file (never the live path), and
 points `~/.local/bin/hearthd` at it with a symlink. `hearthd update` downloads the GitHub asset
 `hearthd-<tag>` into the same layout after checking the tag, asset name, `github.com` download
-URL, size, `sha256` digest, executable bit, and a staged `--version` smoke test. It does not
-re-sign the download: `codesign --force` on a mapped ad-hoc binary SIGKILLs that process, and so
-does writing over its inode. The previous file stays for one generation. A daemon already running
+URL, size, `sha256` digest, executable bit, and a staged `--version` smoke test. The asset
+request uses `Accept: application/octet-stream` and follows only HTTPS redirects onto `github.com`,
+`api.github.com`, `release-assets.githubusercontent.com`, `objects.githubusercontent.com`, or
+`github-releases.githubusercontent.com`. A bearer token is sent only to `https://github.com` and
+`https://api.github.com`. The `~/.local/bin/hearthd` inode is checked again immediately before the
+symlink swap, and a file already rotated into place is moved back if that check or the swap fails.
+It does not re-sign the download: `codesign --force` on a mapped ad-hoc binary SIGKILLs that
+process, and so does writing over its inode. The previous file stays for one generation. A daemon already running
 keeps its old inode until `hearthd --root <project> manager restart` (services stay up); restart
 smp separately. The command refuses any current executable that is not that symlink's regular
 file or a file already in the versioned directory, refuses anything but darwin-arm64, and does
