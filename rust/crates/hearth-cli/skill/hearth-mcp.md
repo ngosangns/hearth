@@ -8,7 +8,7 @@ description: Operate this project's local dev services (start/stop/status/logs) 
 
 This project's local dev services (per-container infra, docker/tailnet-adopted units, and host
 processes it runs directly) are managed by a single background daemon — the
-Hearth daemon, the `hearthd` binary. Do not `kill`/`pkill`/`docker
+Hearth daemon, the `hearth` binary. Do not `kill`/`pkill`/`docker
 restart`/run a dev task raw for a unit this daemon tracks: its state would drift from the real
 process, and every CLI/TUI/MCP surface reading that state would start reporting the wrong thing.
 
@@ -53,7 +53,7 @@ running an older binary — it is not a way to restart a *service* (that is `man
 `stop_daemon` is the full shutdown: unlike `restart_daemon` it does **not** leave services
 running — the daemon stops every service it manages first, then exits. Only call it when the user
 has explicitly asked to stop the daemon (or the whole project). Afterwards **every** tool call —
-including `status` — fails until some other client (`hearthd` or the TUI) starts a
+including `status` — fails until some other client (`hearth` or the TUI) starts a
 new daemon; there is no `start_daemon` tool.
 
 `stop` on a service this daemon does not own a process for (an adopted `ownership: external` unit,
@@ -73,23 +73,23 @@ The same daemon backs a non-interactive CLI and an interactive TUI. All three
 (MCP, CLI, TUI) talk to the same daemon over the same loopback HTTP+SSE API, so state seen
 through one is state seen through all:
 
-- `hearthd status [service]` / `hearthd logs <service> [--tail N] [-f]`
-- `hearthd urls [service]` — the live URLs a service is reachable at (use these rather than guessing ports)
-- `hearthd start|stop|restart <service|group> [--wait]` — `start` also takes `--kill-unowned`
+- `hearth status [service]` / `hearth logs <service> [--tail N] [-f]`
+- `hearth urls [service]` — the live URLs a service is reachable at (use these rather than guessing ports)
+- `hearth start|stop|restart <service|group> [--wait]` — `start` also takes `--kill-unowned`
   (kill the process holding the service's port, then start; on a TTY `start` prompts instead)
-- `hearthd doctor` / `hearthd manager ensure|status|stop|restart|reload` (`restart` replaces the
+- `hearth doctor` / `hearth manager ensure|status|stop|restart|reload` (`restart` replaces the
   daemon process and leaves its services running for the new one to re-adopt; `stop` stops all
   managed services and then the daemon)
-- `hearthd tui` — terminal UI for workspaces and shared services; works from any directory
+- `hearth tui` — terminal UI for workspaces and shared services; works from any directory
 
 ## Architecture, in one paragraph
 
 One daemon per project root (HMAC-signed lock file under `.hearth/runtime/`), reached by
-any client via `hearthd manager ensure --json`, which prints the daemon's token/port/runtime
+any client via `hearth manager ensure --json`, which prints the daemon's token/port/runtime
 directory so a client never needs to reimplement lock-file discovery. A service is either
 daemon-owned (started/stopped only through this daemon) or externally-owned (e.g. a `docker
 compose`/`tailscale serve` unit whose lifecycle is managed elsewhere and merely observed/adopted
 by the daemon) — this project's own catalog decides which is which per service.
 
-This doc is generic to any project managed by `hearthd`; see this project's own docs
+This doc is generic to any project managed by `hearth`; see this project's own docs
 for its specific service list, ports, and any additional operational rules.

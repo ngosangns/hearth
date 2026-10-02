@@ -61,7 +61,7 @@ fn is_task_command(readiness: &ReadinessSpec) -> bool {
 
 /// An `ownership: external` service whose readiness is a `command` probe is also a task: its run
 /// command is a one-shot "bring the external thing up" trigger (e.g. the generated
-/// `hearthd shared attach` for a `shared:` entry), not the service process itself. Only the
+/// `hearth shared attach` for a `shared:` entry), not the service process itself. Only the
 /// external+command combination is treated this way — a daemon-owned service with `command`
 /// readiness still runs a real long-lived process.
 fn is_external_task(definition: Option<&ServiceDefinition>, profile: &VerifiedProfile) -> bool {
@@ -5080,7 +5080,7 @@ mod tests {
     }
 
     /// The `shared:` expansion relies on this: an `ownership: external` service whose readiness is a
-    /// `command` probe treats its run command as a one-shot task (`hearthd shared attach`), not the
+    /// `command` probe treats its run command as a one-shot task (`hearth shared attach`), not the
     /// service process — the service adopts when the probe reports ready and carries no identity.
     #[tokio::test]
     async fn an_external_command_readiness_service_runs_its_command_as_a_one_shot_task() {

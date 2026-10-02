@@ -183,7 +183,7 @@ impl SharedContext {
     /// Catalog URL precedence: the explicit argument (`HEARTH_SHARED_CATALOG_URL`) first, then a
     /// `catalog-url` file under the shared root, then the pinned `SHARED_CATALOG_URL`. The file
     /// exists because a daemon started outside a login shell cannot reliably carry the env var —
-    /// its callers (`hearthd tui`, `hearthd shared ensure`, a project daemon's `attach` task) all
+    /// its callers (`hearth tui`, `hearth shared ensure`, a project daemon's `attach` task) all
     /// run it detached with whatever environment they happened to inherit.
     pub fn open(root: PathBuf, catalog_url: Option<String>) -> Result<Arc<Self>, SharedError> {
         let io: Arc<dyn FileIo> = Arc::from(create_file_io(true));

@@ -1,5 +1,5 @@
-//! `hearthd update` installs the GitHub release asset `hearthd-vX.Y.Z` as
-//! `~/.local/share/hearth/bin/hearthd-X.Y.Z` and points `~/.local/bin/hearthd` at it.
+//! `hearth update` installs the GitHub release asset `hearth-vX.Y.Z` as
+//! `~/.local/share/hearth/bin/hearth-X.Y.Z` and points `~/.local/bin/hearth` at it.
 //!
 //! The swap renames a new inode into place. Overwriting a mapped ad-hoc-signed binary, or running
 //! `codesign --force` on that inode, SIGKILLs the process on macOS, so a download is never
@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::Io;
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/ngosangns/hearth/releases/latest";
-const USAGE: &str = "usage: hearthd update [--check] [--json] [--force]";
-const RESTART_NOTE: &str = "running daemons keep the previous binary until `hearthd --root <project> manager restart` (services stay up) and until `hearthd shared` is restarted for smp";
+const USAGE: &str = "usage: hearth update [--check] [--json] [--force]";
+const RESTART_NOTE: &str = "running daemons keep the previous binary until `hearth --root <project> manager restart` (services stay up) and until `hearth shared` is restarted for smp";
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const ASSET_ACCEPT: &str = "application/octet-stream";
 /// Exact HTTPS hosts a release request may redirect to. A suffix such as
@@ -40,13 +40,13 @@ struct Layout {
 impl Layout {
     fn from_home(home: &Path) -> Self {
         Self {
-            link: home.join(".local/bin/hearthd"),
+            link: home.join(".local/bin/hearth"),
             dir: home.join(".local/share/hearth/bin"),
         }
     }
 
     fn versioned(&self, version: &str) -> PathBuf {
-        self.dir.join(format!("hearthd-{version}"))
+        self.dir.join(format!("hearth-{version}"))
     }
 }
 
@@ -121,13 +121,13 @@ struct UpdateLock {
     file: std::fs::File,
 }
 
-/// Runs `hearthd update`. `current_version` is the hearthd package version, not hearth-cli's.
+/// Runs `hearth update`. `current_version` is the hearth package version, not hearth-cli's.
 pub async fn run(args: &[String], current_version: &str, io: &mut Io<'_>) -> i32 {
     let current_exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
             (io.err)(&format!(
-                "hearthd update: cannot resolve the current executable: {error}"
+                "hearth update: cannot resolve the current executable: {error}"
             ));
             return 1;
         }
@@ -136,14 +136,14 @@ pub async fn run(args: &[String], current_version: &str, io: &mut Io<'_>) -> i32
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     else {
-        (io.err)("hearthd update: HOME is not set");
+        (io.err)("hearth update: HOME is not set");
         return 1;
     };
     let client = match GitHubReleaseClient::production() {
         Ok(client) => client,
         Err(error) => {
             (io.err)(&format!(
-                "hearthd update: {}",
+                "hearth update: {}",
                 fetch_message(&error, "GitHub request failed")
             ));
             return 1;
@@ -204,7 +204,7 @@ async fn run_with(
             flags.json,
             &report_base(env, None),
             &format!(
-                "hearthd update only replaces {} (this process is {})",
+                "hearth update only replaces {} (this process is {})",
                 env.layout.link.display(),
                 env.current_exe.display()
             ),
@@ -232,11 +232,11 @@ async fn run_with(
 
     if flags.check || latest < current || (latest == current && !flags.force) {
         let human = if latest > current {
-            format!("hearthd {latest} is available (current {current})")
+            format!("hearth {latest} is available (current {current})")
         } else if latest == current {
-            format!("hearthd {current} is already up to date")
+            format!("hearth {current} is already up to date")
         } else {
-            format!("hearthd {current} is newer than the latest release {latest}")
+            format!("hearth {current} is newer than the latest release {latest}")
         };
         return succeed(io, flags.json, &report, &human);
     }
@@ -258,7 +258,7 @@ async fn run_with(
     };
 
     let partial = env.layout.dir.join(format!(
-        ".hearthd-{}.{}.partial",
+        ".hearth-{}.{}.partial",
         release.version,
         std::process::id()
     ));
@@ -286,7 +286,7 @@ async fn run_with(
                 flags.json,
                 &report,
                 &format!(
-                    "smoke test printed \"hearthd {printed}\", expected hearthd {}",
+                    "smoke test printed \"hearth {printed}\", expected hearth {}",
                     release.version
                 ),
             );
@@ -313,6 +313,9 @@ async fn run_with(
         undo_rotation(&partial, &final_path, &previous_file, same_version);
         return fail(io, flags.json, &report, &error);
     }
+    // The command was `hearthd` through 0.17.0. A successful install drops that symlink
+    // and leaves the old versioned file alone (a running daemon may still be mapped to it).
+    remove_legacy_command_link(&env.layout);
 
     let mut keep = vec![release.version.as_str()];
     if let Some(previous) = previous_version.as_deref() {
@@ -323,9 +326,9 @@ async fn run_with(
     report.update_available = false;
     report.install_path = final_path.display().to_string();
     let human = if latest > current {
-        format!("updated hearthd to {latest}\n{RESTART_NOTE}")
+        format!("updated hearth to {latest}\n{RESTART_NOTE}")
     } else {
-        format!("reinstalled hearthd {latest}\n{RESTART_NOTE}")
+        format!("reinstalled hearth {latest}\n{RESTART_NOTE}")
     };
     succeed(io, flags.json, &report, &human)
 }
@@ -385,7 +388,7 @@ fn parse_release(document: &str) -> Result<Release, String> {
     if parsed.get("prerelease").and_then(Value::as_bool) != Some(false) {
         return Err("latest release is a prerelease".to_string());
     }
-    let name = format!("hearthd-{tag}");
+    let name = format!("hearth-{tag}");
     let assets = parsed
         .get("assets")
         .and_then(Value::as_array)
@@ -521,7 +524,7 @@ fn smoke_binary(path: &Path) -> Result<String, String> {
         return Err(format!("smoke test failed (exit {code})"));
     }
     let line = stdout.lines().next().unwrap_or("").trim();
-    let Some(version) = line.strip_prefix("hearthd ") else {
+    let Some(version) = line.strip_prefix("hearth ") else {
         return Err(format!("smoke test printed {line:?}"));
     };
     let version = version.trim();
@@ -708,13 +711,29 @@ fn restore_link(link: &Path, backup: &LinkBackup) -> Result<(), String> {
     }
 }
 
+fn remove_legacy_command_link(layout: &Layout) {
+    let Some(parent) = layout.link.parent() else {
+        return;
+    };
+    let legacy = parent.join("hearthd");
+    if legacy == layout.link {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(&legacy) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+}
+
 fn place_symlink(link: &Path, target: &Path) -> Result<(), String> {
     let parent = link
         .parent()
         .ok_or_else(|| format!("cannot symlink {}", link.display()))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    let tmp = parent.join(format!(".hearthd-link-{}", uuid::Uuid::new_v4()));
+    let tmp = parent.join(format!(".hearth-link-{}", uuid::Uuid::new_v4()));
     std::os::unix::fs::symlink(target, &tmp)
         .map_err(|error| format!("cannot symlink {}: {error}", link.display()))?;
     if let Err(error) = std::fs::rename(&tmp, link) {
@@ -725,10 +744,10 @@ fn place_symlink(link: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn unique_aside(dir: &Path) -> PathBuf {
-    let path = dir.join(format!("hearthd-previous-{}", std::process::id()));
+    let path = dir.join(format!("hearth-previous-{}", std::process::id()));
     if std::fs::symlink_metadata(&path).is_ok() {
         dir.join(format!(
-            "hearthd-previous-{}-{}",
+            "hearth-previous-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ))
@@ -760,7 +779,7 @@ fn relative_from(base: &Path, target: &Path) -> PathBuf {
 
 fn version_from_name(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    let version = name.strip_prefix("hearthd-")?;
+    let version = name.strip_prefix("hearth-")?;
     parse_semver(version)?;
     Some(version.to_string())
 }
@@ -771,7 +790,7 @@ fn prune_old_versions(dir: &Path, keep: &[&str]) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(version) = name.strip_prefix("hearthd-") else {
+        let Some(version) = name.strip_prefix("hearth-") else {
             continue;
         };
         if parse_semver(version).is_some() && !keep.contains(&version) {
@@ -800,7 +819,7 @@ impl UpdateLock {
             if error.kind() == std::io::ErrorKind::WouldBlock
                 || error.raw_os_error() == Some(libc::EAGAIN)
             {
-                return Err("hearthd update is already running".to_string());
+                return Err("hearth update is already running".to_string());
             }
             return Err(format!("cannot lock {}: {error}", path.display()));
         }
@@ -856,7 +875,7 @@ fn emit(io: &mut Io<'_>, json_mode: bool, report: &Report, human: &str, ok: bool
             (io.out)(line);
         }
     } else {
-        (io.err)(&format!("hearthd update: {human}"));
+        (io.err)(&format!("hearth update: {human}"));
     }
 }
 
@@ -889,7 +908,7 @@ impl GitHubReleaseClient {
 
     fn new(latest_url: String, token: Option<String>) -> Result<Self, FetchError> {
         let http = reqwest::Client::builder()
-            .user_agent("hearthd")
+            .user_agent("hearth")
             .redirect(reqwest::redirect::Policy::custom(github_redirect))
             .connect_timeout(Duration::from_secs(15))
             .build()
@@ -973,7 +992,7 @@ impl GitHubReleaseClient {
             .http
             .get(url)
             .header("Accept", accept)
-            .header("User-Agent", "hearthd")
+            .header("User-Agent", "hearth")
             .timeout(timeout);
         if api_version {
             request = request.header("X-GitHub-Api-Version", "2022-11-28");
@@ -1151,11 +1170,11 @@ mod tests {
             "draft": false,
             "prerelease": false,
             "assets": [{
-                "name": format!("hearthd-{tag}"),
+                "name": format!("hearth-{tag}"),
                 "state": "uploaded",
                 "size": bytes.len(),
                 "digest": format!("sha256:{sha}"),
-                "browser_download_url": format!("https://github.com/ngosangns/hearth/releases/download/{tag}/hearthd-{tag}"),
+                "browser_download_url": format!("https://github.com/ngosangns/hearth/releases/download/{tag}/hearth-{tag}"),
             }]
         })
         .to_string()
@@ -1217,6 +1236,8 @@ mod tests {
     #[tokio::test]
     async fn newer_release_installs_a_versioned_symlink() {
         let world = world();
+        let legacy = world.layout.link.with_file_name("hearthd");
+        std::os::unix::fs::symlink("old-hearthd", &legacy).unwrap();
         let exe = seed_regular(&world, b"old-regular");
         let before = file_id(&exe).unwrap().unwrap();
         let bytes = b"new-bytes";
@@ -1232,7 +1253,7 @@ mod tests {
         assert_eq!(transport.downloads(), 1);
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.17.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.17.0")
         );
         let installed = world.layout.versioned("0.17.0");
         assert_eq!(std::fs::read(&installed).unwrap(), bytes);
@@ -1247,7 +1268,7 @@ mod tests {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("hearthd-previous-")
+                    .starts_with("hearth-previous-")
             })
             .unwrap();
         assert_eq!(std::fs::read(aside.path()).unwrap(), b"old-regular");
@@ -1255,7 +1276,7 @@ mod tests {
         assert!(captured
             .out
             .iter()
-            .any(|line| line.contains("updated hearthd to 0.17.0")));
+            .any(|line| line.contains("updated hearth to 0.17.0")));
         assert!(captured
             .out
             .iter()
@@ -1263,7 +1284,8 @@ mod tests {
         assert!(captured
             .out
             .iter()
-            .any(|line| line.contains("hearthd shared")));
+            .any(|line| line.contains("hearth shared")));
+        assert!(std::fs::symlink_metadata(&legacy).is_err());
     }
 
     #[tokio::test]
@@ -1283,7 +1305,7 @@ mod tests {
         assert_eq!(transport.downloads(), 0);
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
         assert!(captured
             .out
@@ -1312,17 +1334,17 @@ mod tests {
         );
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
         assert!(world
             .layout
             .versioned("0.16.0")
-            .with_file_name("hearthd-0.16.0.previous")
+            .with_file_name("hearth-0.16.0.previous")
             .is_file());
         assert!(captured
             .out
             .iter()
-            .any(|line| line.contains("reinstalled hearthd 0.16.0")));
+            .any(|line| line.contains("reinstalled hearth 0.16.0")));
     }
 
     #[tokio::test]
@@ -1344,14 +1366,14 @@ mod tests {
         assert_eq!(payload["current"], "0.16.0");
         assert_eq!(payload["latest"], "0.17.0");
         assert_eq!(payload["updateAvailable"], true);
-        assert_eq!(payload["asset"], "hearthd-v0.17.0");
+        assert_eq!(payload["asset"], "hearth-v0.17.0");
         assert!(payload["installPath"]
             .as_str()
             .unwrap()
-            .ends_with("hearthd-0.17.0"));
+            .ends_with("hearth-0.17.0"));
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
     }
 
@@ -1374,7 +1396,7 @@ mod tests {
         );
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
         assert_eq!(
             std::fs::read(world.layout.versioned("0.16.0")).unwrap(),
@@ -1405,9 +1427,9 @@ mod tests {
     async fn wrong_asset_name_leaves_the_previous_symlink() {
         let bytes = b"bytes";
         let document = mutate(&document("v0.17.0", bytes), |value| {
-            value["assets"][0]["name"] = json!("hearthd-v0.17.0-linux");
+            value["assets"][0]["name"] = json!("hearth-v0.17.0-linux");
         });
-        assert_keeps_previous(document, bytes, "no asset named hearthd-v0.17.0").await;
+        assert_keeps_previous(document, bytes, "no asset named hearth-v0.17.0").await;
     }
 
     #[tokio::test]
@@ -1415,9 +1437,9 @@ mod tests {
         let bytes = b"bytes";
         let document = mutate(&document("v0.17.0", bytes), |value| {
             value["assets"][0]["browser_download_url"] =
-                json!("https://example.com/hearthd-v0.17.0");
+                json!("https://example.com/hearth-v0.17.0");
         });
-        assert_keeps_previous(document, bytes, "download url must be https://github.com/ngosangns/hearth/releases/download/v0.17.0/hearthd-v0.17.0").await;
+        assert_keeps_previous(document, bytes, "download url must be https://github.com/ngosangns/hearth/releases/download/v0.17.0/hearth-v0.17.0").await;
     }
 
     #[tokio::test]
@@ -1467,7 +1489,7 @@ mod tests {
             .any(|line| line.contains("smoke test failed")));
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
         assert!(!world.layout.versioned("0.17.0").exists());
         let leftovers: Vec<_> = std::fs::read_dir(&world.layout.dir)
@@ -1496,10 +1518,10 @@ mod tests {
         assert!(captured
             .err
             .iter()
-            .any(|line| line.contains("expected hearthd 0.17.0")));
+            .any(|line| line.contains("expected hearth 0.17.0")));
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
     }
 
@@ -1515,7 +1537,7 @@ mod tests {
         let backup = publish_link(&world.layout, &new).unwrap();
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.17.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.17.0")
         );
         restore_link(&world.layout.link, &backup).unwrap();
         assert_eq!(link_target(&world), relative_old);
@@ -1563,7 +1585,7 @@ mod tests {
         assert_eq!(transport.downloads(), 0);
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
     }
 
@@ -1571,7 +1593,7 @@ mod tests {
     async fn refuses_a_binary_outside_the_install_path() {
         let world = world();
         let _exe = seed_symlink(&world, "0.16.0", b"old");
-        let outside = world._tmp.path().join("target/release/hearthd");
+        let outside = world._tmp.path().join("target/release/hearth");
         std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
         std::fs::write(&outside, b"cargo").unwrap();
         let bytes = b"new";
@@ -1589,21 +1611,21 @@ mod tests {
                 .err
                 .iter()
                 .any(|line| line.contains("only replaces")
-                    && line.contains("target/release/hearthd")),
+                    && line.contains("target/release/hearth")),
             "{:?}",
             captured.err
         );
         assert_eq!(transport.downloads(), 0);
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
     }
 
     #[tokio::test]
     async fn refuses_a_symlink_that_points_outside_the_versioned_dir() {
         let world = world();
-        let outside = world._tmp.path().join("elsewhere/hearthd");
+        let outside = world._tmp.path().join("elsewhere/hearth");
         std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
         std::fs::write(&outside, b"other").unwrap();
         std::os::unix::fs::symlink(&outside, &world.layout.link).unwrap();
@@ -1680,6 +1702,8 @@ mod tests {
     #[tokio::test]
     async fn inode_change_before_publish_restores_the_previous_file() {
         let world = world();
+        let legacy = world.layout.link.with_file_name("hearthd");
+        std::os::unix::fs::symlink("old-hearthd", &legacy).unwrap();
         let exe = seed_symlink(&world, "0.16.0", b"old");
         let bytes = b"new";
         let transport = Scripted::new(Ok(document("v0.16.0", bytes)), bytes.to_vec());
@@ -1704,8 +1728,9 @@ mod tests {
             std::fs::read(world.layout.versioned("0.16.0")).unwrap(),
             b"old"
         );
-        assert!(!world.layout.dir.join("hearthd-0.16.0.previous").exists());
+        assert!(!world.layout.dir.join("hearth-0.16.0.previous").exists());
         assert_eq!(std::fs::read(&world.layout.link).unwrap(), b"replaced");
+        assert!(std::fs::symlink_metadata(&legacy).is_ok());
         let partial = std::fs::read_dir(&world.layout.dir).unwrap().any(|entry| {
             entry
                 .ok()
@@ -1761,7 +1786,7 @@ mod tests {
             .any(|line| line.contains("newer than the latest release")));
         assert_eq!(
             link_target(&world),
-            PathBuf::from("../share/hearth/bin/hearthd-0.18.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.18.0")
         );
     }
 
@@ -1802,7 +1827,7 @@ mod tests {
         let relative = relative_from(world.layout.link.parent().unwrap(), &target);
         assert_eq!(
             relative,
-            PathBuf::from("../share/hearth/bin/hearthd-0.16.0")
+            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
     }
 
@@ -1810,7 +1835,7 @@ mod tests {
     fn smoke_reads_a_version_line_and_rejects_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let ok = tmp.path().join("ok");
-        std::fs::write(&ok, "#!/bin/sh\necho hearthd 0.2.0\n").unwrap();
+        std::fs::write(&ok, "#!/bin/sh\necho hearth 0.2.0\n").unwrap();
         std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(smoke_binary(&ok).unwrap(), "0.2.0");
 
@@ -1836,7 +1861,7 @@ mod tests {
                 .unwrap();
             let request = String::from_utf8_lossy(&buffer[..n]);
             let headers = request.to_ascii_lowercase();
-            assert!(headers.contains("user-agent: hearthd"), "{request}");
+            assert!(headers.contains("user-agent: hearth"), "{request}");
             assert!(headers.contains("application/vnd.github+json"), "{request}");
             assert!(
                 headers.contains("x-github-api-version: 2022-11-28"),
@@ -1878,14 +1903,14 @@ mod tests {
         )
         .unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("hearthd");
+        let dest = tmp.path().join("hearth");
         client
-            .download(&format!("http://{address}/hearthd-v0.17.0"), &dest)
+            .download(&format!("http://{address}/hearth-v0.17.0"), &dest)
             .await
             .unwrap();
         let request = rx.await.unwrap();
         let headers = request.to_ascii_lowercase();
-        assert!(headers.contains("user-agent: hearthd"), "{request}");
+        assert!(headers.contains("user-agent: hearth"), "{request}");
         assert!(
             headers.contains("accept: application/octet-stream"),
             "{request}"
@@ -1920,9 +1945,9 @@ mod tests {
         )
         .unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("hearthd");
+        let dest = tmp.path().join("hearth");
         let error = client
-            .download(&format!("http://{address}/hearthd-v0.17.0"), &dest)
+            .download(&format!("http://{address}/hearth-v0.17.0"), &dest)
             .await
             .unwrap_err();
         let FetchError::Message(message) = error else {
@@ -1947,7 +1972,7 @@ mod tests {
         );
         assert_eq!(
             bearer_for(
-                "https://github.com/ngosangns/hearth/releases/download/v0.16.0/hearthd-v0.16.0",
+                "https://github.com/ngosangns/hearth/releases/download/v0.16.0/hearth-v0.16.0",
                 token
             ),
             token
@@ -1961,14 +1986,14 @@ mod tests {
         );
         assert_eq!(
             bearer_for(
-                "http://github.com/ngosangns/hearth/releases/download/v0.16.0/hearthd-v0.16.0",
+                "http://github.com/ngosangns/hearth/releases/download/v0.16.0/hearth-v0.16.0",
                 token
             ),
             None
         );
-        assert_eq!(bearer_for("https://evil.example/hearthd", token), None);
+        assert_eq!(bearer_for("https://evil.example/hearth", token), None);
         assert_eq!(
-            bearer_for("https://github.com.evil.example/hearthd", token),
+            bearer_for("https://github.com.evil.example/hearth", token),
             None
         );
         assert!(release_redirect_allowed(

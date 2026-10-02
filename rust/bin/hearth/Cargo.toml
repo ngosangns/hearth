@@ -1,11 +1,11 @@
 [package]
-name = "hearthd"
-version = "0.17.0"
+name = "hearth"
+version = "0.18.0"
 edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "hearthd"
+name = "hearth"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! `hearthd tui` app shell. It reads the workspace file and talks to each
+//! `hearth tui` app shell. It reads the workspace file and talks to each
 //! project's daemon over HTTP+SSE. Selecting a workspace only discovers a daemon that is already
 //! running. Enter on a trusted workspace is what spawns one. An untrusted folder takes a second
 //! enter, and that is the confirm.
@@ -83,7 +83,7 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
     let mut store = match WorkspaceStore::open(default_workspace_file()) {
         Ok(store) => store,
         Err(error) => {
-            eprintln!("hearthd tui: {error}");
+            eprintln!("hearth tui: {error}");
             return 1;
         }
     };
@@ -92,14 +92,14 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
         Ok(terminal) => terminal,
         Err(error) => {
             ratatui::restore();
-            eprintln!("hearthd tui: {error}");
+            eprintln!("hearth tui: {error}");
             return 1;
         }
     };
     // Drop the app (and its terminal) before restoring raw mode, the alternate screen, and the mouse.
     let _restorer = Restorer;
     if let Err(error) = execute!(std::io::stdout(), EnableMouseCapture, Hide) {
-        eprintln!("hearthd tui: {error}");
+        eprintln!("hearth tui: {error}");
         return 1;
     }
     let (tx, rx) = mpsc::channel(256);
@@ -1110,8 +1110,8 @@ impl App {
 
     fn open_updates(&mut self) {
         self.desk.notice = match std::process::Command::new("open").arg(RELEASES_URL).status() {
-            Ok(status) if status.success() => "opened the releases page — hearthd update installs the latest binary".to_string(),
-            _ => format!("{RELEASES_URL} — hearthd update installs the latest binary"),
+            Ok(status) if status.success() => "opened the releases page — hearth update installs the latest binary".to_string(),
+            _ => format!("{RELEASES_URL} — hearth update installs the latest binary"),
         };
         self.draw();
     }

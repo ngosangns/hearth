@@ -1,4 +1,4 @@
-//! `hearthd shared …` — the CLI surface for the machine-global smp daemon (`docs/shared-services.md`).
+//! `hearth shared …` — the CLI surface for the machine-global smp daemon (`docs/shared-services.md`).
 //! These commands deliberately do not require a project `hearth.yaml`: `attach`/`detach`/`probe`
 //! derive the project identity from `--root`/cwd so the generated `shared:` service commands work
 //! in any directory a project daemon runs them from.
@@ -36,7 +36,7 @@ pub async fn discover_smp() -> Discovery {
     discover(&shared_root(), &smp_catalog()).await
 }
 
-/// Live client for smp, spawning `hearthd smp` (via `spawn_smp`) when none is running.
+/// Live client for smp, spawning `hearth smp` (via `spawn_smp`) when none is running.
 pub async fn ensure_smp(spawn_smp: &Arc<dyn Fn(&Path) + Send + Sync>) -> LocalctlResult<Client> {
     let spawn = spawn_smp.clone();
     let options = LocalctlOptions {
@@ -120,7 +120,7 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
     let (parsed, passthrough) = split_passthrough(args);
     let flags = parse_command_flags(parsed, &[FlagName::Json, FlagName::Force])?;
     let Some(subcommand) = flags.positionals.first().cloned() else {
-        return usage_err("usage: hearthd shared ensure|list|installed|status|attach|detach|probe|install|start|stop|remove [--json] [--force] [<name>@<version>] [attach-args...]");
+        return usage_err("usage: hearth shared ensure|list|installed|status|attach|detach|probe|install|start|stop|remove [--json] [--force] [<name>@<version>] [attach-args...]");
     };
     if flags.force && subcommand != "remove" {
         return usage_err("--force is only supported by `shared remove`");

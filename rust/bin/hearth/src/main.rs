@@ -1,12 +1,12 @@
-//! `hearthd`: the daemon, the CLI, the TUI, and the MCP server in one binary.
-//! `hearthd daemon` and `hearthd smp` run a manager in the foreground (and are what `ensure` spawns
+//! `hearth`: the daemon, the CLI, the TUI, and the MCP server in one binary.
+//! `hearth daemon` and `hearth smp` run a manager in the foreground (and are what `ensure` spawns
 //! detached); `tui` and bare `mcp` are intercepted here because `hearth-cli` cannot depend on
 //! `hearth-tui`/`hearth-mcp`; every other subcommand delegates to `hearth_cli::main`.
 use std::path::{Path, PathBuf};
 
 fn report_config_error(root: &Path, errors: &[String]) {
     eprintln!(
-        "hearthd: could not load a service catalog for {}",
+        "hearth: could not load a service catalog for {}",
         root.display()
     );
     for error in errors {
@@ -57,7 +57,7 @@ async fn run_manager(
 
 async fn run_daemon_subcommand(root: PathBuf, rest: &[String]) -> i32 {
     if !rest.is_empty() {
-        eprintln!("usage: hearthd daemon --root <path>");
+        eprintln!("usage: hearth daemon --root <path>");
         return 2;
     }
     let loaded = match hearth_core::config_file::load_catalog(&root) {
@@ -79,7 +79,7 @@ async fn run_daemon_subcommand(root: PathBuf, rest: &[String]) -> i32 {
 /// state.json, HTTP+SSE surface, `ensure`/`discover`) is identical to a project daemon.
 async fn run_smp_subcommand(rest: &[String]) -> i32 {
     if !rest.is_empty() {
-        eprintln!("usage: hearthd smp");
+        eprintln!("usage: hearth smp");
         return 2;
     }
     let root = hearth_core::shared::shared_root();
@@ -88,7 +88,7 @@ async fn run_smp_subcommand(rest: &[String]) -> i32 {
     let ctx = match hearth_core::shared::SharedContext::open(root.clone(), catalog_url) {
         Ok(ctx) => ctx,
         Err(error) => {
-            eprintln!("hearthd smp: cannot open {}: {}", root.display(), error);
+            eprintln!("hearth smp: cannot open {}: {}", root.display(), error);
             return 1;
         }
     };
@@ -98,7 +98,7 @@ async fn run_smp_subcommand(rest: &[String]) -> i32 {
     ) {
         Ok(catalog) => catalog,
         Err(error) => {
-            eprintln!("hearthd smp: cannot synthesize catalog: {error}");
+            eprintln!("hearth smp: cannot synthesize catalog: {error}");
             return 1;
         }
     };
@@ -109,7 +109,7 @@ async fn run_smp_subcommand(rest: &[String]) -> i32 {
 /// Re-invokes this binary with `args`, detached: its own process group, stdio discarded, never
 /// waited on — the child outlives this process.
 fn spawn_detached(args: &[&str], cwd: Option<&Path>) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearthd"));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearth"));
     let mut command = std::process::Command::new(exe);
     command
         .args(args)
@@ -127,12 +127,12 @@ fn spawn_detached(args: &[&str], cwd: Option<&Path>) {
     let _ = command.spawn();
 }
 
-/// `hearthd daemon --root <root>`, detached.
+/// `hearth daemon --root <root>`, detached.
 fn spawn_daemon(root: &Path) {
     spawn_detached(&["daemon", "--root", &root.to_string_lossy()], Some(root));
 }
 
-/// `hearthd smp`, detached. smp has one fixed root, so the requested one is ignored.
+/// `hearth smp`, detached. smp has one fixed root, so the requested one is ignored.
 fn spawn_smp(_root: &Path) {
     spawn_detached(&["smp"], None);
 }
@@ -159,14 +159,14 @@ async fn run_mcp_subcommand(root: PathBuf, catalog: hearth_core::catalog::Servic
     let running = match server.serve(rmcp::transport::stdio()).await {
         Ok(running) => running,
         Err(error) => {
-            eprintln!("hearthd mcp: failed to start: {error}");
+            eprintln!("hearth mcp: failed to start: {error}");
             return 1;
         }
     };
     match running.waiting().await {
         Ok(_) => 0,
         Err(error) => {
-            eprintln!("hearthd mcp: {error}");
+            eprintln!("hearth mcp: {error}");
             1
         }
     }
@@ -177,9 +177,9 @@ async fn run_mcp_subcommand(root: PathBuf, catalog: hearth_core::catalog::Servic
 /// here" is a bad first experience for someone who just installed the binary.
 fn print_help() {
     println!(
-        "hearthd — local dev services daemon, CLI, TUI, and MCP server
+        "hearth — local dev services daemon, CLI, TUI, and MCP server
 
-usage: hearthd [--root <path>] <command> [options]
+usage: hearth [--root <path>] <command> [options]
 
   status [target] [--json]              current state of one service, a group, or all
   start|stop|restart <target> [--wait]  lifecycle actions
@@ -203,7 +203,7 @@ usage: hearthd [--root <path>] <command> [options]
   skill install --dest <path>           write the generic MCP skill doc
 
 tui, shared, and update do not need a hearth.yaml in the current directory.
-hearthd --root <project> tui adopts that project when it has a catalog.
+hearth --root <project> tui adopts that project when it has a catalog.
 Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json."
     );
@@ -216,7 +216,7 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
             return 0;
         }
         Some("--version") | Some("-V") => {
-            println!("hearthd {}", env!("CARGO_PKG_VERSION"));
+            println!("hearth {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
         _ => {}
@@ -256,7 +256,7 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
     // The terminal UI is an app shell: it does not need a hearth.yaml in the current directory.
     if rest.first().map(String::as_str) == Some("tui") {
         if rest.len() > 1 {
-            eprintln!("usage: hearthd tui");
+            eprintln!("usage: hearth tui");
             return 2;
         }
         return hearth_tui::run_shell(hearth_tui::ShellOptions {
@@ -315,7 +315,7 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
 
 fn main() {
     // Before the runtime exists, so no other thread can be reading the environment concurrently.
-    // Needed because a GUI-spawned `hearthd` (and the daemon it spawns) inherits launchd's bare PATH,
+    // Needed because a GUI-spawned `hearth` (and the daemon it spawns) inherits launchd's bare PATH,
     // under which `docker`, `tailscale` and `bun` cannot be found — see
     // `hearth_core::env::with_known_tool_directories`.
     let path = hearth_core::env::with_known_tool_directories(
@@ -334,7 +334,7 @@ fn main() {
         if argv.first().map(String::as_str) == Some("smp") {
             return run_smp_subcommand(&argv[1..]).await;
         }
-        // `hearthd daemon --root <path>` is the spawned form; `--root <path> daemon` works too.
+        // `hearth daemon --root <path>` is the spawned form; `--root <path> daemon` works too.
         let (argv, daemon) = match argv.first().map(String::as_str) {
             Some("daemon") => (argv[1..].to_vec(), true),
             _ => (argv, false),

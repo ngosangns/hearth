@@ -1073,7 +1073,7 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
     // May be absent/empty when a project only declares `shared:` services — allowed above.
     let services_raw = services_raw.cloned().unwrap_or_default();
     // Document order, not sorted: the TS loader iterates `Object.entries` (insertion order), and
-    // this order is user-visible — it drives `/v1/catalog`, `hearthd status` row order, and the TUI
+    // this order is user-visible — it drives `/v1/catalog`, `hearth status` row order, and the TUI
     // list. Sorting here made the same YAML file present differently depending on which
     // implementation read it. `serde_json`'s `preserve_order` feature (enabled workspace-wide) is
     // what makes `keys()` document-ordered.
@@ -1301,7 +1301,7 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
     // through the existing `duplicate service` check — both lists share `services` below.
     let mut shared_ids: Vec<String> = Vec::new();
     if let Some(entries) = top.get("shared").and_then(Value::as_object) {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearthd"));
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hearth"));
         for (name, value) in entries {
             let version = match value {
                 Value::String(s) => s.clone(),
@@ -1382,7 +1382,7 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
     }
     // `groups:` values may name other groups — members expand depth-first in declaration order,
     // deduplicated on first occurrence. A name shared by a service and a group resolves as the
-    // service, matching `hearthd <target>` precedence.
+    // service, matching `hearth <target>` precedence.
     let declared_groups: Vec<(String, Vec<String>)> = top
         .get("groups")
         .and_then(Value::as_object)
@@ -1414,7 +1414,7 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
         groups.insert(name.clone(), resolved);
     }
     // Shared services join the conventional `all` group when the project defines one — so
-    // `hearthd start all` brings them up too. No `all` group → no implicit membership.
+    // `hearth start all` brings them up too. No `all` group → no implicit membership.
     if let Some(all) = groups.get_mut("all") {
         for id in &shared_ids {
             if !all.contains(id) {
@@ -1422,7 +1422,7 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
             }
         }
     }
-    // Disabled services never join a group target — `hearthd start <group>` skips them. They stay
+    // Disabled services never join a group target — `hearth start <group>` skips them. They stay
     // in `group_tree` (display membership is still meaningful) and as direct `start <id>` targets,
     // where the operation itself is what gets rejected.
     let disabled_ids: std::collections::HashSet<&str> = services
@@ -1907,8 +1907,8 @@ services:
     }
 
     /// `shared:` expands into generated `ownership: external` services — run is the one-shot
-    /// `hearthd shared attach` task, readiness is the `hearthd shared probe` command, and the
-    /// service joins `all` so `hearthd start all` covers it.
+    /// `hearth shared attach` task, readiness is the `hearth shared probe` command, and the
+    /// service joins `all` so `hearth start all` covers it.
     #[test]
     fn shared_entries_expand_into_generated_external_services() {
         let dir = tempfile::tempdir().unwrap();
@@ -2105,7 +2105,7 @@ services:
     }
 
     /// `disabled: true` keeps the service in the catalog and in `groupTree` (display membership),
-    /// but group targets expand past it — `hearthd start <group>` never touches it.
+    /// but group targets expand past it — `hearth start <group>` never touches it.
     #[test]
     fn disabled_services_leave_group_targets() {
         let dir = tempfile::tempdir().unwrap();
@@ -2245,7 +2245,7 @@ services:
     }
 
     /// Document order, not alphabetical: the TS loader iterates insertion order, and this ordering
-    /// is user-visible in `/v1/catalog`, `hearthd status`, and the TUI.
+    /// is user-visible in `/v1/catalog`, `hearth status`, and the TUI.
     #[test]
     fn services_keep_their_document_order() {
         let dir = tempfile::tempdir().unwrap();

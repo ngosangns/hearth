@@ -717,6 +717,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hearth"
+version = "0.18.0"
+dependencies = [
+ "hearth-cli",
+ "hearth-core",
+ "hearth-mcp",
+ "hearth-tui",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hearth-cli"
 version = "0.1.0"
 dependencies = [
@@ -790,20 +804,6 @@ dependencies = [
  "tokio-util",
  "unicode-width",
  "uuid",
-]
-
-[[package]]
-name = "hearthd"
-version = "0.17.0"
-dependencies = [
- "hearth-cli",
- "hearth-core",
- "hearth-mcp",
- "hearth-tui",
- "rmcp",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! `hearthd mcp`: MCP tools (`status`, `logs`, `trace`, `events`, `manage`, daemon lifecycle and
+//! `hearth mcp`: MCP tools (`status`, `logs`, `trace`, `events`, `manage`, daemon lifecycle and
 //! shared services) over the daemon's HTTP API, built on `rmcp`. See `server.rs` for why it
 //! hand-implements `ServerHandler`.
 pub mod client;

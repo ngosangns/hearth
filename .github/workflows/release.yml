@@ -3,7 +3,7 @@ name: Release
 # Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. The tag push
 # runs CI (ci.yml) first; this workflow starts when that CI run completes and only publishes if it
 # succeeded, so a tag whose tests or clippy fail never gets a release asset. It builds the release
-# `hearthd` binary and attaches it to the GitHub Release.
+# `hearth` binary and attaches it to the GitHub Release.
 #
 # `workflow_run` always runs this file from the default branch, and `github.ref*` there describe
 # that branch — the tag and commit come from `github.event.workflow_run` instead.
@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  hearthd:
+  hearth:
     # For a tag push, `head_branch` is the tag name. CI's other push trigger is `main`, and PR runs
     # are excluded by the event check.
     if: >-
@@ -38,13 +38,13 @@ jobs:
       - uses: ./.github/actions/toolchain-path
         with:
           tools: cargo gh
-      - name: Build hearthd
+      - name: Build hearth
         run: |
           set -euo pipefail
-          cargo build --release -p hearthd
+          cargo build --release -p hearth
           # Ad-hoc sign after the copy-equivalent link, or macOS kills the binary on launch.
-          codesign --sign - --force target/release/hearthd
-          cp target/release/hearthd "hearthd-${RELEASE_TAG}"
+          codesign --sign - --force target/release/hearth
+          cp target/release/hearth "hearth-${RELEASE_TAG}"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,8 +52,8 @@ jobs:
           set -euo pipefail
           # Idempotent so a re-run of a failed/partial release job still lands the asset.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "hearthd-${RELEASE_TAG}" --clobber
+            gh release upload "$RELEASE_TAG" "hearth-${RELEASE_TAG}" --clobber
           else
-            gh release create "$RELEASE_TAG" "hearthd-${RELEASE_TAG}" \
+            gh release create "$RELEASE_TAG" "hearth-${RELEASE_TAG}" \
               --title "$RELEASE_TAG" --generate-notes --verify-tag
           fi

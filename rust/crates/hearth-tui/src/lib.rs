@@ -1,4 +1,4 @@
-//! `hearthd tui`. `run_shell` is the workspace shell (any directory) and paints with Ratatui.
+//! `hearth tui`. `run_shell` is the workspace shell (any directory) and paints with Ratatui.
 //! `run_tui` is the single-project screen that shell's service pane grew out of; it still draws
 //! crossterm strings and has no automated coverage.
 pub mod actions;

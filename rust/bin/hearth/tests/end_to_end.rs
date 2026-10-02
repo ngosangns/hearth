@@ -1,5 +1,5 @@
-//! Real end-to-end test of the actual compiled `hearthd` binary — the closest Rust equivalent to
-//! `test/bin/hearthd.test.ts`, the one true subprocess-level test in the TS source, and also the
+//! Real end-to-end test of the actual compiled `hearth` binary — the closest Rust equivalent to
+//! `test/bin/hearth.test.ts`, the one true subprocess-level test in the TS source, and also the
 //! natural place to re-validate the Phase 0 signing/Gatekeeper spike against the *real* binary
 //! (not just a hello-world compile) before any real consumer shells out to it.
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::process::Command;
 use std::time::Duration;
 
 fn lsd_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hearthd")
+    env!("CARGO_BIN_EXE_hearth")
 }
 
 fn free_port() -> u16 {
@@ -35,7 +35,7 @@ fn run_lsd(root: &Path, args: &[&str]) -> (i32, String, String) {
         .arg(root)
         .args(args)
         .output()
-        .expect("failed to spawn hearthd");
+        .expect("failed to spawn hearth");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -46,7 +46,7 @@ fn run_lsd(root: &Path, args: &[&str]) -> (i32, String, String) {
 #[test]
 fn ad_hoc_signed_binary_runs_without_being_killed() {
     // Phase 0 answered GO for a trivial hello-world binary; this reconfirms it for the actual
-    // multi-thousand-line `hearthd` binary, ad-hoc signed exactly the way a real packaging step would.
+    // multi-thousand-line `hearth` binary, ad-hoc signed exactly the way a real packaging step would.
     let status = Command::new("codesign")
         .args(["--force", "--sign", "-", lsd_bin()])
         .status();
@@ -206,7 +206,7 @@ fn missing_config_file_reports_a_clear_error() {
     );
 }
 
-/// Real end-to-end test of `hearthd mcp`: spawns the actual compiled binary as a child process over
+/// Real end-to-end test of `hearth mcp`: spawns the actual compiled binary as a child process over
 /// stdio (`rmcp`'s `TokioChildProcess`, the same transport a real MCP host like an editor/agent tool
 /// uses), lists tools, and calls `status` against a real bootstrapped daemon it also spawns via
 /// `manager ensure`. This is the Rust equivalent of infra's/viclass's own hand-rolled `src/mcp.ts`
@@ -232,7 +232,7 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
 
     let mut command = tokio::process::Command::new(lsd_bin());
     command.arg("--root").arg(dir.path()).arg("mcp");
-    let transport = TokioChildProcess::new(command).expect("should spawn `hearthd mcp`");
+    let transport = TokioChildProcess::new(command).expect("should spawn `hearth mcp`");
     let client = NoopClientHandler
         .serve(transport)
         .await
@@ -280,7 +280,7 @@ async fn mcp_subcommand_serves_the_real_tool_surface_over_stdio() {
     let _ = run_lsd(dir.path(), &["manager", "stop", "--json"]);
 }
 
-/// Real end-to-end test of `hearthd mcp install`: the whole point of resolving `std::env::current_exe()`
+/// Real end-to-end test of `hearth mcp install`: the whole point of resolving `std::env::current_exe()`
 /// inside `hearth_cli`'s `mcp_install_command` is that it names *this actual compiled binary*, not some
 /// dev-time cargo artifact path or a symlink — the only way to prove that is to run the real
 /// binary and check what it wrote about itself.
@@ -357,13 +357,13 @@ fn help_and_version_work_outside_a_project() {
             .unwrap();
         assert!(
             output.status.success(),
-            "hearthd {args:?} failed outside a project: {}",
+            "hearth {args:?} failed outside a project: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("usage: hearthd"),
-            "hearthd {args:?} printed no usage: {stdout}"
+            stdout.contains("usage: hearth"),
+            "hearth {args:?} printed no usage: {stdout}"
         );
     }
     let version = std::process::Command::new(lsd_bin())
@@ -372,5 +372,5 @@ fn help_and_version_work_outside_a_project() {
         .output()
         .unwrap();
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).starts_with("hearthd "));
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("hearth "));
 }

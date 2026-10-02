@@ -1,4 +1,4 @@
-//! The workspace list for `hearthd tui`.
+//! The workspace list for `hearth tui`.
 //!
 //! The file is `~/Library/Application Support/HearthApp/workspaces.json`. Swift encodes each row
 //! as `{ id, path, trusted, addedAt }` with an ISO-8601 timestamp and no fractional seconds.

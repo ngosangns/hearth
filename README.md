@@ -6,18 +6,18 @@ Local dev services manager: one long-lived daemon per project folder, plus a CLI
 server. All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every managed
 process; nothing else starts or stops one directly.
 
-The product is the compiled `hearthd` binary (`rust/bin/hearthd`). `hearthd tui` is the workspace
+The product is the compiled `hearth` binary (`rust/bin/hearth`). `hearth tui` is the workspace
 UI. It runs from any directory.
 
 ```
  your CLI  ─┐
- your TUI   ├──HTTP + SSE (loopback)──►  daemon (hearthd)
+ your TUI   ├──HTTP + SSE (loopback)──►  daemon (hearth)
  your MCP  ─┘                                  │
                                         ProcessSupervisor (spawns/probes/tails)
 ```
 
 ```
-hearthd tui
+hearth tui
 ```
 
 The TUI lists workspaces, starts and stops services, tails logs, and manages shared services.
@@ -25,7 +25,7 @@ A new folder stays untrusted until a second Enter, and an untrusted folder does 
 daemon. A daemon you stop stays stopped until you press Enter on that workspace again.
 **Kill & Start**, and removing a shared instance that still has project attachments, both take
 a second keypress. Check for updates opens this repo's GitHub Releases page.
-`hearthd update` installs the latest binary. Add a folder by
+`hearth update` installs the latest binary. Add a folder by
 its absolute path. The workspace list stays in
 `~/Library/Application Support/HearthApp/workspaces.json`.
 
@@ -115,11 +115,11 @@ commands, env values, readiness and urls at load time. The install runs once per
 preparation and build; an `external` or run-less service cannot declare an `artifact:`.
 
 A `shared:` block registers machine-global singletons (postgres, redis, …) installed on the host
-under `~/.hearth/shared` and run by a separate global daemon (`hearthd smp`). Every repo that
+under `~/.hearth/shared` and run by a separate global daemon (`hearth smp`). Every repo that
 registers the same `name@version` shares one instance; different versions run side by side.
 Shared entries show up as ordinary `infrastructure` services — `start` attaches this project
 (first start installs the service), `stop` only detaches, and connection info is read via the
-`local_services_shared_*` MCP tools or `hearthd shared status`. See `docs/shared-services.md`.
+`local_services_shared_*` MCP tools or `hearth shared status`. See `docs/shared-services.md`.
 
 ```yaml
 shared:
@@ -151,24 +151,24 @@ A plain attach gets a
 blocks into the shared instance — `nginx -t` validates before reload, so a bad drop fails the
 attach instead of wedging the singleton. Detach removes the project's confs via `deprovision`.
 
-Install `hearthd` onto `PATH`, then drive a project. `task install` builds the release binary
-into `~/.local/share/hearth/bin/hearthd-<version>`, ad-hoc signs that file, and points
-`~/.local/bin/hearthd` at it. `hearthd update` installs the latest GitHub release into the same
+Install `hearth` onto `PATH`, then drive a project. `task install` builds the release binary
+into `~/.local/share/hearth/bin/hearth-<version>`, ad-hoc signs that file, and points
+`~/.local/bin/hearth` at it. `hearth update` installs the latest GitHub release into the same
 layout. A daemon that is already running keeps its old binary until it is restarted.
 
 ```bash
-task install          # versioned binary + symlink at ~/.local/bin/hearthd
-hearthd update --check
-hearthd update
-hearthd --root /path/to/project status
-hearthd tui           # workspaces and shared services; works from any directory
-hearthd --root /path/to/project tui   # also adopts that project when it has a catalog
-hearthd --root /path/to/project mcp
+task install          # versioned binary + symlink at ~/.local/bin/hearth
+hearth update --check
+hearth update
+hearth --root /path/to/project status
+hearth tui           # workspaces and shared services; works from any directory
+hearth --root /path/to/project tui   # also adopts that project when it has a catalog
+hearth --root /path/to/project mcp
 ```
 
-`hearthd manager ensure --json` is the connection contract for another client: it ensures a daemon
+`hearth manager ensure --json` is the connection contract for another client: it ensures a daemon
 is running for `--root` and prints `{instanceId, port, token, protocolVersion, runtimeDirectory,
-root}`. `hearthd manager restart --json` prints the same payload for a freshly started daemon,
+root}`. `hearth manager restart --json` prints the same payload for a freshly started daemon,
 replacing the old one *without* stopping its services — they are detached, and the new daemon
 re-adopts them from their persisted identities.
 
@@ -187,7 +187,7 @@ Shared services are specified in [docs/shared-services.md](docs/shared-services.
 
 ## Release
 
-The version string is `rust/bin/hearthd/Cargo.toml`. Pushing a `v*.*.*` tag runs CI
+The version string is `rust/bin/hearth/Cargo.toml`. Pushing a `v*.*.*` tag runs CI
 (`.github/workflows/ci.yml`). A successful tag run starts `.github/workflows/release.yml`, which
-runs `cargo build --release -p hearthd`, ad-hoc signs the binary, and uploads `hearthd-<tag>` to the
-GitHub Release. A red CI run does not publish. `hearthd update` installs that asset.
+runs `cargo build --release -p hearth`, ad-hoc signs the binary, and uploads `hearth-<tag>` to the
+GitHub Release. A red CI run does not publish. `hearth update` installs that asset.

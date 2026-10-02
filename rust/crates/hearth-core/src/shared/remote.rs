@@ -358,7 +358,7 @@ impl RemoteCatalog {
 
     /// The disk cache, topped up with any recipe the embedded catalog has that the cache lacks.
     /// A cache written once (env / `catalog-url` / `file://` use) would otherwise hide every recipe
-    /// added in a newer `hearthd` build forever, because the private-repo fetch always fails.
+    /// added in a newer `hearth` build forever, because the private-repo fetch always fails.
     /// A recipe present in both keeps the cached (actually fetched) version.
     fn load_cached(&self) -> Option<Arc<SharedCatalogDocument>> {
         let text = std::fs::read_to_string(&self.cache_path).ok()?;

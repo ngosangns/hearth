@@ -12,8 +12,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-const START_MARKER: &str = "__hearthd_env_start__";
-const END_MARKER: &str = "__hearthd_env_end__";
+const START_MARKER: &str = "__hearth_env_start__";
+const END_MARKER: &str = "__hearth_env_end__";
 const DEFAULT_LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn login_shell_env_cache() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
@@ -104,7 +104,7 @@ pub const KNOWN_TOOL_DIRECTORIES: [&str; 3] =
 /// `path` with every directory in `KNOWN_TOOL_DIRECTORIES` (plus `~/.bun/bin` and `~/.cargo/bin`)
 /// appended if it is not already present.
 ///
-/// `hearthd` is often started outside a login shell, and that process inherits launchd's bare
+/// `hearth` is often started outside a login shell, and that process inherits launchd's bare
 /// `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) — which the daemon it spawns then inherits too. Every tool the daemon calls by name (`docker compose` for container services,
 /// `tailscale serve status` for tailnet readiness, `tailscale status` for `{tailnetHost}` URLs)
 /// would then fail to spawn, even though all of them work from a terminal. Appending rather than
@@ -314,7 +314,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good-shell");
         let bad = dir.path().join("bad-shell");
-        std::fs::write(&good, "#!/bin/sh\nprintf '%s' '__hearthd_env_start__'\nprintf 'FOO=bar\\0'\nprintf '%s' '__hearthd_env_end__'\n").unwrap();
+        std::fs::write(&good, "#!/bin/sh\nprintf '%s' '__hearth_env_start__'\nprintf 'FOO=bar\\0'\nprintf '%s' '__hearth_env_end__'\n").unwrap();
         std::fs::write(&bad, "#!/bin/sh\nprintf '%s' 'no markers here'\n").unwrap();
         #[cfg(unix)]
         {

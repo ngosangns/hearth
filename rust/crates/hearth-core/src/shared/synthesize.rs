@@ -124,7 +124,7 @@ pub fn synthesize_service(
     })
 }
 
-/// Project-side `hearthd shared probe` budget. Must out-wait a script artifact pack
+/// Project-side `hearth shared probe` budget. Must out-wait a script artifact pack
 /// (`PACK_SCRIPT_TIMEOUT` in install.rs, 45 min) plus extract (120s) plus the instance
 /// readiness budget (`SHARED_INSTANCE_READINESS_TIMEOUT_MS`).
 pub const SHARED_READINESS_TIMEOUT_MS: u64 =
@@ -132,10 +132,10 @@ pub const SHARED_READINESS_TIMEOUT_MS: u64 =
 
 /// The project-side service a `shared:` yaml entry expands to (see `docs/shared-services.md`).
 /// `ownership: external` + `command` readiness makes its run command a one-shot task
-/// (`hearthd shared attach`) and its probe (`hearthd shared probe`, exit 0 iff the instance is
+/// (`hearth shared attach`) and its probe (`hearth shared probe`, exit 0 iff the instance is
 /// ready AND this project is attached) the adoption signal `syncExternalServices` polls. `stop` is
-/// `hearthd shared detach` — released via the probe going false, never by killing the singleton.
-/// `exe` is the hearthd binary's own path so the commands never depend on PATH.
+/// `hearth shared detach` — released via the probe going false, never by killing the singleton.
+/// `exe` is the hearth binary's own path so the commands never depend on PATH.
 /// `attach_args` append to the attach argv (forwarded to the recipe's provision commands);
 /// `preparation` runs project-side before every attach — e.g. rendering the conf the provision
 /// step will publish.

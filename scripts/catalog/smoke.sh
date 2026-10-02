@@ -16,9 +16,9 @@ if [[ "$(grep -v '^#' MANIFEST)" != "$expected" ]]; then
 fi
 
 REPO="$(cd ../.. && pwd)"
-HEARTHD="${HEARTHD:-$REPO/rust/target/debug/hearthd}"
-if [[ ! -x "$HEARTHD" ]]; then
-  (cd "$REPO/rust" && cargo build -p hearthd)
+HEARTH="${HEARTH:-$REPO/rust/target/debug/hearth}"
+if [[ ! -x "$HEARTH" ]]; then
+  (cd "$REPO/rust" && cargo build -p hearth)
 fi
 
 HOME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hearth-catalog-smoke.XXXXXX")"
@@ -58,8 +58,8 @@ ids=(
 cleanup() {
   local id
   for id in "${ids[@]}"; do
-    "$HEARTHD" --root "$PROJECT" shared stop "$id" >/dev/null 2>&1 || true
-    "$HEARTHD" --root "$PROJECT" shared remove "$id" >/dev/null 2>&1 || true
+    "$HEARTH" --root "$PROJECT" shared stop "$id" >/dev/null 2>&1 || true
+    "$HEARTH" --root "$PROJECT" shared remove "$id" >/dev/null 2>&1 || true
   done
   local meta="$HOME_DIR/.hearth/shared/runtime-v1/manager.lock/metadata.json"
   if [[ -f "$meta" ]]; then
@@ -74,8 +74,8 @@ cd "$PROJECT"
 attach() {
   local id="$1"
   echo "== attach $id"
-  "$HEARTHD" --root "$PROJECT" shared attach "$id" --json | tee "$HOME_DIR/${id//@/_}.json"
-  "$HEARTHD" --root "$PROJECT" shared probe "$id"
+  "$HEARTH" --root "$PROJECT" shared attach "$id" --json | tee "$HOME_DIR/${id//@/_}.json"
+  "$HEARTH" --root "$PROJECT" shared probe "$id"
 }
 
 attach "redis@${REDIS_VERSION}"
@@ -108,8 +108,8 @@ export KAFKA_HEAP_OPTS="-Xms64M -Xmx256M"
 "$HOME_DIR/.hearth/shared/installs/kafka/${KAFKA_VERSION}/kafka/bin/kafka-topics.sh" --bootstrap-server "127.0.0.1:${KAFKA_PORT}" --list | grep -qx "$KAFKA_TOPIC"
 
 echo "== detach leaves redis listening"
-"$HEARTHD" --root "$PROJECT" shared detach "redis@${REDIS_VERSION}"
-if "$HEARTHD" --root "$PROJECT" shared probe "redis@${REDIS_VERSION}"; then
+"$HEARTH" --root "$PROJECT" shared detach "redis@${REDIS_VERSION}"
+if "$HEARTH" --root "$PROJECT" shared probe "redis@${REDIS_VERSION}"; then
   echo "probe should fail after detach" >&2
   exit 1
 fi

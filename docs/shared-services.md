@@ -15,7 +15,7 @@ share one instance, different versions run side by side.
 | Ports | Deterministic `hash(name@version)` into `43100–43999`, collision → probe next slot, persisted |
 | Topology | One global `smp` daemon; project daemons adopt via `ownership: external` |
 | Connection info | Via `hearth-mcp` `shared_*` tools + skill doc; not auto-injected into app env |
-| Lifecycle | On-demand start; never auto-stops; `hearthd shared remove` is the only GC |
+| Lifecycle | On-demand start; never auto-stops; `hearth shared remove` is the only GC |
 | Recipe source | `catalog.json` fetched from the pinned GitHub repo URL (HTTPS is the trust boundary) |
 | Provisioning | Per-project logical resources (e.g. `db_<hash>` + user) via recipe `provision` commands |
 | Yaml schema | Top-level `shared:` map; each entry generates an `external` service |
@@ -34,7 +34,7 @@ share one instance, different versions run side by side.
 └── runtime-v1/                   # manager.lock/, token, state.json, logs — same layout as projects
 ```
 
-`smp` is the same `hearthd` binary: `hearthd smp` runs `run_daemon` with
+`smp` is the same `hearth` binary: `hearth smp` runs `run_daemon` with
 `root = ~/.hearth/shared` and a **synthesized** `ServiceCatalog` (built from `registry.json`, not a
 yaml file — `HearthManagerOptions.catalog` is already consumer-authored). `catalog.runtime_directory
 = "runtime-v1"` so lock/token/state land in `~/.hearth/shared/runtime-v1` and the existing
@@ -216,14 +216,14 @@ ports are pinned anyway, so project confs can hardcode 80/443.
 `config_file` generates, per entry, a normal `ServiceDefinition` (id = the map key):
 
 - `kind: infrastructure`, `ownership: external`, `label: "postgres@16.4 (shared)"`
-- `run`: `argv [hearthd, "shared", "attach", "postgres@16.4"]` — a **one-shot task**: ensure smp,
-  install, start, attach, provision, print conninfo to stdout (→ `hearthd logs postgres`).
-  `hearthd` resolves to the daemon's own `current_exe` — never PATH.
-- `readiness`: `{ kind: command, command: { argv: [hearthd, "shared", "probe", "postgres@16.4"] } }` —
+- `run`: `argv [hearth, "shared", "attach", "postgres@16.4"]` — a **one-shot task**: ensure smp,
+  install, start, attach, provision, print conninfo to stdout (→ `hearth logs postgres`).
+  `hearth` resolves to the daemon's own `current_exe` — never PATH.
+- `readiness`: `{ kind: command, command: { argv: [hearth, "shared", "probe", "postgres@16.4"] } }` —
   exit 0 iff the instance is ready **and this project is attached** (projectId = sha256 of the
   canonical project root, derived from the probe's cwd). This makes detach→release work through
   plain `syncExternalServices`.
-- `stop`: `argv [hearthd, "shared", "detach", "postgres@16.4"]` — releases the attachment; the
+- `stop`: `argv [hearth, "shared", "detach", "postgres@16.4"]` — releases the attachment; the
   instance keeps running.
 - `readinessTimeoutMs`: 49 min default. The project-side probe has to out-wait a script artifact pack (45 min) plus extract and the instance readiness budget. The instance server itself stays at 2 min.
 - Joins group `all` when it exists. A `shared` key colliding with a `services` id is a validation
@@ -250,22 +250,22 @@ Mounted only when `HearthManagerOptions.shared` is set:
 `attach`/`probe`/`detach` on the CLI derive `projectRoot` from `--root` or cwd — no project
 catalog needed.
 
-## CLI — `hearthd shared …` (no project catalog required)
+## CLI — `hearth shared …` (no project catalog required)
 
 `ensure --json` (the `manager ensure --json` contract for smp — prints the `ManagerConnection`
-for `~/.hearth/shared`, used by `hearthd tui`) · `list [--json]` (remote registry, no daemon
+for `~/.hearth/shared`, used by `hearth tui`) · `list [--json]` (remote registry, no daemon
 needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attach|detach|probe
 <name@ver>` · `install <name@ver>` · `remove <name@ver>`.
 
 ## MCP + skill
 
 `hearth-mcp` gains `shared_list`, `shared_status`, `shared_connection` (queried against smp
-directly via its lock-dir token). The skill doc (`hearthd skill install`) documents the flow:
+directly via its lock-dir token). The skill doc (`hearth skill install`) documents the flow:
 read `shared:` in `hearth.yaml` → attach happens on `start` → query connection info via MCP.
 
 ## TUI
 
-`hearthd tui` has a shared-services view. It reads recipes from the remote catalog and instances
+`hearth tui` has a shared-services view. It reads recipes from the remote catalog and instances
 from a live smp daemon or the local registry, and it does not spawn smp just to draw the list.
 Install follows the version selected on that row and uses an unbounded request timeout. Start,
 stop, and restart act on one instance. Remove takes a second keypress; when projects are still

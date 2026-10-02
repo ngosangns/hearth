@@ -1,7 +1,7 @@
 version: "3"
 
 vars:
-  HEARTHD_BIN: '{{env "HOME"}}/.local/bin/hearthd'
+  HEARTH_BIN: '{{env "HOME"}}/.local/bin/hearth'
 
 tasks:
   test:
@@ -17,38 +17,44 @@ tasks:
       - cargo clippy --workspace --all-targets -- -D warnings
 
   install:
-    desc: Build release hearthd, sign the versioned binary, and symlink ~/.local/bin/hearthd to it
+    desc: Build release hearth, sign the versioned binary, and symlink ~/.local/bin/hearth to it
     dir: rust
     cmds:
-      - cargo build --release -p hearthd
+      - cargo build --release -p hearth
       # Sign a new inode, then point the symlink at it. codesign --force on a mapped
       # binary SIGKILLs that process, and cp onto the symlink would collapse this layout.
       - |
         set -eu
-        version="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' bin/hearthd/Cargo.toml)"
+        version="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' bin/hearth/Cargo.toml)"
         test -n "$version"
         dest_dir="{{env "HOME"}}/.local/share/hearth/bin"
-        link="{{.HEARTHD_BIN}}"
-        dest="$dest_dir/hearthd-$version"
-        staged="$dest_dir/.hearthd-$version.staging.$$"
+        link="{{.HEARTH_BIN}}"
+        dest="$dest_dir/hearth-$version"
+        staged="$dest_dir/.hearth-$version.staging.$$"
         mkdir -p "$dest_dir" "$(dirname "$link")"
-        cp target/release/hearthd "$staged"
+        cp target/release/hearth "$staged"
         codesign --sign - --force "$staged"
         chmod 755 "$staged"
         mv -f "$staged" "$dest"
         aside=""
         if [ -e "$link" ] && [ ! -L "$link" ]; then
-          aside="$dest_dir/hearthd-previous-$$"
+          aside="$dest_dir/hearth-previous-$$"
           mv -f "$link" "$aside"
         fi
-        tmp="$(dirname "$link")/.hearthd-link.$$"
-        ln -s "../share/hearth/bin/hearthd-$version" "$tmp"
+        tmp="$(dirname "$link")/.hearth-link.$$"
+        ln -s "../share/hearth/bin/hearth-$version" "$tmp"
         if ! mv -f "$tmp" "$link"; then
           rm -f "$tmp"
           if [ -n "$aside" ] && [ ! -e "$link" ]; then
             mv -f "$aside" "$link"
           fi
           exit 1
+        fi
+        # 0.18.0 renamed the command. Drop the old symlink; leave the versioned file a
+        # running daemon may still have mapped.
+        legacy="$(dirname "$link")/hearthd"
+        if [ -L "$legacy" ]; then
+          rm -f "$legacy"
         fi
         echo "installed $("$link" --version) at $link -> $dest"
 

@@ -163,7 +163,7 @@ impl HearthMcpClient for ManagerApiClient {
         }
     }
 
-    /// The same `hearthd manager restart` the CLI runs, in-process: shut the daemon down leaving its
+    /// The same `hearth manager restart` the CLI runs, in-process: shut the daemon down leaving its
     /// services running, wait for it to exit, ensure a fresh one.
     async fn restart_daemon(&self) -> Result<Value, String> {
         let result = restart_manager(&self.root, &self.options).await.map_err(|e| e.message);
@@ -171,7 +171,7 @@ impl HearthMcpClient for ManagerApiClient {
         result
     }
 
-    /// The same `hearthd manager stop` the CLI runs, in-process: `stop-services` shutdown, then the
+    /// The same `hearth manager stop` the CLI runs, in-process: `stop-services` shutdown, then the
     /// wait for the daemon pid to exit — returning early would let the caller reconnect into a
     /// still-draining daemon that answers every request with `manager_closing`.
     async fn stop_daemon(&self) -> Result<Value, String> {
@@ -229,7 +229,7 @@ impl HearthMcpClient for ManagerApiClient {
 }
 
 /// `"postgres"` → `"postgres@16.4"` via this project catalog's generated `shared:` service (its run
-/// command is `hearthd shared attach <name@version> [attach-args…]`); `"postgres@16.4"` passes
+/// command is `hearth shared attach <name@version> [attach-args…]`); `"postgres@16.4"` passes
 /// through.
 fn resolve_shared_instance_id(catalog: &hearth_core::catalog::ServiceCatalog, service: &str) -> Result<String, String> {
     if service.contains('@') {
@@ -300,7 +300,7 @@ mod tests {
     /// viclass/infra's shared nginx passes `attachArgs`, which land after the instance id.
     #[test]
     fn resolves_the_instance_id_even_when_attach_args_follow_it() {
-        let exe = Path::new("hearthd");
+        let exe = Path::new("hearth");
         let with_args = hearth_core::shared::synthesize::project_service_entry("nginx".to_string(), "nginx@1.27", exe, None, vec!["--conf".to_string(), "/tmp/conf".to_string()], None);
         assert_eq!(resolve_shared_instance_id(&catalog_with(with_args), "nginx").unwrap(), "nginx@1.27");
         let bare = hearth_core::shared::synthesize::project_service_entry("postgres".to_string(), "postgres@16.4", exe, None, Vec::new(), None);

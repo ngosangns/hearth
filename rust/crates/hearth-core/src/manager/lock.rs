@@ -450,7 +450,7 @@ pub async fn claim_lock(
         if artifacts.metadata.port == 0 {
             // An UNPARSEABLE `startedAt` must not count as "started just now". Defaulting it to the
             // current time made `started_age_ms` zero, so the grace check was always true and this
-            // loop spun every 25ms forever with no way out — `hearthd daemon`/`manager ensure` hanging
+            // loop spun every 25ms forever with no way out — `hearth daemon`/`manager ensure` hanging
             // instead of erroring. Treat it as outside the grace window and let the liveness check
             // below decide, which is what `Date.parse` -> NaN makes the TS source do.
             let within_startup_grace =

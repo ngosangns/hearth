@@ -132,7 +132,7 @@ pub struct HearthManagerOptions {
     pub log_max_bytes: Option<u64>,
     pub log_rotation_count: Option<usize>,
     pub supervisor: Option<SupervisorOptions>,
-    /// Set only for the smp daemon (`hearthd smp`) — enables the `/v1/shared/*` route surface.
+    /// Set only for the smp daemon (`hearth smp`) — enables the `/v1/shared/*` route surface.
     pub shared: Option<Arc<crate::shared::SharedContext>>,
 }
 
@@ -1069,7 +1069,7 @@ fn run_service_operation(
 ) -> BoxFuture<'static, Result<(), OperationError>> {
     async move {
         // `start_services` is `[service_id]` for a `start` action — routed through the same
-        // `start_selected_dag` as bulk-start so `hearthd start <id>`, the TUI's start key and MCP
+        // `start_selected_dag` as bulk-start so `hearth start <id>`, the TUI's start key and MCP
         // `manage start` all land on one code path.
         let result = match action {
             ServiceOperationKind::Start => {
@@ -1939,7 +1939,7 @@ async fn post_shutdown(
         default_daemon_owned(&catalog, &s.service_id) && !non_terminal.contains(&s.actual_state)
     });
     // Only `refuse-if-active` guards. `leave-services` is the deliberate "restart the daemon, keep
-    // the services" path (`hearthd manager restart`): daemon-owned processes are detached and
+    // the services" path (`hearth manager restart`): daemon-owned processes are detached and
     // outlive this daemon, and the next one re-adopts them from their persisted identities — the
     // same thing a SIGTERM shutdown already does.
     if active && mode == "refuse-if-active" {
@@ -2270,7 +2270,7 @@ mod tests {
         .expect("manager should finish shutting down");
     }
 
-    /// `hearthd manager restart` shuts the daemon down with `leave-services`: the daemon goes away
+    /// `hearth manager restart` shuts the daemon down with `leave-services`: the daemon goes away
     /// but a running daemon-owned service must survive it (it is detached, and the next daemon
     /// re-adopts it from its persisted identity). The `refuse-if-active` guard must stay exactly as
     /// strict as it was — it is the mode that exists to refuse.

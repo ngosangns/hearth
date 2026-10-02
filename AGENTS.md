@@ -5,13 +5,14 @@ architecture, and sharp edges. Add durable notes here as real work discovers the
 
 ## Orientation
 
-The product is the compiled `hearthd` binary (`rust/bin/hearthd`, crates `hearth-core` `hearth-cli` `hearth-tui`
-`hearth-mcp`). `hearthd tui` is the workspace UI. A project authors `hearth.yaml`
+The product is the compiled `hearth` binary (`rust/bin/hearth`, crates `hearth-core` `hearth-cli` `hearth-tui`
+`hearth-mcp`). `hearth tui` is the workspace UI. 0.18.0 renamed the command from `hearthd`; do not
+install or publish `hearthd`. A project authors `hearth.yaml`
 (`.yml` / `.json`); TypeScript catalogs are not accepted.
 
-Consumers (`infra`, `viclass`) spawn `hearthd` from `~/.local/bin/hearthd` after `task install`.
+Consumers (`infra`, `viclass`) spawn `hearth` from `~/.local/bin/hearth` after `task install`.
 
-`hearthd manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
+`hearth manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
 HTTP+SSE client needs. `env.rs` resolves the daemon's own base environment (login shell + `.env`)
 because a process started outside a login shell inherits launchd's bare `PATH`.
 
@@ -22,19 +23,19 @@ Also `task test` / `task clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
-**Installing/refreshing `hearthd`** — `task install` builds the release binary into
-`~/.local/share/hearth/bin/hearthd-<version>`, ad-hoc signs that file (never the live path), and
-points `~/.local/bin/hearthd` at it with a symlink. `hearthd update` downloads the GitHub asset
-`hearthd-<tag>` into the same layout after checking the tag, asset name, `github.com` download
+**Installing/refreshing `hearth`** — `task install` builds the release binary into
+`~/.local/share/hearth/bin/hearth-<version>`, ad-hoc signs that file (never the live path), and
+points `~/.local/bin/hearth` at it with a symlink. `hearth update` downloads the GitHub asset
+`hearth-<tag>` into the same layout after checking the tag, asset name, `github.com` download
 URL, size, `sha256` digest, executable bit, and a staged `--version` smoke test. The asset
 request uses `Accept: application/octet-stream` and follows only HTTPS redirects onto `github.com`,
 `api.github.com`, `release-assets.githubusercontent.com`, `objects.githubusercontent.com`, or
 `github-releases.githubusercontent.com`. A bearer token is sent only to `https://github.com` and
-`https://api.github.com`. The `~/.local/bin/hearthd` inode is checked again immediately before the
+`https://api.github.com`. The `~/.local/bin/hearth` inode is checked again immediately before the
 symlink swap, and a file already rotated into place is moved back if that check or the swap fails.
 It does not re-sign the download: `codesign --force` on a mapped ad-hoc binary SIGKILLs that
 process, and so does writing over its inode. The previous file stays for one generation. A daemon already running
-keeps its old inode until `hearthd --root <project> manager restart` (services stay up); restart
+keeps its old inode until `hearth --root <project> manager restart` (services stay up); restart
 smp separately. The command refuses any current executable that is not that symlink's regular
 file or a file already in the versioned directory, refuses anything but darwin-arm64, and does
 not replace an equal version unless `--force`. It does not downgrade.
@@ -43,10 +44,10 @@ not replace an equal version unless `--force`. It does not downgrade.
 (`timeout-minutes: 90`; tool `cargo`). Pushing a `v*.*.*` tag runs CI, and a successful tag CI run
 triggers `.github/workflows/release.yml` (`workflow_run`, so a red tag never publishes; tag/sha
 come from `github.event.workflow_run`, not `github.ref`) on the self-hosted runner
-(`timeout-minutes: 60`): `cargo build --release -p hearthd` → ad-hoc `codesign` →
+(`timeout-minutes: 60`): `cargo build --release -p hearth` → ad-hoc `codesign` →
 `gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
-`hearthd-<tag>` asset). The version string lives only in `rust/bin/hearthd/Cargo.toml` (and the
-matching `hearthd` entry in `rust/Cargo.lock`).
+`hearth-<tag>` asset). The version string lives only in `rust/bin/hearth/Cargo.toml` (and the
+matching `hearth` entry in `rust/Cargo.lock`).
 
 `PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
 bump there must be treated as breaking for every client.
@@ -174,7 +175,7 @@ from any dev box here, with the same username.
   catalog always carries literal paths. Only those var names are substituted — other braces
   (`awk '{print}'`) are legal, and a `{port}` with no declared port fails the load.
 - Service order from a config file is **document order**, not sorted — it's user-visible in
-  `/v1/catalog`, `hearthd status`, and the TUI.
+  `/v1/catalog`, `hearth status`, and the TUI.
 - `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
   into `ServiceCatalog.groups` for target resolution; the declared membership stays in
   `group_tree` (`groupTree` on the wire) so a client can group by *direct* membership instead of
@@ -197,8 +198,8 @@ from any dev box here, with the same username.
 
 - A top-level `shared:` map in `hearth.yaml` (`postgres: "16.4"`) expands into generated
   `ownership: external` services (`config_file.rs` → `shared::synthesize::project_service_entry`):
-  run = one-shot `hearthd shared attach <name@ver>` task, readiness = `hearthd shared probe`
-  (exit 0 iff the instance is ready **and this project is attached**), stop = `hearthd shared
+  run = one-shot `hearth shared attach <name@ver>` task, readiness = `hearth shared probe`
+  (exit 0 iff the instance is ready **and this project is attached**), stop = `hearth shared
   detach`. `projectId` = sha256 of the canonicalized cwd, so attach/probe/stop commands all agree
   by running with the project root as cwd. The object form (`{ version, preparationCommand,
   attachArgs, urls }`) adds a project-side prep hook before every attach and trailing attach
@@ -207,7 +208,7 @@ from any dev box here, with the same username.
 - The task semantics depend on a supervisor rule: `ownership: external` + `command` readiness ⇒
   the run command is a one-shot trigger, not the service process (`is_external_task`). A
   daemon-owned `command`-readiness service is still a normal long-lived process — don't widen it.
-- **`smp` = `hearthd smp`** — the same binary, rooted at `~/.hearth/shared`, catalog *synthesized*
+- **`smp` = `hearth smp`** — the same binary, rooted at `~/.hearth/shared`, catalog *synthesized*
   from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
@@ -236,7 +237,7 @@ from any dev box here, with the same username.
   `~/.hearth/shared/catalog-url` → pinned URL — the file exists because a daemon started outside a
   login shell does not inherit `HEARTH_SHARED_CATALOG_URL`. `remote.rs` also embeds the same `catalog.json` (`include_str!`) as the
   final fallback — a stale disk cache is topped up with any recipe the embedded catalog has that the
-  cache lacks, so recipes added in newer `hearthd` builds still reach machines that cached an old
+  cache lacks, so recipes added in newer `hearth` builds still reach machines that cached an old
   `catalog-url`/`file://` document.
 - Shared MongoDB runs `--replSet rs0` (consumers use transactions — e.g. engreel's
   `WithTransaction`) and `--wiredTigerCacheSizeGB 0.25`; its `provision` payload initiates rs0
@@ -245,33 +246,33 @@ from any dev box here, with the same username.
 - `POST /v1/shared/attach` blocks through install+start+provision — clients must not use the 10s
   manager timeout for it (`request_with_timeout` with `None`).
 - `POST /v1/shared/remove` refuses (409) an instance that still has project attachments unless
-  `force: true` — it deletes every attached project's data. `hearthd shared remove --force` and the
+  `force: true` — it deletes every attached project's data. `hearth shared remove --force` and the
   TUI's two-press confirm (when attachments > 0) are the sanctioned confirmations, same contract as
   `killUnowned`. `POST /v1/manager/reload` likewise fails with 409 `stop_failed` and keeps the old
-  catalog when a removed-but-active service can't be stopped. `hearthd shared stop`/`start` exit
-  non-zero when the operation fails. `hearthd doctor` checks the suite's host tools (docker,
+  catalog when a removed-but-active service can't be stopped. `hearth shared stop`/`start` exit
+  non-zero when the operation fails. `hearth doctor` checks the suite's host tools (docker,
   tailscale, nc, ps, sh) on top of platform + catalog validation.
 
-**Consumers and the `hearthd` binary**
+**Consumers and the `hearth` binary**
 
-- Consumer scripts should call `~/.local/bin/hearthd` (what `task install` writes), not assume
-  a bare `hearthd` on `PATH`.
+- Consumer scripts should call `~/.local/bin/hearth` (what `task install` writes), not assume
+  a bare `hearth` on `PATH`.
 - **Never assume tools are on `PATH`**: a process started by launchd gets
-  `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon inherits that, so `hearthd` appends Homebrew and
+  `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon inherits that, so `hearth` appends Homebrew and
   `~/.bun`/`~/.cargo` bin dirs (`with_known_tool_directories`) — otherwise `docker compose`,
   `tailscale serve status` and `tailscale status` fail to spawn. Test anything the daemon spawns under
   `env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
 - `serde_json`'s `preserve_order` feature is on workspace-wide and is load-bearing: without it
-  `Value`'s object type is a `BTreeMap`, and `hearthd mcp install` silently alphabetizes every key in any
+  `Value`'s object type is a `BTreeMap`, and `hearth mcp install` silently alphabetizes every key in any
   hand-maintained config file it touches.
-- `hearthd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
+- `hearth mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
-**Terminal UI (`hearthd tui`)**
+**Terminal UI (`hearth tui`)**
 
 - Dispatched before catalog load, so it runs with no `hearth.yaml` in the current directory.
-  `hearthd --root <project> tui` adds that project untrusted and selects it when it has a catalog.
-  Extra arguments are `usage: hearthd tui` (exit 2). The workspace file stays
+  `hearth --root <project> tui` adds that project untrusted and selects it when it has a catalog.
+  Extra arguments are `usage: hearth tui` (exit 2). The workspace file stays
   `~/Library/Application Support/HearthApp/workspaces.json` (ISO-8601 `addedAt`, no fractional
   seconds) so lists written before the desktop app was removed still load.
 - It is an HTTP+SSE client. Highlighting a workspace only `discover`s. Enter on a trusted
@@ -313,7 +314,7 @@ from any dev box here, with the same username.
 
 - A `bun build --compile` sidecar: on the `self-hosted, macmini` machine a freshly compiled, ad-hoc
   signed Bun executable is SIGKILLed on launch. The same test with a trivial Rust binary passed,
-  which is why the product is the Rust `hearthd` binary.
+  which is why the product is the Rust `hearth` binary.
 
 ## Notes on the Rust implementation
 
@@ -325,8 +326,8 @@ from any dev box here, with the same username.
   native addon. The tab width is a fixed 3-space replacement. See `truncate_to_width`'s doc comment.
 - **`hearth-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
   carry a runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
-- **`hearthd mcp` and `hearthd tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
-  `hearthd update` is dispatched before catalog load too (the implementation lives in `hearth-cli`). `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`. `tui` is dispatched before catalog load: it is an app shell.
+- **`hearth mcp` and `hearth tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
+  `hearth update` is dispatched before catalog load too (the implementation lives in `hearth-cli`). `hearth mcp install` / `hearth skill install` live in `hearth-cli`. `tui` is dispatched before catalog load: it is an app shell.
 - **`state.json` timestamp validation is a non-empty-string check.**
 
 ## Maintaining this file

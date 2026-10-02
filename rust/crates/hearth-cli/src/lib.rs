@@ -1,4 +1,4 @@
-//! The `hearthd` CLI: a thin HTTP client for one daemon's loopback API, plain-text or JSON output,
+//! The `hearth` CLI: a thin HTTP client for one daemon's loopback API, plain-text or JSON output,
 //! hand-rolled flag parsing. The typed per-endpoint client lives in `client.rs`.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -346,7 +346,7 @@ pub async fn require_client_for(root: &Path, catalog: &ServiceCatalog) -> Localc
 
 /// The `manager ensure --json` payload: everything a generic HTTP+SSE client needs to talk to the
 /// daemon directly — the bearer token and runtime directory
-/// are no more exposed than the lock directory already is. `pub(crate)` because `hearthd shared
+/// are no more exposed than the lock directory already is. `pub(crate)` because `hearth shared
 /// ensure --json` prints the same contract for the smp daemon.
 pub(crate) fn ensure_payload(client: &Client) -> Value {
     json!({
@@ -468,7 +468,7 @@ async fn service_rows(client: &Client) -> LocalctlResult<Vec<ServiceLifecycleSta
     client.services().await
 }
 
-/// The state `hearthd status` prints. In-flight states collapse into "running", but a state that
+/// The state `hearth status` prints. In-flight states collapse into "running", but a state that
 /// means something went wrong or is out of this daemon's hands is NEVER collapsed into "stopped" —
 /// a crashed service must not read as one nobody started.
 fn text_state(state: Option<&ServiceLifecycleState>) -> &'static str {
@@ -621,7 +621,7 @@ pub async fn main(options: &LocalctlOptions, root: &Path, argv: &[String], io: &
 
 async fn main_inner(options: &LocalctlOptions, root: &Path, argv: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let root = root.to_path_buf();
-    let Some(command) = argv.first() else { return usage_err("usage: hearthd <command>") };
+    let Some(command) = argv.first() else { return usage_err("usage: hearth <command>") };
     let rest = &argv[1..];
 
     match command.as_str() {
@@ -659,7 +659,7 @@ async fn main_inner(options: &LocalctlOptions, root: &Path, argv: &[String], io:
         "status" => {
             let flags = parse_command_flags(rest, &[FlagName::Json])?;
             if flags.positionals.len() > 1 {
-                return usage_err("usage: hearthd status [target] [--json]");
+                return usage_err("usage: hearth status [target] [--json]");
             }
             let client = require_client(&root, options).await?;
             let rows = service_rows(&client).await?;
@@ -696,7 +696,7 @@ async fn main_inner(options: &LocalctlOptions, root: &Path, argv: &[String], io:
         "operation" => {
             let flags = parse_command_flags(rest, &[FlagName::Json])?;
             if flags.positionals.len() != 2 || !matches!(flags.positionals[0].as_str(), "get" | "watch") {
-                return usage_err("usage: hearthd operation get|watch <operationId> [--json]");
+                return usage_err("usage: hearth operation get|watch <operationId> [--json]");
             }
             let client = require_client(&root, options).await?;
             let operation = if flags.positionals[0] == "watch" { wait_operation(&client, &flags.positionals[1]).await? } else { client.operation(&flags.positionals[1]).await? };
@@ -707,7 +707,7 @@ async fn main_inner(options: &LocalctlOptions, root: &Path, argv: &[String], io:
             let flags = parse_command_flags(rest, &[FlagName::Tail, FlagName::Follow, FlagName::Json])?;
             let service_ok = flags.positionals.len() == 1 && options.catalog.services.iter().any(|s| Some(&s.id) == flags.positionals.first());
             if !service_ok {
-                return usage_err("usage: hearthd logs <service> [--tail N] [--follow] [--json]");
+                return usage_err("usage: hearth logs <service> [--tail N] [--follow] [--json]");
             }
             let client = require_client(&root, options).await?;
             logs(client, &flags.positionals[0], flags.tail.unwrap_or(200), flags.follow, flags.json, options, |s| (io.out)(s), |s| (io.err)(s)).await?;
@@ -731,7 +731,7 @@ async fn manager_command(root: &Path, options: &LocalctlOptions, rest: &[String]
     let flags = parse_command_flags(rest, &[FlagName::Json])?;
     let subcommand = flags.positionals.first().cloned();
     if flags.positionals.len() != 1 || !matches!(subcommand.as_deref(), Some("ensure") | Some("status") | Some("stop") | Some("restart") | Some("reload")) {
-        return usage_err("usage: hearthd manager ensure|status|stop|restart|reload [--json]");
+        return usage_err("usage: hearth manager ensure|status|stop|restart|reload [--json]");
     }
     match subcommand.as_deref().unwrap() {
         "reload" => {
@@ -818,7 +818,7 @@ async fn wait_for_daemon_exit(pid: i64, timeout: Duration, alive: impl Fn(i64) -
 async fn urls_command(root: &Path, options: &LocalctlOptions, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Json])?;
     if flags.positionals.len() > 1 {
-        return usage_err("usage: hearthd urls [target] [--json]");
+        return usage_err("usage: hearth urls [target] [--json]");
     }
     let selected = targets(&options.catalog, flags.positionals.first().map(String::as_str))?;
     let client = require_client(root, options).await?;
@@ -882,11 +882,11 @@ fn prompt_kill_unowned(service_id: &str, row: Option<&ServiceLifecycleState>, fl
 async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, command: &str, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Wait, FlagName::Json, FlagName::KillUnowned])?;
     if flags.kill_unowned && command != "start" {
-        return usage_err("--kill-unowned only applies to `hearthd start`");
+        return usage_err("--kill-unowned only applies to `hearth start`");
     }
     if flags.positionals.len() != 1 {
         let flag_hint = if command == "start" { " [--kill-unowned]" } else { "" };
-        return usage_err(format!("usage: hearthd {command} <service|group> [--wait] [--json]{flag_hint}"));
+        return usage_err(format!("usage: hearth {command} <service|group> [--wait] [--json]{flag_hint}"));
     }
     let target = &flags.positionals[0];
     let selected = runnable_targets(&options.catalog, Some(target))?;
@@ -979,13 +979,13 @@ async fn start_stop_restart_command(root: &Path, options: &LocalctlOptions, comm
 // ---------------------------------------------------------------------------------------------
 // mcp install / skill install
 //
-// `mcp install` registers the *running* `hearthd` binary's absolute path directly in an MCP host's
+// `mcp install` registers the *running* `hearth` binary's absolute path directly in an MCP host's
 // JSON config — no wrapper script — merging only `{command, args}`.
 // ---------------------------------------------------------------------------------------------
 
 async fn mcp_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let Some(subcommand) = rest.first() else {
-        return usage_err("usage: hearthd mcp install [--name <name>] [--json] <config-file>...");
+        return usage_err("usage: hearth mcp install [--name <name>] [--json] <config-file>...");
     };
     match subcommand.as_str() {
         "install" => mcp_install_command(root, &rest[1..], io).await,
@@ -1001,12 +1001,12 @@ async fn mcp_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlR
 async fn mcp_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let flags = parse_command_flags(rest, &[FlagName::Name, FlagName::Key, FlagName::Json])?;
     if flags.positionals.is_empty() {
-        return usage_err("usage: hearthd mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>...");
+        return usage_err("usage: hearth mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>...");
     }
     let name = flags.name.clone().unwrap_or_else(|| "hearth".to_string());
     let key = flags.key.clone().unwrap_or_else(|| "mcpServers".to_string());
     let exe = std::env::current_exe()
-        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not resolve the running hearthd binary's own path: {e}") })?;
+        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not resolve the running hearth binary's own path: {e}") })?;
     let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let command = exe.to_string_lossy().to_string();
     let args = vec!["--root".to_string(), resolved_root.to_string_lossy().to_string(), "mcp".to_string()];
@@ -1061,7 +1061,7 @@ const SKILL_MARKDOWN: &str = include_str!("../skill/hearth-mcp.md");
 
 async fn skill_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let Some(subcommand) = rest.first() else {
-        return usage_err("usage: hearthd skill install --dest <path>");
+        return usage_err("usage: hearth skill install --dest <path>");
     };
     match subcommand.as_str() {
         "install" => skill_install_command(root, &rest[1..], io).await,
@@ -1075,7 +1075,7 @@ async fn skill_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) ->
         return usage_err("skill install takes no positional arguments");
     }
     let Some(dest) = flags.dest.clone() else {
-        return usage_err("usage: hearthd skill install --dest <path>");
+        return usage_err("usage: hearth skill install --dest <path>");
     };
     let dest_path = Path::new(&dest);
     let resolved = if dest_path.is_absolute() { dest_path.to_path_buf() } else { root.join(dest_path) };
@@ -1595,7 +1595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_install_creates_a_new_config_file_with_the_resolved_hearthd_path() {
+    async fn mcp_install_creates_a_new_config_file_with_the_resolved_hearth_path() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("mcp.json");
         let (code, out, _err) = run_cli(dir.path(), &["mcp", "install", config_path.to_str().unwrap()]).await;
@@ -1714,7 +1714,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (code, _out, err) = run_cli(dir.path(), &["mcp", "install"]).await;
         assert_eq!(code, EXIT_USAGE);
-        assert!(err[0].contains("usage: hearthd mcp install"));
+        assert!(err[0].contains("usage: hearth mcp install"));
     }
 
     #[tokio::test]
@@ -1741,7 +1741,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (code, _out, err) = run_cli(dir.path(), &["skill", "install"]).await;
         assert_eq!(code, EXIT_USAGE);
-        assert!(err[0].contains("usage: hearthd skill install"));
+        assert!(err[0].contains("usage: hearth skill install"));
     }
 
     /// A failed service must not print as "stopped" — that made a crash indistinguishable from a

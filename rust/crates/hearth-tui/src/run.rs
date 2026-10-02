@@ -450,7 +450,7 @@ impl TuiApp {
     }
 
     /// The focused service's URLs as screen rows, flagging the ones that need the service running
-    /// while it is not — the same rule as `hearthd urls`.
+    /// while it is not — the same rule as `hearth urls`.
     fn focused_urls(&self) -> Vec<String> {
         let selected = &self.state.selection.selected_name;
         let running = self.state.selection.services.iter().find(|s| &s.name == selected).is_some_and(|s| {
