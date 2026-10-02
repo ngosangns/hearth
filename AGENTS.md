@@ -6,7 +6,7 @@ architecture, and sharp edges. Add durable notes here as real work discovers the
 ## Orientation
 
 The product is the compiled `hearthd` binary (`rust/bin/hearthd`, crates `hearth-core` `hearth-cli` `hearth-tui`
-`hearth-mcp` `hearth-web`). `hearthd web` is the browser GUI. A project authors `hearth.yaml`
+`hearth-mcp`). `hearthd tui` is the workspace UI. A project authors `hearth.yaml`
 (`.yml` / `.json`); TypeScript catalogs are not accepted.
 
 Consumers (`infra`, `viclass`) spawn `hearthd` from `~/.local/bin/hearthd` after `task install`.
@@ -22,20 +22,15 @@ Also `task test` / `task clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
-**Installing/refreshing `hearthd`** — `task install` builds the Solid UI (`npm ci` and `npm run
-build` in `rust/crates/hearth-web/ui`), then the release binary, copies it to
+**Installing/refreshing `hearthd`** — `task install` builds the release binary, copies it to
 `~/.local/bin/hearthd`, and ad-hoc re-signs it. The re-sign is required after every copy on macOS.
-A daemon already running keeps its old `hearthd` until it is restarted. `hearth-web`'s `build.rs`
-runs `npm ci` only when `node_modules` is missing or `package-lock.json` is newer, and `npm run
-build` only when `ui/dist/index.html` is missing or a UI source is newer. Node and npm must be on
-PATH for any `cargo` build of `hearthd`.
+A daemon already running keeps its old `hearthd` until it is restarted.
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags
-(`timeout-minutes: 90`; tools `cargo`, `node`, `npm`). There is no npm publish. Pushing a
-`v*.*.*` tag runs CI, and a successful tag CI run triggers `.github/workflows/release.yml`
-(`workflow_run`, so a red tag never publishes; tag/sha come from `github.event.workflow_run`, not
-`github.ref`) on the self-hosted runner (`timeout-minutes: 60`): `npm ci && npm run build` in
-`rust/crates/hearth-web/ui` → `cargo build --release -p hearthd` → ad-hoc `codesign` →
+(`timeout-minutes: 90`; tool `cargo`). Pushing a `v*.*.*` tag runs CI, and a successful tag CI run
+triggers `.github/workflows/release.yml` (`workflow_run`, so a red tag never publishes; tag/sha
+come from `github.event.workflow_run`, not `github.ref`) on the self-hosted runner
+(`timeout-minutes: 60`): `cargo build --release -p hearthd` → ad-hoc `codesign` →
 `gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
 `hearthd-<tag>` asset). The version string lives only in `rust/bin/hearthd/Cargo.toml` (and the
 matching `hearthd` entry in `rust/Cargo.lock`).
@@ -53,8 +48,6 @@ from any dev box here, with the same username.
   toolchain under `~/.cargo/bin` or Homebrew is not on PATH by default. Both workflows add it via
   the composite action `.github/actions/toolchain-path` — keep using it.
 - `ci.yml` skips fork pull requests: the runner shares a user account with other repos' runners.
-- Both workflows request `node` and `npm`. `cargo build -p hearthd` runs `hearth-web`'s
-  `build.rs`, which shells out to `npm`.
 - **Its Rust is managed by rustup, whose stable toolchain does not include clippy**, while dev
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
@@ -99,8 +92,8 @@ from any dev box here, with the same username.
 - **`killUnowned` is the only path that signals a process the daemon does not own.** It is a
   client-supplied flag on `POST /v1/operations` (`action: start` only — every surface rejects it
   otherwise) that must only ever be set after an explicit user confirmation: CLI `--kill-unowned`
-  or its TTY `[y/N]` prompt (non-TTY always answers no), TUI's two-keypress arm-then-confirm, the
-  web GUI's "Kill & Start" dialog, MCP's `killUnowned` argument. `ProcessSupervisor::reclaim_port`
+  or its TTY `[y/N]` prompt (non-TTY always answers no), TUI's two-keypress arm-then-confirm, and
+  MCP's `killUnowned` argument. `ProcessSupervisor::reclaim_port`
   resolves listeners via `ProbeAdapter::port_holders` (lsof) and signals **individual pids** via
   `ProcessAdapter::signal_pid` — SIGTERM, poll, then a re-resolved SIGKILL pass. Never `killpg` an
   unowned holder: its group membership is untrusted (a shared job can hold innocent siblings; pgid
@@ -168,7 +161,7 @@ from any dev box here, with the same username.
   catalog always carries literal paths. Only those var names are substituted — other braces
   (`awk '{print}'`) are legal, and a `{port}` with no declared port fails the load.
 - Service order from a config file is **document order**, not sorted — it's user-visible in
-  `/v1/catalog`, `hearthd status`, the TUI, and the web GUI.
+  `/v1/catalog`, `hearthd status`, and the TUI.
 - `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
   into `ServiceCatalog.groups` for target resolution; the declared membership stays in
   `group_tree` (`groupTree` on the wire) so a client can group by *direct* membership instead of
@@ -240,7 +233,7 @@ from any dev box here, with the same username.
   manager timeout for it (`request_with_timeout` with `None`).
 - `POST /v1/shared/remove` refuses (409) an instance that still has project attachments unless
   `force: true` — it deletes every attached project's data. `hearthd shared remove --force` and the
-  web GUI's attachment-counting confirmation are the sanctioned confirmations, same contract as
+  TUI's two-press confirm (when attachments > 0) are the sanctioned confirmations, same contract as
   `killUnowned`. `POST /v1/manager/reload` likewise fails with 409 `stop_failed` and keeps the old
   catalog when a removed-but-active service can't be stopped. `hearthd shared stop`/`start` exit
   non-zero when the operation fails. `hearthd doctor` checks the suite's host tools (docker,
@@ -261,20 +254,27 @@ from any dev box here, with the same username.
 - `hearthd mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
-**Web GUI (`hearthd web`)**
+**Terminal UI (`hearthd tui`)**
 
-- The page is a SolidJS app in `rust/crates/hearth-web/ui` (Kobalte button, Tailwind tokens, Lucide icons). `build.rs` embeds `ui/dist` with `include_dir`. Service, group, copy, and shared-instance actions are icon buttons; the workspace toolbar keeps text. First load of a workspace, its log, and the shared page shows a skeleton. `ui/node_modules` and `ui/dist` are gitignored; `package-lock.json` is committed.
-- Loopback only. `--host 0.0.0.0` is rejected. The printed URL carries a process token; `GET /`
-  trades it for an HttpOnly cookie and redirects. `/api` requires that cookie plus a loopback
-  Host, and a matching Origin on mutations. Static assets are not the session.
-- It is a client of each project's daemon and of smp. An untrusted workspace does not spawn a
-  daemon. Stopping the daemon from the page stays stopped until **Start daemon**. The workspace
-  file stays `~/Library/Application Support/HearthApp/workspaces.json` (ISO-8601 `addedAt`, no
-  fractional seconds) so lists written before the desktop app was removed still load. `hearthd web`
-  is dispatched before catalog load because the current directory does not need a `hearth.yaml`.
+- Dispatched before catalog load, so it runs with no `hearth.yaml` in the current directory.
+  `hearthd --root <project> tui` adds that project untrusted and selects it when it has a catalog.
+  Extra arguments are `usage: hearthd tui` (exit 2). The workspace file stays
+  `~/Library/Application Support/HearthApp/workspaces.json` (ISO-8601 `addedAt`, no fractional
+  seconds) so lists written before the desktop app was removed still load.
+- It is an HTTP+SSE client. Highlighting a workspace only `discover`s. Enter on a trusted
+  workspace with no live daemon `ensure`s. An untrusted folder takes a second enter before
+  anything is spawned. A daemon the user stopped stays stopped until they press enter on that
+  workspace again; refresh never `ensure`s.
+- Two presses confirm trust, forget (services keep running), stop daemon, restart daemon
+  (services stay up), kill-unowned reclaim, and shared remove (`force` when attachments > 0).
+- The shared view reads recipes from the remote catalog and instances from a live smp or the
+  local registry. It does not spawn smp just to draw. Install uses an unbounded request timeout.
+- `WorkspaceStore::reload` must not quarantine `workspaces.json`; only `open` does.
+- A catalog mtime change reloads once while a daemon is up, and that reload must not `ensure`. The first observation only records the mtime. Stop and copy stay available during an in-flight start. Enter on a queued row cancels it. Reveal is `open -R`. Stop-all skips rows that are already stopped or succeeded.
+- The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. `run_tui` remains the single-project screen and still draws ANSI strings; it has no automated coverage. The binary calls `run_shell`.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
-  catalog reloads. `displayState` collapses `running`/`running-unready` → `running` and
+  catalog reloads. `display_state` collapses `running`/`running-unready` → `running` and
   `starting`/`preparing` → `starting`. `ready` and `running` both count in the ready/total
   summaries. Finite services (`readiness: exit`) stay out of those totals unless `failed`.
 
@@ -306,14 +306,14 @@ from any dev box here, with the same username.
 
 - **No `Custom` readiness variant.** A closure can't cross the YAML/JSON boundary.
 - **SSE backpressure is frame-count only** (64 frames).
-- **`crossterm` + `unicode-width`** for the TUI. `hearth-tui`'s `run.rs` has no automated coverage (it
-  owns a real terminal).
+- **Ratatui 0.30 paints the workspace shell; `run_tui` still uses crossterm strings.** `run.rs` has no automated coverage (it
+  owns a real terminal). Log text is sanitized, then SGR is parsed into spans for the shell log pane.
 - **`truncateToWidth`/`visibleWidth`/`DEFAULT_TAB_WIDTH` were reverse-engineered** against pi-tui's
   native addon. The tab width is a fixed 3-space replacement. See `truncate_to_width`'s doc comment.
 - **`hearth-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
   carry a runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
-- **`hearthd mcp`, `hearthd tui`, and `hearthd web` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
-  `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`. `web` is also before catalog load: it is the app shell.
+- **`hearthd mcp` and `hearthd tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.
+  `hearthd mcp install` / `hearthd skill install` live in `hearth-cli`. `tui` is dispatched before catalog load: it is an app shell.
 - **`state.json` timestamp validation is a non-empty-string check.**
 
 ## Maintaining this file

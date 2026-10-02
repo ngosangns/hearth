@@ -325,7 +325,7 @@ mod tests {
 
     fn service(name: &str, state: &str) -> Service {
         let state = serde_json::from_value(serde_json::json!(state)).unwrap();
-        Service { name: name.to_string(), kind: None, state, generation: None, current_operation_id: None, error: None }
+        Service { name: name.to_string(), kind: None, state, generation: None, current_operation_id: None, error: None, readiness_detail: None }
     }
 
     #[test]

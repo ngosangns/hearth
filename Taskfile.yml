@@ -20,8 +20,6 @@ tasks:
     desc: Build release hearthd and install it onto ~/.local/bin (ad-hoc signed)
     dir: rust
     cmds:
-      - npm --prefix crates/hearth-web/ui ci
-      - npm --prefix crates/hearth-web/ui run build
       - cargo build --release -p hearthd
       - mkdir -p "$(dirname "{{.HEARTHD_BIN}}")"
       - cp target/release/hearthd "{{.HEARTHD_BIN}}"

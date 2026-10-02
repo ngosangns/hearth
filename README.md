@@ -2,37 +2,30 @@
 
 # hearth
 
-Local dev services manager: one long-lived daemon per project folder, plus a CLI, TUI, browser
-GUI, and MCP server. All of them talk to the daemon over loopback HTTP+SSE. The daemon owns
-every managed process; nothing else starts or stops one directly.
+Local dev services manager: one long-lived daemon per project folder, plus a CLI, TUI, and MCP
+server. All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every managed
+process; nothing else starts or stops one directly.
 
-The product is the compiled `hearthd` binary (`rust/bin/hearthd`). `hearthd web` is the browser
-GUI on `127.0.0.1`.
+The product is the compiled `hearthd` binary (`rust/bin/hearthd`). `hearthd tui` is the workspace
+UI. It runs from any directory.
 
 ```
  your CLI  ─┐
  your TUI   ├──HTTP + SSE (loopback)──►  daemon (hearthd)
  your MCP  ─┘                                  │
- hearthd web ──────────────────────────────────┘
                                         ProcessSupervisor (spawns/probes/tails)
 ```
 
 ```
-hearthd web
+hearthd tui
 ```
 
-Prints `hearth web: http://127.0.0.1:4730/?token=…` and opens it. The token is only the sign-in
-for that process. `--no-open` skips the browser, `--port` moves the listen port, and
-`--host 0.0.0.0` is rejected.
-
-The page is the SolidJS app in `rust/crates/hearth-web/ui` (Tailwind, Lucide icons), built into
-the binary. It lists workspaces, starts and stops services, tails logs, and manages shared
-services. A new folder stays untrusted until you confirm **Trust and start**, and an untrusted
-folder does not spawn a daemon. **Stop daemon** stays stopped until **Start daemon**. Service
-and group actions are icon buttons; the workspace toolbar keeps text labels and shows a spinner
-while the action is in flight. **Kill & Start**, and removing a shared instance that still has
-project attachments, both ask before they run. **Check for updates** opens this repo's GitHub
-Releases page. Add a folder by its absolute path. The workspace list stays in
+The TUI lists workspaces, starts and stops services, tails logs, and manages shared services.
+A new folder stays untrusted until a second Enter, and an untrusted folder does not spawn a
+daemon. A daemon you stop stays stopped until you press Enter on that workspace again.
+**Kill & Start**, and removing a shared instance that still has project attachments, both take
+a second keypress. Check for updates opens this repo's GitHub Releases page. Add a folder by
+its absolute path. The workspace list stays in
 `~/Library/Application Support/HearthApp/workspaces.json`.
 
 A project supplies a `hearth.yaml` (`.yml` / `.json` also work) naming its services, how to
@@ -64,7 +57,7 @@ services:
 
 `groups:` members may also name other groups — `all: [infra, app]` expands depth-first in
 declaration order (deduplicated, cycles rejected at load). A member naming both a service and a
-group resolves as the service. The web GUI groups its service list by direct membership and
+group resolves as the service. The TUI groups its service list by direct membership and
 offers per-group start and stop.
 
 `disabled: true` on a service keeps it in the catalog but out of every lifecycle action: direct
@@ -157,16 +150,16 @@ A plain attach gets a
 blocks into the shared instance — `nginx -t` validates before reload, so a bad drop fails the
 attach instead of wedging the singleton. Detach removes the project's confs via `deprovision`.
 
-Install `hearthd` onto `PATH`, then drive a project. `task install` needs Node and npm: it
-builds the web UI, then the release binary, copies it to `~/.local/bin/hearthd`, and ad-hoc
-signs it. A daemon that is already running keeps its old binary until it is restarted.
+Install `hearthd` onto `PATH`, then drive a project. `task install` builds the release binary,
+copies it to `~/.local/bin/hearthd`, and ad-hoc signs it. A daemon that is already running keeps
+its old binary until it is restarted.
 
 ```bash
 task install   # release binary → ~/.local/bin/hearthd
 hearthd --root /path/to/project status
-hearthd --root /path/to/project tui
+hearthd tui    # workspaces and shared services; works from any directory
+hearthd --root /path/to/project tui   # also adopts that project when it has a catalog
 hearthd --root /path/to/project mcp
-hearthd web
 ```
 
 `hearthd manager ensure --json` is the connection contract for another client: it ensures a daemon
@@ -192,6 +185,5 @@ Shared services are specified in [docs/shared-services.md](docs/shared-services.
 
 The version string is `rust/bin/hearthd/Cargo.toml`. Pushing a `v*.*.*` tag runs CI
 (`.github/workflows/ci.yml`). A successful tag run starts `.github/workflows/release.yml`, which
-builds the web UI (`npm ci && npm run build` in `rust/crates/hearth-web/ui`), then
-`cargo build --release -p hearthd`, ad-hoc signs the binary, and uploads `hearthd-<tag>` to the
+runs `cargo build --release -p hearthd`, ad-hoc signs the binary, and uploads `hearthd-<tag>` to the
 GitHub Release. A red CI run does not publish.

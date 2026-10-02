@@ -253,7 +253,7 @@ catalog needed.
 ## CLI — `hearthd shared …` (no project catalog required)
 
 `ensure --json` (the `manager ensure --json` contract for smp — prints the `ManagerConnection`
-for `~/.hearth/shared`, used by `hearthd web`) · `list [--json]` (remote registry, no daemon
+for `~/.hearth/shared`, used by `hearthd tui`) · `list [--json]` (remote registry, no daemon
 needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attach|detach|probe
 <name@ver>` · `install <name@ver>` · `remove <name@ver>`.
 
@@ -263,12 +263,12 @@ needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attac
 directly via its lock-dir token). The skill doc (`hearthd skill install`) documents the flow:
 read `shared:` in `hearth.yaml` → attach happens on `start` → query connection info via MCP.
 
-## Web GUI
+## TUI
 
-`hearthd web` has a Shared services page. It connects to smp the same way `hearthd shared ensure`
-does. The page lists registered instances (state, port, attached projects, copyable connection
-info) and the installable versions of each recipe. Install follows the version selected in that
-row. Start, stop, and restart act on one instance. Remove asks first; when projects are still
+`hearthd tui` has a shared-services view. It reads recipes from the remote catalog and instances
+from a live smp daemon or the local registry, and it does not spawn smp just to draw the list.
+Install follows the version selected on that row and uses an unbounded request timeout. Start,
+stop, and restart act on one instance. Remove takes a second keypress; when projects are still
 attached, confirming sends `force: true` and deletes their data. Attach and detach stay
 project-side: a `shared:` entry plus start or stop.
 

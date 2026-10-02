@@ -1,11 +1,16 @@
-//! `hearthd tui`: a `crossterm`-based terminal app that is just another HTTP+SSE client of the
-//! daemon, built on `hearth-cli`'s `ManagerClient`.
+//! `hearthd tui`. `run_shell` is the workspace shell (any directory) and paints with Ratatui.
+//! `run_tui` is the single-project screen that shell's service pane grew out of; it still draws
+//! crossterm strings and has no automated coverage.
 pub mod actions;
 pub mod client;
+pub mod desk;
 pub mod run;
 pub mod screen;
+pub mod shell;
 pub mod state;
 pub mod text_utils;
+
+pub use shell::{run_shell, ShellOptions, SpawnHook};
 
 pub use actions::{keyboard_action, TuiAction};
 pub use client::{append_sse_chunk, is_sse_comment, next_sse_frame, parse_sse, refresh_selected_log, EventReplay, ManagerTuiClient, SseFrame, WatchEvent, LOG_TAIL_BYTES, MAX_SSE_FRAME_BYTES};

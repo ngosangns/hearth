@@ -59,6 +59,10 @@ impl ManagerTuiClient {
         Self { api: ManagerClient::new(root, catalog) }
     }
 
+    pub fn root(&self) -> &std::path::Path {
+        self.api.root()
+    }
+
     pub async fn snapshot(&self) -> Result<Vec<ServiceLifecycleState>, LocalctlError> {
         self.api.services().await
     }
@@ -67,6 +71,16 @@ impl ManagerTuiClient {
     pub async fn urls(&self) -> Result<Vec<hearth_core::catalog::ResolvedServiceUrl>, LocalctlError> {
         let body = self.api.urls().await?;
         serde_json::from_value(body["urls"].clone()).map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.to_string() })
+    }
+
+    /// `GET /v1/daemon/log` — the daemon's own log, not a service id.
+    pub async fn daemon_log(&self) -> Result<String, LocalctlError> {
+        let body = self.api.request("/v1/daemon/log?bytes=16384", reqwest::Method::GET, None).await?;
+        Ok(body.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string())
+    }
+
+    pub async fn catalog(&self) -> Result<hearth_core::catalog::ServiceCatalog, LocalctlError> {
+        self.api.catalog().await
     }
 
     pub async fn log(&self, service_id: &str, cursor: Option<u64>, generation: Option<u64>) -> Result<LogSlice, LocalctlError> {
@@ -88,6 +102,15 @@ impl ManagerTuiClient {
 
     pub async fn wait_operation(&self, id: &str) -> Result<Operation, LocalctlError> {
         self.api.wait(id, None).await
+    }
+
+    pub async fn request(&self, path: &str, method: reqwest::Method, body: Option<&Value>) -> Result<Value, LocalctlError> {
+        self.api.request(path, method, body).await
+    }
+
+    /// Pid from the daemon lock. Fails when no daemon is up; callers leave the header blank.
+    pub async fn daemon_pid(&self) -> Result<i64, LocalctlError> {
+        Ok(self.api.connection().await?.metadata.pid)
     }
 
     /// The current connection, for work that must outlive a borrow of this client (a spawned wait).
@@ -228,6 +251,32 @@ pub async fn refresh_selected_log(client: &ManagerTuiClient, state: &mut crate::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hearth_core::manager::HearthManager;
+    use std::sync::Arc;
+
+    /// Reaps spawned services (`nc -lk` listeners) even when the test panics before its
+    /// explicit shutdown — without this each failing run leaves orphaned listeners behind.
+    struct StopAllOnDrop(Arc<HearthManager>);
+    impl Drop for StopAllOnDrop {
+        fn drop(&mut self) {
+            let manager = self.0.clone();
+            let _ = std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async move {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            manager.shutdown(true),
+                        )
+                        .await;
+                    });
+                }
+            })
+            .join();
+        }
+    }
 
     #[test]
     fn parses_a_replay_frame() {
@@ -358,6 +407,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_all = StopAllOnDrop(manager.clone());
         let client = ManagerTuiClient::new(PathBuf::from("/tmp"), catalog);
 
         // Without the flag the start refuses — and the squatter is left alone.
@@ -376,6 +426,6 @@ mod tests {
         assert!(squatter.try_wait().unwrap().is_some(), "the confirmed reclaim must terminate the squatter");
         let _ = squatter.kill();
         let _ = squatter.wait();
-        manager.close().await;
+        manager.shutdown(true).await;
     }
 }

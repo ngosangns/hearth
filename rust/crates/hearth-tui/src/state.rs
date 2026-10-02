@@ -25,6 +25,7 @@ pub struct Service {
     /// The daemon's last error for the row — for `externally-owned` it names the port-holder
     /// ("Port 8080 is held by pid 91600 (node dist/main)"), which the reclaim confirmation shows.
     pub error: Option<String>,
+    pub readiness_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,6 +59,7 @@ pub fn service_from_lifecycle(service: &ServiceLifecycleState, service_kind: &Se
         generation: Some(service.generation),
         current_operation_id: service.current_operation_id.clone(),
         error: service.error.clone(),
+        readiness_detail: service.readiness_detail.clone(),
     }
 }
 

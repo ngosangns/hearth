@@ -1,7 +1,7 @@
-//! `hearthd`: the daemon, the CLI, the TUI, the browser GUI and the MCP server in one binary.
+//! `hearthd`: the daemon, the CLI, the TUI, and the MCP server in one binary.
 //! `hearthd daemon` and `hearthd smp` run a manager in the foreground (and are what `ensure` spawns
-//! detached); `tui`, `web` and bare `mcp` are intercepted here because `hearth-cli` cannot depend on
-//! `hearth-tui`/`hearth-mcp`/`hearth-web`; every other subcommand delegates to `hearth_cli::main`.
+//! detached); `tui` and bare `mcp` are intercepted here because `hearth-cli` cannot depend on
+//! `hearth-tui`/`hearth-mcp`; every other subcommand delegates to `hearth_cli::main`.
 use std::path::{Path, PathBuf};
 
 fn report_config_error(root: &Path, errors: &[String]) {
@@ -172,12 +172,12 @@ async fn run_mcp_subcommand(root: PathBuf, catalog: hearth_core::catalog::Servic
     }
 }
 
-/// `--help`/`--version` must work from ANY directory. Every other subcommand needs a catalog, but
-/// these two don't — and answering "how do I use this?" with "there is no config file here" is a
+/// `--help`/`--version` must work from ANY directory. `tui` and `shared` also run without a
+/// project catalog. Answering "how do I use this?" with "there is no config file here" is a
 /// bad first experience for someone who just installed the binary.
 fn print_help() {
     println!(
-        "hearthd — local dev services daemon, CLI, TUI, browser GUI and MCP server
+        "hearthd — local dev services daemon, CLI, TUI, and MCP server
 
 usage: hearthd [--root <path>] <command> [options]
 
@@ -195,14 +195,15 @@ usage: hearthd [--root <path>] <command> [options]
   shared list|installed|status          inspect the shared service registry and smp
   shared attach|detach|probe <id>       attach this project to a shared service (used by hearth.yaml `shared:`)
   shared install|start|stop|remove <id> manage a shared service instance
-  web [--port N] [--no-open]            browser GUI on 127.0.0.1
-  tui                                   interactive terminal UI
+  tui                                   terminal UI for workspaces and shared services
   mcp                                   serve the MCP tool surface over stdio
   mcp install [--name N] [--key K] <config-file>...
                                         register this binary in an MCP client config
   skill install --dest <path>           write the generic MCP skill doc
 
-Every command except --help/--version resolves a catalog from --root (default: cwd):
+tui and shared do not need a hearth.yaml in the current directory.
+hearthd --root <project> tui adopts that project when it has a catalog.
+Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json."
     );
 }
@@ -235,14 +236,18 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
         )
         .await;
     }
-    // The browser GUI is the app shell: it does not need a hearth.yaml in the current directory.
-    if rest.first().map(String::as_str) == Some("web") {
-        return hearth_web::run(
-            &root,
-            &rest[1..],
-            std::sync::Arc::new(spawn_daemon),
-            std::sync::Arc::new(spawn_smp),
-        )
+    // The terminal UI is an app shell: it does not need a hearth.yaml in the current directory.
+    if rest.first().map(String::as_str) == Some("tui") {
+        if rest.len() > 1 {
+            eprintln!("usage: hearthd tui");
+            return 2;
+        }
+        return hearth_tui::run_shell(hearth_tui::ShellOptions {
+            initial_root: root,
+            spawn_daemon: std::sync::Arc::new(|path: &Path| spawn_daemon(path)),
+            spawn_smp: std::sync::Arc::new(|path: &Path| spawn_smp(path)),
+            refresh_interval: std::time::Duration::from_secs(2),
+        })
         .await;
     }
     let loaded = match hearth_core::config_file::load_catalog(&root) {
@@ -252,22 +257,8 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
             return 1;
         }
     };
-    // `hearth-cli` cannot depend on `hearth-tui` (which depends on it), so `tui` is handled here.
-    if rest.first().map(String::as_str) == Some("tui") {
-        if rest.len() > 1 {
-            eprintln!("usage: hearthd tui");
-            return 2;
-        }
-        return hearth_tui::run_tui(hearth_tui::RunTuiOptions {
-            root: root.clone(),
-            catalog: loaded.catalog,
-            spawn_daemon: Box::new(spawn_daemon),
-            refresh_interval: std::time::Duration::from_secs(10),
-        })
-        .await;
-    }
-    // Only the bare `mcp` (serve over stdio) needs `hearth-mcp`, for the same dependency reason as
-    // `tui`; `mcp install` is plain file editing and falls through to `hearth_cli::main`.
+    // Only the bare `mcp` (serve over stdio) needs `hearth-mcp`; `hearth-cli` cannot depend on it.
+    // `mcp install` is plain file editing and falls through to `hearth_cli::main`.
     if rest.first().map(String::as_str) == Some("mcp") && rest.len() == 1 {
         return run_mcp_subcommand(root, loaded.catalog).await;
     }

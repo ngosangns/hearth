@@ -37,10 +37,7 @@ jobs:
       # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as cargo's.
       - uses: ./.github/actions/toolchain-path
         with:
-          tools: cargo gh node npm
-      - name: Build web UI
-        working-directory: rust/crates/hearth-web/ui
-        run: npm ci && npm run build
+          tools: cargo gh
       - name: Build hearthd
         run: |
           set -euo pipefail

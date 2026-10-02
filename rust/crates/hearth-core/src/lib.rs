@@ -17,6 +17,7 @@ pub mod shared;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
+pub mod workspaces;
 
 pub use catalog::{
     is_container_command, validate_catalog, CatalogValidation, CommandSpec, ReadinessSpec,

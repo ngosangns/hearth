@@ -203,7 +203,7 @@ pub struct ServicePort {
     pub requires_running: Option<bool>,
 }
 
-/// A URL where a service can be reached, surfaced by every client (CLI `urls`, TUI, web, MCP
+/// A URL where a service can be reached, surfaced by every client (CLI `urls`, TUI, MCP
 /// `status`). `url` may contain placeholders from `SERVICE_URL_PLACEHOLDERS`, resolved by the
 /// daemon at request time — `{tailnetHost}` becomes this machine's Tailscale DNS name, so a catalog
 /// shared across machines never hardcodes one machine's hostname. `requires_running: Some(false)`

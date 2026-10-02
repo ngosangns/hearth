@@ -53,7 +53,7 @@ running an older binary — it is not a way to restart a *service* (that is `man
 `stop_daemon` is the full shutdown: unlike `restart_daemon` it does **not** leave services
 running — the daemon stops every service it manages first, then exits. Only call it when the user
 has explicitly asked to stop the daemon (or the whole project). Afterwards **every** tool call —
-including `status` — fails until some other client (`hearthd`, `hearthd web`, or the TUI) starts a
+including `status` — fails until some other client (`hearthd` or the TUI) starts a
 new daemon; there is no `start_daemon` tool.
 
 `stop` on a service this daemon does not own a process for (an adopted `ownership: external` unit,
@@ -69,8 +69,8 @@ service `externally-owned` and report the holder to the user.
 
 ## Equivalent CLI
 
-The same daemon backs a non-interactive CLI, an interactive TUI, and `hearthd web`. All four
-(MCP, CLI, TUI, web) talk to the same daemon over the same loopback HTTP+SSE API, so state seen
+The same daemon backs a non-interactive CLI and an interactive TUI. All three
+(MCP, CLI, TUI) talk to the same daemon over the same loopback HTTP+SSE API, so state seen
 through one is state seen through all:
 
 - `hearthd status [service]` / `hearthd logs <service> [--tail N] [-f]`
@@ -80,8 +80,7 @@ through one is state seen through all:
 - `hearthd doctor` / `hearthd manager ensure|status|stop|restart|reload` (`restart` replaces the
   daemon process and leaves its services running for the new one to re-adopt; `stop` stops all
   managed services and then the daemon)
-- `hearthd tui`
-- `hearthd web` — the browser GUI for workspaces and shared services (loopback only)
+- `hearthd tui` — terminal UI for workspaces and shared services; works from any directory
 
 ## Architecture, in one paragraph
 

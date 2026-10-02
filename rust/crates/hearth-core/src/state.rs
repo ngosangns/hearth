@@ -184,7 +184,7 @@ pub enum ReadinessKind {
 impl ReadinessKind {
     /// The lowercase wire encoding, matching this enum's serde representation. Same rule as
     /// `ActualServiceState::as_wire_str`: `Debug` would give `Tcp`, which leaks into
-    /// `readinessDetail` — a string persisted in `state.json` and rendered by the TUI and the web GUI.
+    /// `readinessDetail` — a string persisted in `state.json` and rendered by the TUI.
     pub fn as_wire_str(self) -> &'static str {
         match self {
             Self::Process => "process",

@@ -1641,7 +1641,7 @@ async fn get_events_stream(
 
     // On overflow the stream is CLOSED, not silently thinned. A client that merely stops receiving
     // some frames has no way to know it missed them: it keeps applying deltas to state that is now
-    // permanently wrong (the TUI's service list, the web GUI's status). Closing makes it reconnect with
+    // permanently wrong (the TUI's service list). Closing makes it reconnect with
     // its cursor and take a `reset` replay, which is the whole point of having a cursor. This
     // mirrors the TS source's `stop()` on a full queue.
     //
@@ -1968,7 +1968,7 @@ async fn post_shutdown(
 // Real end-to-end test: a real bootstrap()'ed manager, a real spawned TCP-readiness service, real
 // HTTP calls via reqwest against the real bound port — proof that every store (lock, state,
 // events, operations, logs) and the supervisor are wired together behind the HTTP+SSE surface
-// the clients (CLI, TUI, web, MCP) use.
+// the clients (CLI, TUI, MCP) use.
 #[cfg(test)]
 mod tests {
     use super::*;

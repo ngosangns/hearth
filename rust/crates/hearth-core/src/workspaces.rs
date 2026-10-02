@@ -1,4 +1,4 @@
-//! The workspace list for the browser GUI.
+//! The workspace list for `hearthd tui`.
 //!
 //! The file is `~/Library/Application Support/HearthApp/workspaces.json`. Swift encodes each row
 //! as `{ id, path, trusted, addedAt }` with an ISO-8601 timestamp and no fractional seconds.
@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use hearth_core::config_file::load_catalog;
-use hearth_core::supervisor::types::format_iso8601_millis;
+use crate::config_file::load_catalog;
+use crate::supervisor::types::format_iso8601_millis;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -100,7 +100,7 @@ impl WorkspaceStore {
         match self.add(path) {
             Ok(added) => Some(added.record.id),
             Err(error) => {
-                eprintln!("hearth web: could not remember {}: {error}", root.display());
+                eprintln!("could not remember {}: {error}", root.display());
                 None
             }
         }
@@ -118,6 +118,35 @@ impl WorkspaceStore {
             return Err(error);
         }
         Ok(record)
+    }
+
+    /// Re-reads the file. A read or parse failure leaves the in-memory list alone and does not
+    /// quarantine the file — a refresh tick must not move the user's list aside.
+    pub fn reload(&mut self) -> Result<(), String> {
+        match fs::read(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.rows.clear();
+                self.load_error = None;
+                Ok(())
+            }
+            Err(error) => Err(format!("could not read {}: {error}", self.path.display())),
+            Ok(data) if data.is_empty() => {
+                self.rows.clear();
+                self.load_error = None;
+                Ok(())
+            }
+            Ok(data) => match serde_json::from_slice::<Vec<WorkspaceRecord>>(&data) {
+                Ok(rows) => {
+                    self.rows = rows;
+                    self.load_error = None;
+                    Ok(())
+                }
+                Err(error) => Err(format!(
+                    "{} could not be read: {error}",
+                    self.path.display()
+                )),
+            },
+        }
     }
 
     pub fn remove(&mut self, id: &str) -> Result<bool, String> {
@@ -255,4 +284,23 @@ pub fn default_workspace_file() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("Library/Application Support/HearthApp/workspaces.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_keeps_the_list_when_the_file_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        let mut store = WorkspaceStore::open(path.clone()).unwrap();
+        let added = store.add(dir.path().to_str().unwrap()).unwrap();
+        assert!(added.created);
+        fs::write(&path, b"{not-json").unwrap();
+        let error = store.reload().unwrap_err();
+        assert!(error.contains("could not be read"), "{error}");
+        assert_eq!(store.list().len(), 1);
+        assert!(path.exists(), "a refresh must not quarantine the file");
+    }
 }

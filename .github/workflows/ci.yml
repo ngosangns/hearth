@@ -24,7 +24,7 @@ jobs:
       # The runner service has no login-shell PATH; see the action for why.
       - uses: ./.github/actions/toolchain-path
         with:
-          tools: cargo node npm
+          tools: cargo
       - run: cargo --version && rustc --version
       - run: cargo test --workspace
       # The runner's toolchain is managed by rustup, whose stable toolchain does not include clippy

@@ -2245,7 +2245,7 @@ services:
     }
 
     /// Document order, not alphabetical: the TS loader iterates insertion order, and this ordering
-    /// is user-visible in `/v1/catalog`, `hearthd status`, the TUI, and the web GUI.
+    /// is user-visible in `/v1/catalog`, `hearthd status`, and the TUI.
     #[test]
     fn services_keep_their_document_order() {
         let dir = tempfile::tempdir().unwrap();
