@@ -22,6 +22,8 @@ because a process started outside a login shell inherits launchd's bare `PATH`.
 
 `ShutdownMode` (`LeaveServices` | `StopServices`) in `manager/protocol.rs` replaces the old `stop_services: bool` on manager/daemon shutdown.
 
+`ProcessSupervisor` lives under `supervisor/engine/` (`mod.rs` + `tests.rs`); adapters remain in `default_adapters.rs`. A deeper owned-vs-external backend split is still deferred.
+
 ## Build, test, release
 
 From `rust/`: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`.
@@ -295,7 +297,7 @@ from any dev box here, with the same username.
   local registry. It does not spawn smp just to draw. Install uses an unbounded request timeout.
 - `WorkspaceStore::reload` must not quarantine `workspaces.json`; only `open` does.
 - A catalog mtime change reloads once while a daemon is up, and that reload must not `ensure`. The first observation only records the mtime. Stop and copy stay available during an in-flight start. Enter on a queued row cancels it. Reveal is `open -R`. Stop-all skips rows that are already stopped or succeeded.
-- The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. `run_tui` remains the single-project screen and still draws ANSI strings; it has no automated coverage. The binary calls `run_shell`.
+- The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. The binary calls `run_shell` only. `run_tui` (ANSI single-project) is **deprecated** and kept as reference; do not wire new entry points to it.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
   catalog reloads. `display_state` collapses `running`/`running-unready` → `running` and

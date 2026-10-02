@@ -27,6 +27,10 @@ use crate::state::{ServiceKindLookup, TuiFence, TuiState};
 const MOUSE_TRACKING_ON: &str = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_TRACKING_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 
+#[deprecated(
+    since = "0.18.0",
+    note = "use hearth_tui::run_shell / `hearth tui` (Ratatui workspace shell); this ANSI single-project path is legacy"
+)]
 pub struct RunTuiOptions {
     pub root: PathBuf,
     pub catalog: ServiceCatalog,
@@ -39,6 +43,11 @@ pub struct RunTuiOptions {
 
 /// Boots a terminal app that is just another HTTP+SSE client of the daemon. Resolves with an exit
 /// code once the user quits (`q`/Ctrl-C).
+#[deprecated(
+    since = "0.18.0",
+    note = "use hearth_tui::run_shell / `hearth tui` (Ratatui workspace shell); this ANSI single-project path is legacy"
+)]
+#[allow(deprecated)]
 pub async fn run_tui(options: RunTuiOptions) -> i32 {
     let RunTuiOptions { root, catalog, spawn_daemon, refresh_interval } = options;
     let localctl_options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon };
