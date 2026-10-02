@@ -45,7 +45,7 @@ async fn run_manager(
             supervisor: Some(supervisor),
             shared,
         },
-        false,
+        hearth_core::manager::ShutdownMode::LeaveServices,
     )
     .await;
     if started {

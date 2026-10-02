@@ -41,7 +41,7 @@ pub fn is_pid_alive(_pid: i64) -> bool {
 }
 
 /// Sends SIGTERM to `pid` — the graceful shutdown path a daemon already has (`DaemonLifecycle` runs
-/// with `stop_services: false`, so it leaves its services running for the next daemon to re-adopt).
+/// with `ShutdownMode::LeaveServices`, so it leaves its services running for the next daemon to re-adopt).
 /// Used to replace a daemon that predates a shutdown mode this binary knows about; the caller must
 /// have authenticated the pid first (the lock-ownership proof `discover` verifies), never a pid read
 /// from anywhere else.

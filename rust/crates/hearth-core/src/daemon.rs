@@ -9,8 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::manager::{
-    bootstrap, BootstrapError, ClaimLockError, HearthManager, HearthManagerOptions,
-};
+    bootstrap, BootstrapError, ClaimLockError, HearthManager, HearthManagerOptions, ShutdownMode};
 use crate::paths::metadata_path;
 
 const DAEMON_LOG_MAX_BYTES: u64 = 512 * 1024;
@@ -148,14 +147,14 @@ impl LockOwnershipWatch {
 
 #[async_trait]
 pub trait ShutdownManager: Send + Sync {
-    async fn shutdown(self: Arc<Self>, stop_services: bool);
+    async fn shutdown(self: Arc<Self>, mode: ShutdownMode);
     fn shutdown_completion(&self) -> watch::Receiver<bool>;
 }
 
 #[async_trait]
 impl ShutdownManager for HearthManager {
-    async fn shutdown(self: Arc<Self>, stop_services: bool) {
-        HearthManager::shutdown(&self, stop_services).await
+    async fn shutdown(self: Arc<Self>, mode: ShutdownMode) {
+        HearthManager::shutdown(&self, mode).await
     }
     fn shutdown_completion(&self) -> watch::Receiver<bool> {
         HearthManager::shutdown_completion(self)
@@ -164,28 +163,28 @@ impl ShutdownManager for HearthManager {
 
 pub struct DaemonLifecycle<M: ShutdownManager + 'static> {
     manager: Arc<M>,
-    stop_services: bool,
+    mode: ShutdownMode,
     once: tokio::sync::OnceCell<()>,
 }
 
 impl<M: ShutdownManager + 'static> DaemonLifecycle<M> {
-    pub fn new(manager: Arc<M>, stop_services: bool) -> Self {
+    pub fn new(manager: Arc<M>, mode: ShutdownMode) -> Self {
         Self {
             manager,
-            stop_services,
+            mode,
             once: tokio::sync::OnceCell::new(),
         }
     }
 
-    /// Triggered by SIGINT/SIGTERM. Default mode (`stop_services: false`) leaves already-running
+    /// Triggered by SIGINT/SIGTERM. Default [`ShutdownMode::LeaveServices`] leaves already-running
     /// services alone — they're detached processes that outlive this daemon and get reconciled/
     /// re-adopted by the next one — so interrupting the daemon never kills a developer's in-flight
     /// work.
     pub async fn shutdown(&self) {
         let manager = self.manager.clone();
-        let stop_services = self.stop_services;
+        let mode = self.mode;
         self.once
-            .get_or_init(|| async move { manager.shutdown(stop_services).await })
+            .get_or_init(|| async move { manager.shutdown(mode).await })
             .await;
     }
 
@@ -227,7 +226,7 @@ pub fn install_panic_log(log: DaemonLog) {
 /// Returns `false` when bootstrap failed, so the caller can exit non-zero. Losing a race to another
 /// daemon is a normal, successful outcome (`true`) — that daemon is now serving this root.
 #[cfg(unix)]
-pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> bool {
+pub async fn run_daemon(options: HearthManagerOptions, mode: ShutdownMode) -> bool {
     let root = options
         .root
         .clone()
@@ -255,7 +254,7 @@ pub async fn run_daemon(options: HearthManagerOptions, stop_services: bool) -> b
         root.display()
     ));
 
-    let lifecycle = Arc::new(DaemonLifecycle::new(manager.clone(), stop_services));
+    let lifecycle = Arc::new(DaemonLifecycle::new(manager.clone(), mode));
 
     let lock_watch = (read_lock_instance_id(&runtime_directory).as_deref()
         == Some(manager.instance_id.as_str()))
@@ -455,7 +454,7 @@ mod tests {
         }
         #[async_trait]
         impl ShutdownManager for CountingManager {
-            async fn shutdown(self: Arc<Self>, _stop_services: bool) {
+            async fn shutdown(self: Arc<Self>, _mode: ShutdownMode) {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let _ = self.done.send(true);
             }
@@ -468,7 +467,7 @@ mod tests {
             calls: std::sync::atomic::AtomicU32::new(0),
             done: tx,
         });
-        let lifecycle = DaemonLifecycle::new(manager.clone(), false);
+        let lifecycle = DaemonLifecycle::new(manager.clone(), ShutdownMode::LeaveServices);
         lifecycle.shutdown().await;
         lifecycle.shutdown().await;
         assert_eq!(

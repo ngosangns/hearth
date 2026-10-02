@@ -251,7 +251,7 @@ pub async fn refresh_selected_log(client: &ManagerTuiClient, state: &mut crate::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hearth_core::manager::HearthManager;
+    use hearth_core::manager::{HearthManager, ShutdownMode};
     use std::sync::Arc;
 
     /// Reaps spawned services (`nc -lk` listeners) even when the test panics before its
@@ -268,7 +268,7 @@ mod tests {
                     rt.block_on(async move {
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(15),
-                            manager.shutdown(true),
+                            manager.shutdown(ShutdownMode::StopServices),
                         )
                         .await;
                     });
@@ -426,6 +426,6 @@ mod tests {
         assert!(squatter.try_wait().unwrap().is_some(), "the confirmed reclaim must terminate the squatter");
         let _ = squatter.kill();
         let _ = squatter.wait();
-        manager.shutdown(true).await;
+        manager.shutdown(ShutdownMode::StopServices).await;
     }
 }

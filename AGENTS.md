@@ -20,6 +20,8 @@ because a process started outside a login shell inherits launchd's bare `PATH`.
 `mod.rs` owns `HearthManager` / bootstrap / shutdown; `routes.rs` is the axum route table
 (handlers stay a child module so they can use private manager fields without widening crate visibility).
 
+`ShutdownMode` (`LeaveServices` | `StopServices`) in `manager/protocol.rs` replaces the old `stop_services: bool` on manager/daemon shutdown.
+
 ## Build, test, release
 
 From `rust/`: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`.

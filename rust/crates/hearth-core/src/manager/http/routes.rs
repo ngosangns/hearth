@@ -29,6 +29,7 @@ use super::{
     default_daemon_owned, default_state_or, json_response, lifecycle_event, now, HearthManager,
     HttpResult, ManagerHttpError,
 };
+use crate::manager::ShutdownMode;
 
 pub fn router(manager: Arc<HearthManager>) -> Router {
     let authorized_routes = Router::new()
@@ -1228,7 +1229,11 @@ async fn post_shutdown(
             ))
         }
     };
-    let stop_services = mode == "stop-services";
+    let shutdown_mode = if mode == "stop-services" {
+        ShutdownMode::StopServices
+    } else {
+        ShutdownMode::LeaveServices
+    };
     let schedule_input = OperationInput {
         request_id,
         kind: OperationKind::ManagerShutdown,
@@ -1267,7 +1272,7 @@ async fn post_shutdown(
     }
     let manager_for_shutdown = manager.clone();
     tokio::spawn(async move {
-        manager_for_shutdown.shutdown(stop_services).await;
+        manager_for_shutdown.shutdown(shutdown_mode).await;
     });
     let operation = manager.operations.schedule(
         schedule_input,

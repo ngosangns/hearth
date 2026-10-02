@@ -7,6 +7,7 @@ pub mod http;
 pub mod lock;
 pub mod log_store;
 pub mod operations;
+pub mod protocol;
 pub mod service_urls;
 pub mod shared;
 pub mod state_store;
@@ -25,6 +26,7 @@ pub use log_store::{
     CursorLogStore, LogStoreError, DEFAULT_LOG_MAX_BYTES, DEFAULT_LOG_ROTATION_COUNT,
     DEFAULT_LOG_TAIL_BYTES,
 };
+pub use protocol::ShutdownMode;
 pub use operations::{
     OperationExecute, OperationHandle, OperationInput, OperationRejected, OperationScheduler,
     RequestIdConflict,

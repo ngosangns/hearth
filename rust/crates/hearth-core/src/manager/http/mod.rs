@@ -35,6 +35,7 @@ use super::lock::{
 use super::log_store::CursorLogStore;
 use super::operations::{OperationScheduler, RequestIdConflict};
 use super::state_store::AtomicStateStore;
+use super::ShutdownMode;
 
 mod routes;
 pub use routes::router;
@@ -390,21 +391,21 @@ impl HearthManager {
         self.shutdown_done.subscribe()
     }
 
-    /// Alias for `shutdown("refuse-if-active")`.
+    /// Alias for HTTP `"refuse-if-active"` after the caller has already confirmed nothing is active:
+    /// shut down and leave managed services running for re-adoption.
     pub async fn close(self: &Arc<Self>) {
-        self.shutdown(false).await;
+        self.shutdown(ShutdownMode::LeaveServices).await;
     }
 
-    /// `stop_services = true` mirrors the TS `"stop-services"` mode; `false` covers both
-    /// `"refuse-if-active"` (the caller is expected to have already checked for active services
-    /// before calling this, same as the TS `shutdownRequest` handler does) and `"leave-services"`
-    /// (shut down now, leave running services for the next daemon to re-adopt).
-    pub async fn shutdown(self: &Arc<Self>, stop_services: bool) {
+    /// Shut the manager down. [`ShutdownMode::StopServices`] stops managed processes first;
+    /// [`ShutdownMode::LeaveServices`] detaches them for the next daemon to re-adopt (also what
+    /// SIGTERM / `hearth manager restart` use once past any refuse-if-active guard).
+    pub async fn shutdown(self: &Arc<Self>, mode: ShutdownMode) {
         self.closing.store(true, Ordering::SeqCst);
         self.operations.close_mutations();
         self.supervisor().begin_shutdown();
         self.operations.drain_services().await;
-        if stop_services {
+        if mode.stops_services() {
             self.supervisor().shutdown().await;
         }
         let _guard = self.lifecycle.lock().await;

@@ -382,7 +382,7 @@ async fn shut_down_for_restart(client: &Client) -> LocalctlResult<()> {
     match request(client, "/v1/manager/shutdown", reqwest::Method::POST, Some(&body), Some(client.metadata.protocol_version)).await {
         Ok(_) => {}
         // A daemon from before `leave-services` existed rejects the mode outright. Its own SIGTERM
-        // path is the same shutdown (`DaemonLifecycle` runs with `stop_services: false`), so signal
+        // path is the same shutdown (`DaemonLifecycle` runs with `ShutdownMode::LeaveServices`), so signal
         // it instead: a daemon that predates this command is precisely the one `restart` exists to
         // replace, and refusing it would leave the user with no way to swap it.
         Err(error) if error.starts_with("invalid_shutdown_mode") => {
@@ -1454,7 +1454,7 @@ mod tests {
             let root = root.to_path_buf();
             let catalog = catalog_for_spawn.clone();
             tokio::spawn(async move {
-                hearth_core::daemon::run_daemon(HearthManagerOptions { runtime_directory: None, root: Some(root), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }, false).await;
+                hearth_core::daemon::run_daemon(HearthManagerOptions { runtime_directory: None, root: Some(root), catalog, event_capacity: None, log_tail_bytes: None, log_max_bytes: None, log_rotation_count: None, supervisor: None, shared: None }, hearth_core::manager::ShutdownMode::LeaveServices).await;
             });
         });
         let options = LocalctlOptions { catalog, spawn_daemon };
