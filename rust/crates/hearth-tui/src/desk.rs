@@ -56,6 +56,7 @@ pub enum Command {
     Move(i64),
     ScrollLog(i64),
     ToggleShared,
+    ToggleMouse,
     Activate,
     Stop,
     Restart,
@@ -150,7 +151,11 @@ pub struct RecipeLine {
 
 impl RecipeLine {
     pub fn chosen(&self) -> String {
-        let version = self.versions.get(self.version_index).map(String::as_str).unwrap_or("");
+        let version = self
+            .versions
+            .get(self.version_index)
+            .map(String::as_str)
+            .unwrap_or("");
         format!("{}@{version}", self.name)
     }
 }
@@ -182,6 +187,65 @@ struct Geometry {
     modal: Rect,
 }
 
+/// An http(s) URL that was painted this frame, with the cells it occupies. The shell re-writes
+/// those cells as an OSC 8 hyperlink after `terminal.draw`, and a drag on them is selected here:
+/// mouse reporting swallows the terminal's own selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub x: u16,
+    pub y: u16,
+    /// The painted text the sequence wraps, clipped to the cells that were drawn.
+    pub text: String,
+    /// The full URL. Copied when the whole visible run is selected, including a clipped tail.
+    pub target: String,
+    /// Inner pane origin of the line, so a press on the `URL ` prefix still hits this link.
+    pub row_x: u16,
+    pub row_width: u16,
+    /// Service URL rows accept a press anywhere on the line. Log lines only on the URL itself.
+    pub row_press: bool,
+}
+
+impl Link {
+    pub fn end_x(&self) -> u16 {
+        self.x.saturating_add(visible_width(&self.text) as u16)
+    }
+
+    fn contains_cell(&self, column: usize, row: usize) -> bool {
+        row == self.y as usize && column >= self.x as usize && column < self.end_x() as usize
+    }
+
+    fn on_row(&self, column: usize, row: usize) -> bool {
+        row == self.y as usize
+            && column >= self.row_x as usize
+            && column < self.row_x as usize + self.row_width as usize
+    }
+}
+
+/// The link run the pointer is selecting. Columns are screen columns; `end` is exclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSelection {
+    pub y: u16,
+    pub x: u16,
+    pub start: u16,
+    pub end: u16,
+    pub text: String,
+    pub target: String,
+}
+
+impl LinkSelection {
+    /// The whole visible run copies `target`, so a clipped URL still yields the full address.
+    pub fn copied(&self) -> String {
+        let start = self.start.saturating_sub(self.x) as usize;
+        let end = self.end.saturating_sub(self.x) as usize;
+        let visible = slice_columns(&self.text, start, end);
+        if visible == self.text {
+            self.target.clone()
+        } else {
+            visible
+        }
+    }
+}
+
 pub struct Desk {
     pub focus: Pane,
     pub shared_open: bool,
@@ -208,6 +272,8 @@ pub struct Desk {
     service_offset: usize,
     shared_offset: usize,
     geometry: Geometry,
+    pub links: Vec<Link>,
+    pub link_selection: Option<LinkSelection>,
 }
 
 impl Default for Desk {
@@ -238,6 +304,8 @@ impl Default for Desk {
             service_offset: 0,
             shared_offset: 0,
             geometry: Geometry::default(),
+            links: Vec::new(),
+            link_selection: None,
         }
     }
 }
@@ -271,7 +339,10 @@ impl Desk {
     }
 
     pub fn service_line(&self, id: &str) -> Option<&ServiceLine> {
-        self.sections.iter().flat_map(|section| section.services.iter()).find(|service| service.id == id)
+        self.sections
+            .iter()
+            .flat_map(|section| section.services.iter())
+            .find(|service| service.id == id)
     }
 
     /// Replaces the service tree and keeps the cursor on the same row when it still exists.
@@ -280,7 +351,9 @@ impl Desk {
         self.sections = sections;
         self.start_all = start_all;
         let ids = self.service_ids();
-        self.service_cursor = keep.and_then(|id| ids.iter().position(|row| row == &id)).unwrap_or(0);
+        self.service_cursor = keep
+            .and_then(|id| ids.iter().position(|row| row == &id))
+            .unwrap_or(0);
     }
 
     /// First call arms `pending` and returns false. The same call again returns true and clears it.
@@ -326,7 +399,11 @@ impl Desk {
     pub fn toggle_shared(&mut self) {
         self.pending = None;
         self.shared_open = !self.shared_open;
-        self.focus = if self.shared_open { Pane::Shared } else { Pane::Services };
+        self.focus = if self.shared_open {
+            Pane::Shared
+        } else {
+            Pane::Services
+        };
     }
 
     pub fn cycle_version(&mut self, delta: i64) -> bool {
@@ -362,7 +439,9 @@ impl Desk {
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.geometry = Geometry::default();
+        self.links.clear();
         if area.width == 0 || area.height == 0 {
+            self.link_selection = None;
             return;
         }
         let notice = self.status_notice();
@@ -375,13 +454,19 @@ impl Desk {
         ])
         .areas(area);
         if header_h > 0 {
-            frame.render_widget(Paragraph::new(title_line(&self.summary, self.daemon_pid)).style(theme::title()), header);
+            frame.render_widget(
+                Paragraph::new(title_line(&self.summary, self.daemon_pid)).style(theme::title()),
+                header,
+            );
         }
         if notice_h > 0 {
             frame.render_widget(Paragraph::new(notice).style(theme::notice()), notice_area);
         }
         if footer_h > 0 {
-            frame.render_widget(Paragraph::new(footer_line(self, footer.width as usize)), footer);
+            frame.render_widget(
+                Paragraph::new(footer_line(self, footer.width as usize)),
+                footer,
+            );
         }
         if self.help {
             self.draw_help(frame, body);
@@ -390,8 +475,83 @@ impl Desk {
         } else {
             self.draw_narrow(frame, body);
         }
+        self.reconcile_link_selection();
+        self.paint_link_chrome(frame.buffer_mut());
         if self.composer.is_some() || self.pending.is_some() {
             self.draw_modal(frame, area);
+        }
+    }
+
+    /// A press on a URL, or on the only URL of that row (the `URL ` label included).
+    pub fn link_for_press(&self, column: usize, row: usize) -> Option<Link> {
+        if self.help || self.composer.is_some() {
+            return None;
+        }
+        if self.pending.is_some() && contains_cell(self.geometry.modal, column, row) {
+            return None;
+        }
+        let hits: Vec<&Link> = self
+            .links
+            .iter()
+            .filter(|link| link.on_row(column, row))
+            .collect();
+        if let Some(link) = hits.iter().find(|link| link.contains_cell(column, row)) {
+            return Some((*link).clone());
+        }
+        if hits.len() == 1 && hits[0].row_press {
+            Some(hits[0].clone())
+        } else {
+            None
+        }
+    }
+
+    /// `moved` is a drag that travelled at least two columns. A click, or a one-cell jitter,
+    /// keeps the whole URL so the copy is the address and not a single character.
+    pub fn select_link(&mut self, link: &Link, anchor: u16, current: u16, moved: bool) {
+        let origin = link.x;
+        let end = link.end_x();
+        let (start, stop) = link_range(origin, end, anchor, current, moved);
+        self.link_selection = Some(LinkSelection {
+            y: link.y,
+            x: origin,
+            start,
+            end: stop,
+            text: link.text.clone(),
+            target: link.target.clone(),
+        });
+    }
+
+    pub fn clear_link_selection(&mut self) {
+        self.link_selection = None;
+    }
+
+    fn reconcile_link_selection(&mut self) {
+        let keep = self.link_selection.as_ref().is_some_and(|selection| {
+            self.links.iter().any(|link| {
+                link.y == selection.y && link.x == selection.x && link.target == selection.target
+            })
+        });
+        if !keep {
+            self.link_selection = None;
+        }
+    }
+
+    fn paint_link_chrome(&self, buf: &mut Buffer) {
+        for link in &self.links {
+            for x in link.x..link.end_x() {
+                if let Some(cell) = buf.cell_mut((x, link.y)) {
+                    cell.modifier.insert(Modifier::UNDERLINED);
+                }
+            }
+        }
+        let Some(selection) = &self.link_selection else {
+            return;
+        };
+        for x in selection.start..selection.end {
+            if let Some(cell) = buf.cell_mut((x, selection.y)) {
+                cell.modifier.insert(Modifier::UNDERLINED);
+                cell.modifier.insert(Modifier::REVERSED);
+            }
         }
     }
 
@@ -437,7 +597,13 @@ impl Desk {
         let geo = self.geometry;
         if contains_cell(geo.workspace_items, column, row) {
             let before = self.workspace_index;
-            scroll_window(&mut self.workspace_offset, &mut self.workspace_index, self.workspaces.len(), geo.workspace_items.height as usize, delta);
+            scroll_window(
+                &mut self.workspace_offset,
+                &mut self.workspace_index,
+                self.workspaces.len(),
+                geo.workspace_items.height as usize,
+                delta,
+            );
             return self.workspace_index != before;
         }
         if contains_cell(geo.log_items, column, row) {
@@ -470,11 +636,20 @@ impl Desk {
                 let visuals = service_visuals(self);
                 let current = visual_index_of_item(&visuals, self.service_cursor).unwrap_or(0);
                 if current < self.service_offset {
-                    if let Some(item) = visuals.iter().skip(self.service_offset).find(|row| row.kind == Visual::Item) {
+                    if let Some(item) = visuals
+                        .iter()
+                        .skip(self.service_offset)
+                        .find(|row| row.kind == Visual::Item)
+                    {
                         self.service_cursor = item.selectable;
                     }
                 } else if current >= self.service_offset + height {
-                    if let Some(item) = visuals.iter().take(self.service_offset + height).rev().find(|row| row.kind == Visual::Item) {
+                    if let Some(item) = visuals
+                        .iter()
+                        .take(self.service_offset + height)
+                        .rev()
+                        .find(|row| row.kind == Visual::Item)
+                    {
                         self.service_cursor = item.selectable;
                     }
                 }
@@ -509,27 +684,41 @@ impl Desk {
         } else {
             area
         };
-        let lines: Vec<Line> = HELP.iter().take(target.height as usize).map(|line| Line::from(*line)).collect();
+        let lines: Vec<Line> = HELP
+            .iter()
+            .take(target.height as usize)
+            .map(|line| Line::from(*line))
+            .collect();
         frame.render_widget(Paragraph::new(lines), target);
     }
 
     fn draw_split(&mut self, frame: &mut Frame, body: Rect, sidebar: u16) {
-        let [left, right] = Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(0)]).areas(body);
+        let [left, right] =
+            Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(0)]).areas(body);
         let (height, offset) = self.fit_workspace(block_inner_height(left), self.workspaces.len());
         self.paint_workspaces(frame, left, height, offset);
-        let main = if self.shared_open { Pane::Shared } else { Pane::Services };
+        let main = if self.shared_open {
+            Pane::Shared
+        } else {
+            Pane::Services
+        };
         self.paint_main(frame, right, main);
     }
 
     fn draw_narrow(&mut self, frame: &mut Frame, body: Rect) {
         match self.focus {
             Pane::Workspaces => {
-                let (height, offset) = self.fit_workspace(block_inner_height(body), self.workspaces.len());
+                let (height, offset) =
+                    self.fit_workspace(block_inner_height(body), self.workspaces.len());
                 self.paint_workspaces(frame, body, height, offset);
                 self.geometry.main = Pane::Workspaces;
             }
             Pane::Services | Pane::Shared => {
-                let main = if self.focus == Pane::Shared || self.shared_open { Pane::Shared } else { Pane::Services };
+                let main = if self.focus == Pane::Shared || self.shared_open {
+                    Pane::Shared
+                } else {
+                    Pane::Services
+                };
                 self.paint_main(frame, body, main);
             }
         }
@@ -537,17 +726,33 @@ impl Desk {
 
     fn fit_workspace(&mut self, height: usize, len: usize) -> (usize, usize) {
         let height = height.min(len);
-        reveal(&mut self.workspace_offset, self.workspace_index, height, len);
+        reveal(
+            &mut self.workspace_offset,
+            self.workspace_index,
+            height,
+            len,
+        );
         (height, self.workspace_offset)
     }
 
-    fn paint_workspaces(&mut self, frame: &mut Frame, area: Rect, item_slots: usize, offset: usize) {
+    fn paint_workspaces(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        item_slots: usize,
+        offset: usize,
+    ) {
         let focused = self.focus == Pane::Workspaces;
         let block = pane_block("WORKSPACES", focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let rows = item_slots.min(inner.height as usize);
-        self.geometry.workspace_items = Rect { x: inner.x, y: inner.y, width: inner.width, height: rows as u16 };
+        self.geometry.workspace_items = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: rows as u16,
+        };
         self.geometry.workspace_offset = offset;
         let buf = frame.buffer_mut();
         for slot in 0..rows {
@@ -559,44 +764,89 @@ impl Desk {
                 .get(index)
                 .map(|workspace| workspace_line(workspace, focused && current, summary))
                 .unwrap_or_else(|| Line::from(""));
-            paint_line(buf, inner.x, inner.y + slot as u16, inner.width, &line, focused && current);
+            paint_line(
+                buf,
+                inner.x,
+                inner.y + slot as u16,
+                inner.width,
+                &line,
+                focused && current,
+            );
         }
     }
 
     fn paint_main(&mut self, frame: &mut Frame, area: Rect, pane: Pane) {
         let (list_area, log_area) = split_main(area);
-        let visuals = if pane == Pane::Shared { shared_visuals(self) } else { service_visuals(self) };
-        let cursor = if pane == Pane::Shared { self.shared_cursor } else { self.service_cursor };
+        let visuals = if pane == Pane::Shared {
+            shared_visuals(self)
+        } else {
+            service_visuals(self)
+        };
+        let cursor = if pane == Pane::Shared {
+            self.shared_cursor
+        } else {
+            self.service_cursor
+        };
         let focused = self.focus == pane;
         let title = pane_title(self, pane);
         let block = pane_block(&title, focused);
         let inner = block.inner(list_area);
         frame.render_widget(block, list_area);
-        let url_rows = if pane == Pane::Services { self.urls.len().min(3).min(inner.height as usize) } else { 0 };
-        let url_rows = if (inner.height as usize) > url_rows { url_rows } else { 0 };
+        let url_rows = if pane == Pane::Services {
+            self.urls.len().min(3).min(inner.height as usize)
+        } else {
+            0
+        };
+        let url_rows = if (inner.height as usize) > url_rows {
+            url_rows
+        } else {
+            0
+        };
         let item_capacity = (inner.height as usize).saturating_sub(url_rows);
         let item_height = item_capacity.min(visuals.len());
         let visual_cursor = visual_index_of_item(&visuals, cursor).unwrap_or(0);
         let offset = {
-            let slot = if pane == Pane::Shared { &mut self.shared_offset } else { &mut self.service_offset };
+            let slot = if pane == Pane::Shared {
+                &mut self.shared_offset
+            } else {
+                &mut self.service_offset
+            };
             reveal(slot, visual_cursor, item_height, visuals.len());
             *slot
         };
         self.geometry.main = pane;
         self.geometry.main_offset = offset;
-        self.geometry.main_items = Rect { x: inner.x, y: inner.y, width: inner.width, height: item_height as u16 };
+        self.geometry.main_items = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: item_height as u16,
+        };
         {
             let buf = frame.buffer_mut();
             for slot in 0..item_height {
                 let painted = visuals.get(offset + slot);
-                let selected = painted.is_some_and(|row| focused && row.kind == Visual::Item && row.selectable == cursor);
-                let line = painted.map(|row| row.line.clone()).unwrap_or_else(|| Line::from(""));
-                paint_line(buf, inner.x, inner.y + slot as u16, inner.width, &line, selected);
+                let selected = painted.is_some_and(|row| {
+                    focused && row.kind == Visual::Item && row.selectable == cursor
+                });
+                let line = painted
+                    .map(|row| row.line.clone())
+                    .unwrap_or_else(|| Line::from(""));
+                paint_line(
+                    buf,
+                    inner.x,
+                    inner.y + slot as u16,
+                    inner.width,
+                    &line,
+                    selected,
+                );
             }
             if pane == Pane::Services {
                 for (index, url) in self.urls.iter().take(url_rows).enumerate() {
                     let line = Line::styled(format!("URL {url}"), theme::dim());
-                    buf.set_line(inner.x, inner.y + item_height as u16 + index as u16, &line, inner.width);
+                    let y = inner.y + item_height as u16 + index as u16;
+                    buf.set_line(inner.x, y, &line, inner.width);
+                    collect_links(&line, inner.x, y, inner.width, true, &mut self.links);
                 }
             }
         }
@@ -612,7 +862,16 @@ impl Desk {
         let buf = frame.buffer_mut();
         for (index, row) in rows.iter().enumerate() {
             let line = sgr_to_line(row);
-            buf.set_line(log_inner.x, log_inner.y + index as u16, &line, log_inner.width);
+            let y = log_inner.y + index as u16;
+            buf.set_line(log_inner.x, y, &line, log_inner.width);
+            collect_links(
+                &line,
+                log_inner.x,
+                y,
+                log_inner.width,
+                false,
+                &mut self.links,
+            );
         }
     }
 
@@ -621,11 +880,18 @@ impl Desk {
         if composing.is_none() && self.pending.is_none() {
             return;
         }
-        let title = if composing.is_some() { "add folder" } else { "confirm" };
+        let title = if composing.is_some() {
+            "add folder"
+        } else {
+            "confirm"
+        };
         let rect = centered(area, modal_width(area), modal_height(area));
         self.geometry.modal = rect;
         frame.render_widget(Clear, rect);
-        let block = Block::bordered().title(title).border_style(theme::modal()).title_style(theme::title());
+        let block = Block::bordered()
+            .title(title)
+            .border_style(theme::modal())
+            .title_style(theme::title());
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if inner.width == 0 || inner.height == 0 {
@@ -636,7 +902,10 @@ impl Desk {
         let body = if let Some(text) = composing {
             composer_lines(&text, inner.width as usize, body_rows)
         } else {
-            fitted_lines(&self.header_notice(), inner.width as usize, body_rows).into_iter().map(Line::from).collect()
+            fitted_lines(&self.header_notice(), inner.width as usize, body_rows)
+                .into_iter()
+                .map(Line::from)
+                .collect()
         };
         let buf = frame.buffer_mut();
         for (index, line) in body.iter().enumerate().take(body_rows) {
@@ -660,21 +929,37 @@ fn service_visuals(desk: &Desk) -> Vec<Painted> {
     let focused = desk.focus == Pane::Services;
     if desk.selected_workspace().is_some() {
         let selected = focused && desk.service_cursor == selectable;
-        rows.push(Painted { line: item_line(selected, "daemon log"), kind: Visual::Item, selectable });
+        rows.push(Painted {
+            line: item_line(selected, "daemon log"),
+            kind: Visual::Item,
+            selectable,
+        });
         selectable += 1;
     }
     let named = desk.sections.iter().any(|section| section.name.is_some());
     for section in &desk.sections {
         if let Some(name) = &section.name {
             let selected = focused && desk.service_cursor == selectable;
-            rows.push(Painted { line: item_line(selected, &name.to_uppercase()), kind: Visual::Item, selectable });
+            rows.push(Painted {
+                line: item_line(selected, &name.to_uppercase()),
+                kind: Visual::Item,
+                selectable,
+            });
             selectable += 1;
         } else if named {
-            rows.push(Painted { line: Line::styled("OTHER", theme::dim()), kind: Visual::Label, selectable });
+            rows.push(Painted {
+                line: Line::styled("OTHER", theme::dim()),
+                kind: Visual::Label,
+                selectable,
+            });
         }
         for service in &section.services {
             let selected = focused && desk.service_cursor == selectable;
-            rows.push(Painted { line: service_line(service, selected), kind: Visual::Item, selectable });
+            rows.push(Painted {
+                line: service_line(service, selected),
+                kind: Visual::Item,
+                selectable,
+            });
             selectable += 1;
         }
     }
@@ -686,17 +971,36 @@ fn shared_visuals(desk: &Desk) -> Vec<Painted> {
     let mut selectable = 0;
     let focused = desk.focus == Pane::Shared;
     if !desk.recipes.is_empty() {
-        rows.push(Painted { line: Line::styled("RECIPES", theme::dim()), kind: Visual::Label, selectable });
+        rows.push(Painted {
+            line: Line::styled("RECIPES", theme::dim()),
+            kind: Visual::Label,
+            selectable,
+        });
     }
     for recipe in &desk.recipes {
         let selected = focused && desk.shared_cursor == selectable;
-        let installed = desk.instances.iter().any(|instance| instance.id == recipe.chosen());
-        let version = recipe.versions.get(recipe.version_index).map(String::as_str).unwrap_or("");
-        rows.push(Painted { line: recipe_line(selected, &recipe.name, version, installed), kind: Visual::Item, selectable });
+        let installed = desk
+            .instances
+            .iter()
+            .any(|instance| instance.id == recipe.chosen());
+        let version = recipe
+            .versions
+            .get(recipe.version_index)
+            .map(String::as_str)
+            .unwrap_or("");
+        rows.push(Painted {
+            line: recipe_line(selected, &recipe.name, version, installed),
+            kind: Visual::Item,
+            selectable,
+        });
         selectable += 1;
     }
     if !desk.instances.is_empty() {
-        rows.push(Painted { line: Line::styled("INSTALLED", theme::dim()), kind: Visual::Label, selectable });
+        rows.push(Painted {
+            line: Line::styled("INSTALLED", theme::dim()),
+            kind: Visual::Label,
+            selectable,
+        });
     }
     for instance in &desk.instances {
         let selected = focused && desk.shared_cursor == selectable;
@@ -705,8 +1009,17 @@ fn shared_visuals(desk: &Desk) -> Vec<Painted> {
             1 => "  1 project".to_string(),
             n => format!("  {n} projects"),
         };
-        let failure = instance.install_error.as_deref().filter(|text| !text.is_empty()).map(|text| format!("  {text}")).unwrap_or_default();
-        rows.push(Painted { line: instance_line(instance, selected, &projects, &failure), kind: Visual::Item, selectable });
+        let failure = instance
+            .install_error
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("  {text}"))
+            .unwrap_or_default();
+        rows.push(Painted {
+            line: instance_line(instance, selected, &projects, &failure),
+            kind: Visual::Item,
+            selectable,
+        });
         selectable += 1;
     }
     rows
@@ -717,9 +1030,19 @@ fn pane_title(desk: &Desk, pane: Pane) -> String {
         Pane::Shared => "SHARED".to_string(),
         Pane::Services | Pane::Workspaces => {
             let workspace = desk.selected_workspace();
-            let name = workspace.map(|workspace| workspace.name.as_str()).unwrap_or("no workspace");
-            let path = workspace.and_then(|workspace| (!workspace.path.is_empty()).then(|| format!("  {}", workspace.path))).unwrap_or_default();
-            let summary = if desk.summary.is_empty() { String::new() } else { format!("  {}", desk.summary) };
+            let name = workspace
+                .map(|workspace| workspace.name.as_str())
+                .unwrap_or("no workspace");
+            let path = workspace
+                .and_then(|workspace| {
+                    (!workspace.path.is_empty()).then(|| format!("  {}", workspace.path))
+                })
+                .unwrap_or_default();
+            let summary = if desk.summary.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", desk.summary)
+            };
             format!("SERVICES  {name}{path}{summary}")
         }
     }
@@ -766,12 +1089,32 @@ fn service_line(service: &ServiceLine, selected: bool) -> Line<'static> {
     } else {
         format!("{}  {}", service.label, service.id)
     };
-    let ports = if service.ports.is_empty() { String::new() } else { format!("  {}", service.ports) };
-    let detail = service.error.as_deref().filter(|text| !text.is_empty()).map(|text| format!("  {text}")).unwrap_or_default();
+    let ports = if service.ports.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", service.ports)
+    };
+    let detail = service
+        .error
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(|text| format!("  {text}"))
+        .unwrap_or_default();
+    let name_style = if service.disabled {
+        theme::dim()
+    } else {
+        theme::title()
+    };
+    let tail_style = if service.disabled {
+        theme::dim()
+    } else {
+        Style::default()
+    };
     Line::from(vec![
         Span::raw(format!("{mark} ")),
         Span::styled(format!("{label:<9}"), style),
-        Span::raw(format!(" {name}{ports}{flags}{detail}")),
+        Span::styled(format!(" {name}"), name_style),
+        Span::styled(format!("{ports}{flags}{detail}"), tail_style),
     ])
 }
 
@@ -786,11 +1129,19 @@ fn recipe_line(selected: bool, name: &str, version: &str, installed: bool) -> Li
     Line::from(format!("{mark} {name}  {version}  {action}"))
 }
 
-fn instance_line(instance: &InstanceLine, selected: bool, projects: &str, failure: &str) -> Line<'static> {
+fn instance_line(
+    instance: &InstanceLine,
+    selected: bool,
+    projects: &str,
+    failure: &str,
+) -> Line<'static> {
     let mark = if selected { ">" } else { " " };
     let state = compact_wire(&instance.actual_state);
     Line::from(vec![
-        Span::raw(format!("{mark} {}  {}  ", instance.id, instance.install_state)),
+        Span::raw(format!(
+            "{mark} {}  {}  ",
+            instance.id, instance.install_state
+        )),
         Span::styled(state.to_string(), wire_style(state)),
         Span::raw(format!("  :{}{projects}{failure}", instance.port)),
     ])
@@ -815,9 +1166,14 @@ fn state_style(state: ActualServiceState) -> Style {
     Style::default().fg(match state {
         ActualServiceState::Ready | ActualServiceState::Succeeded => Color::Green,
         ActualServiceState::Running | ActualServiceState::RunningUnready => Color::Cyan,
-        ActualServiceState::Preparing | ActualServiceState::QueuedStart | ActualServiceState::Starting | ActualServiceState::Stopping => Color::Yellow,
+        ActualServiceState::Preparing
+        | ActualServiceState::QueuedStart
+        | ActualServiceState::Starting
+        | ActualServiceState::Stopping => Color::Yellow,
         ActualServiceState::Stopped => Color::DarkGray,
-        ActualServiceState::Failed | ActualServiceState::Orphaned | ActualServiceState::ExternallyOwned => Color::Red,
+        ActualServiceState::Failed
+        | ActualServiceState::Orphaned
+        | ActualServiceState::ExternallyOwned => Color::Red,
     })
 }
 
@@ -833,7 +1189,11 @@ fn wire_style(state: &str) -> Style {
 }
 
 fn title_line(summary: &str, pid: Option<i64>) -> Line<'static> {
-    let mut text = if summary.is_empty() { "Hearth".to_string() } else { format!("Hearth  {summary}") };
+    let mut text = if summary.is_empty() {
+        "Hearth".to_string()
+    } else {
+        format!("Hearth  {summary}")
+    };
     if let Some(pid) = pid {
         text.push_str(&format!("  pid {pid}"));
     }
@@ -841,7 +1201,11 @@ fn title_line(summary: &str, pid: Option<i64>) -> Line<'static> {
 }
 
 fn plain_cell(text: &str) -> String {
-    sgr_to_line(text).spans.into_iter().map(|span| span.content.into_owned()).collect()
+    sgr_to_line(text)
+        .spans
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect()
 }
 
 fn chrome_heights(height: u16, show_notice: bool) -> (u16, u16, u16) {
@@ -859,8 +1223,15 @@ fn chrome_heights(height: u16, show_notice: bool) -> (u16, u16, u16) {
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
-    let style = if focused { theme::focus() } else { theme::idle() };
-    Block::bordered().title(title).border_style(style).title_style(style)
+    let style = if focused {
+        theme::focus()
+    } else {
+        theme::idle()
+    };
+    Block::bordered()
+        .title(title)
+        .border_style(style)
+        .title_style(style)
 }
 
 fn block_inner_height(area: Rect) -> usize {
@@ -869,11 +1240,17 @@ fn block_inner_height(area: Rect) -> usize {
 
 fn split_main(area: Rect) -> (Rect, Rect) {
     if area.height < 6 {
-        let log = Rect { x: area.x, y: area.bottom(), width: area.width, height: 0 };
+        let log = Rect {
+            x: area.x,
+            y: area.bottom(),
+            width: area.width,
+            height: 0,
+        };
         return (area, log);
     }
     let log_h = ((area.height as usize) / 3).clamp(3, area.height as usize - 3) as u16;
-    let [list, log] = Layout::vertical([Constraint::Length(area.height - log_h), Constraint::Min(0)]).areas(area);
+    let [list, log] =
+        Layout::vertical([Constraint::Length(area.height - log_h), Constraint::Min(0)]).areas(area);
     (list, log)
 }
 
@@ -882,9 +1259,170 @@ fn paint_line(buf: &mut Buffer, x: u16, y: u16, width: u16, line: &Line, selecte
         return;
     }
     if selected {
-        buf.set_style(Rect { x, y, width, height: 1 }, Style::default().bg(Color::Indexed(238)).add_modifier(Modifier::BOLD));
+        buf.set_style(
+            Rect {
+                x,
+                y,
+                width,
+                height: 1,
+            },
+            Style::default()
+                .bg(Color::Indexed(238))
+                .add_modifier(Modifier::BOLD),
+        );
     }
     buf.set_line(x, y, line, width);
+}
+
+/// Finds every http(s) URL in a painted line and records where its text sits so the shell can
+/// wrap those cells in an OSC 8 hyperlink after the draw. Anything past `width` was clipped off
+/// screen and is ignored; a clipped tail links the visible prefix to the full target.
+fn collect_links(line: &Line, x: u16, y: u16, width: u16, row_press: bool, links: &mut Vec<Link>) {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let mut starts: Vec<usize> = text
+        .match_indices("https://")
+        .map(|(index, _)| index)
+        .collect();
+    starts.extend(text.match_indices("http://").map(|(index, _)| index));
+    starts.sort_unstable();
+    for start in starts {
+        let column = visible_width(&text[..start]);
+        if column >= width as usize {
+            continue;
+        }
+        let tail = &text[start..];
+        let end = tail
+            .find(char::is_whitespace)
+            .map(|offset| start + offset)
+            .unwrap_or(text.len());
+        let target = text[start..end]
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+        if target.is_empty() {
+            continue;
+        }
+        let text = clip_width(target, width as usize - column);
+        if !text.is_empty() {
+            links.push(Link {
+                x: x + column as u16,
+                y,
+                text,
+                target: target.to_string(),
+                row_x: x,
+                row_width: width,
+                row_press,
+            });
+        }
+    }
+}
+
+/// A drag shorter than two columns is a click: copy the whole URL, not the cell under the pointer.
+fn link_range(origin: u16, end: u16, anchor: u16, current: u16, moved: bool) -> (u16, u16) {
+    if end <= origin || !moved || anchor.abs_diff(current) < 2 {
+        return (origin, end);
+    }
+    let inside = |column: u16| column >= origin && column < end;
+    if !inside(anchor) && !inside(current) {
+        return (origin, end);
+    }
+    let last = end - 1;
+    let clamp = |column: u16| {
+        if inside(column) {
+            column
+        } else if column < origin {
+            origin
+        } else {
+            last
+        }
+    };
+    let (start, stop) = (clamp(anchor), clamp(current));
+    if start <= stop {
+        (start, stop.saturating_add(1))
+    } else {
+        (stop, start.saturating_add(1))
+    }
+}
+
+fn slice_columns(text: &str, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    let mut column = 0usize;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if column >= end {
+            break;
+        }
+        if column >= start {
+            out.push(ch);
+        }
+        column += width;
+    }
+    out
+}
+
+/// Bytes written at the link's first cell: OSC 8 around the visible text, underlined, with the
+/// selected columns reversed. The escape stays out of the Ratatui buffer.
+pub fn link_overlay(link: &Link, selection: Option<&LinkSelection>, fg: Color) -> String {
+    let target: String = link.target.chars().filter(|ch| !ch.is_control()).collect();
+    let selected = selection.filter(|selection| {
+        selection.y == link.y && selection.x == link.x && selection.target == link.target
+    });
+    let (sel_start, sel_end) = selected
+        .map(|selection| {
+            (
+                (selection.start.saturating_sub(link.x)) as usize,
+                (selection.end.saturating_sub(link.x)) as usize,
+            )
+        })
+        .unwrap_or((0, 0));
+    let mut body = String::new();
+    body.push_str("\x1b[0m");
+    body.push_str(&sgr_fg(fg));
+    body.push_str("\x1b[4m");
+    let mut column = 0usize;
+    let mut reversed = false;
+    for ch in link.text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let in_sel =
+            sel_end > sel_start && width > 0 && column < sel_end && column + width > sel_start;
+        if in_sel != reversed {
+            body.push_str(if in_sel { "\x1b[7m" } else { "\x1b[27m" });
+            reversed = in_sel;
+        }
+        body.push(ch);
+        column += width;
+    }
+    if reversed {
+        body.push_str("\x1b[27m");
+    }
+    body.push_str("\x1b[0m");
+    format!("\x1b]8;;{target}\x1b\\{body}\x1b]8;;\x1b\\")
+}
+
+fn sgr_fg(color: Color) -> String {
+    match color {
+        Color::Reset => "\x1b[39m".to_string(),
+        Color::Black => "\x1b[30m".to_string(),
+        Color::Red => "\x1b[31m".to_string(),
+        Color::Green => "\x1b[32m".to_string(),
+        Color::Yellow => "\x1b[33m".to_string(),
+        Color::Blue => "\x1b[34m".to_string(),
+        Color::Magenta => "\x1b[35m".to_string(),
+        Color::Cyan => "\x1b[36m".to_string(),
+        Color::Gray => "\x1b[37m".to_string(),
+        Color::DarkGray => "\x1b[90m".to_string(),
+        Color::LightRed => "\x1b[91m".to_string(),
+        Color::LightGreen => "\x1b[92m".to_string(),
+        Color::LightYellow => "\x1b[93m".to_string(),
+        Color::LightBlue => "\x1b[94m".to_string(),
+        Color::LightMagenta => "\x1b[95m".to_string(),
+        Color::LightCyan => "\x1b[96m".to_string(),
+        Color::White => "\x1b[97m".to_string(),
+        Color::Indexed(index) => format!("\x1b[38;5;{index}m"),
+        Color::Rgb(red, green, blue) => format!("\x1b[38;2;{red};{green};{blue}m"),
+    }
 }
 
 fn contains_cell(rect: Rect, column: usize, row: usize) -> bool {
@@ -898,7 +1436,11 @@ fn contains_cell(rect: Rect, column: usize, row: usize) -> bool {
 }
 
 fn modal_width(area: Rect) -> u16 {
-    if area.width <= 24 { area.width } else { (area.width - 4).clamp(24, 68) }
+    if area.width <= 24 {
+        area.width
+    } else {
+        (area.width - 4).clamp(24, 68)
+    }
 }
 
 fn modal_height(area: Rect) -> u16 {
@@ -1010,8 +1552,20 @@ struct Binding {
     gate: Gate,
 }
 
-const fn bind(code: KeyCode, command: Command, hint: Option<&'static str>, show: Audience, gate: Gate) -> Binding {
-    Binding { code, command, hint, show, gate }
+const fn bind(
+    code: KeyCode,
+    command: Command,
+    hint: Option<&'static str>,
+    show: Audience,
+    gate: Gate,
+) -> Binding {
+    Binding {
+        code,
+        command,
+        hint,
+        show,
+        gate,
+    }
 }
 
 const COMPOSER_HINTS: &[&str] = &["esc cancel", "enter add", "bksp erase"];
@@ -1020,35 +1574,216 @@ const CONFIRM_HINTS: &[&str] = &["enter confirm", "esc cancel"];
 
 /// Dispatch order is first match. Hint order is this order, with aliases (`hint: None`) omitted.
 const BINDINGS: &[Binding] = &[
-    bind(KeyCode::Char('j'), Command::Move(1), Some("j/k move"), Audience::Always, Gate::Always),
-    bind(KeyCode::Char('k'), Command::Move(-1), Some("j/k move"), Audience::Always, Gate::Always),
-    bind(KeyCode::Enter, Command::Activate, Some("enter act"), Audience::Always, Gate::Always),
-    bind(KeyCode::Char('x'), Command::Stop, Some("x stop"), Audience::Main, Gate::Always),
-    bind(KeyCode::Char('a'), Command::StartAll, Some("a all"), Audience::Services, Gate::Always),
-    bind(KeyCode::Char('s'), Command::StopAll, Some("s stop all"), Audience::Services, Gate::Always),
-    bind(KeyCode::Char('K'), Command::Reclaim, Some("K reclaim"), Audience::Services, Gate::Always),
-    bind(KeyCode::Char('c'), Command::CopyUrl, Some("c copy"), Audience::Main, Gate::Always),
-    bind(KeyCode::Char('l'), Command::ReloadCatalog, Some("l reload"), Audience::Main, Gate::Always),
-    bind(KeyCode::Char('['), Command::CycleVersion(-1), Some("[ ] version"), Audience::Shared, Gate::Always),
-    bind(KeyCode::Char('X'), Command::RemoveShared, Some("X remove"), Audience::Shared, Gate::Focus(Pane::Shared)),
-    bind(KeyCode::Char('o'), Command::OpenFolder, Some("o reveal"), Audience::Workspace, Gate::Focus(Pane::Workspaces)),
-    bind(KeyCode::Backspace, Command::Forget, Some("bksp forget"), Audience::Workspace, Gate::Focus(Pane::Workspaces)),
-    bind(KeyCode::Char('D'), Command::StopDaemon, Some("D stop daemon"), Audience::Workspace, Gate::Focus(Pane::Workspaces)),
-    bind(KeyCode::Char('n'), Command::Add, Some("n add"), Audience::Always, Gate::Always),
-    bind(KeyCode::Char('r'), Command::Restart, Some("r restart daemon"), Audience::Workspace, Gate::Always),
-    bind(KeyCode::Char('r'), Command::Restart, Some("r restart"), Audience::Main, Gate::Always),
-    bind(KeyCode::PageUp, Command::ScrollLog(1), Some("pgup/pgdn log"), Audience::Main, Gate::Always),
-    bind(KeyCode::Tab, Command::FocusNext, Some("tab pane"), Audience::Always, Gate::Always),
-    bind(KeyCode::Char('S'), Command::ToggleShared, Some("S shared"), Audience::Always, Gate::Always),
-    bind(KeyCode::Char('?'), Command::ToggleHelp, Some("? help"), Audience::Always, Gate::Always),
-    bind(KeyCode::Char('q'), Command::Quit, Some("q quit"), Audience::Always, Gate::Always),
-    bind(KeyCode::Up, Command::Move(-1), None, Audience::Always, Gate::Always),
-    bind(KeyCode::Down, Command::Move(1), None, Audience::Always, Gate::Always),
-    bind(KeyCode::Char(' '), Command::Activate, None, Audience::Always, Gate::Always),
-    bind(KeyCode::Char('R'), Command::Restart, None, Audience::Always, Gate::Always),
-    bind(KeyCode::PageDown, Command::ScrollLog(-1), None, Audience::Always, Gate::Always),
-    bind(KeyCode::Char(']'), Command::CycleVersion(1), None, Audience::Always, Gate::Always),
-    bind(KeyCode::Char('u'), Command::Updates, None, Audience::Always, Gate::Always),
+    bind(
+        KeyCode::Char('j'),
+        Command::Move(1),
+        Some("j/k move"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('k'),
+        Command::Move(-1),
+        Some("j/k move"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Enter,
+        Command::Activate,
+        Some("enter act"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('x'),
+        Command::Stop,
+        Some("x stop"),
+        Audience::Main,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('a'),
+        Command::StartAll,
+        Some("a all"),
+        Audience::Services,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('s'),
+        Command::StopAll,
+        Some("s stop all"),
+        Audience::Services,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('K'),
+        Command::Reclaim,
+        Some("K reclaim"),
+        Audience::Services,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('c'),
+        Command::CopyUrl,
+        Some("c copy"),
+        Audience::Main,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('l'),
+        Command::ReloadCatalog,
+        Some("l reload"),
+        Audience::Main,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('['),
+        Command::CycleVersion(-1),
+        Some("[ ] version"),
+        Audience::Shared,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('X'),
+        Command::RemoveShared,
+        Some("X remove"),
+        Audience::Shared,
+        Gate::Focus(Pane::Shared),
+    ),
+    bind(
+        KeyCode::Char('o'),
+        Command::OpenFolder,
+        Some("o reveal"),
+        Audience::Workspace,
+        Gate::Focus(Pane::Workspaces),
+    ),
+    bind(
+        KeyCode::Backspace,
+        Command::Forget,
+        Some("bksp forget"),
+        Audience::Workspace,
+        Gate::Focus(Pane::Workspaces),
+    ),
+    bind(
+        KeyCode::Char('D'),
+        Command::StopDaemon,
+        Some("D stop daemon"),
+        Audience::Workspace,
+        Gate::Focus(Pane::Workspaces),
+    ),
+    bind(
+        KeyCode::Char('n'),
+        Command::Add,
+        Some("n add"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('r'),
+        Command::Restart,
+        Some("r restart daemon"),
+        Audience::Workspace,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('r'),
+        Command::Restart,
+        Some("r restart"),
+        Audience::Main,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::PageUp,
+        Command::ScrollLog(1),
+        Some("pgup/pgdn log"),
+        Audience::Main,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Tab,
+        Command::FocusNext,
+        Some("tab pane"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('S'),
+        Command::ToggleShared,
+        Some("S shared"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('m'),
+        Command::ToggleMouse,
+        Some("m mouse"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('?'),
+        Command::ToggleHelp,
+        Some("? help"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('q'),
+        Command::Quit,
+        Some("q quit"),
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Up,
+        Command::Move(-1),
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Down,
+        Command::Move(1),
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char(' '),
+        Command::Activate,
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('R'),
+        Command::Restart,
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::PageDown,
+        Command::ScrollLog(-1),
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char(']'),
+        Command::CycleVersion(1),
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
+    bind(
+        KeyCode::Char('u'),
+        Command::Updates,
+        None,
+        Audience::Always,
+        Gate::Always,
+    ),
 ];
 
 fn shows(audience: Audience, desk: &Desk) -> bool {
@@ -1131,7 +1866,9 @@ mod theme {
     use ratatui::style::{Color, Modifier, Style};
 
     pub fn title() -> Style {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn notice() -> Style {
@@ -1143,7 +1880,9 @@ mod theme {
     }
 
     pub fn focus() -> Style {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn idle() -> Style {
@@ -1181,7 +1920,10 @@ pub fn key_command(desk: &Desk, key: KeyEvent) -> Option<Command> {
             None
         };
     }
-    BINDINGS.iter().find(|binding| binding.code == key.code && gate_open(binding.gate, desk)).map(|binding| binding.command)
+    BINDINGS
+        .iter()
+        .find(|binding| binding.code == key.code && gate_open(binding.gate, desk))
+        .map(|binding| binding.command)
 }
 
 fn composer_key(key: KeyEvent) -> Option<Command> {
@@ -1189,7 +1931,9 @@ fn composer_key(key: KeyEvent) -> Option<Command> {
         KeyCode::Esc => Some(Command::CancelComposer),
         KeyCode::Enter => Some(Command::SubmitComposer),
         KeyCode::Backspace => Some(Command::Backspace),
-        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) && !ch.is_control() => Some(Command::Type(ch)),
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) && !ch.is_control() => {
+            Some(Command::Type(ch))
+        }
         _ => None,
     }
 }
@@ -1229,18 +1973,35 @@ pub fn activation(desk: &Desk) -> Act {
             }
             Some(RowId::Service(id)) => match desk.service_line(&id) {
                 Some(service) if service.disabled => Act::Disabled,
-                Some(service) if service.state == ActualServiceState::ExternallyOwned => Act::Reclaim(id),
+                Some(service) if service.state == ActualServiceState::ExternallyOwned => {
+                    Act::Reclaim(id)
+                }
                 Some(service) if service.state == ActualServiceState::Stopping => Act::Idle,
-                Some(service) if service.state == ActualServiceState::QueuedStart || is_up(service.state) => Act::StopService(id),
+                Some(service)
+                    if service.state == ActualServiceState::QueuedStart || is_up(service.state) =>
+                {
+                    Act::StopService(id)
+                }
                 Some(_) => Act::StartService(id),
                 None => Act::Idle,
             },
             Some(RowId::Recipe(_) | RowId::Instance(_)) => Act::Idle,
         },
         Pane::Shared => match desk.selected_shared() {
-            Some(RowId::Recipe(name)) => desk.recipes.iter().find(|recipe| recipe.name == name).map(|recipe| Act::Install(recipe.chosen())).unwrap_or(Act::Idle),
+            Some(RowId::Recipe(name)) => desk
+                .recipes
+                .iter()
+                .find(|recipe| recipe.name == name)
+                .map(|recipe| Act::Install(recipe.chosen()))
+                .unwrap_or(Act::Idle),
             Some(RowId::Instance(id)) => {
-                let up = desk.instances.iter().find(|instance| instance.id == id).is_some_and(|instance| matches!(compact_wire(&instance.actual_state), "ready" | "running"));
+                let up = desk
+                    .instances
+                    .iter()
+                    .find(|instance| instance.id == id)
+                    .is_some_and(|instance| {
+                        matches!(compact_wire(&instance.actual_state), "ready" | "running")
+                    });
                 if up {
                     Act::StopInstance(id)
                 } else {
@@ -1257,7 +2018,13 @@ pub fn group_is_up(sections: &[Section], name: &str) -> bool {
     let long_lived: Vec<&ServiceLine> = sections
         .iter()
         .find(|section| section.name.as_deref() == Some(name))
-        .map(|section| section.services.iter().filter(|service| !service.disabled && !service.finite).collect())
+        .map(|section| {
+            section
+                .services
+                .iter()
+                .filter(|service| !service.disabled && !service.finite)
+                .collect()
+        })
         .unwrap_or_default();
     !long_lived.is_empty() && long_lived.iter().all(|service| is_up(service.state))
 }
@@ -1267,7 +2034,13 @@ pub fn stop_all_targets(sections: &[Section]) -> Vec<String> {
     sections
         .iter()
         .flat_map(|section| section.services.iter())
-        .filter(|service| !service.disabled && !matches!(service.state, ActualServiceState::Stopped | ActualServiceState::Succeeded))
+        .filter(|service| {
+            !service.disabled
+                && !matches!(
+                    service.state,
+                    ActualServiceState::Stopped | ActualServiceState::Succeeded
+                )
+        })
         .map(|service| service.id.clone())
         .collect()
 }
@@ -1286,7 +2059,14 @@ pub fn group_targets(sections: &[Section], name: &str) -> Vec<String> {
     sections
         .iter()
         .find(|section| section.name.as_deref() == Some(name))
-        .map(|section| section.services.iter().filter(|service| !service.disabled).map(|service| service.id.clone()).collect())
+        .map(|section| {
+            section
+                .services
+                .iter()
+                .filter(|service| !service.disabled)
+                .map(|service| service.id.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1299,7 +2079,12 @@ pub fn summary_of(sections: &[Section]) -> String {
             continue;
         }
         total += 1;
-        if matches!(service.state, ActualServiceState::Ready | ActualServiceState::Running | ActualServiceState::RunningUnready) {
+        if matches!(
+            service.state,
+            ActualServiceState::Ready
+                | ActualServiceState::Running
+                | ActualServiceState::RunningUnready
+        ) {
             ready += 1;
         } else if service.state == ActualServiceState::Failed {
             failed += 1;
@@ -1327,7 +2112,11 @@ fn compact_wire(state: &str) -> &str {
 
 /// Document order, then any live service the catalog does not list. Named groups take the first
 /// declared membership. Anything left is an unlabeled section, which the shell shows as Other.
-pub fn group_sections(metas: &[ServiceMeta], tree: &[CatalogGroup], live: &[Service]) -> Vec<Section> {
+pub fn group_sections(
+    metas: &[ServiceMeta],
+    tree: &[CatalogGroup],
+    live: &[Service],
+) -> Vec<Section> {
     let mut order: Vec<ServiceMeta> = metas.to_vec();
     for service in live {
         if !order.iter().any(|meta| meta.id == service.name) {
@@ -1343,40 +2132,66 @@ pub fn group_sections(metas: &[ServiceMeta], tree: &[CatalogGroup], live: &[Serv
     }
     let line = |meta: &ServiceMeta| -> ServiceLine {
         let found = live.iter().find(|service| service.name == meta.id);
-        let state = found.map(|service| service.state).unwrap_or(ActualServiceState::Stopped);
-        let error = found.and_then(|service| service.error.clone()).filter(|text| !text.is_empty()).or_else(|| {
-            if state == ActualServiceState::Failed {
-                found.and_then(|service| service.readiness_detail.clone()).filter(|text| !text.is_empty())
-            } else {
-                None
-            }
-        });
+        let state = found
+            .map(|service| service.state)
+            .unwrap_or(ActualServiceState::Stopped);
+        let error = found
+            .and_then(|service| service.error.clone())
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                if state == ActualServiceState::Failed {
+                    found
+                        .and_then(|service| service.readiness_detail.clone())
+                        .filter(|text| !text.is_empty())
+                } else {
+                    None
+                }
+            });
         ServiceLine {
             id: meta.id.clone(),
-            label: if meta.label.is_empty() { meta.id.clone() } else { meta.label.clone() },
+            label: if meta.label.is_empty() {
+                meta.id.clone()
+            } else {
+                meta.label.clone()
+            },
             ports: meta.ports.clone(),
             state,
             disabled: meta.disabled,
             finite: meta.finite,
-            infra: meta.infra || found.and_then(|service| service.kind) == Some(ServiceKind::Infrastructure),
+            infra: meta.infra
+                || found.and_then(|service| service.kind) == Some(ServiceKind::Infrastructure),
             error,
         }
     };
     if tree.is_empty() {
-        return vec![Section { name: None, services: order.iter().map(line).collect() }];
+        return vec![Section {
+            name: None,
+            services: order.iter().map(line).collect(),
+        }];
     }
     let mut first = HashMap::new();
     for group in tree {
         for member in &group.members {
-            first.entry(member.clone()).or_insert_with(|| group.name.clone());
+            first
+                .entry(member.clone())
+                .or_insert_with(|| group.name.clone());
         }
     }
-    let mut built: Vec<Section> = tree.iter().map(|group| Section { name: Some(group.name.clone()), services: Vec::new() }).collect();
+    let mut built: Vec<Section> = tree
+        .iter()
+        .map(|group| Section {
+            name: Some(group.name.clone()),
+            services: Vec::new(),
+        })
+        .collect();
     let mut rest = Vec::new();
     for meta in &order {
         let service = line(meta);
         if let Some(name) = first.get(&meta.id) {
-            if let Some(section) = built.iter_mut().find(|section| section.name.as_deref() == Some(name.as_str())) {
+            if let Some(section) = built
+                .iter_mut()
+                .find(|section| section.name.as_deref() == Some(name.as_str()))
+            {
                 section.services.push(service);
                 continue;
             }
@@ -1385,10 +2200,16 @@ pub fn group_sections(metas: &[ServiceMeta], tree: &[CatalogGroup], live: &[Serv
     }
     built.retain(|section| !section.services.is_empty());
     if !rest.is_empty() {
-        built.push(Section { name: None, services: rest });
+        built.push(Section {
+            name: None,
+            services: rest,
+        });
     }
     if built.is_empty() {
-        vec![Section { name: None, services: Vec::new() }]
+        vec![Section {
+            name: None,
+            services: Vec::new(),
+        }]
     } else {
         built
     }
@@ -1401,7 +2222,17 @@ pub fn metas_from_catalog(catalog: &ServiceCatalog) -> Vec<ServiceMeta> {
         .map(|service| ServiceMeta {
             id: service.id.clone(),
             label: service.label.clone().unwrap_or_else(|| service.id.clone()),
-            ports: service.ports.as_ref().map(|ports| ports.iter().map(|port| port.port.to_string()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
+            ports: service
+                .ports
+                .as_ref()
+                .map(|ports| {
+                    ports
+                        .iter()
+                        .map(|port| port.port.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default(),
             disabled: service.disabled,
             finite: matches!(service.profiles.run.readiness(), ReadinessSpec::Exit),
             infra: service.kind == Some(ServiceKind::Infrastructure),
@@ -1410,13 +2241,28 @@ pub fn metas_from_catalog(catalog: &ServiceCatalog) -> Vec<ServiceMeta> {
 }
 
 pub fn start_all_targets(catalog: &ServiceCatalog, sections: &[Section]) -> Vec<String> {
-    catalog.groups.get("all").cloned().filter(|ids| !ids.is_empty()).unwrap_or_else(|| {
-        sections.iter().flat_map(|section| section.services.iter()).filter(|service| !service.disabled).map(|service| service.id.clone()).collect()
-    })
+    catalog
+        .groups
+        .get("all")
+        .cloned()
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| {
+            sections
+                .iter()
+                .flat_map(|section| section.services.iter())
+                .filter(|service| !service.disabled)
+                .map(|service| service.id.clone())
+                .collect()
+        })
 }
 
 fn is_up(state: ActualServiceState) -> bool {
-    matches!(state, ActualServiceState::Ready | ActualServiceState::Running | ActualServiceState::RunningUnready)
+    matches!(
+        state,
+        ActualServiceState::Ready
+            | ActualServiceState::Running
+            | ActualServiceState::RunningUnready
+    )
 }
 
 fn service_ids(sections: &[Section], have_workspace: bool) -> Vec<RowId> {
@@ -1436,28 +2282,58 @@ fn service_ids(sections: &[Section], have_workspace: bool) -> Vec<RowId> {
 }
 
 fn arm_notice(pending: &Pending, desk: &Desk) -> String {
-    let workspace = |id: &str| -> String { desk.workspaces.iter().find(|workspace| workspace.id == id).map(|workspace| workspace.name.clone()).unwrap_or_else(|| id.to_string()) };
+    let workspace = |id: &str| -> String {
+        desk.workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
     match pending {
         Pending::Trust(id) => {
             let name = workspace(id);
-            let path = desk.workspaces.iter().find(|row| row.id == *id).map(|row| row.path.as_str()).unwrap_or("");
+            let path = desk
+                .workspaces
+                .iter()
+                .find(|row| row.id == *id)
+                .map(|row| row.path.as_str())
+                .unwrap_or("");
             if path.is_empty() {
                 format!("press again to trust {name} and start its daemon")
             } else {
                 format!("press again to trust {name} ({path}) and start its daemon")
             }
         }
-        Pending::Forget(id) => format!("press again to forget {} — its services keep running", workspace(id)),
-        Pending::StopDaemon(id) => format!("press again to stop the daemon for {} — its services stop", workspace(id)),
-        Pending::RestartDaemon(id) => format!("press again to restart the daemon for {} — services keep running", workspace(id)),
+        Pending::Forget(id) => format!(
+            "press again to forget {} — its services keep running",
+            workspace(id)
+        ),
+        Pending::StopDaemon(id) => format!(
+            "press again to stop the daemon for {} — its services stop",
+            workspace(id)
+        ),
+        Pending::RestartDaemon(id) => format!(
+            "press again to restart the daemon for {} — services keep running",
+            workspace(id)
+        ),
         Pending::Reclaim(id) => {
-            let holder = desk.service_line(id).and_then(|service| service.error.clone()).unwrap_or_else(|| format!("{id} is externally owned"));
+            let holder = desk
+                .service_line(id)
+                .and_then(|service| service.error.clone())
+                .unwrap_or_else(|| format!("{id} is externally owned"));
             format!("{holder} — press again to kill it and start {id}")
         }
         Pending::RemoveShared(id) => {
-            let attached = desk.instances.iter().find(|instance| &instance.id == id).map(|instance| instance.attachments).unwrap_or(0);
+            let attached = desk
+                .instances
+                .iter()
+                .find(|instance| &instance.id == id)
+                .map(|instance| instance.attachments)
+                .unwrap_or(0);
             if attached > 0 {
-                format!("press again to remove {id} and delete data for {attached} attached project(s)")
+                format!(
+                    "press again to remove {id} and delete data for {attached} attached project(s)"
+                )
             } else {
                 format!("press again to remove {id}")
             }
@@ -1465,7 +2341,13 @@ fn arm_notice(pending: &Pending, desk: &Desk) -> String {
     }
 }
 
-fn scroll_window(offset: &mut usize, index: &mut usize, len: usize, height: usize, delta: i64) -> bool {
+fn scroll_window(
+    offset: &mut usize,
+    index: &mut usize,
+    len: usize,
+    height: usize,
+    delta: i64,
+) -> bool {
     if height == 0 || len <= height {
         return false;
     }
@@ -1521,14 +2403,20 @@ fn reveal(offset: &mut usize, cursor: usize, height: usize, len: usize) {
 }
 
 fn visual_index_of_item(visuals: &[Painted], item: usize) -> Option<usize> {
-    visuals.iter().position(|row| row.kind == Visual::Item && row.selectable == item)
+    visuals
+        .iter()
+        .position(|row| row.kind == Visual::Item && row.selectable == item)
 }
 
 fn log_window<'a>(log: &'a str, height: usize, scroll: &mut usize) -> Vec<&'a str> {
     if height == 0 {
         return Vec::new();
     }
-    let all: Vec<&str> = if log.is_empty() { vec![" "] } else { log.split('\n').collect() };
+    let all: Vec<&str> = if log.is_empty() {
+        vec![" "]
+    } else {
+        log.split('\n').collect()
+    };
     let max_scroll = all.len().saturating_sub(height);
     *scroll = (*scroll).min(max_scroll);
     let end = all.len().saturating_sub(*scroll);
@@ -1549,6 +2437,7 @@ const HELP: &[&str] = &[
     "Shared       S opens it · [ ] change version · enter installs, or starts and stops an instance",
     "              x stops · r restarts · X removes (twice, and deletes attached project data)",
     "Log          page up and page down · u releases page · hearth update · esc cancels · q quits",
+    "Mouse        clicks and the wheel act on rows · drag a URL to copy it · m frees the mouse",
     "A folder stays untrusted until the second enter, and that does not spawn a daemon before then.",
     "Stop daemon stays stopped until you press enter on that workspace again.",
 ];
@@ -1582,7 +2471,10 @@ mod tests {
     }
 
     fn line_text(line: &Line) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn live(name: &str, state: &str) -> Service {
@@ -1598,24 +2490,60 @@ mod tests {
     }
 
     fn meta(id: &str, disabled: bool, finite: bool) -> ServiceMeta {
-        ServiceMeta { id: id.to_string(), label: id.to_string(), ports: String::new(), disabled, finite, infra: id == "postgres" }
+        ServiceMeta {
+            id: id.to_string(),
+            label: id.to_string(),
+            ports: String::new(),
+            disabled,
+            finite,
+            infra: id == "postgres",
+        }
     }
 
     fn row(id: &str, state: ActualServiceState, finite: bool) -> ServiceLine {
-        ServiceLine { id: id.into(), label: id.into(), ports: String::new(), state, disabled: false, finite, infra: false, error: None }
+        ServiceLine {
+            id: id.into(),
+            label: id.into(),
+            ports: String::new(),
+            state,
+            disabled: false,
+            finite,
+            infra: false,
+            error: None,
+        }
     }
 
     fn workspace(id: &str, name: &str, trusted: bool) -> WorkspaceLine {
-        WorkspaceLine { id: id.into(), name: name.into(), path: String::new(), trusted, missing: false }
+        WorkspaceLine {
+            id: id.into(),
+            name: name.into(),
+            path: String::new(),
+            trusted,
+            missing: false,
+        }
     }
 
     #[test]
     fn groups_by_first_declared_membership_and_keeps_the_rest() {
         let tree = vec![
-            CatalogGroup { name: "infra".to_string(), members: vec!["postgres".to_string(), "not-a-service".to_string()] },
-            CatalogGroup { name: "app".to_string(), members: vec!["api".to_string(), "postgres".to_string()] },
+            CatalogGroup {
+                name: "infra".to_string(),
+                members: vec!["postgres".to_string(), "not-a-service".to_string()],
+            },
+            CatalogGroup {
+                name: "app".to_string(),
+                members: vec!["api".to_string(), "postgres".to_string()],
+            },
         ];
-        let sections = group_sections(&[meta("api", false, false), meta("postgres", false, false), meta("worker", true, true)], &tree, &[live("api", "ready"), live("postgres", "stopped")]);
+        let sections = group_sections(
+            &[
+                meta("api", false, false),
+                meta("postgres", false, false),
+                meta("worker", true, true),
+            ],
+            &tree,
+            &[live("api", "ready"), live("postgres", "stopped")],
+        );
         assert_eq!(sections[0].name.as_deref(), Some("infra"));
         assert_eq!(sections[0].services[0].id, "postgres");
         assert_eq!(sections[1].name.as_deref(), Some("app"));
@@ -1646,7 +2574,9 @@ mod tests {
         desk.workspaces.push(workspace("ID", "viclass", false));
         assert_eq!(activation(&desk), Act::Trust("ID".into()));
         assert!(!desk.arm(Pending::Trust("ID".into())));
-        assert!(desk.header_notice().contains("press again to trust viclass"));
+        assert!(desk
+            .header_notice()
+            .contains("press again to trust viclass"));
         assert!(desk.arm(Pending::Trust("ID".into())));
     }
 
@@ -1657,7 +2587,11 @@ mod tests {
         desk.attached = true;
         assert_eq!(activation(&desk), Act::FocusServices);
         desk.focus = Pane::Services;
-        desk.sections = group_sections(&[meta("api", false, false)], &[], &[live("api", "externally-owned")]);
+        desk.sections = group_sections(
+            &[meta("api", false, false)],
+            &[],
+            &[live("api", "externally-owned")],
+        );
         desk.service_cursor = 1;
         assert_eq!(activation(&desk), Act::Reclaim("api".into()));
         desk.sections[0].services[0].disabled = true;
@@ -1668,9 +2602,20 @@ mod tests {
     #[test]
     fn a_narrow_frame_shows_only_the_focused_pane_and_stays_inside_the_terminal() {
         let mut desk = Desk {
-            workspaces: vec![workspace("1", "viclass", true), workspace("2", "other", false)],
-            sections: group_sections(&[meta("postgres", false, false)], &[], &[live("postgres", "ready")]),
-            summary: summary_of(&group_sections(&[meta("postgres", false, false)], &[], &[live("postgres", "ready")])),
+            workspaces: vec![
+                workspace("1", "viclass", true),
+                workspace("2", "other", false),
+            ],
+            sections: group_sections(
+                &[meta("postgres", false, false)],
+                &[],
+                &[live("postgres", "ready")],
+            ),
+            summary: summary_of(&group_sections(
+                &[meta("postgres", false, false)],
+                &[],
+                &[live("postgres", "ready")],
+            )),
             log: "line-1\nline-2".into(),
             log_title: "postgres".into(),
             ..Desk::default()
@@ -1680,7 +2625,10 @@ mod tests {
         let joined = buffer_text(&buffer);
         assert!(joined.contains("viclass"), "{joined}");
         assert!(!joined.contains("postgres"), "{joined}");
-        assert!(joined.contains("move") && joined.contains("quit"), "{joined}");
+        assert!(
+            joined.contains("move") && joined.contains("quit"),
+            "{joined}"
+        );
         desk.focus = Pane::Services;
         let joined = buffer_text(&paint(&mut desk, 70, 20));
         assert!(joined.contains("postgres"), "{joined}");
@@ -1696,8 +2644,15 @@ mod tests {
             workspaces: vec![workspace("1", "viclass", true)],
             ..Desk::default()
         };
-        let tree = vec![CatalogGroup { name: "infra".into(), members: vec!["postgres".into()] }];
-        let sections = group_sections(&[meta("postgres", false, false), meta("api", false, false)], &tree, &[live("postgres", "ready")]);
+        let tree = vec![CatalogGroup {
+            name: "infra".into(),
+            members: vec!["postgres".into()],
+        }];
+        let sections = group_sections(
+            &[meta("postgres", false, false), meta("api", false, false)],
+            &tree,
+            &[live("postgres", "ready")],
+        );
         desk.summary = summary_of(&sections);
         desk.set_sections(sections, vec!["postgres".into(), "api".into()]);
         desk.service_cursor = 2;
@@ -1711,11 +2666,19 @@ mod tests {
         assert!(joined.contains('>'), "{joined}");
         assert!(joined.contains("stop all"), "{joined}");
         assert!(joined.contains("quit"), "{joined}");
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == ">" && cell.bg == Color::Indexed(238) && cell.modifier.contains(Modifier::BOLD)));
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == "┌" && cell.fg == Color::Cyan));
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == ">"
+            && cell.bg == Color::Indexed(238)
+            && cell.modifier.contains(Modifier::BOLD)));
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "┌" && cell.fg == Color::Cyan));
         desk.focus = Pane::Workspaces;
         let workspace = buffer_text(&paint(&mut desk, 120, 24));
-        assert!(workspace.contains("forget") && workspace.contains("quit"), "{workspace}");
+        assert!(
+            workspace.contains("forget") && workspace.contains("quit"),
+            "{workspace}"
+        );
     }
 
     #[test]
@@ -1739,14 +2702,32 @@ mod tests {
         };
         let text = buffer_text(&paint(&mut desk, 40, 16));
         assert!(text.contains("press again"), "{text}");
-        assert!(text.contains("confirm") && text.contains("cancel"), "{text}");
+        assert!(
+            text.contains("confirm") && text.contains("cancel"),
+            "{text}"
+        );
     }
 
     #[test]
     fn shared_enter_installs_the_chosen_version_and_stops_a_running_instance() {
-        let mut desk = Desk { focus: Pane::Shared, shared_open: true, ..Desk::default() };
-        desk.recipes.push(RecipeLine { name: "redis".into(), versions: vec!["8.2.10".into(), "7.2".into()], version_index: 0 });
-        desk.instances.push(InstanceLine { id: "redis@8.2.10".into(), install_state: "installed".into(), actual_state: "ready".into(), port: 43110, attachments: 2, install_error: None });
+        let mut desk = Desk {
+            focus: Pane::Shared,
+            shared_open: true,
+            ..Desk::default()
+        };
+        desk.recipes.push(RecipeLine {
+            name: "redis".into(),
+            versions: vec!["8.2.10".into(), "7.2".into()],
+            version_index: 0,
+        });
+        desk.instances.push(InstanceLine {
+            id: "redis@8.2.10".into(),
+            install_state: "installed".into(),
+            actual_state: "ready".into(),
+            port: 43110,
+            attachments: 2,
+            install_error: None,
+        });
         assert_eq!(activation(&desk), Act::Install("redis@8.2.10".into()));
         assert!(desk.cycle_version(1));
         assert_eq!(activation(&desk), Act::Install("redis@7.2".into()));
@@ -1771,17 +2752,32 @@ mod tests {
         assert_eq!(key_command(&desk, key('?')), Some(Command::ToggleHelp));
         desk.help = true;
         assert_eq!(key_command(&desk, key('a')), None);
-        assert_eq!(key_command(&desk, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(Command::CloseHelp));
+        assert_eq!(
+            key_command(&desk, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Command::CloseHelp)
+        );
         assert!(buffer_text(&paint(&mut desk, 80, 16)).contains("untrusted"));
-        assert_eq!(key_command(&Desk::default(), key('u')), Some(Command::Updates));
-        let composing = Desk { composer: Some(String::new()), ..Desk::default() };
+        assert_eq!(
+            key_command(&Desk::default(), key('u')),
+            Some(Command::Updates)
+        );
+        let composing = Desk {
+            composer: Some(String::new()),
+            ..Desk::default()
+        };
         assert_eq!(key_command(&composing, key('u')), Some(Command::Type('u')));
     }
 
     #[test]
     fn enter_cancels_a_queued_start_and_restarts_a_group_that_is_already_up() {
-        let mut desk = Desk { focus: Pane::Services, ..Desk::default() };
-        desk.sections = vec![Section { name: Some("app".into()), services: vec![row("api", ActualServiceState::QueuedStart, false)] }];
+        let mut desk = Desk {
+            focus: Pane::Services,
+            ..Desk::default()
+        };
+        desk.sections = vec![Section {
+            name: Some("app".into()),
+            services: vec![row("api", ActualServiceState::QueuedStart, false)],
+        }];
         desk.service_cursor = 1;
         assert_eq!(activation(&desk), Act::StopService("api".into()));
         desk.sections[0].services[0].state = ActualServiceState::Stopping;
@@ -1809,7 +2805,10 @@ mod tests {
             ],
         }];
         sections[0].services[4].disabled = true;
-        assert_eq!(stop_all_targets(&sections), vec!["bad".to_string(), "wait".to_string()]);
+        assert_eq!(
+            stop_all_targets(&sections),
+            vec!["bad".to_string(), "wait".to_string()]
+        );
     }
 
     #[test]
@@ -1845,33 +2844,251 @@ mod tests {
             error: Some("timed out".into()),
         };
         let text = line_text(&service_line(&line, true));
-        assert!(text.contains("API") && text.contains("api") && text.contains("8080") && text.contains("timed out"), "{text}");
-        let workspace_row = WorkspaceLine { id: "1".into(), name: "viclass".into(), path: "~/src/viclass".into(), trusted: true, missing: false };
+        assert!(
+            text.contains("API")
+                && text.contains("api")
+                && text.contains("8080")
+                && text.contains("timed out"),
+            "{text}"
+        );
+        let workspace_row = WorkspaceLine {
+            id: "1".into(),
+            name: "viclass".into(),
+            path: "~/src/viclass".into(),
+            trusted: true,
+            missing: false,
+        };
         let shown = line_text(&workspace_line(&workspace_row, true, "1/2 ready"));
-        assert!(shown.contains("viclass") && shown.contains("~/src/viclass") && shown.contains("1/2 ready"), "{shown}");
+        assert!(
+            shown.contains("viclass")
+                && shown.contains("~/src/viclass")
+                && shown.contains("1/2 ready"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn service_names_are_bold_and_disabled_rows_dim_but_keep_state_colour() {
+        let enabled = service_line(&row("api", ActualServiceState::Ready, false), false);
+        let name = enabled
+            .spans
+            .iter()
+            .find(|span| span.content.contains("api"))
+            .unwrap();
+        assert_eq!(name.style.fg, Some(Color::White));
+        assert!(name.style.add_modifier.contains(Modifier::BOLD));
+
+        let mut disabled_row = row("worker", ActualServiceState::Ready, false);
+        disabled_row.disabled = true;
+        let line = service_line(&disabled_row, false);
+        let name = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("worker"))
+            .unwrap();
+        assert_eq!(name.style.fg, Some(Color::DarkGray));
+        let flags = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("disabled"))
+            .unwrap();
+        assert_eq!(flags.style.fg, Some(Color::DarkGray));
+        let state = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("ready"))
+            .unwrap();
+        assert_eq!(state.style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn painted_urls_become_links_at_their_cell_positions() {
+        let mut links = Vec::new();
+        let line = Line::styled("URL http://localhost:3000/path.", theme::dim());
+        collect_links(&line, 2, 5, 60, true, &mut links);
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].x, links[0].y), (6, 5));
+        assert_eq!(links[0].text, "http://localhost:3000/path");
+        assert_eq!(links[0].target, "http://localhost:3000/path");
+        assert_eq!((links[0].row_x, links[0].row_width), (2, 60));
+
+        // A clipped tail still links the visible prefix to the full target.
+        links.clear();
+        collect_links(&line, 2, 5, 10, true, &mut links);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, "http:/");
+        assert_eq!(links[0].target, "http://localhost:3000/path");
+
+        // Log rows find URLs inside styled text too.
+        links.clear();
+        let log = sgr_to_line("ready on https://a.test:1/x  next");
+        collect_links(&log, 0, 0, 60, false, &mut links);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].x, 9);
+        assert_eq!(links[0].target, "https://a.test:1/x");
+    }
+
+    #[test]
+    fn a_press_on_the_url_row_selects_that_link_and_a_drag_copies_the_span() {
+        let link = Link {
+            x: 6,
+            y: 5,
+            text: "http://localhost:3000/path".into(),
+            target: "http://localhost:3000/path".into(),
+            row_x: 2,
+            row_width: 60,
+            row_press: true,
+        };
+        let mut desk = Desk {
+            links: vec![link.clone()],
+            ..Desk::default()
+        };
+        assert_eq!(
+            desk.link_for_press(2, 5)
+                .as_ref()
+                .map(|hit| hit.target.as_str()),
+            Some(link.target.as_str())
+        );
+        assert_eq!(desk.link_for_press(6, 5).as_ref().map(|hit| hit.x), Some(6));
+        assert_eq!(desk.link_for_press(0, 5), None);
+
+        desk.select_link(&link, 6, 6, false);
+        assert_eq!(
+            desk.link_selection
+                .as_ref()
+                .map(|selection| selection.copied()),
+            Some(link.target.clone())
+        );
+        // One column of movement is a click, not a partial selection.
+        desk.select_link(&link, 6, 7, true);
+        assert_eq!(
+            desk.link_selection
+                .as_ref()
+                .map(|selection| selection.copied()),
+            Some(link.target.clone())
+        );
+        desk.select_link(&link, 11, 20, true);
+        let partial = desk.link_selection.as_ref().unwrap().copied();
+        assert_eq!(partial, "//localhos");
+        assert_ne!(partial, link.target);
+
+        let clipped = Link {
+            text: "http:/".into(),
+            ..link
+        };
+        desk.select_link(&clipped, clipped.x, clipped.x, false);
+        assert_eq!(
+            desk.link_selection
+                .as_ref()
+                .map(|selection| selection.copied())
+                .as_deref(),
+            Some("http://localhost:3000/path")
+        );
+
+        // A frame that no longer paints the link drops the highlight.
+        desk.links.clear();
+        let _ = paint(&mut desk, 40, 8);
+        assert!(desk.link_selection.is_none());
+    }
+
+    #[test]
+    fn painted_service_urls_are_underlined_and_a_selection_is_reversed() {
+        let mut desk = Desk {
+            focus: Pane::Services,
+            workspaces: vec![workspace("1", "viclass", true)],
+            urls: vec!["app  http://127.0.0.1:3000/health".into()],
+            ..Desk::default()
+        };
+        desk.sections = group_sections(&[meta("api", false, false)], &[], &[live("api", "ready")]);
+        let _ = paint(&mut desk, 120, 24);
+        let link = desk
+            .links
+            .iter()
+            .find(|link| link.target.contains("3000"))
+            .expect("url row")
+            .clone();
+        assert!(desk
+            .link_for_press(link.row_x as usize, link.y as usize)
+            .is_some());
+        desk.select_link(&link, link.x, link.x, false);
+        let buffer = paint(&mut desk, 120, 24);
+        let cell = buffer.cell((link.x, link.y)).expect("url cell");
+        assert!(
+            cell.modifier.contains(Modifier::UNDERLINED),
+            "{:?}",
+            cell.modifier
+        );
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "{:?}",
+            cell.modifier
+        );
+        let overlay = link_overlay(&link, desk.link_selection.as_ref(), Color::DarkGray);
+        assert!(
+            overlay.contains("\x1b]8;;http://127.0.0.1:3000/health\x1b\\"),
+            "{overlay}"
+        );
+        assert!(overlay.contains("\x1b[7m"), "{overlay}");
     }
 
     #[test]
     fn command_table_keeps_focus_gates_and_aliases() {
         let desk = Desk::default();
-        assert_eq!(key_command(&desk, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)), Some(Command::Move(-1)));
-        assert_eq!(key_command(&desk, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), Some(Command::Move(1)));
-        assert_eq!(key_command(&desk, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)), Some(Command::ScrollLog(1)));
-        assert_eq!(key_command(&desk, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)), Some(Command::ScrollLog(-1)));
+        assert_eq!(
+            key_command(&desk, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(Command::Move(-1))
+        );
+        assert_eq!(
+            key_command(&desk, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(Command::Move(1))
+        );
+        assert_eq!(
+            key_command(&desk, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(Command::ScrollLog(1))
+        );
+        assert_eq!(
+            key_command(&desk, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            Some(Command::ScrollLog(-1))
+        );
         assert_eq!(key_command(&desk, key(' ')), Some(Command::Activate));
         assert_eq!(key_command(&desk, key('R')), Some(Command::Restart));
         assert_eq!(key_command(&desk, key(']')), Some(Command::CycleVersion(1)));
         assert_eq!(key_command(&desk, key('D')), Some(Command::StopDaemon));
         assert_eq!(key_command(&desk, key('X')), None);
-        let services = Desk { focus: Pane::Services, ..Desk::default() };
+        let services = Desk {
+            focus: Pane::Services,
+            ..Desk::default()
+        };
         assert_eq!(key_command(&services, key('D')), None);
         assert_eq!(key_command(&services, key('a')), Some(Command::StartAll));
-        let shared = Desk { focus: Pane::Shared, shared_open: true, ..Desk::default() };
-        assert_eq!(key_command(&shared, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(Command::ToggleShared));
-        let armed = Desk { pending: Some(Pending::Forget("1".into())), ..Desk::default() };
-        assert_eq!(key_command(&armed, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(Command::ClearArm));
-        let composing = Desk { composer: Some(String::new()), ..Desk::default() };
-        assert_eq!(key_command(&composing, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), Some(Command::Quit));
+        let shared = Desk {
+            focus: Pane::Shared,
+            shared_open: true,
+            ..Desk::default()
+        };
+        assert_eq!(
+            key_command(&shared, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Command::ToggleShared)
+        );
+        let armed = Desk {
+            pending: Some(Pending::Forget("1".into())),
+            ..Desk::default()
+        };
+        assert_eq!(
+            key_command(&armed, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Command::ClearArm)
+        );
+        let composing = Desk {
+            composer: Some(String::new()),
+            ..Desk::default()
+        };
+        assert_eq!(
+            key_command(
+                &composing,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            ),
+            Some(Command::Quit)
+        );
     }
 
     #[test]
@@ -1896,7 +3113,10 @@ mod tests {
         desk.log = "\x1b[32mLOGGREEN\x1b[0m".into();
         desk.log_scroll = 0;
         let buffer = paint(&mut desk, 80, 24);
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == "L" && cell.fg == Color::Green));
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "L" && cell.fg == Color::Green));
     }
 
     #[test]
@@ -1906,11 +3126,21 @@ mod tests {
             workspaces: vec![workspace("1", "viclass", true)],
             ..Desk::default()
         };
-        desk.sections = group_sections(&[meta("postgres", false, false)], &[], &[live("postgres", "ready")]);
+        desk.sections = group_sections(
+            &[meta("postgres", false, false)],
+            &[],
+            &[live("postgres", "ready")],
+        );
         let _ = paint(&mut desk, 120, 24);
         let workspace_at = desk.geometry.workspace_items;
-        assert_eq!(desk.hit(workspace_at.x as usize, workspace_at.y as usize), Some(Hit::Workspace(0)));
+        assert_eq!(
+            desk.hit(workspace_at.x as usize, workspace_at.y as usize),
+            Some(Hit::Workspace(0))
+        );
         let service_at = desk.geometry.main_items;
-        assert_eq!(desk.hit(service_at.x as usize, service_at.y as usize), Some(Hit::Service(0)));
+        assert_eq!(
+            desk.hit(service_at.x as usize, service_at.y as usize),
+            Some(Hit::Service(0))
+        );
     }
 }

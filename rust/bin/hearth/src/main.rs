@@ -196,6 +196,7 @@ usage: hearth [--root <path>] <command> [options]
   shared attach|detach|probe <id>       attach this project to a shared service (used by hearth.yaml `shared:`)
   shared install|start|stop|remove <id> manage a shared service instance
   tui                                   terminal UI for workspaces and shared services
+                                        (also the default for a bare `hearth` on a terminal)
   update [--check] [--json] [--force]   install the latest stable GitHub release
   mcp                                   serve the MCP tool surface over stdio
   mcp install [--name N] [--key K] <config-file>...
@@ -209,9 +210,19 @@ hearth.yaml, .yml, or .json."
     );
 }
 
+async fn run_tui(root: PathBuf) -> i32 {
+    hearth_tui::run_shell(hearth_tui::ShellOptions {
+        initial_root: root,
+        spawn_daemon: std::sync::Arc::new(|path: &Path| spawn_daemon(path)),
+        spawn_smp: std::sync::Arc::new(|path: &Path| spawn_smp(path)),
+        refresh_interval: std::time::Duration::from_secs(2),
+    })
+    .await
+}
+
 async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
     match rest.first().map(String::as_str) {
-        Some("--help") | Some("-h") | Some("help") | None => {
+        Some("--help") | Some("-h") | Some("help") => {
             print_help();
             return 0;
         }
@@ -220,6 +231,15 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
             return 0;
         }
         _ => {}
+    }
+    // A bare `hearth` on a terminal is the app shell; piped (scripts, agents) it prints help.
+    if rest.is_empty() {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return run_tui(root).await;
+        }
+        print_help();
+        return 0;
     }
     // `shared` manages the machine-global smp daemon — it deliberately does NOT require a
     // project `hearth.yaml` (the project root, when a command needs one for attach/probe identity,
@@ -259,13 +279,7 @@ async fn run_cli(root: PathBuf, rest: Vec<String>) -> i32 {
             eprintln!("usage: hearth tui");
             return 2;
         }
-        return hearth_tui::run_shell(hearth_tui::ShellOptions {
-            initial_root: root,
-            spawn_daemon: std::sync::Arc::new(|path: &Path| spawn_daemon(path)),
-            spawn_smp: std::sync::Arc::new(|path: &Path| spawn_smp(path)),
-            refresh_interval: std::time::Duration::from_secs(2),
-        })
-        .await;
+        return run_tui(root).await;
     }
     let loaded = match hearth_core::config_file::load_catalog(&root) {
         Ok(loaded) => loaded,

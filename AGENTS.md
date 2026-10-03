@@ -298,6 +298,19 @@ from any dev box here, with the same username.
 - `WorkspaceStore::reload` must not quarantine `workspaces.json`; only `open` does.
 - A catalog mtime change reloads once while a daemon is up, and that reload must not `ensure`. The first observation only records the mtime. Stop and copy stay available during an in-flight start. Enter on a queued row cancels it. Reveal is `open -R`. Stop-all skips rows that are already stopped or succeeded.
 - The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. The binary calls `run_shell` only. `run_tui` (ANSI single-project) is **deprecated** and kept as reference; do not wire new entry points to it.
+- A bare `hearth` on a terminal **is** `tui` (stdin+stdout TTY check in `main.rs::run_cli`); piped
+  it prints help, so `hearth` in scripts/`Command::output()` stays a usage printer.
+- Mouse reporting is button, drag, and wheel (`?1000`/`?1002`/`?1006`, `MOUSE_ON` in `shell.rs`).
+  Do not enable all-motion (`?1003`) or crossterm's `EnableMouseCapture`. Any reporting mode stops
+  the terminal from selecting text. Ghostty will not select while it is on, and Shift does nothing
+  when `mouse-shift-capture` is off, so a drag that starts on a painted URL is selected in the shell
+  (reversed cells, copied on mouse-up). `m` drops reporting for a native drag. `paint_links` must
+  not rewrite unchanged link cells, or that selection is cleared on the next frame.
+- URLs are OSC 8 hyperlinks: `Desk::draw` records each painted http(s) URL (the `URL …` rows and
+  log lines) into `desk.links`, and `paint_links` re-writes those cells wrapped in `]8;;` after
+  `terminal.draw`. The escape must stay out-of-band — inside a `Span` it lands as literal cell text.
+  A Cmd-click is not delivered while reporting is on (Command is not in the SGR mouse report), so
+  the shell copies the URL itself.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
   catalog reloads. `display_state` collapses `running`/`running-unready` → `running` and
