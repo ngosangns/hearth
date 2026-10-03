@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.18.2
+
+- A one-time command (`readiness: { kind: exit }`) stays `running` until the process exits. It does not become `ready`, and `readinessTimeoutMs` does not stop it. Exit 0 is still `succeeded`.
+- The TUI no longer shows "Manager restarted; state resynchronized." after a manager restart.
+
 ## 0.18.1
 
 - In `hearth tui`, drag a painted service URL to copy it while mouse reporting is on. A click or a drag shorter than two columns copies the whole address; a longer drag copies that span. `m` still releases the mouse for a native selection.
