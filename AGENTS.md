@@ -166,13 +166,15 @@ from any dev box here, with the same username.
 
 - `{ kind: "command" }` readiness is the JSON-serializable stand-in for a custom probe. Exit 0 means
   ready; anything else keeps retrying until the readiness timeout.
-- `{ kind: "exit" }` means the run command is the job. Exit 0 records `succeeded` and sets desired
-  back to `stopped`, so reconcile does not run it again; any other exit is `failed` with desired
-  `stopped` (no auto-restart). The exit code is valid only from the in-memory spawn watcher — a
-  daemon restart mid-run that finds the process gone records `failed` with an unknown code, never
-  `succeeded`. Stop of a finished row (`succeeded`, or `failed` while not in flight) succeeds and
-  leaves that state. `exit` is rejected for `ownership: external` and for container commands. A
-  shared recipe with this kind does not get the two-minute instance readiness deadline.
+- `{ kind: "exit" }` means the run command is the job. While it runs the state is `running` — not
+  `ready` and not `running-unready`. Exit 0 records `succeeded` and sets desired back to `stopped`,
+  so reconcile does not run it again; any other exit is `failed` with desired `stopped` (no
+  auto-restart). `readinessTimeoutMs` does not apply: a configured deadline must not fail or stop
+  the command. The exit code is valid only from the in-memory spawn watcher — a daemon restart
+  mid-run that finds the process gone records `failed` with an unknown code, never `succeeded`.
+  Stop of a finished row (`succeeded`, or `failed` while not in flight) succeeds and leaves that
+  state. `exit` is rejected for `ownership: external` and for container commands. A shared recipe
+  with this kind does not get the two-minute instance readiness deadline.
 - `preparationCommand` (with `serializationKey`) runs via the same `command` adapter. Services
   sharing a key run their preparation one at a time. **`viclass`'s prep-dependent services must all
   share one key**: `ensure_local_certificates` is a check-then-generate race, and concurrent

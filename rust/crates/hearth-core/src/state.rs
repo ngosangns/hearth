@@ -32,10 +32,9 @@ pub enum ActualServiceState {
     QueuedStart,
     Preparing,
     Starting,
-    /// Reserved: never produced by this daemon (`kind: process` readiness settles in
-    /// `RunningUnready`). Kept because the wire and `state.json` encodings still accept it — a state
-    /// file written by a predecessor tool may carry it — so removing it is a `PROTOCOL_VERSION` bump.
-    #[doc = "reserved: never produced"]
+    /// In flight for `readiness: exit`. A one-time command has no ready state: it stays `running`
+    /// until the process exits (`succeeded` or `failed`). `kind: process` does not use this variant;
+    /// it settles in `RunningUnready`.
     Running,
     RunningUnready,
     Ready,

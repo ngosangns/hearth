@@ -87,7 +87,8 @@ catalog on a fresh machine.
 ```
 
 A recipe may use `readiness: { kind: exit }` when the command is a job that runs and stops
-rather than a server. Exit 0 settles `succeeded`. That recipe does not inherit the two-minute
+rather than a server. While it runs the state is `running`, not `ready`. Exit 0 settles
+`succeeded`. That recipe ignores `readinessTimeoutMs` and does not inherit the two-minute
 readiness deadline applied to shared servers, so a long job is not killed for still running.
 A port is still allocated; a command that does not listen can ignore `{port}`.
 

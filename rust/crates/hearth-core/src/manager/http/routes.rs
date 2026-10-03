@@ -737,19 +737,25 @@ async fn start_selected_dag(
                     .unwrap()
                     .services
                     .get(&service_id_owned)
-                    .map(|s| {
+                    .and_then(|s| {
                         // `succeeded` is the success state of `readiness: exit`. Treating only `ready`
-                        // as settled made a finished job report "did not become ready".
-                        s.actual_state == ActualServiceState::Ready
-                            || s.actual_state == ActualServiceState::Succeeded
+                        // as settled made a finished job report "did not become ready". A one-time
+                        // command never becomes `ready`; its trace says succeeded.
+                        if s.actual_state == ActualServiceState::Succeeded {
+                            Some("Succeeded")
+                        } else if s.actual_state == ActualServiceState::Ready
                             || (s.actual_state == ActualServiceState::RunningUnready
                                 && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
-                    })
-                    .unwrap_or(false);
-                if settled {
+                        {
+                            Some("Ready")
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(label) = settled {
                     manager
                         .operations
-                        .trace(&operation, &format!("Ready: {service_id_owned}"));
+                        .trace(&operation, &format!("{label}: {service_id_owned}"));
                     StartResult {
                         service_id: service_id_owned,
                         outcome: StartOutcome::Ready,

@@ -2402,6 +2402,10 @@
         let started = clock.now_millis();
         let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
         let pid = wait_for_posix_pid(&host, "fe").await;
+        assert_eq!(
+            host.state_of("fe").unwrap().actual_state,
+            ActualServiceState::Running
+        );
         while clock.now_millis() < started + 40 {
             tokio::task::yield_now().await;
         }
@@ -2461,25 +2465,35 @@
     }
 
     #[tokio::test]
-    async fn an_exit_command_times_out_only_when_a_deadline_is_set() {
+    async fn an_exit_command_stays_running_past_a_configured_deadline() {
         let h = build_harness(one_service_catalog(with_exit_timeout(
             argv_verified("fe", ReadinessSpec::Exit),
             40,
         )));
-        let error = h
-            .supervisor
-            .start(&"fe".to_string(), None)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, "Readiness timed out");
-        let state = h.host.state_of("fe").unwrap();
-        assert_eq!(state.actual_state, ActualServiceState::Failed);
-        assert_eq!(state.desired_state, DesiredServiceState::Stopped);
-        assert!(state
-            .readiness_detail
-            .as_deref()
-            .unwrap_or("")
-            .contains("did not exit"));
+        let supervisor = h.supervisor.clone();
+        let host = h.host.clone();
+        let process = h.process.clone();
+        let clock = h.clock.clone();
+        let started = clock.now_millis();
+        let run = tokio::spawn(async move { supervisor.start(&"fe".to_string(), None).await });
+        let pid = wait_for_posix_pid(&host, "fe").await;
+        let running = host.state_of("fe").unwrap();
+        assert_eq!(running.actual_state, ActualServiceState::Running);
+        assert_ne!(running.actual_state, ActualServiceState::Ready);
+        assert_ne!(running.readiness, ServiceReadiness::Ready);
+        while clock.now_millis() < started + 80 {
+            tokio::task::yield_now().await;
+        }
+        let still = host.state_of("fe").unwrap();
+        assert_eq!(still.actual_state, ActualServiceState::Running);
+        assert_ne!(still.actual_state, ActualServiceState::Failed);
+        process.kill_externally(pid, 0);
+        run.await.unwrap().unwrap();
+        let state = host.state_of("fe").unwrap();
+        assert_eq!(state.actual_state, ActualServiceState::Succeeded);
+        assert_ne!(state.actual_state, ActualServiceState::Ready);
+        assert_ne!(state.readiness, ServiceReadiness::Ready);
+        assert_eq!(state.exit_code, Some(0));
     }
 
     #[tokio::test]

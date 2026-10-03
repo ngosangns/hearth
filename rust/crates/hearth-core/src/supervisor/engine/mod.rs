@@ -28,8 +28,8 @@ use super::types::{
     ProcessRecord, ProcessSignal, SpawnInput, StartOptions, SupervisorError, SupervisorOptions,
 };
 
-/// `Running` is never produced (see its doc), but a persisted `state.json` may still carry it — it
-/// stays "active" so such a row is reconciled rather than ignored.
+/// `Running` is the in-flight state of a `readiness: exit` command (and may appear in an older
+/// `state.json`). It stays active so the row is reconciled rather than ignored.
 pub const ACTIVE_STATES: [ActualServiceState; 7] = [
     ActualServiceState::QueuedStart,
     ActualServiceState::Preparing,
@@ -523,11 +523,25 @@ impl ProcessSupervisor {
                         None => return,
                     }
                     let updated_identity = with_manager_instance(identity, sup.host.instance_id());
+                    let profile = profile_for(&sup.host.catalog(), &service_id).ok();
+                    // A one-time command is `running` until it exits. Reconcile must not park it in
+                    // `running-unready`, which is the "not ready yet" state of a probed server.
+                    let exit_job = profile
+                        .as_ref()
+                        .is_some_and(|profile| matches!(profile.readiness, ReadinessSpec::Exit));
                     sup.transition(
                         &service_id,
                         state.generation,
-                        ActualServiceState::RunningUnready,
-                        ServiceReadiness::NotReady,
+                        if exit_job {
+                            ActualServiceState::Running
+                        } else {
+                            ActualServiceState::RunningUnready
+                        },
+                        if exit_job {
+                            ServiceReadiness::Unknown
+                        } else {
+                            ServiceReadiness::NotReady
+                        },
                         Changes {
                             identity: Patch::Set(updated_identity.clone()),
                             error: Patch::Clear,
@@ -541,7 +555,7 @@ impl ProcessSupervisor {
                     if !sup.has_live_output_tail(&service_id) {
                         sup.attach_output(&service_id, output_source(&updated_identity, true));
                     }
-                    let Ok(profile) = profile_for(&sup.host.catalog(), &service_id) else {
+                    let Some(profile) = profile else {
                         return;
                     };
                     let token = sup.current_token(&service_id);
@@ -745,11 +759,20 @@ impl ProcessSupervisor {
 
         if let Some(retained) = retained_identity {
             let identity = with_manager_instance(retained, self.host.instance_id());
+            let exit_job = matches!(profile.readiness, ReadinessSpec::Exit);
             self.transition(
                 service_id,
                 generation,
-                ActualServiceState::RunningUnready,
-                ServiceReadiness::NotReady,
+                if exit_job {
+                    ActualServiceState::Running
+                } else {
+                    ActualServiceState::RunningUnready
+                },
+                if exit_job {
+                    ServiceReadiness::Unknown
+                } else {
+                    ServiceReadiness::NotReady
+                },
                 Changes {
                     desired_state: Some(DesiredServiceState::Running),
                     current_operation_id: operation_id
@@ -1482,11 +1505,20 @@ impl ProcessSupervisor {
             app.exited,
         );
         self.attach_output(service_id, output_source(&identity, false));
+        let exit_job = matches!(profile.readiness, ReadinessSpec::Exit);
         self.transition(
             service_id,
             generation,
-            ActualServiceState::RunningUnready,
-            ServiceReadiness::NotReady,
+            if exit_job {
+                ActualServiceState::Running
+            } else {
+                ActualServiceState::RunningUnready
+            },
+            if exit_job {
+                ServiceReadiness::Unknown
+            } else {
+                ServiceReadiness::NotReady
+            },
             Changes {
                 identity: Patch::Set(identity),
                 ..Default::default()
@@ -1696,17 +1728,18 @@ impl ProcessSupervisor {
         }
     }
 
-    /// Wait until a `readiness: exit` command's process exits. Exit 0 is `succeeded` with desired
-    /// `stopped` (reconcile must not run it again). Any other code is `failed`, also with desired
-    /// `stopped`. `readiness_timeout_ms` is the only deadline — the supervisor's default timeout
-    /// is for probes, and a build can run for minutes.
+    /// Wait until a `readiness: exit` command's process exits. The command has no ready state and
+    /// no readiness deadline: it stays `running` until the process exits or the start is cancelled.
+    /// `readinessTimeoutMs` is a probe give-up and does not apply. Exit 0 is `succeeded` with
+    /// desired `stopped` (reconcile must not run it again). Any other code is `failed`, also with
+    /// desired `stopped`.
     ///
     /// An adopted process (daemon restarted while the command was still running) has no watcher,
     /// so its exit code is unknown: when it disappears the result is `failed`, never `succeeded`.
     async fn await_exit(
         self: &Arc<Self>,
         service_id: &ServiceId,
-        profile: &VerifiedProfile,
+        _profile: &VerifiedProfile,
         generation: u64,
         identity: Option<ProcessIdentity>,
         token: u64,
@@ -1719,19 +1752,16 @@ impl ProcessSupervisor {
             service_id,
             generation,
             token,
-            ActualServiceState::RunningUnready,
-            ServiceReadiness::NotReady,
+            ActualServiceState::Running,
+            ServiceReadiness::Unknown,
             Changes {
                 identity: identity.clone().map(Patch::Set).unwrap_or(Patch::Keep),
                 readiness_kind: Patch::Set(ReadinessKind::Exit),
-                readiness_detail: Patch::Set("waiting for the command to exit".to_string()),
+                readiness_detail: Patch::Clear,
                 ..Default::default()
             },
         )
         .await;
-        let deadline = profile
-            .readiness_timeout_ms
-            .map(|ms| self.options.clock.now_millis() + ms as i64);
         loop {
             if !self.valid(service_id, generation, token) {
                 return ReadinessOutcome::Superseded;
@@ -1764,15 +1794,6 @@ impl ProcessSupervisor {
                     return ReadinessOutcome::Exited { message };
                 }
             }
-            if let Some(deadline) = deadline {
-                if self.options.clock.now_millis() > deadline {
-                    let timeout = profile.readiness_timeout_ms.unwrap_or(0);
-                    return ReadinessOutcome::Timeout {
-                        message: "Readiness timed out".to_string(),
-                        detail: format!("Command did not exit within {timeout}ms"),
-                    };
-                }
-            }
             self.options
                 .clock
                 .sleep(self.options.readiness_backoff_ms)
@@ -1802,7 +1823,7 @@ impl ProcessSupervisor {
         let (actual, readiness, message) = if code == 0 {
             (
                 ActualServiceState::Succeeded,
-                ServiceReadiness::Ready,
+                ServiceReadiness::Unknown,
                 "exited 0".to_string(),
             )
         } else {

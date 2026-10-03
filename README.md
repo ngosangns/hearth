@@ -66,10 +66,10 @@ start/stop/restart is rejected (`service_disabled`) and group targets expand pas
 stop a service already running — stop it before disabling, or leave it be.
 
 A command that runs and then exits — a one-shot build, not a server — uses
-`readiness: { kind: exit }`. The row stays `running` until the process exits. Exit 0 becomes
-`succeeded` and is not run again until you start it; any other exit is `failed`. Leave
-`readinessTimeoutMs` unset when the command may take longer than a probe: there is no default
-deadline.
+`readiness: { kind: exit }`. The row stays `running` until the process exits. It does not
+become `ready`. Exit 0 becomes `succeeded` and is not run again until you start it; any other
+exit is `failed`. `readinessTimeoutMs` does not apply: the command is not failed for still
+running.
 
 ```yaml
 services:
@@ -86,7 +86,7 @@ Readiness is the completion signal, not the deadline. Pick the kind that matches
 | `http` | `GET` returns 2xx | `{ kind: http }` is `http://127.0.0.1:<port>/health`. Set `path` for any other path (`/metrics`, `/minio/health/live`). Set `url` when the host or port is not that default. `url` cannot be combined with `path` or `port`. |
 | `tcp` | the port accepts a connection | `{ kind: tcp, port: 4222 }`, or `{ kind: tcp }` when `ports:` already names the port |
 | `command` | the command exits 0 | a real protocol check (`redis-cli ping`, `pg_isready`). Retries until `readinessTimeoutMs` |
-| `exit` | the run command itself exits | one-shot builds. Exit 0 is `succeeded` |
+| `exit` | the run command itself exits | one-shot builds. The row is `running` until exit. Exit 0 is `succeeded`. No readiness deadline |
 | `container` | the named container is running | docker compose services |
 | `process` | the process is alive | no port and no HTTP |
 | `tailnet` | Tailscale serve is up | tailnet tasks |
