@@ -14,7 +14,7 @@ share one instance, different versions run side by side.
 | Share identity | `name@exact-version` → singleton |
 | Ports | Deterministic `hash(name@version)` into `43100–43999`, collision → probe next slot, persisted |
 | Topology | One global `smp` daemon; project daemons adopt via `ownership: external` |
-| Connection info | Via `hearth-mcp` `shared_*` tools + skill doc; not auto-injected into app env |
+| Connection info | Via skill scripts (`shared-list`/`shared-status`/`shared-connection`) or CLI; not auto-injected into app env |
 | Lifecycle | On-demand start; never auto-stops; `hearth shared remove` is the only GC |
 | Recipe source | `catalog.json` fetched from the pinned GitHub repo URL (HTTPS is the trust boundary) |
 | Provisioning | Per-project logical resources (e.g. `db_<hash>` + user) via recipe `provision` commands |
@@ -259,7 +259,7 @@ needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attac
 
 ## MCP + skill
 
-`hearth-mcp` gains `shared_list`, `shared_status`, `shared_connection` (queried against smp
+Skill scripts / CLI cover `shared list`, `shared status`, and `scripts/shared-connection.sh` (MCP tools of the same names remain in-binary but are retired for agents) (queried against smp
 directly via its lock-dir token). The skill doc (`hearth skill install`) documents the flow:
 read `shared:` in `hearth.yaml` → attach happens on `start` → query connection info via MCP.
 

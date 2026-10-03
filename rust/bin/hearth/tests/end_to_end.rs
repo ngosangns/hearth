@@ -331,16 +331,34 @@ fn mcp_install_writes_the_real_compiled_binarys_own_path() {
     );
 }
 
+/// The compiled binary must install a skill pack (SKILL.md plus executable scripts), not a
+/// single markdown file. `--dest` is the skill directory.
 #[test]
-fn skill_install_writes_the_real_binarys_generic_skill_doc() {
+fn skill_install_writes_the_real_binarys_skill_pack() {
     let dir = tempfile::tempdir().unwrap();
     write_config(dir.path(), free_port());
-    let dest = ".agent/skills/local-dev/SKILL.md";
+    let dest = ".agent/skills/local-dev";
     let (code, stdout, stderr) = run_lsd(dir.path(), &["skill", "install", "--dest", dest]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(stdout.contains("installed skill doc"), "{stdout}");
-    let written = std::fs::read_to_string(dir.path().join(dest)).unwrap();
+    assert!(stdout.contains("installed hearth skill"), "{stdout}");
+
+    let skill_dir = dir.path().join(dest);
+    let written = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
     assert!(written.contains("local_services_manage"), "{written}");
+    assert!(written.contains("scripts/manage.sh"), "{written}");
+    for script in ["hearth.sh", "manage.sh", "status.sh", "shared-connection.sh"] {
+        let path = skill_dir.join("scripts").join(script);
+        assert!(path.is_file(), "missing skill script {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(skill_dir.join("scripts/hearth.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "hearth.sh should be executable");
+    }
 }
 
 /// `--help` and `--version` must work from a directory with no catalog — every other subcommand
