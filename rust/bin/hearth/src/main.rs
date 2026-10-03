@@ -200,7 +200,7 @@ usage: hearth [--root <path>] <command> [options]
   mcp                                   serve the MCP tool surface over stdio
   mcp install [--name N] [--key K] <config-file>...
                                         register this binary in an MCP client config
-  skill install --dest <path>           write the generic MCP skill doc
+  skill install --dest <skill-dir>      install SKILL.md + scripts (MCP retired for agents)
 
 tui, shared, and update do not need a hearth.yaml in the current directory.
 hearth --root <project> tui adopts that project when it has a catalog.

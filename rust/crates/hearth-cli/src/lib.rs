@@ -1053,15 +1053,42 @@ fn install_mcp_entry(path: &Path, key: &str, name: &str, command: &str, args: &[
     Ok(())
 }
 
-/// A generic, project-agnostic doc describing the MCP tool contract and mutate-gate policy any
-/// hearth-backed project shares — deliberately doesn't mention a project's own
-/// service list, ports, or Taskfile targets, since those vary per consumer and belong in that
-/// project's own supplementary docs.
-const SKILL_MARKDOWN: &str = include_str!("../skill/hearth-mcp.md");
+/// Generic skill pack (SKILL.md + scripts) for agent operation of hearth-backed projects.
+/// MCP is retired for coding agents — scripts wrap the `hearth` CLI instead.
+const SKILL_MARKDOWN: &str = include_str!("../skill/SKILL.md");
+const SKILL_SCRIPT_HEARTH: &str = include_str!("../skill/scripts/hearth.sh");
+const SKILL_SCRIPT_STATUS: &str = include_str!("../skill/scripts/status.sh");
+const SKILL_SCRIPT_LOGS: &str = include_str!("../skill/scripts/logs.sh");
+const SKILL_SCRIPT_URLS: &str = include_str!("../skill/scripts/urls.sh");
+const SKILL_SCRIPT_DOCTOR: &str = include_str!("../skill/scripts/doctor.sh");
+const SKILL_SCRIPT_MANAGE: &str = include_str!("../skill/scripts/manage.sh");
+const SKILL_SCRIPT_TRACE: &str = include_str!("../skill/scripts/trace.sh");
+const SKILL_SCRIPT_EVENTS: &str = include_str!("../skill/scripts/events.sh");
+const SKILL_SCRIPT_RESTART_DAEMON: &str = include_str!("../skill/scripts/restart-daemon.sh");
+const SKILL_SCRIPT_STOP_DAEMON: &str = include_str!("../skill/scripts/stop-daemon.sh");
+const SKILL_SCRIPT_SHARED_LIST: &str = include_str!("../skill/scripts/shared-list.sh");
+const SKILL_SCRIPT_SHARED_STATUS: &str = include_str!("../skill/scripts/shared-status.sh");
+const SKILL_SCRIPT_SHARED_CONNECTION: &str = include_str!("../skill/scripts/shared-connection.sh");
+
+const SKILL_SCRIPTS: &[(&str, &str)] = &[
+    ("hearth.sh", SKILL_SCRIPT_HEARTH),
+    ("status.sh", SKILL_SCRIPT_STATUS),
+    ("logs.sh", SKILL_SCRIPT_LOGS),
+    ("urls.sh", SKILL_SCRIPT_URLS),
+    ("doctor.sh", SKILL_SCRIPT_DOCTOR),
+    ("manage.sh", SKILL_SCRIPT_MANAGE),
+    ("trace.sh", SKILL_SCRIPT_TRACE),
+    ("events.sh", SKILL_SCRIPT_EVENTS),
+    ("restart-daemon.sh", SKILL_SCRIPT_RESTART_DAEMON),
+    ("stop-daemon.sh", SKILL_SCRIPT_STOP_DAEMON),
+    ("shared-list.sh", SKILL_SCRIPT_SHARED_LIST),
+    ("shared-status.sh", SKILL_SCRIPT_SHARED_STATUS),
+    ("shared-connection.sh", SKILL_SCRIPT_SHARED_CONNECTION),
+];
 
 async fn skill_command(root: &Path, rest: &[String], io: &mut Io<'_>) -> LocalctlResult<i32> {
     let Some(subcommand) = rest.first() else {
-        return usage_err("usage: hearth skill install --dest <path>");
+        return usage_err("usage: hearth skill install --dest <skill-dir>");
     };
     match subcommand.as_str() {
         "install" => skill_install_command(root, &rest[1..], io).await,
@@ -1075,17 +1102,39 @@ async fn skill_install_command(root: &Path, rest: &[String], io: &mut Io<'_>) ->
         return usage_err("skill install takes no positional arguments");
     }
     let Some(dest) = flags.dest.clone() else {
-        return usage_err("usage: hearth skill install --dest <path>");
+        return usage_err("usage: hearth skill install --dest <skill-dir>");
     };
     let dest_path = Path::new(&dest);
-    let resolved = if dest_path.is_absolute() { dest_path.to_path_buf() } else { root.join(dest_path) };
-    if let Some(parent) = resolved.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not create {}: {e}", parent.display()) })?;
+    // `--dest` is the skill directory (e.g. ~/.agents/skills/hearth). A trailing SKILL.md path
+    // is accepted and normalized to its parent so older one-file installs still work.
+    let mut resolved = if dest_path.is_absolute() { dest_path.to_path_buf() } else { root.join(dest_path) };
+    if resolved.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
+        if let Some(parent) = resolved.parent() {
+            resolved = parent.to_path_buf();
+        }
     }
-    std::fs::write(&resolved, SKILL_MARKDOWN)
-        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not write {}: {e}", resolved.display()) })?;
-    (io.out)(&format!("installed skill doc at {}", resolved.display()));
+    let scripts_dir = resolved.join("scripts");
+    std::fs::create_dir_all(&scripts_dir)
+        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not create {}: {e}", scripts_dir.display()) })?;
+    let skill_md = resolved.join("SKILL.md");
+    std::fs::write(&skill_md, SKILL_MARKDOWN)
+        .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not write {}: {e}", skill_md.display()) })?;
+    for (name, body) in SKILL_SCRIPTS {
+        let path = scripts_dir.join(name);
+        std::fs::write(&path, body)
+            .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not write {}: {e}", path.display()) })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)
+                .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not stat {}: {e}", path.display()) })?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)
+                .map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: format!("could not chmod {}: {e}", path.display()) })?;
+        }
+    }
+    (io.out)(&format!("installed hearth skill at {}", resolved.display()));
     Ok(0)
 }
 
@@ -1726,14 +1775,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skill_install_writes_the_generic_doc_at_a_relative_dest() {
+    async fn skill_install_writes_the_skill_pack_at_a_relative_dest() {
         let dir = tempfile::tempdir().unwrap();
-        let (code, out, _err) = run_cli(dir.path(), &["skill", "install", "--dest", ".agent/skills/local-dev/SKILL.md"]).await;
+        let (code, out, _err) = run_cli(dir.path(), &["skill", "install", "--dest", ".agents/skills/hearth"]).await;
         assert_eq!(code, 0);
-        assert!(out[0].contains("installed skill doc"));
-        let written = std::fs::read_to_string(dir.path().join(".agent/skills/local-dev/SKILL.md")).unwrap();
+        assert!(out[0].contains("installed hearth skill"));
+        let skill_dir = dir.path().join(".agents/skills/hearth");
+        let written = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
         assert_eq!(written, SKILL_MARKDOWN);
-        assert!(written.contains("local_services_manage"));
+        assert!(written.contains("scripts/manage.sh"));
+        assert!(written.contains("`hearth`"));
+        assert!(!written.contains("hearthd"));
+        let wrapper = skill_dir.join("scripts/hearth.sh");
+        assert!(wrapper.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&wrapper).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "hearth.sh should be executable");
+        }
+        let wrapper_body = std::fs::read_to_string(&wrapper).unwrap();
+        assert!(wrapper_body.contains("HEARTH_BIN"));
+        assert!(wrapper_body.contains(".local/bin/hearth"));
+        assert!(!wrapper_body.contains("hearthd"));
+        assert!(skill_dir.join("scripts/status.sh").is_file());
+        assert!(skill_dir.join("scripts/shared-connection.sh").is_file());
+    }
+
+    #[tokio::test]
+    async fn skill_install_normalizes_a_skill_md_dest_to_its_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, out, _err) = run_cli(dir.path(), &["skill", "install", "--dest", ".agents/skills/hearth/SKILL.md"]).await;
+        assert_eq!(code, 0);
+        assert!(out[0].contains("installed hearth skill"));
+        assert!(dir.path().join(".agents/skills/hearth/SKILL.md").is_file());
+        assert!(dir.path().join(".agents/skills/hearth/scripts/hearth.sh").is_file());
     }
 
     #[tokio::test]
