@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.18.1
+
+- In `hearth tui`, drag a painted service URL to copy it while mouse reporting is on. A click or a drag shorter than two columns copies the whole address; a longer drag copies that span. `m` still releases the mouse for a native selection.
+- A bare `hearth` on a terminal opens the TUI. Piped input or output still prints help.
+
 ## 0.18.0
 
 The CLI command is `hearth`. It was `hearthd` through 0.17.0.
