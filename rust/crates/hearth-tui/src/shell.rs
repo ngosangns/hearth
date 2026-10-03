@@ -972,12 +972,8 @@ impl App {
                 self.apply_services(gen, &services).await;
                 self.draw();
             }
-            WatchEvent::Replay(replay) => {
-                if replay.reset {
-                    self.desk.notice = "Manager restarted; state resynchronized.".to_string();
-                    self.draw();
-                }
-            }
+            // Replay only advances the event cursor. The service list comes from the snapshot.
+            WatchEvent::Replay(_) => {}
             WatchEvent::ManagerEvent(event) => {
                 let fence = self
                     .session

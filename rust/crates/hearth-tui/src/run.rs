@@ -165,12 +165,9 @@ impl TuiApp {
                 let fence = self.state.begin_request();
                 self.refresh_selected(client, fence).await;
             }
-            WatchEvent::Replay(replay) => {
+            WatchEvent::Replay(_) => {
                 if !self.state.connected(*current_fence) {
                     return;
-                }
-                if replay.reset {
-                    self.state.notice = "Manager restarted; state resynchronized.".to_string();
                 }
                 self.draw();
             }
