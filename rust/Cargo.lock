@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "hearth"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "hearth-cli",
  "hearth-core",

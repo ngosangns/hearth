@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.18.3
+
+- In `hearth tui`, the word `shared` on a project shared service is blue. The state word keeps its own colour.
+- Stop, restart, or remove of a shared instance, and stop or restart of a project `shared:` service, asks for a second press when another workspace is attached and names those workspaces. Stopping or restarting the instance takes it down for every attachment. Stopping or restarting it from a project only detaches that workspace. If the attachment list cannot be read, the second press is an explicit override.
+
 ## 0.18.2
 
 - A one-time command (`readiness: { kind: exit }`) stays `running` until the process exits. It does not become `ready`, and `readinessTimeoutMs` does not stop it. Exit 0 is still `succeeded`.
