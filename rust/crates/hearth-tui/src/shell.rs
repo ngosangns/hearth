@@ -30,10 +30,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{refresh_selected_log, safe_message, ManagerTuiClient, WatchEvent};
 use crate::desk::{
-    activation, group_is_up, group_sections, group_targets, key_command, link_overlay,
-    metas_from_catalog, should_reload_catalog, start_all_targets, stop_all_targets, summary_of,
-    url_visible, Act, Command, Desk, Hit, InstanceLine, Link, LinkSelection, Pane, Pending,
-    RecipeLine, RowId, WorkspaceLine,
+    activation, classify_attachments, group_is_up, group_sections, group_targets,
+    instance_shared_notice, join_names, key_command, link_overlay, metas_from_catalog,
+    project_shared_notice, should_reload_catalog, start_all_targets, stop_all_targets, summary_of,
+    unchecked_shared_notice, url_visible, Act, Command, Desk, Hit, ImpactFollow, InstanceLine,
+    KnownRoot, Link, LinkSelection, Pane, Pending, RecipeLine, RowId, SharedTouch, WorkspaceLine,
 };
 use crate::state::{Service, TuiFence, TuiState};
 
@@ -386,7 +387,7 @@ impl App {
             }
             Act::Install(id) => self.install_shared(id).await,
             Act::StartInstance(id) => self.shared_action(id, "start").await,
-            Act::StopInstance(id) => self.shared_action(id, "stop").await,
+            Act::StopInstance(id) => self.guarded_shared(id, "stop").await,
             Act::Disabled => {
                 self.desk.notice = "service is disabled".to_string();
                 self.draw();
@@ -412,14 +413,15 @@ impl App {
                 self.service_action(ServiceOperationKind::Start, id, true)
                     .await
             }
-            Pending::RemoveShared(id) => {
-                let force = self
-                    .desk
-                    .instances
-                    .iter()
-                    .any(|instance| instance.id == id && instance.attachments > 0);
-                self.remove_shared(id, force).await;
+            Pending::RemoveShared {
+                id,
+                affected,
+                unchecked,
+            } => {
+                self.remove_shared(id, unchecked || !affected.is_empty())
+                    .await
             }
+            Pending::SharedImpact { follow, .. } => self.run_impact(follow).await,
         }
         true
     }
@@ -437,7 +439,10 @@ impl App {
             Pending::Forget(id) => self.forget(&id).await,
             Pending::StopDaemon(id) => self.stop_daemon(&id).await,
             Pending::RestartDaemon(id) => self.restart_daemon(&id).await,
-            Pending::Trust(_) | Pending::Reclaim(_) | Pending::RemoveShared(_) => self.draw(),
+            Pending::Trust(_)
+            | Pending::Reclaim(_)
+            | Pending::RemoveShared { .. }
+            | Pending::SharedImpact { .. } => self.draw(),
         }
     }
 
@@ -456,16 +461,183 @@ impl App {
             self.draw();
             return;
         };
-        if self.desk.arm(Pending::RemoveShared(id.clone())) {
-            let force = self
-                .desk
-                .instances
-                .iter()
-                .any(|instance| instance.id == id && instance.attachments > 0);
+        let pending = self.remove_pending(&id);
+        let force = remove_is_forced(&pending);
+        if self.desk.arm(pending) {
             self.remove_shared(id, force).await;
         } else {
             self.draw();
         }
+    }
+
+    /// Second press runs the action. First press draws the alert and returns true.
+    fn hold_for_shared(
+        &mut self,
+        ids: &[String],
+        action: ServiceOperationKind,
+        label: &str,
+    ) -> bool {
+        let Some(pending) = self.project_pending(ids, action, label) else {
+            return false;
+        };
+        if self.desk.arm(pending) {
+            return false;
+        }
+        self.draw();
+        true
+    }
+
+    async fn guarded_shared(&mut self, id: String, action: &str) {
+        if let Some(pending) = self.instance_pending(&id, action) {
+            if !self.desk.arm(pending) {
+                self.draw();
+                return;
+            }
+        }
+        self.shared_action(id, action).await;
+    }
+
+    async fn run_impact(&mut self, follow: ImpactFollow) {
+        match follow {
+            ImpactFollow::Instance { id, action } => self.shared_action(id, &action).await,
+            ImpactFollow::Remove { id, force } => self.remove_shared(id, force).await,
+            ImpactFollow::Service { id, action } => {
+                self.run_service_action(action, id, false).await
+            }
+            ImpactFollow::Many { label, ids, action } => {
+                self.run_group_action(label, action, ids).await
+            }
+        }
+    }
+
+    fn project_pending(
+        &self,
+        ids: &[String],
+        action: ServiceOperationKind,
+        label: &str,
+    ) -> Option<Pending> {
+        let verb = action.as_wire_str();
+        let mut touches = Vec::new();
+        let mut unknown = Vec::new();
+        for id in ids {
+            let Some(instance) = self
+                .desk
+                .service_line(id)
+                .and_then(|service| service.shared_instance.clone())
+            else {
+                continue;
+            };
+            match attachment_roots(&instance) {
+                Ok(roots) => {
+                    let report = classify_attachments(
+                        &roots,
+                        self.current_root().as_deref(),
+                        &self.known_roots(),
+                    );
+                    if !report.others.is_empty() {
+                        touches.push(SharedTouch {
+                            instance,
+                            others: report.others,
+                        });
+                    }
+                }
+                Err(()) => unknown.push(instance),
+            }
+        }
+        if touches.is_empty() && unknown.is_empty() {
+            return None;
+        }
+        touches.sort_by(|left, right| left.instance.cmp(&right.instance));
+        unknown.sort();
+        let current = self
+            .desk
+            .selected_workspace()
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "this workspace".to_string());
+        let notice = if touches.is_empty() {
+            unchecked_shared_notice(verb, &join_names(&unknown))
+        } else {
+            project_shared_notice(verb, &current, &touches, &unknown)
+        };
+        let follow = if ids.len() == 1 {
+            ImpactFollow::Service {
+                id: ids[0].clone(),
+                action,
+            }
+        } else {
+            ImpactFollow::Many {
+                label: label.to_string(),
+                ids: ids.to_vec(),
+                action,
+            }
+        };
+        Some(Pending::SharedImpact { notice, follow })
+    }
+
+    fn instance_pending(&self, id: &str, action: &str) -> Option<Pending> {
+        if action == "start" {
+            return None;
+        }
+        let follow = ImpactFollow::Instance {
+            id: id.to_string(),
+            action: action.to_string(),
+        };
+        match attachment_roots(id) {
+            Ok(roots) => {
+                let report = classify_attachments(
+                    &roots,
+                    self.current_root().as_deref(),
+                    &self.known_roots(),
+                );
+                if report.others.is_empty() {
+                    return None;
+                }
+                Some(Pending::SharedImpact {
+                    notice: instance_shared_notice(action, id, &report.all),
+                    follow,
+                })
+            }
+            Err(()) => Some(Pending::SharedImpact {
+                notice: unchecked_shared_notice(action, id),
+                follow,
+            }),
+        }
+    }
+
+    fn remove_pending(&self, id: &str) -> Pending {
+        match attachment_roots(id) {
+            Ok(roots) => {
+                let report = classify_attachments(&roots, None, &self.known_roots());
+                Pending::RemoveShared {
+                    id: id.to_string(),
+                    affected: report.all,
+                    unchecked: false,
+                }
+            }
+            Err(()) => Pending::RemoveShared {
+                id: id.to_string(),
+                affected: Vec::new(),
+                unchecked: true,
+            },
+        }
+    }
+
+    fn current_root(&self) -> Option<String> {
+        let id = self.desk.selected_workspace()?.id.clone();
+        let path = self.workspace_path(&id)?;
+        Some(canon_root(path.to_string_lossy().as_ref()))
+    }
+
+    fn known_roots(&self) -> Vec<KnownRoot> {
+        self.store
+            .list()
+            .iter()
+            .map(|row| KnownRoot {
+                root: canon_root(&row.path),
+                name: folder_name(&row.path),
+                path: display_path(&row.path),
+            })
+            .collect()
     }
 
     fn toggle_mouse(&mut self) {
@@ -1168,6 +1340,33 @@ impl App {
         service: String,
         kill_unowned: bool,
     ) {
+        if self
+            .desk
+            .service_line(&service)
+            .is_some_and(|row| row.disabled)
+        {
+            self.desk.notice = "service is disabled".to_string();
+            self.draw();
+            return;
+        }
+        if !kill_unowned
+            && matches!(
+                action,
+                ServiceOperationKind::Stop | ServiceOperationKind::Restart
+            )
+            && self.hold_for_shared(std::slice::from_ref(&service), action, &service)
+        {
+            return;
+        }
+        self.run_service_action(action, service, kill_unowned).await;
+    }
+
+    async fn run_service_action(
+        &mut self,
+        action: ServiceOperationKind,
+        service: String,
+        kill_unowned: bool,
+    ) {
         let Some(session) = &self.session else {
             self.desk.notice = "start the daemon first".to_string();
             self.draw();
@@ -1220,6 +1419,19 @@ impl App {
             self.bulk(targets, &format!("start {name}")).await;
             return;
         }
+        if self.hold_for_shared(&targets, action, name) {
+            return;
+        }
+        self.run_group_action(name.to_string(), action, targets)
+            .await;
+    }
+
+    async fn run_group_action(
+        &mut self,
+        label: String,
+        action: ServiceOperationKind,
+        targets: Vec<String>,
+    ) {
         let Some(session) = &self.session else {
             self.desk.notice = "start the daemon first".to_string();
             self.draw();
@@ -1227,11 +1439,10 @@ impl App {
         };
         let client = Arc::clone(&session.client);
         self.begin_job();
-        self.desk.notice = format!("{} {name}…", action.as_wire_str());
+        self.desk.notice = format!("{} {label}…", action.as_wire_str());
         self.draw();
         let tx = self.tx.clone();
         let gen = self.gen;
-        let label = name.to_string();
         tokio::spawn(async move {
             let mut failed = None;
             for service in &targets {
@@ -1269,36 +1480,11 @@ impl App {
             self.draw();
             return;
         }
-        self.group_stop_ids("all".to_string(), targets).await;
-    }
-
-    async fn group_stop_ids(&mut self, label: String, targets: Vec<String>) {
-        let Some(session) = &self.session else {
-            self.desk.notice = "start the daemon first".to_string();
-            self.draw();
+        if self.hold_for_shared(&targets, ServiceOperationKind::Stop, "all") {
             return;
-        };
-        let client = Arc::clone(&session.client);
-        self.begin_job();
-        self.desk.notice = format!("stop {label}…");
-        self.draw();
-        let tx = self.tx.clone();
-        let gen = self.gen;
-        tokio::spawn(async move {
-            let mut failed = None;
-            for service in &targets {
-                if let Err(error) = client
-                    .action(service, ServiceOperationKind::Stop, false)
-                    .await
-                {
-                    failed = Some(safe_message(&error.message));
-                    break;
-                }
-            }
-            let text = failed.unwrap_or_else(|| format!("stop {label}"));
-            let _ = tx.send(Msg::Note { gen, text }).await;
-            let _ = tx.send(Msg::JobFinished).await;
-        });
+        }
+        self.run_group_action("all".to_string(), ServiceOperationKind::Stop, targets)
+            .await;
     }
 
     async fn bulk(&mut self, targets: Vec<String>, label: &str) {
@@ -1354,7 +1540,7 @@ impl App {
             },
             Pane::Shared => {
                 if let Some(RowId::Instance(id)) = self.desk.selected_shared() {
-                    self.shared_action(id, "stop").await;
+                    self.guarded_shared(id, "stop").await;
                 }
             }
             Pane::Workspaces => {}
@@ -1377,7 +1563,7 @@ impl App {
             },
             Pane::Shared => {
                 if let Some(RowId::Instance(id)) = self.desk.selected_shared() {
-                    self.shared_action(id, "restart").await;
+                    self.guarded_shared(id, "restart").await;
                 }
             }
         }
@@ -1960,6 +2146,40 @@ fn copy_to_pasteboard(text: &str) -> Result<(), String> {
     } else {
         Err(format!("pbcopy exited {status}"))
     }
+}
+
+fn remove_is_forced(pending: &Pending) -> bool {
+    match pending {
+        Pending::RemoveShared {
+            affected,
+            unchecked,
+            ..
+        } => *unchecked || !affected.is_empty(),
+        _ => false,
+    }
+}
+
+/// Project roots attached to `id`, canonicalized. `Err` means the registry could not be read,
+/// which is not the same as an instance with no attachments.
+fn attachment_roots(id: &str) -> Result<Vec<String>, ()> {
+    let io = hearth_core::file_io::create_file_io(false);
+    let registry = SharedRegistry::load(Arc::from(io), &shared_root()).map_err(|_| ())?;
+    let Some(instance) = registry.get(id) else {
+        return Ok(Vec::new());
+    };
+    Ok(instance
+        .attachments
+        .values()
+        .map(|attachment| canon_root(&attachment.project_root))
+        .collect())
+}
+
+fn canon_root(path: &str) -> String {
+    let path = Path::new(path);
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 async fn fetch_shared(spawn: &SpawnHook) -> SharedSnapshot {

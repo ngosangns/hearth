@@ -4,8 +4,12 @@
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use hearth_core::catalog::{CatalogGroup, ReadinessSpec, ServiceCatalog, ServiceKind};
-use hearth_core::state::ActualServiceState;
+use hearth_core::catalog::{
+    CatalogGroup, CommandSpec, ReadinessSpec, ServiceCatalog, ServiceDefinition, ServiceKind,
+    ServiceRunProfile,
+};
+use hearth_core::state::{ActualServiceState, ServiceOperationKind};
+use hearth_core::workspaces::{display_path, folder_name};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,7 +47,64 @@ pub enum Pending {
     StopDaemon(String),
     RestartDaemon(String),
     Reclaim(String),
-    RemoveShared(String),
+    /// Second press removes the instance. `affected` names every attached workspace.
+    /// `unchecked` means the attachment list could not be read, so the press is an explicit
+    /// override rather than a known blast radius.
+    RemoveShared {
+        id: String,
+        affected: Vec<String>,
+        unchecked: bool,
+    },
+    /// Second press runs `follow`. The notice already names the other workspaces.
+    SharedImpact {
+        notice: String,
+        follow: ImpactFollow,
+    },
+}
+
+/// What a confirmed shared-impact alert does. Project actions only detach or reattach this
+/// workspace. Instance actions stop, restart, or delete the singleton for every attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImpactFollow {
+    Instance {
+        id: String,
+        action: String,
+    },
+    Remove {
+        id: String,
+        force: bool,
+    },
+    Service {
+        id: String,
+        action: ServiceOperationKind,
+    },
+    Many {
+        label: String,
+        ids: Vec<String>,
+        action: ServiceOperationKind,
+    },
+}
+
+/// One shared instance another workspace is attached to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedTouch {
+    pub instance: String,
+    pub others: Vec<String>,
+}
+
+/// A workspace the TUI already knows, used to turn an attachment root into a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownRoot {
+    pub root: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// Attachment roots split into every user and the users that are not the selected workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentReport {
+    pub all: Vec<String>,
+    pub others: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +173,9 @@ pub struct ServiceMeta {
     pub disabled: bool,
     pub finite: bool,
     pub infra: bool,
+    /// Synthesized from a `shared:` entry. `shared_instance` is `name@version`.
+    pub shared: bool,
+    pub shared_instance: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +187,8 @@ pub struct ServiceLine {
     pub disabled: bool,
     pub finite: bool,
     pub infra: bool,
+    pub shared: bool,
+    pub shared_instance: Option<String>,
     pub error: Option<String>,
 }
 
@@ -1110,12 +1176,43 @@ fn service_line(service: &ServiceLine, selected: bool) -> Line<'static> {
     } else {
         Style::default()
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(format!("{mark} ")),
         Span::styled(format!("{label:<9}"), style),
-        Span::styled(format!(" {name}"), name_style),
-        Span::styled(format!("{ports}{flags}{detail}"), tail_style),
-    ])
+    ];
+    push_service_name(&mut spans, &name, name_style, service.shared);
+    spans.push(Span::styled(format!("{ports}{flags}{detail}"), tail_style));
+    Line::from(spans)
+}
+
+/// A project `shared:` row keeps the normal state colour. The word `shared` in the label is blue.
+fn push_service_name(spans: &mut Vec<Span<'static>>, name: &str, style: Style, shared: bool) {
+    if !shared {
+        spans.push(Span::styled(format!(" {name}"), style));
+        return;
+    }
+    let Some(index) = name.find("shared") else {
+        spans.push(Span::styled(" shared ".to_string(), shared_word()));
+        spans.push(Span::styled(name.to_string(), style));
+        return;
+    };
+    let (before, after) = name.split_at(index);
+    let after = &after["shared".len()..];
+    if before.is_empty() {
+        spans.push(Span::raw(" ".to_string()));
+    } else {
+        spans.push(Span::styled(format!(" {before}"), style));
+    }
+    spans.push(Span::styled("shared".to_string(), shared_word()));
+    if !after.is_empty() {
+        spans.push(Span::styled(after.to_string(), style));
+    }
+}
+
+fn shared_word() -> Style {
+    Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn item_line(selected: bool, text: &str) -> Line<'static> {
@@ -1175,6 +1272,153 @@ fn state_style(state: ActualServiceState) -> Style {
         | ActualServiceState::Orphaned
         | ActualServiceState::ExternallyOwned => Color::Red,
     })
+}
+
+/// `name@version` carried by a project service synthesized from `shared:`.
+pub fn shared_instance_of(service: &ServiceDefinition) -> Option<String> {
+    let ServiceRunProfile::Verified { command, .. } = &service.profiles.run else {
+        return None;
+    };
+    let CommandSpec::Argv { argv } = &command.command else {
+        return None;
+    };
+    let index = argv
+        .windows(2)
+        .position(|pair| pair[0] == "shared" && pair[1] == "attach")?;
+    let id = argv.get(index + 2)?;
+    if id.contains('@') && !id.starts_with('-') {
+        Some(id.clone())
+    } else {
+        None
+    }
+}
+
+pub fn classify_attachments(
+    roots: &[String],
+    current: Option<&str>,
+    known: &[KnownRoot],
+) -> AttachmentReport {
+    let others: Vec<String> = roots
+        .iter()
+        .filter(|root| current.is_none_or(|current| !same_root(root, current)))
+        .cloned()
+        .collect();
+    AttachmentReport {
+        all: labels_for(roots, known),
+        others: labels_for(&others, known),
+    }
+}
+
+pub fn instance_shared_notice(verb: &str, instance: &str, affected: &[String]) -> String {
+    let who = join_names(affected);
+    let (doing, consequence) = match verb {
+        "restart" => (
+            "Restarting",
+            format!("takes the shared service down for {who}"),
+        ),
+        "remove" => (
+            "Removing",
+            format!("deletes its data and takes it down for {who}"),
+        ),
+        _ => (
+            "Stopping",
+            format!("takes the shared service down for {who}"),
+        ),
+    };
+    format!("{doing} {instance} {consequence}. Press again to {verb}.")
+}
+
+pub fn project_shared_notice(
+    verb: &str,
+    current: &str,
+    touches: &[SharedTouch],
+    unknown: &[String],
+) -> String {
+    let mut sentences = Vec::new();
+    if !touches.is_empty() {
+        let parts: Vec<String> = touches
+            .iter()
+            .map(|touch| format!("{} ({})", touch.instance, join_names(&touch.others)))
+            .collect();
+        let listed = join_names(&parts);
+        let (be, them) = if touches.len() == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        let doing = if verb == "restart" {
+            "Restarting"
+        } else {
+            "Stopping"
+        };
+        let effect = match verb {
+            "restart" => format!("only detaches and reattaches {current}"),
+            _ => format!("only detaches {current}"),
+        };
+        sentences.push(format!(
+            "{listed} {be} also used by other workspaces. {doing} {them} here {effect} — those workspaces keep {them}"
+        ));
+    }
+    if !unknown.is_empty() {
+        sentences.push(format!(
+            "Could not check which workspaces use {}",
+            join_names(unknown)
+        ));
+    }
+    format!("{}. Press again to {verb}.", sentences.join(". "))
+}
+
+pub fn unchecked_shared_notice(verb: &str, instance: &str) -> String {
+    format!("could not check which workspaces use {instance}. Press again to {verb} anyway.")
+}
+
+fn labels_for(roots: &[String], known: &[KnownRoot]) -> Vec<String> {
+    let rows: Vec<(String, String)> = roots
+        .iter()
+        .map(|root| {
+            let found = known.iter().find(|item| same_root(&item.root, root));
+            let name = found
+                .map(|item| item.name.clone())
+                .unwrap_or_else(|| folder_name(root));
+            let path = found
+                .map(|item| item.path.clone())
+                .unwrap_or_else(|| display_path(root));
+            (name, path)
+        })
+        .collect();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (name, _) in &rows {
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    let mut labels: Vec<String> = rows
+        .into_iter()
+        .map(|(name, path)| {
+            if counts.get(&name).copied().unwrap_or(0) > 1 {
+                format!("{name} ({path})")
+            } else {
+                name
+            }
+        })
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn same_root(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+pub fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [one, two] => format!("{one} and {two}"),
+        many => {
+            let (last, rest) = many.split_last().unwrap();
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
 }
 
 fn wire_style(state: &str) -> Style {
@@ -2127,6 +2371,8 @@ pub fn group_sections(
                 disabled: false,
                 finite: false,
                 infra: service.kind == Some(ServiceKind::Infrastructure),
+                shared: false,
+                shared_instance: None,
             });
         }
     }
@@ -2160,6 +2406,8 @@ pub fn group_sections(
             finite: meta.finite,
             infra: meta.infra
                 || found.and_then(|service| service.kind) == Some(ServiceKind::Infrastructure),
+            shared: meta.shared,
+            shared_instance: meta.shared_instance.clone(),
             error,
         }
     };
@@ -2219,23 +2467,28 @@ pub fn metas_from_catalog(catalog: &ServiceCatalog) -> Vec<ServiceMeta> {
     catalog
         .services
         .iter()
-        .map(|service| ServiceMeta {
-            id: service.id.clone(),
-            label: service.label.clone().unwrap_or_else(|| service.id.clone()),
-            ports: service
-                .ports
-                .as_ref()
-                .map(|ports| {
-                    ports
-                        .iter()
-                        .map(|port| port.port.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default(),
-            disabled: service.disabled,
-            finite: matches!(service.profiles.run.readiness(), ReadinessSpec::Exit),
-            infra: service.kind == Some(ServiceKind::Infrastructure),
+        .map(|service| {
+            let shared_instance = shared_instance_of(service);
+            ServiceMeta {
+                id: service.id.clone(),
+                label: service.label.clone().unwrap_or_else(|| service.id.clone()),
+                ports: service
+                    .ports
+                    .as_ref()
+                    .map(|ports| {
+                        ports
+                            .iter()
+                            .map(|port| port.port.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+                disabled: service.disabled,
+                finite: matches!(service.profiles.run.readiness(), ReadinessSpec::Exit),
+                infra: service.kind == Some(ServiceKind::Infrastructure),
+                shared: shared_instance.is_some(),
+                shared_instance,
+            }
         })
         .collect()
 }
@@ -2323,21 +2576,20 @@ fn arm_notice(pending: &Pending, desk: &Desk) -> String {
                 .unwrap_or_else(|| format!("{id} is externally owned"));
             format!("{holder} — press again to kill it and start {id}")
         }
-        Pending::RemoveShared(id) => {
-            let attached = desk
-                .instances
-                .iter()
-                .find(|instance| &instance.id == id)
-                .map(|instance| instance.attachments)
-                .unwrap_or(0);
-            if attached > 0 {
-                format!(
-                    "press again to remove {id} and delete data for {attached} attached project(s)"
-                )
-            } else {
+        Pending::RemoveShared {
+            id,
+            affected,
+            unchecked,
+        } => {
+            if *unchecked {
+                unchecked_shared_notice("remove", id)
+            } else if affected.is_empty() {
                 format!("press again to remove {id}")
+            } else {
+                instance_shared_notice("remove", id, affected)
             }
         }
+        Pending::SharedImpact { notice, .. } => notice.clone(),
     }
 }
 
@@ -2435,7 +2687,7 @@ const HELP: &[&str] = &[
     "              c copies a visible URL, or the log · l reloads · editing hearth.yaml reloads too",
     "              x still stops while a start is running · the first row is the daemon log",
     "Shared       S opens it · [ ] change version · enter installs, or starts and stops an instance",
-    "              x stops · r restarts · X removes (twice, and deletes attached project data)",
+    "              the word shared is blue · x stops · r restarts · X removes · another workspace is named first",
     "Log          page up and page down · u releases page · hearth update · esc cancels · q quits",
     "Mouse        clicks and the wheel act on rows · drag a URL to copy it · m frees the mouse",
     "A folder stays untrusted until the second enter, and that does not spawn a daemon before then.",
@@ -2497,6 +2749,8 @@ mod tests {
             disabled,
             finite,
             infra: id == "postgres",
+            shared: false,
+            shared_instance: None,
         }
     }
 
@@ -2509,6 +2763,8 @@ mod tests {
             disabled: false,
             finite,
             infra: false,
+            shared: false,
+            shared_instance: None,
             error: None,
         }
     }
@@ -2695,6 +2951,8 @@ mod tests {
                     disabled: false,
                     finite: false,
                     infra: false,
+                    shared: false,
+                    shared_instance: None,
                     error: Some("x".repeat(80)),
                 }],
             }],
@@ -2742,8 +3000,17 @@ mod tests {
         assert!(joined.contains("starting"), "{joined}");
         assert!(joined.contains("sha256 mismatch"), "{joined}");
         assert_eq!(key_command(&desk, key('X')), Some(Command::RemoveShared));
-        assert!(!desk.arm(Pending::RemoveShared("redis@8.2.10".into())));
-        assert!(desk.header_notice().contains("2 attached"));
+        assert!(!desk.arm(Pending::RemoveShared {
+            id: "redis@8.2.10".into(),
+            affected: vec!["infra".into(), "viclass".into()],
+            unchecked: false,
+        }));
+        let notice = desk.header_notice();
+        assert!(
+            notice.contains("infra") && notice.contains("viclass"),
+            "{notice}"
+        );
+        assert!(notice.contains("Press again"), "{notice}");
     }
 
     #[test]
@@ -2841,6 +3108,8 @@ mod tests {
             disabled: false,
             finite: false,
             infra: false,
+            shared: false,
+            shared_instance: None,
             error: Some("timed out".into()),
         };
         let text = line_text(&service_line(&line, true));
@@ -2899,6 +3168,237 @@ mod tests {
             .find(|span| span.content.contains("ready"))
             .unwrap();
         assert_eq!(state.style.fg, Some(Color::Green));
+        assert_eq!(state.style.bg, None);
+    }
+
+    #[test]
+    fn a_shared_catalog_row_remembers_its_instance() {
+        use hearth_core::catalog::{ServiceCommand, ServiceId, ServiceOwnership, ServiceProfiles};
+        let service = ServiceDefinition {
+            id: ServiceId::from("postgres"),
+            label: Some("postgres@16.4 (shared)".into()),
+            kind: Some(ServiceKind::Infrastructure),
+            ownership: Some(ServiceOwnership::External),
+            disabled: false,
+            profiles: ServiceProfiles {
+                run: ServiceRunProfile::Verified {
+                    command: ServiceCommand {
+                        command: CommandSpec::Argv {
+                            argv: vec![
+                                "hearth".into(),
+                                "shared".into(),
+                                "attach".into(),
+                                "postgres@16.4".into(),
+                            ],
+                        },
+                        cwd: ".".into(),
+                        environment: None,
+                        container_name: None,
+                        docker_stop_command: None,
+                    },
+                    readiness_timeout_ms: None,
+                    readiness: ReadinessSpec::Process,
+                    preparation: None,
+                    preparation_command: None,
+                },
+                build: None,
+            },
+            ports: None,
+            urls: None,
+            artifact: None,
+        };
+        assert_eq!(
+            shared_instance_of(&service).as_deref(),
+            Some("postgres@16.4")
+        );
+        let metas = metas_from_catalog(&ServiceCatalog {
+            services: vec![service],
+            groups: HashMap::new(),
+            group_tree: Vec::new(),
+            compose_file: None,
+            runtime_directory: None,
+            start_failure_policy: Default::default(),
+            private_file_guard: None,
+        });
+        assert!(metas[0].shared);
+        assert_eq!(metas[0].shared_instance.as_deref(), Some("postgres@16.4"));
+    }
+
+    #[test]
+    fn the_word_shared_is_blue_and_the_state_keeps_its_colour() {
+        let mut shared = row("postgres", ActualServiceState::Ready, false);
+        shared.shared = true;
+        shared.label = "postgres@16.4 (shared)".into();
+        shared.shared_instance = Some("postgres@16.4".into());
+        let line = service_line(&shared, false);
+        let state = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("ready"))
+            .unwrap();
+        assert_eq!(state.style.fg, Some(Color::Green));
+        assert_eq!(state.style.bg, None);
+        let word = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "shared")
+            .unwrap();
+        assert_eq!(word.style.fg, Some(Color::Blue));
+        assert_eq!(word.style.bg, None);
+        assert!(word.style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            line_text(&line).contains("(shared)"),
+            "{}",
+            line_text(&line)
+        );
+
+        let mut stopped = row("postgres", ActualServiceState::Stopped, false);
+        stopped.shared = true;
+        stopped.label = "postgres@16.4 (shared)".into();
+        let stopped_line = service_line(&stopped, false);
+        let state = stopped_line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("stopped"))
+            .unwrap();
+        assert_eq!(state.style.fg, Some(Color::DarkGray));
+        assert_eq!(state.style.bg, None);
+
+        let mut failed = row("postgres", ActualServiceState::Failed, false);
+        failed.shared = true;
+        failed.label = "postgres@16.4 (shared)".into();
+        let failed_line = service_line(&failed, false);
+        let state = failed_line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("failed"))
+            .unwrap();
+        assert_eq!(state.style.fg, Some(Color::Red));
+        assert_eq!(state.style.bg, None);
+        assert!(failed_line.spans.iter().any(|span| {
+            span.content.as_ref() == "shared"
+                && span.style.fg == Some(Color::Blue)
+                && span.style.bg.is_none()
+        }));
+
+        let mut bare = row("postgres", ActualServiceState::Ready, false);
+        bare.shared = true;
+        let bare_line = service_line(&bare, false);
+        assert!(bare_line.spans.iter().any(|span| {
+            span.content.contains("shared") && span.style.fg == Some(Color::Blue)
+        }));
+        let state = bare_line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("ready"))
+            .unwrap();
+        assert_eq!(state.style.bg, None);
+
+        let mut ordinary = row("api", ActualServiceState::Ready, false);
+        ordinary.label = "api (shared)".into();
+        let ordinary_line = service_line(&ordinary, false);
+        assert!(ordinary_line.spans.iter().all(|span| {
+            !(span.content.as_ref() == "shared" && span.style.fg == Some(Color::Blue))
+        }));
+
+        let instance = InstanceLine {
+            id: "redis@8.2.10".into(),
+            install_state: "installed".into(),
+            actual_state: "running".into(),
+            port: 1,
+            attachments: 0,
+            install_error: None,
+        };
+        let painted = instance_line(&instance, false, "", "");
+        let state = painted
+            .spans
+            .iter()
+            .find(|span| span.content.contains("running"))
+            .unwrap();
+        assert_eq!(state.style.fg, Some(Color::Cyan));
+        assert_eq!(state.style.bg, None);
+    }
+
+    #[test]
+    fn another_workspace_is_named_before_a_shared_action() {
+        let known = vec![
+            KnownRoot {
+                root: "/work/viclass".into(),
+                name: "viclass".into(),
+                path: "~/work/viclass".into(),
+            },
+            KnownRoot {
+                root: "/work/infra".into(),
+                name: "infra".into(),
+                path: "~/work/infra".into(),
+            },
+            KnownRoot {
+                root: "/work/shop".into(),
+                name: "shop".into(),
+                path: "~/work/shop".into(),
+            },
+        ];
+        let roots = vec![
+            "/work/viclass".into(),
+            "/work/infra".into(),
+            "/work/shop".into(),
+        ];
+        let report = classify_attachments(&roots, Some("/work/viclass"), &known);
+        assert_eq!(report.others, vec!["infra".to_string(), "shop".to_string()]);
+        assert_eq!(
+            report.all,
+            vec![
+                "infra".to_string(),
+                "shop".to_string(),
+                "viclass".to_string()
+            ]
+        );
+        let only_here =
+            classify_attachments(&["/work/viclass".into()], Some("/work/viclass"), &known);
+        assert!(only_here.others.is_empty());
+
+        let down = instance_shared_notice("stop", "redis@8.2.10", &report.all);
+        assert!(
+            down.contains("viclass") && down.contains("infra") && down.contains("shop"),
+            "{down}"
+        );
+        assert!(down.contains("takes the shared service down"), "{down}");
+
+        let detach = project_shared_notice(
+            "stop",
+            "viclass",
+            &[SharedTouch {
+                instance: "postgres@16.4".into(),
+                others: report.others.clone(),
+            }],
+            &[],
+        );
+        assert!(detach.contains("postgres@16.4"), "{detach}");
+        assert!(detach.contains("infra and shop"), "{detach}");
+        assert!(detach.contains("only detaches viclass"), "{detach}");
+        assert!(detach.contains("keep it"), "{detach}");
+
+        let twins = vec![
+            KnownRoot {
+                root: "/a/web".into(),
+                name: "web".into(),
+                path: "~/a/web".into(),
+            },
+            KnownRoot {
+                root: "/b/web".into(),
+                name: "web".into(),
+                path: "~/b/web".into(),
+            },
+        ];
+        let named = classify_attachments(&["/a/web".into(), "/b/web".into()], None, &twins);
+        assert!(
+            named.all.iter().any(|label| label.contains("~/a/web")),
+            "{named:?}"
+        );
+        assert!(
+            named.all.iter().any(|label| label.contains("~/b/web")),
+            "{named:?}"
+        );
     }
 
     #[test]

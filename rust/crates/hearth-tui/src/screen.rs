@@ -52,16 +52,41 @@ pub struct ServiceScreen {
 
 impl ServiceScreen {
     pub fn new(terminal: Viewport) -> Self {
-        Self { terminal, state: ScreenState { log: "Loading…".to_string(), ..Default::default() }, service_offset: 0, revision: 0, cache_key: String::new(), cache: Vec::new() }
+        Self {
+            terminal,
+            state: ScreenState {
+                log: "Loading…".to_string(),
+                ..Default::default()
+            },
+            service_offset: 0,
+            revision: 0,
+            cache_key: String::new(),
+            cache: Vec::new(),
+        }
     }
 
     pub fn update(&mut self, patch: ScreenUpdate) {
-        let selection_changed = patch.selected_name.as_deref().is_some_and(|n| n != self.state.selected_name);
-        let unchanged = patch.services.as_ref().is_none_or(|v| same_services(&self.state.services, v))
-            && patch.selected_name.as_ref().is_none_or(|v| v == &self.state.selected_name)
-            && patch.log_service.as_ref().is_none_or(|v| v == &self.state.log_service)
+        let selection_changed = patch
+            .selected_name
+            .as_deref()
+            .is_some_and(|n| n != self.state.selected_name);
+        let unchanged = patch
+            .services
+            .as_ref()
+            .is_none_or(|v| same_services(&self.state.services, v))
+            && patch
+                .selected_name
+                .as_ref()
+                .is_none_or(|v| v == &self.state.selected_name)
+            && patch
+                .log_service
+                .as_ref()
+                .is_none_or(|v| v == &self.state.log_service)
             && patch.log.as_ref().is_none_or(|v| v == &self.state.log)
-            && patch.notice.as_ref().is_none_or(|v| v == &self.state.notice)
+            && patch
+                .notice
+                .as_ref()
+                .is_none_or(|v| v == &self.state.notice)
             && patch.urls.as_ref().is_none_or(|v| v == &self.state.urls);
         if unchanged {
             return;
@@ -92,7 +117,12 @@ impl ServiceScreen {
     }
 
     /// Applies wheel movement inside service rows and returns the nearest visible service.
-    pub fn handle_wheel(&mut self, row: usize, delta: i64, viewport_rows: Option<usize>) -> Option<String> {
+    pub fn handle_wheel(
+        &mut self,
+        row: usize,
+        delta: i64,
+        viewport_rows: Option<usize>,
+    ) -> Option<String> {
         let viewport_rows = viewport_rows.unwrap_or(self.terminal.rows);
         let service_height = self.service_height(viewport_rows);
         let first_service_row = HEADER_HEIGHT + 1;
@@ -105,14 +135,29 @@ impl ServiceScreen {
             self.service_offset = offset;
             self.revision += 1;
         }
-        let selected_index = self.state.services.iter().position(|s| s.name == self.state.selected_name);
+        let selected_index = self
+            .state
+            .services
+            .iter()
+            .position(|s| s.name == self.state.selected_name);
         let nearest_index = match selected_index {
             Some(index) if index < self.service_offset => self.service_offset,
-            Some(index) if index >= self.service_offset + service_height => self.service_offset + service_height - 1,
+            Some(index) if index >= self.service_offset + service_height => {
+                self.service_offset + service_height - 1
+            }
             Some(index) => index,
-            None => return self.state.services.get(self.service_offset).map(|s| s.name.clone()),
+            None => {
+                return self
+                    .state
+                    .services
+                    .get(self.service_offset)
+                    .map(|s| s.name.clone())
+            }
         };
-        self.state.services.get(nearest_index).map(|s| s.name.clone())
+        self.state
+            .services
+            .get(nearest_index)
+            .map(|s| s.name.clone())
     }
 
     /// Returns the service rendered at a left-click row, if any.
@@ -127,7 +172,10 @@ impl ServiceScreen {
             return None;
         }
         let start = self.clamp_service_offset(service_height);
-        self.state.services.get(start + service_row).map(|s| s.name.clone())
+        self.state
+            .services
+            .get(start + service_row)
+            .map(|s| s.name.clone())
     }
 
     pub fn render(&mut self, width: usize, viewport_rows: Option<usize>) -> &[String] {
@@ -141,26 +189,57 @@ impl ServiceScreen {
         let body_height = rows.saturating_sub(HEADER_HEIGHT);
         let service_height = self.service_height(rows);
         let url_rows = self.state.urls.len().min(MAX_URL_ROWS);
-        let log_height = body_height.saturating_sub(service_height + url_rows + if service_height > 0 { 2 } else { 1 });
+        let log_height = body_height
+            .saturating_sub(service_height + url_rows + if service_height > 0 { 2 } else { 1 });
         let start = self.clamp_service_offset(service_height);
-        let services: Vec<&Service> = self.state.services.iter().skip(start).take(service_height).collect();
+        let services: Vec<&Service> = self
+            .state
+            .services
+            .iter()
+            .skip(start)
+            .take(service_height)
+            .collect();
         let has_service_scrollbar = self.state.services.len() > service_height;
         let service_width = width.saturating_sub(if has_service_scrollbar { 1 } else { 0 });
         let logs = split_lines(&self.state.log, log_height);
 
-        let mut lines: Vec<String> = vec![fit(HEADER_LINE_1, width), fit(HEADER_LINE_2, width), fit_notice(&self.state.notice, width)];
+        let mut lines: Vec<String> = vec![
+            fit(HEADER_LINE_1, width),
+            fit(HEADER_LINE_2, width),
+            fit_notice(&self.state.notice, width),
+        ];
         lines.truncate(rows);
 
         if service_height > 0 {
             lines.push(fit("SERVICES", width));
             for index in 0..service_height {
                 let service = services.get(index).copied();
-                let kind = if service.and_then(|s| s.kind) == Some(hearth_core::catalog::ServiceKind::Infrastructure) { " infra" } else { "" };
+                let kind = if service.and_then(|s| s.kind)
+                    == Some(hearth_core::catalog::ServiceKind::Infrastructure)
+                {
+                    " infra"
+                } else {
+                    ""
+                };
                 let content = match service {
-                    Some(service) => format!("{} {} {}{}", if service.name == self.state.selected_name { ">" } else { " " }, status_label(service.state), service.name, kind),
+                    Some(service) => format!(
+                        "{} {} {}{}",
+                        if service.name == self.state.selected_name {
+                            ">"
+                        } else {
+                            " "
+                        },
+                        status_label(service.state),
+                        service.name,
+                        kind
+                    ),
                     None => String::new(),
                 };
-                let scrollbar = if has_service_scrollbar { scrollbar_cell(index, start, service_height, self.state.services.len()) } else { "" };
+                let scrollbar = if has_service_scrollbar {
+                    scrollbar_cell(index, start, service_height, self.state.services.len())
+                } else {
+                    ""
+                };
                 lines.push(format!("{}{}", fit(&content, service_width), scrollbar));
             }
         }
@@ -188,7 +267,10 @@ impl ServiceScreen {
         if body_height < 3 {
             0
         } else {
-            self.state.services.len().min(((body_height - 2) / 3).max(1))
+            self.state
+                .services
+                .len()
+                .min(((body_height - 2) / 3).max(1))
         }
     }
 
@@ -197,7 +279,9 @@ impl ServiceScreen {
     }
 
     fn clamp_service_offset(&mut self, service_height: usize) -> usize {
-        self.service_offset = self.service_offset.min(self.max_service_offset(service_height));
+        self.service_offset = self
+            .service_offset
+            .min(self.max_service_offset(service_height));
         self.service_offset
     }
 
@@ -206,7 +290,14 @@ impl ServiceScreen {
         if service_height == 0 {
             return;
         }
-        let Some(selected_index) = self.state.services.iter().position(|s| s.name == self.state.selected_name) else { return };
+        let Some(selected_index) = self
+            .state
+            .services
+            .iter()
+            .position(|s| s.name == self.state.selected_name)
+        else {
+            return;
+        };
         if selected_index < self.service_offset {
             self.service_offset = selected_index;
         } else if selected_index >= self.service_offset + service_height {
@@ -256,21 +347,35 @@ fn status_colour(state: ActualServiceState) -> u8 {
     match state {
         ActualServiceState::Ready | ActualServiceState::Succeeded => 32,
         ActualServiceState::Running => 36,
-        ActualServiceState::Preparing | ActualServiceState::QueuedStart | ActualServiceState::Starting | ActualServiceState::Stopping | ActualServiceState::RunningUnready => 33,
+        ActualServiceState::Preparing
+        | ActualServiceState::QueuedStart
+        | ActualServiceState::Starting
+        | ActualServiceState::Stopping
+        | ActualServiceState::RunningUnready => 33,
         ActualServiceState::Stopped => 90,
-        ActualServiceState::Failed | ActualServiceState::Orphaned | ActualServiceState::ExternallyOwned => 31,
+        ActualServiceState::Failed
+        | ActualServiceState::Orphaned
+        | ActualServiceState::ExternallyOwned => 31,
     }
 }
 
 fn status_label(state: ActualServiceState) -> String {
-    format!("\x1b[{}m{:<9}\x1b[0m", status_colour(state), display_state(state))
+    format!(
+        "\x1b[{}m{:<9}\x1b[0m",
+        status_colour(state),
+        display_state(state)
+    )
 }
 
 fn scrollbar_cell(index: usize, start: usize, height: usize, total: usize) -> &'static str {
     let thumb_height = (((height * height) as f64 / total as f64).ceil() as usize).max(1);
     let max_thumb_start = height.saturating_sub(thumb_height);
     let max_start = total.saturating_sub(height);
-    let thumb_start = if max_start == 0 { 0 } else { ((start * max_thumb_start) as f64 / max_start as f64).round() as usize };
+    let thumb_start = if max_start == 0 {
+        0
+    } else {
+        ((start * max_thumb_start) as f64 / max_start as f64).round() as usize
+    };
     if index >= thumb_start && index < thumb_start + thumb_height {
         "█"
     } else {
@@ -288,7 +393,11 @@ fn split_lines(text: &str, limit: usize) -> Vec<&str> {
 }
 
 fn same_services(left: &[Service], right: &[Service]) -> bool {
-    left.len() == right.len() && left.iter().zip(right.iter()).all(|(a, b)| a.name == b.name && a.kind == b.kind && a.state == b.state)
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a.name == b.name && a.kind == b.kind && a.state == b.state)
 }
 
 #[cfg(test)]
@@ -298,7 +407,10 @@ mod tests {
     use crate::text_utils::visible_width;
 
     fn terminal() -> Viewport {
-        Viewport { columns: 80, rows: 8 }
+        Viewport {
+            columns: 80,
+            rows: 8,
+        }
     }
 
     fn strip_ansi(line: &str) -> String {
@@ -308,7 +420,9 @@ mod tests {
         while i < bytes.len() {
             if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
                 let mut j = i + 2;
-                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b':') {
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b':')
+                {
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b'm' {
@@ -325,7 +439,15 @@ mod tests {
 
     fn service(name: &str, state: &str) -> Service {
         let state = serde_json::from_value(serde_json::json!(state)).unwrap();
-        Service { name: name.to_string(), kind: None, state, generation: None, current_operation_id: None, error: None, readiness_detail: None }
+        Service {
+            name: name.to_string(),
+            kind: None,
+            state,
+            generation: None,
+            current_operation_id: None,
+            error: None,
+            readiness_detail: None,
+        }
     }
 
     #[test]
@@ -339,22 +461,41 @@ mod tests {
             ..Default::default()
         });
         assert!(screen.render(2, None).iter().all(|l| visible_width(l) <= 2));
-        assert!(screen.render(16, None).iter().all(|l| visible_width(l) <= 16));
+        assert!(screen
+            .render(16, None)
+            .iter()
+            .all(|l| visible_width(l) <= 16));
     }
 
     #[test]
     fn shows_the_focused_service_stop_binding() {
-        let mut screen = ServiceScreen::new(Viewport { columns: 160, rows: 8 });
-        assert!(screen.render(160, None).iter().any(|l| l.contains("x stop focused")));
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 160,
+            rows: 8,
+        });
+        assert!(screen
+            .render(160, None)
+            .iter()
+            .any(|l| l.contains("x stop focused")));
     }
 
     #[test]
     fn labels_infrastructure_services_in_the_normal_service_list() {
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 8 });
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 8,
+        });
         let mut mongo = service("mongo", "ready");
         mongo.kind = Some(hearth_core::catalog::ServiceKind::Infrastructure);
-        screen.update(ScreenUpdate { services: Some(vec![mongo]), selected_name: Some("mongo".to_string()), ..Default::default() });
-        assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("mongo infra")));
+        screen.update(ScreenUpdate {
+            services: Some(vec![mongo]),
+            selected_name: Some("mongo".to_string()),
+            ..Default::default()
+        });
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| strip_ansi(l).contains("mongo infra")));
     }
 
     #[test]
@@ -368,8 +509,14 @@ mod tests {
             ..Default::default()
         });
         let lines = screen.render(80, None).to_vec();
-        let log_index = lines.iter().position(|l| strip_ansi(l).contains("LOG — frontend")).unwrap();
-        let service_index = lines.iter().position(|l| strip_ansi(l).contains("> stopped   frontend")).unwrap();
+        let log_index = lines
+            .iter()
+            .position(|l| strip_ansi(l).contains("LOG — frontend"))
+            .unwrap();
+        let service_index = lines
+            .iter()
+            .position(|l| strip_ansi(l).contains("> stopped   frontend"))
+            .unwrap();
         assert!(log_index > service_index);
         assert!(lines.iter().any(|l| strip_ansi(l).contains("No log yet.")));
     }
@@ -407,30 +554,51 @@ mod tests {
         let first = screen.render(80, None).to_vec();
         let second = screen.render(80, None).to_vec();
         assert_eq!(first, second);
-        screen.update(ScreenUpdate { notice: Some("updated".to_string()), ..Default::default() });
+        screen.update(ScreenUpdate {
+            notice: Some("updated".to_string()),
+            ..Default::default()
+        });
         assert_ne!(screen.render(80, None).to_vec(), first);
     }
 
     #[test]
     fn does_not_invalidate_the_frame_for_equivalent_status_data() {
         let mut screen = ServiceScreen::new(terminal());
-        screen.update(ScreenUpdate { services: Some(vec![service("metadata", "ready")]), ..Default::default() });
+        screen.update(ScreenUpdate {
+            services: Some(vec![service("metadata", "ready")]),
+            ..Default::default()
+        });
         let first = screen.render(80, None).to_vec();
-        screen.update(ScreenUpdate { services: Some(vec![service("metadata", "ready")]), ..Default::default() });
+        screen.update(ScreenUpdate {
+            services: Some(vec![service("metadata", "ready")]),
+            ..Default::default()
+        });
         assert_eq!(screen.render(80, None).to_vec(), first);
     }
 
     #[test]
     fn never_returns_more_rows_than_the_terminal_owns() {
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 2 });
-        screen.update(ScreenUpdate { services: Some(vec![service("metadata", "ready")]), ..Default::default() });
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 2,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(vec![service("metadata", "ready")]),
+            ..Default::default()
+        });
         assert_eq!(screen.render(80, None).len(), 2);
     }
 
     #[test]
     fn fills_every_row_when_the_caller_passes_the_frame_height() {
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 8 });
-        screen.update(ScreenUpdate { services: Some(vec![service("metadata", "ready")]), ..Default::default() });
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 8,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(vec![service("metadata", "ready")]),
+            ..Default::default()
+        });
         assert_eq!(screen.render(80, Some(20)).len(), 20);
         assert_eq!(screen.render(80, Some(3)).len(), 3);
     }
@@ -465,7 +633,10 @@ mod tests {
             log: Some("\x1b[90m1:53 PM\x1b[0m ready".to_string()),
             ..Default::default()
         });
-        assert!(screen.render(80, None).iter().any(|l| l.contains("\x1b[90m1:53 PM\x1b[0m")));
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| l.contains("\x1b[90m1:53 PM\x1b[0m")));
     }
 
     #[test]
@@ -485,10 +656,18 @@ mod tests {
 
     #[test]
     fn pads_every_row_to_the_full_width_at_any_geometry() {
-        let services: Vec<Service> = (0..30).map(|i| service(&format!("svc-{i}"), "ready")).collect();
+        let services: Vec<Service> = (0..30)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
         for (columns, rows) in [(3, 4), (12, 5), (40, 6), (200, 40)] {
             let mut screen = ServiceScreen::new(Viewport { columns, rows });
-            screen.update(ScreenUpdate { services: Some(services.clone()), selected_name: Some("svc-29".to_string()), log_service: Some("svc-29".to_string()), log: Some("x".repeat(500)), ..Default::default() });
+            screen.update(ScreenUpdate {
+                services: Some(services.clone()),
+                selected_name: Some("svc-29".to_string()),
+                log_service: Some("svc-29".to_string()),
+                log: Some("x".repeat(500)),
+                ..Default::default()
+            });
             let lines = screen.render(columns, None).to_vec();
             assert_eq!(lines.len(), rows);
             for line in &lines {
@@ -499,11 +678,22 @@ mod tests {
 
     #[test]
     fn scrolls_the_list_to_keep_the_selected_service_visible_and_renders_its_position() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("svc-19".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services),
+            selected_name: Some("svc-19".to_string()),
+            ..Default::default()
+        });
         let lines = screen.render(80, None).to_vec();
-        assert!(lines.iter().any(|l| strip_ansi(l).contains("> ready     svc-19")));
+        assert!(lines
+            .iter()
+            .any(|l| strip_ansi(l).contains("> ready     svc-19")));
         assert!(lines.iter().any(|l| l.ends_with('█')));
         assert!(lines.iter().any(|l| l.ends_with('░')));
     }
@@ -511,65 +701,138 @@ mod tests {
     /// After the terminal shrinks, keyboard selection must scroll against the new height.
     #[test]
     fn keeps_the_selection_visible_after_a_resize() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 80 });
-        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("svc-0".to_string()), ..Default::default() });
-        screen.resize(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { selected_name: Some("svc-19".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 80,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services),
+            selected_name: Some("svc-0".to_string()),
+            ..Default::default()
+        });
+        screen.resize(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            selected_name: Some("svc-19".to_string()),
+            ..Default::default()
+        });
         let lines = screen.render(80, Some(20)).to_vec();
-        assert!(lines.iter().any(|l| strip_ansi(l).contains("> ready     svc-19")));
+        assert!(lines
+            .iter()
+            .any(|l| strip_ansi(l).contains("> ready     svc-19")));
     }
 
     #[test]
     fn colours_service_states_without_colouring_their_names() {
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { services: Some(vec![service("ready-service", "ready"), service("queued-service", "queued-start"), service("failed-service", "failed")]), ..Default::default() });
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(vec![
+                service("ready-service", "ready"),
+                service("queued-service", "queued-start"),
+                service("failed-service", "failed"),
+            ]),
+            ..Default::default()
+        });
         let lines = screen.render(80, None).to_vec();
         assert!(lines.iter().any(|l| l.contains("\x1b[32mready    ")));
         assert!(lines.iter().any(|l| l.contains("\x1b[31mfailed   ")));
         assert!(lines.iter().any(|l| l.contains("\x1b[33mqueued-start")));
-        assert!(lines.iter().any(|l| strip_ansi(l).contains("queued-service")));
-        assert!(lines.iter().any(|l| strip_ansi(l).contains("failed-service")));
+        assert!(lines
+            .iter()
+            .any(|l| strip_ansi(l).contains("queued-service")));
+        assert!(lines
+            .iter()
+            .any(|l| strip_ansi(l).contains("failed-service")));
     }
 
     #[test]
     fn shows_the_first_services_when_the_selection_is_unknown() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 8 });
-        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("missing".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 8,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services),
+            selected_name: Some("missing".to_string()),
+            ..Default::default()
+        });
         assert!(screen.render(80, None).iter().any(|l| l.contains("svc-0")));
     }
 
     #[test]
     fn keeps_wheel_focus_while_it_remains_visible_then_selects_the_closest_visible_boundary() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { services: Some(services.clone()), selected_name: Some("svc-3".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services.clone()),
+            selected_name: Some("svc-3".to_string()),
+            ..Default::default()
+        });
 
         let mut selected = screen.handle_wheel(4, 1, None);
         assert_eq!(selected.as_deref(), Some("svc-3"));
-        screen.update(ScreenUpdate { selected_name: selected.clone(), ..Default::default() });
+        screen.update(ScreenUpdate {
+            selected_name: selected.clone(),
+            ..Default::default()
+        });
 
         for _ in 0..3 {
             selected = screen.handle_wheel(4, 1, None);
-            screen.update(ScreenUpdate { selected_name: selected.clone(), ..Default::default() });
+            screen.update(ScreenUpdate {
+                selected_name: selected.clone(),
+                ..Default::default()
+            });
         }
         assert_eq!(selected.as_deref(), Some("svc-4"));
-        assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("> ready     svc-4")));
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| strip_ansi(l).contains("> ready     svc-4")));
 
         for _ in 0..services.len() {
             selected = screen.handle_wheel(4, 1, None);
-            screen.update(ScreenUpdate { selected_name: selected.clone(), ..Default::default() });
+            screen.update(ScreenUpdate {
+                selected_name: selected.clone(),
+                ..Default::default()
+            });
         }
         assert_eq!(selected.as_deref(), Some("svc-15"));
-        assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("> ready     svc-15")));
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| strip_ansi(l).contains("> ready     svc-15")));
     }
 
     #[test]
     fn returns_the_service_under_a_click_row() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("svc-0".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services),
+            selected_name: Some("svc-0".to_string()),
+            ..Default::default()
+        });
 
         assert_eq!(screen.service_at(4, None).as_deref(), Some("svc-0"));
         assert_eq!(screen.service_at(5, None).as_deref(), Some("svc-1"));
@@ -580,31 +843,65 @@ mod tests {
 
     #[test]
     fn keeps_keyboard_selection_visible_after_manual_service_scrolling() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("svc-0".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services),
+            selected_name: Some("svc-0".to_string()),
+            ..Default::default()
+        });
         for _ in 0..3 {
             screen.handle_wheel(4, 1, None);
         }
 
-        screen.update(ScreenUpdate { selected_name: Some("svc-1".to_string()), ..Default::default() });
-        assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("> ready     svc-1")));
+        screen.update(ScreenUpdate {
+            selected_name: Some("svc-1".to_string()),
+            ..Default::default()
+        });
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| strip_ansi(l).contains("> ready     svc-1")));
 
-        screen.update(ScreenUpdate { selected_name: Some("svc-19".to_string()), ..Default::default() });
-        assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("> ready     svc-19")));
+        screen.update(ScreenUpdate {
+            selected_name: Some("svc-19".to_string()),
+            ..Default::default()
+        });
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| strip_ansi(l).contains("> ready     svc-19")));
     }
 
     #[test]
     fn ignores_wheel_input_outside_rendered_service_rows() {
-        let services: Vec<Service> = (0..20).map(|i| service(&format!("svc-{i}"), "ready")).collect();
-        let mut screen = ServiceScreen::new(Viewport { columns: 80, rows: 20 });
-        screen.update(ScreenUpdate { services: Some(services), selected_name: Some("svc-0".to_string()), log: Some("log content".to_string()), ..Default::default() });
+        let services: Vec<Service> = (0..20)
+            .map(|i| service(&format!("svc-{i}"), "ready"))
+            .collect();
+        let mut screen = ServiceScreen::new(Viewport {
+            columns: 80,
+            rows: 20,
+        });
+        screen.update(ScreenUpdate {
+            services: Some(services),
+            selected_name: Some("svc-0".to_string()),
+            log: Some("log content".to_string()),
+            ..Default::default()
+        });
         let first = screen.render(80, None).to_vec();
 
         assert_eq!(screen.handle_wheel(3, 1, None), None);
         assert_eq!(screen.handle_wheel(9, 1, None), None);
         assert_eq!(screen.render(80, None).to_vec(), first);
-        assert!(screen.render(80, None).iter().any(|l| strip_ansi(l).contains("svc-0")));
+        assert!(screen
+            .render(80, None)
+            .iter()
+            .any(|l| strip_ansi(l).contains("svc-0")));
     }
 
     #[test]
@@ -618,9 +915,22 @@ mod tests {
             urls: Some(vec!["app  http://127.0.0.1:1166/".to_string()]),
             ..Default::default()
         });
-        let lines: Vec<String> = screen.render(80, Some(12)).iter().map(|l| strip_ansi(l)).collect();
-        let url = lines.iter().position(|l| l.contains("URL app  http://127.0.0.1:1166/")).expect("url row rendered");
-        let log = lines.iter().position(|l| l.starts_with("LOG")).expect("log header rendered");
-        assert!(url < log, "urls sit between the services and the log: {lines:?}");
+        let lines: Vec<String> = screen
+            .render(80, Some(12))
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect();
+        let url = lines
+            .iter()
+            .position(|l| l.contains("URL app  http://127.0.0.1:1166/"))
+            .expect("url row rendered");
+        let log = lines
+            .iter()
+            .position(|l| l.starts_with("LOG"))
+            .expect("log header rendered");
+        assert!(
+            url < log,
+            "urls sit between the services and the log: {lines:?}"
+        );
     }
 }

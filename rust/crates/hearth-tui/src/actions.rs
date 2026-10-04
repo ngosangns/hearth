@@ -42,9 +42,17 @@ pub fn keyboard_action(key: KeyEvent, selected: Option<&Service>) -> Option<TuiA
             }
             let starting = matches!(
                 selected.map(|s| s.state),
-                Some(ActualServiceState::Stopped | ActualServiceState::QueuedStart | ActualServiceState::Succeeded)
+                Some(
+                    ActualServiceState::Stopped
+                        | ActualServiceState::QueuedStart
+                        | ActualServiceState::Succeeded
+                )
             );
-            Some(if starting { TuiAction::Start } else { TuiAction::Stop })
+            Some(if starting {
+                TuiAction::Start
+            } else {
+                TuiAction::Stop
+            })
         }
         _ => None,
     }
@@ -61,34 +69,69 @@ mod tests {
 
     fn service(state: &str) -> Service {
         let state = serde_json::from_value(serde_json::json!(state)).unwrap();
-        Service { name: "metadata".to_string(), kind: None, state, generation: None, current_operation_id: None, error: None, readiness_detail: None }
+        Service {
+            name: "metadata".to_string(),
+            kind: None,
+            state,
+            generation: None,
+            current_operation_id: None,
+            error: None,
+            readiness_detail: None,
+        }
     }
 
     #[test]
     fn r_and_shift_r_rebuild_and_restart_only_the_focused_service() {
         let selected = service("ready");
-        assert_eq!(keyboard_action(key('r'), Some(&selected)), Some(TuiAction::Restart));
-        assert_eq!(keyboard_action(key('R'), Some(&selected)), Some(TuiAction::Restart));
+        assert_eq!(
+            keyboard_action(key('r'), Some(&selected)),
+            Some(TuiAction::Restart)
+        );
+        assert_eq!(
+            keyboard_action(key('R'), Some(&selected)),
+            Some(TuiAction::Restart)
+        );
     }
 
     #[test]
     fn enter_and_space_start_a_queued_service_rather_than_stopping_it() {
         let selected = service("queued-start");
-        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&selected)), Some(TuiAction::Start));
-        assert_eq!(keyboard_action(key(' '), Some(&selected)), Some(TuiAction::Start));
+        assert_eq!(
+            keyboard_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Some(&selected)
+            ),
+            Some(TuiAction::Start)
+        );
+        assert_eq!(
+            keyboard_action(key(' '), Some(&selected)),
+            Some(TuiAction::Start)
+        );
     }
 
     #[test]
     fn enter_starts_a_succeeded_command_again() {
         let selected = service("succeeded");
-        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&selected)), Some(TuiAction::Start));
-        assert_eq!(keyboard_action(key(' '), Some(&selected)), Some(TuiAction::Start));
+        assert_eq!(
+            keyboard_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Some(&selected)
+            ),
+            Some(TuiAction::Start)
+        );
+        assert_eq!(
+            keyboard_action(key(' '), Some(&selected)),
+            Some(TuiAction::Start)
+        );
     }
 
     #[test]
     fn x_stops_exactly_the_focused_service() {
         let selected = service("ready");
-        assert_eq!(keyboard_action(key('x'), Some(&selected)), Some(TuiAction::Stop));
+        assert_eq!(
+            keyboard_action(key('x'), Some(&selected)),
+            Some(TuiAction::Stop)
+        );
         assert_eq!(keyboard_action(key('x'), None), Some(TuiAction::Stop));
     }
 
@@ -97,15 +140,39 @@ mod tests {
     #[test]
     fn externally_owned_rows_map_their_actions_to_reclaim() {
         let selected = service("externally-owned");
-        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&selected)), Some(TuiAction::Reclaim));
-        assert_eq!(keyboard_action(key(' '), Some(&selected)), Some(TuiAction::Reclaim));
-        assert_eq!(keyboard_action(key('K'), Some(&selected)), Some(TuiAction::Reclaim));
+        assert_eq!(
+            keyboard_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Some(&selected)
+            ),
+            Some(TuiAction::Reclaim)
+        );
+        assert_eq!(
+            keyboard_action(key(' '), Some(&selected)),
+            Some(TuiAction::Reclaim)
+        );
+        assert_eq!(
+            keyboard_action(key('K'), Some(&selected)),
+            Some(TuiAction::Reclaim)
+        );
 
         // Any other state: no reclaim — `K` is unmapped and Enter still toggles start/stop.
         let ready = service("ready");
         assert_eq!(keyboard_action(key('K'), Some(&ready)), None);
-        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&ready)), Some(TuiAction::Stop));
+        assert_eq!(
+            keyboard_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Some(&ready)
+            ),
+            Some(TuiAction::Stop)
+        );
         let stopped = service("stopped");
-        assert_eq!(keyboard_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), Some(&stopped)), Some(TuiAction::Start));
+        assert_eq!(
+            keyboard_action(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Some(&stopped)
+            ),
+            Some(TuiAction::Start)
+        );
     }
 }

@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hearth_core::catalog::ServiceKind;
-use hearth_core::state::{ActualServiceState, Operation, ServiceLifecycleState, ServiceOperationKind};
+use hearth_core::state::{
+    ActualServiceState, Operation, ServiceLifecycleState, ServiceOperationKind,
+};
 
 /// Looks up a service's `kind` for display — pass the consumer's `ServiceCatalog` lookup, or a
 /// closure returning `None` for no kind badges.
@@ -51,7 +53,10 @@ pub fn display_state(state: ActualServiceState) -> &'static str {
     }
 }
 
-pub fn service_from_lifecycle(service: &ServiceLifecycleState, service_kind: &ServiceKindLookup) -> Service {
+pub fn service_from_lifecycle(
+    service: &ServiceLifecycleState,
+    service_kind: &ServiceKindLookup,
+) -> Service {
     Service {
         name: service.service_id.clone(),
         kind: service_kind(&service.service_id),
@@ -86,14 +91,24 @@ impl ServiceSelection {
     pub fn set_services(&mut self, services: Vec<Service>) {
         self.services = services;
         if !self.services.iter().any(|s| s.name == self.selected_name) {
-            self.selected_name = self.services.first().map(|s| s.name.clone()).unwrap_or_default();
+            self.selected_name = self
+                .services
+                .first()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
         }
     }
 
     /// Moves the selection by `delta` positions; a no-op (returns `false`) if the result would
     /// land outside the current service list.
     pub fn move_by(&mut self, delta: i64) -> bool {
-        let Some(index) = self.services.iter().position(|s| s.name == self.selected_name) else { return false };
+        let Some(index) = self
+            .services
+            .iter()
+            .position(|s| s.name == self.selected_name)
+        else {
+            return false;
+        };
         let next = index as i64 + delta;
         if next < 0 || next >= self.services.len() as i64 {
             return false;
@@ -150,7 +165,17 @@ pub struct TuiState {
 
 impl TuiState {
     pub fn new(service_kind: ServiceKindLookup) -> Self {
-        Self { selection: ServiceSelection::default(), log: "Loading…".to_string(), operation: None, notice: String::new(), logs: HashMap::new(), service_kind, connection: 0, request: 0, selection_generation: 0 }
+        Self {
+            selection: ServiceSelection::default(),
+            log: "Loading…".to_string(),
+            operation: None,
+            notice: String::new(),
+            logs: HashMap::new(),
+            service_kind,
+            connection: 0,
+            request: 0,
+            selection_generation: 0,
+        }
     }
 
     pub fn begin_connection(&mut self) -> TuiFence {
@@ -173,15 +198,25 @@ impl TuiState {
     }
 
     pub fn begin_action(&mut self, service: &str, action: ServiceOperationKind) -> ActionFence {
-        ActionFence { fence: self.begin_request(), service: service.to_string(), action }
+        ActionFence {
+            fence: self.begin_request(),
+            service: service.to_string(),
+            action,
+        }
     }
 
     fn fence(&self) -> TuiFence {
-        TuiFence { connection: self.connection, request: self.request, selection: self.selection_generation }
+        TuiFence {
+            connection: self.connection,
+            request: self.request,
+            selection: self.selection_generation,
+        }
     }
 
     pub fn current(&self, fence: TuiFence) -> bool {
-        self.connected(fence) && fence.request == self.request && fence.selection == self.selection_generation
+        self.connected(fence)
+            && fence.request == self.request
+            && fence.selection == self.selection_generation
     }
 
     pub fn connected(&self, fence: TuiFence) -> bool {
@@ -197,7 +232,12 @@ impl TuiState {
             return false;
         }
         let selected = self.selection.selected_name.clone();
-        self.selection.set_services(services.iter().map(|s| service_from_lifecycle(s, &self.service_kind)).collect());
+        self.selection.set_services(
+            services
+                .iter()
+                .map(|s| service_from_lifecycle(s, &self.service_kind))
+                .collect(),
+        );
         if selected != self.selection.selected_name {
             self.sync_selected_log();
         }
@@ -206,7 +246,10 @@ impl TuiState {
 
     pub fn log_cursor(&self, service: &str) -> LogCursor {
         match self.logs.get(service) {
-            Some(stream) => LogCursor { cursor: stream.cursor, generation: stream.generation },
+            Some(stream) => LogCursor {
+                cursor: stream.cursor,
+                generation: stream.generation,
+            },
             None => LogCursor::default(),
         }
     }
@@ -216,10 +259,24 @@ impl TuiState {
             return false;
         }
         let current = self.logs.get(service);
-        let replace = slice.reset || current.and_then(|c| c.generation) != Some(slice.generation) || current.map(|c| c.cursor.is_none()).unwrap_or(true);
-        let data = if replace { bounded_tail("", &slice.data, DEFAULT_LOG_TAIL_LIMIT) } else { bounded_tail(&current.unwrap().data, &slice.data, DEFAULT_LOG_TAIL_LIMIT) };
-        let stream = LogStream { data, cursor: Some(slice.next_cursor), generation: Some(slice.generation) };
-        self.log = if stream.data.is_empty() { "No log yet.".to_string() } else { stream.data.clone() };
+        let replace = slice.reset
+            || current.and_then(|c| c.generation) != Some(slice.generation)
+            || current.map(|c| c.cursor.is_none()).unwrap_or(true);
+        let data = if replace {
+            bounded_tail("", &slice.data, DEFAULT_LOG_TAIL_LIMIT)
+        } else {
+            bounded_tail(&current.unwrap().data, &slice.data, DEFAULT_LOG_TAIL_LIMIT)
+        };
+        let stream = LogStream {
+            data,
+            cursor: Some(slice.next_cursor),
+            generation: Some(slice.generation),
+        };
+        self.log = if stream.data.is_empty() {
+            "No log yet.".to_string()
+        } else {
+            stream.data.clone()
+        };
         self.logs.insert(service.to_string(), stream);
         true
     }
@@ -229,13 +286,26 @@ impl TuiState {
             return false;
         }
         let data = bounded_tail("", &slice.data, DEFAULT_LOG_TAIL_LIMIT);
-        self.log = if data.is_empty() { "No log yet.".to_string() } else { data.clone() };
-        self.logs.insert(service.to_string(), LogStream { data, cursor: Some(slice.next_cursor), generation: Some(slice.generation) });
+        self.log = if data.is_empty() {
+            "No log yet.".to_string()
+        } else {
+            data.clone()
+        };
+        self.logs.insert(
+            service.to_string(),
+            LogStream {
+                data,
+                cursor: Some(slice.next_cursor),
+                generation: Some(slice.generation),
+            },
+        );
         true
     }
 
     pub fn apply_operation(&mut self, fence: TuiFence, operation: Operation) -> bool {
-        if !self.current(fence) || operation.service_id.as_deref() != Some(self.selection.selected_name.as_str()) {
+        if !self.current(fence)
+            || operation.service_id.as_deref() != Some(self.selection.selected_name.as_str())
+        {
             return false;
         }
         self.operation = Some(operation);
@@ -243,14 +313,22 @@ impl TuiState {
     }
 
     pub fn apply_action(&mut self, fence: &ActionFence, operation: Operation) -> bool {
-        if !self.current_action(fence) || operation.service_id.as_deref() != Some(fence.service.as_str()) || operation.action != Some(fence.action) {
+        if !self.current_action(fence)
+            || operation.service_id.as_deref() != Some(fence.service.as_str())
+            || operation.action != Some(fence.action)
+        {
             return false;
         }
         self.operation = Some(operation);
         if fence.action == ServiceOperationKind::Start {
             self.clear_log(&fence.service);
         }
-        self.notice = format!("{} {}: {}", fence.action.as_wire_str(), fence.service, self.operation.as_ref().unwrap().id);
+        self.notice = format!(
+            "{} {}: {}",
+            fence.action.as_wire_str(),
+            fence.service,
+            self.operation.as_ref().unwrap().id
+        );
         true
     }
 
@@ -258,7 +336,11 @@ impl TuiState {
         if !self.current_action(fence) {
             return false;
         }
-        self.notice = format!("{} {} failed: {error}", fence.action.as_wire_str(), fence.service);
+        self.notice = format!(
+            "{} {} failed: {error}",
+            fence.action.as_wire_str(),
+            fence.service
+        );
         true
     }
 
@@ -268,14 +350,22 @@ impl TuiState {
     pub fn event_requires_services_snapshot(event_type: &str) -> bool {
         matches!(
             event_type,
-            "service.lifecycle" | "manager.catalog-reloaded" | "operation.accepted" | "operation.updated"
+            "service.lifecycle"
+                | "manager.catalog-reloaded"
+                | "operation.accepted"
+                | "operation.updated"
         )
     }
 
     /// Formerly patched lifecycle fields from the SSE payload. Authoritative service state now
     /// comes from `GET /v1/services`; this remains a connection/fence gate for callers that still
     /// route events through it (returns true when connected so they know to fetch a snapshot).
-    pub fn apply_event(&mut self, fence: TuiFence, event_type: &str, _data: &serde_json::Map<String, serde_json::Value>) -> bool {
+    pub fn apply_event(
+        &mut self,
+        fence: TuiFence,
+        event_type: &str,
+        _data: &serde_json::Map<String, serde_json::Value>,
+    ) -> bool {
         if !self.connected(fence) {
             return false;
         }
@@ -284,12 +374,26 @@ impl TuiState {
     }
 
     pub fn detail(&self) -> String {
-        let Some(service) = self.selection.selected() else { return "No services.".to_string() };
-        let mut parts = vec![format!("state={}", display_state(service.state)), format!("generation={}", service.generation.unwrap_or(0))];
+        let Some(service) = self.selection.selected() else {
+            return "No services.".to_string();
+        };
+        let mut parts = vec![
+            format!("state={}", display_state(service.state)),
+            format!("generation={}", service.generation.unwrap_or(0)),
+        ];
         if let Some(operation) = &self.operation {
             if operation.service_id.as_deref() == Some(service.name.as_str()) {
-                parts.push(format!("operation={} {}", operation.id, operation.status.as_wire_str()));
-                parts.extend(operation.trace.iter().map(|entry| format!("{} {}", entry.at, entry.message)));
+                parts.push(format!(
+                    "operation={} {}",
+                    operation.id,
+                    operation.status.as_wire_str()
+                ));
+                parts.extend(
+                    operation
+                        .trace
+                        .iter()
+                        .map(|entry| format!("{} {}", entry.at, entry.message)),
+                );
                 if let Some(error) = &operation.error {
                     parts.push(format!("operation error={}", error.message));
                 }
@@ -300,15 +404,30 @@ impl TuiState {
 
     fn clear_log(&mut self, service: &str) {
         let previous = self.logs.get(service);
-        let (cursor, generation) = (previous.and_then(|p| p.cursor), previous.and_then(|p| p.generation));
-        self.logs.insert(service.to_string(), LogStream { data: String::new(), cursor, generation });
+        let (cursor, generation) = (
+            previous.and_then(|p| p.cursor),
+            previous.and_then(|p| p.generation),
+        );
+        self.logs.insert(
+            service.to_string(),
+            LogStream {
+                data: String::new(),
+                cursor,
+                generation,
+            },
+        );
         if service == self.selection.selected_name {
             self.log = "No log yet.".to_string();
         }
     }
 
     fn sync_selected_log(&mut self) {
-        self.log = self.logs.get(&self.selection.selected_name).map(|s| s.data.clone()).filter(|d| !d.is_empty()).unwrap_or_else(|| "Loading…".to_string());
+        self.log = self
+            .logs
+            .get(&self.selection.selected_name)
+            .map(|s| s.data.clone())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "Loading…".to_string());
     }
 }
 
@@ -382,7 +501,16 @@ mod tests {
         let mut state = TuiState::new(no_service_kind());
         let fence = state.begin_connection();
         state.apply_snapshot(fence, &[service()]);
-        state.apply_log(fence, "metadata", &LogSlice { data: "old output\n".to_string(), generation: 1, next_cursor: 11, reset: false });
+        state.apply_log(
+            fence,
+            "metadata",
+            &LogSlice {
+                data: "old output\n".to_string(),
+                generation: 1,
+                next_cursor: 11,
+                reset: false,
+            },
+        );
         let action = state.begin_action("metadata", ServiceOperationKind::Start);
         assert!(state.apply_action(&action, operation()));
         assert_eq!(state.log, "No log yet.");
@@ -399,20 +527,30 @@ mod tests {
         s.actual_state = ActualServiceState::RunningUnready;
         state.apply_snapshot(fence, &[s]);
         assert!(state.detail().contains("state=degraded"));
-        assert!(TuiState::event_requires_services_snapshot("service.lifecycle"));
-        assert!(TuiState::event_requires_services_snapshot("manager.catalog-reloaded"));
+        assert!(TuiState::event_requires_services_snapshot(
+            "service.lifecycle"
+        ));
+        assert!(TuiState::event_requires_services_snapshot(
+            "manager.catalog-reloaded"
+        ));
         assert!(!TuiState::event_requires_services_snapshot("service.log"));
         // apply_event no longer patches rows — a fresh snapshot is the source of truth.
         let event = serde_json::json!({ "serviceId": "metadata", "actualState": "externally-owned", "error": "Port 1 is held by pid 2 (nc)" });
         assert!(state.apply_event(fence, "service.lifecycle", event.as_object().unwrap()));
-        assert_eq!(state.selection.selected().unwrap().state, ActualServiceState::RunningUnready);
+        assert_eq!(
+            state.selection.selected().unwrap().state,
+            ActualServiceState::RunningUnready
+        );
         let mut next = service();
         next.actual_state = ActualServiceState::ExternallyOwned;
         next.error = Some("Port 1 is held by pid 2 (nc)".to_string());
         assert!(state.apply_snapshot(fence, &[next]));
         let selected = state.selection.selected().unwrap();
         assert_eq!(selected.state, ActualServiceState::ExternallyOwned);
-        assert_eq!(selected.error.as_deref(), Some("Port 1 is held by pid 2 (nc)"));
+        assert_eq!(
+            selected.error.as_deref(),
+            Some("Port 1 is held by pid 2 (nc)")
+        );
     }
 
     #[test]
@@ -431,12 +569,21 @@ mod tests {
 
     #[test]
     fn looks_up_service_kind_through_the_injected_lookup() {
-        let lookup: ServiceKindLookup = Arc::new(|id: &str| if id == "mongo" { Some(ServiceKind::Infrastructure) } else { Some(ServiceKind::Application) });
+        let lookup: ServiceKindLookup = Arc::new(|id: &str| {
+            if id == "mongo" {
+                Some(ServiceKind::Infrastructure)
+            } else {
+                Some(ServiceKind::Application)
+            }
+        });
         let mut state = TuiState::new(lookup);
         let fence = state.begin_connection();
         let mut s = service();
         s.service_id = "mongo".to_string();
         state.apply_snapshot(fence, &[s]);
-        assert_eq!(state.selection.selected().unwrap().kind, Some(ServiceKind::Infrastructure));
+        assert_eq!(
+            state.selection.selected().unwrap().kind,
+            Some(ServiceKind::Infrastructure)
+        );
     }
 }

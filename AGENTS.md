@@ -295,6 +295,13 @@ from any dev box here, with the same username.
   workspace again; refresh never `ensure`s.
 - Two presses confirm trust, forget (services keep running), stop daemon, restart daemon
   (services stay up), kill-unowned reclaim, and shared remove (`force` when attachments > 0).
+  Stop, restart, or remove of a shared instance, and stop or restart of a project `shared:` row
+  (including group and stop-all), also confirm when another workspace is attached. The confirm
+  names those workspaces. Instance stop/restart/remove takes the singleton down for every
+  attachment. A project stop or restart only detaches this workspace — the other workspaces keep
+  the shared service. The attachment list is `registry.json`; if it cannot be read the confirm
+  says so and the second press is an explicit override. A project `shared:` row keeps the
+  normal state colour and paints the word `shared` in its label blue.
 - The shared view reads recipes from the remote catalog and instances from a live smp or the
   local registry. It does not spawn smp just to draw. Install uses an unbounded request timeout.
 - `WorkspaceStore::reload` must not quarantine `workspaces.json`; only `open` does.

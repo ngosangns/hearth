@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{keyboard_action, TuiAction};
 use crate::client::{refresh_selected_log, safe_message, ManagerTuiClient, WatchEvent};
-use crate::screen::{ServiceScreen, ScreenUpdate, Viewport};
+use crate::screen::{ScreenUpdate, ServiceScreen, Viewport};
 use crate::state::{ServiceKindLookup, TuiFence, TuiState};
 
 const MOUSE_TRACKING_ON: &str = "\x1b[?1000h\x1b[?1006h";
@@ -49,21 +49,44 @@ pub struct RunTuiOptions {
 )]
 #[allow(deprecated)]
 pub async fn run_tui(options: RunTuiOptions) -> i32 {
-    let RunTuiOptions { root, catalog, spawn_daemon, refresh_interval } = options;
-    let localctl_options = LocalctlOptions { catalog: catalog.clone(), spawn_daemon };
+    let RunTuiOptions {
+        root,
+        catalog,
+        spawn_daemon,
+        refresh_interval,
+    } = options;
+    let localctl_options = LocalctlOptions {
+        catalog: catalog.clone(),
+        spawn_daemon,
+    };
     if let Err(error) = ensure(&root, &localctl_options).await {
         eprintln!("{}", error.message);
         return error.exit_code;
     }
 
     let lookup_catalog = catalog.clone();
-    let service_kind_lookup: ServiceKindLookup = Arc::new(move |id: &str| lookup_catalog.services.iter().find(|s| s.id == id).and_then(|s| s.kind));
+    let service_kind_lookup: ServiceKindLookup = Arc::new(move |id: &str| {
+        lookup_catalog
+            .services
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.kind)
+    });
     // Fallback "all" = every service the catalog knows — minus disabled ones, matching how a
     // declared `all` group expands past them at load.
-    let all_targets: Vec<String> = catalog.groups.get("all").cloned().unwrap_or_else(|| catalog.services.iter().filter(|s| !s.disabled).map(|s| s.id.clone()).collect());
+    let all_targets: Vec<String> = catalog.groups.get("all").cloned().unwrap_or_else(|| {
+        catalog
+            .services
+            .iter()
+            .filter(|s| !s.disabled)
+            .map(|s| s.id.clone())
+            .collect()
+    });
 
     let client = ManagerTuiClient::new(root, catalog);
-    let (columns, rows) = crossterm::terminal::size().map(|(c, r)| (c as usize, r as usize)).unwrap_or((80, 24));
+    let (columns, rows) = crossterm::terminal::size()
+        .map(|(c, r)| (c as usize, r as usize))
+        .unwrap_or((80, 24));
 
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel::<WatchEvent>(256);
@@ -118,10 +141,19 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    async fn event_loop(&mut self, client: &ManagerTuiClient, mut rx: mpsc::Receiver<WatchEvent>, refresh_interval: Duration, cancel: CancellationToken) -> i32 {
+    async fn event_loop(
+        &mut self,
+        client: &ManagerTuiClient,
+        mut rx: mpsc::Receiver<WatchEvent>,
+        refresh_interval: Duration,
+        cancel: CancellationToken,
+    ) -> i32 {
         let mut current_fence = TuiFence::default();
         let mut events = EventStream::new();
-        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + refresh_interval, refresh_interval);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + refresh_interval,
+            refresh_interval,
+        );
         self.draw();
 
         loop {
@@ -147,7 +179,12 @@ impl TuiApp {
         0
     }
 
-    async fn handle_watch_event(&mut self, message: WatchEvent, client: &ManagerTuiClient, current_fence: &mut TuiFence) {
+    async fn handle_watch_event(
+        &mut self,
+        message: WatchEvent,
+        client: &ManagerTuiClient,
+        current_fence: &mut TuiFence,
+    ) {
         match message {
             WatchEvent::BeginConnection => {
                 *current_fence = self.state.begin_connection();
@@ -172,8 +209,15 @@ impl TuiApp {
                 self.draw();
             }
             WatchEvent::ManagerEvent(event) => {
-                let service_id = event.data.get("serviceId").and_then(|v| v.as_str()).map(str::to_string);
-                if !self.state.apply_event(*current_fence, &event.event_type, &event.data) {
+                let service_id = event
+                    .data
+                    .get("serviceId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                if !self
+                    .state
+                    .apply_event(*current_fence, &event.event_type, &event.data)
+                {
                     return;
                 }
                 if event.event_type == "service.log" {
@@ -195,7 +239,8 @@ impl TuiApp {
                                 let fence = self.state.begin_request();
                                 self.refresh_selected(client, fence).await;
                                 if event.event_type == "operation.updated"
-                                    && service_id.as_deref() == Some(self.state.selection.selected_name.as_str())
+                                    && service_id.as_deref()
+                                        == Some(self.state.selection.selected_name.as_str())
                                 {
                                     let fence = self.state.begin_request();
                                     self.refresh_operation(client, fence).await;
@@ -203,7 +248,10 @@ impl TuiApp {
                             }
                         }
                         Err(error) => {
-                            self.state.notice = format!("Failed to refresh services: {}", safe_message(&error.message));
+                            self.state.notice = format!(
+                                "Failed to refresh services: {}",
+                                safe_message(&error.message)
+                            );
                             self.draw();
                         }
                     }
@@ -221,7 +269,15 @@ impl TuiApp {
             WatchEvent::BulkStartFinished(outcome) => {
                 self.start_all_pending = false;
                 self.state.notice = match outcome {
-                    Ok(operation) if operation.status == OperationStatus::Failed => format!("start all failed: {}", safe_message(&operation.error.map(|e| e.message).unwrap_or_else(|| "start all failed".to_string()))),
+                    Ok(operation) if operation.status == OperationStatus::Failed => format!(
+                        "start all failed: {}",
+                        safe_message(
+                            &operation
+                                .error
+                                .map(|e| e.message)
+                                .unwrap_or_else(|| "start all failed".to_string())
+                        )
+                    ),
                     Ok(_) => "start all: succeeded".to_string(),
                     Err(error) => format!("start all failed: {}", safe_message(&error)),
                 };
@@ -236,14 +292,19 @@ impl TuiApp {
             Event::Resize(columns, rows) => {
                 self.columns = columns as usize;
                 self.rows = rows as usize;
-                self.screen.resize(Viewport { columns: self.columns, rows: self.rows });
+                self.screen.resize(Viewport {
+                    columns: self.columns,
+                    rows: self.rows,
+                });
                 self.draw();
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => self.handle_wheel(mouse.row as usize, -1),
                 MouseEventKind::ScrollDown => self.handle_wheel(mouse.row as usize, 1),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(service) = self.screen.service_at(mouse.row as usize, Some(self.rows)) {
+                    if let Some(service) =
+                        self.screen.service_at(mouse.row as usize, Some(self.rows))
+                    {
                         self.select_service(&service, client).await;
                     }
                 }
@@ -269,9 +330,33 @@ impl TuiApp {
                     TuiAction::Down => self.move_selection(1, client).await,
                     TuiAction::StartAll => self.start_all(client).await,
                     TuiAction::StopAll => self.stop_all(client).await,
-                    TuiAction::Start => self.run_action(ServiceOperationKind::Start, self.state.selection.selected_name.clone(), client, false).await,
-                    TuiAction::Stop => self.run_action(ServiceOperationKind::Stop, self.state.selection.selected_name.clone(), client, false).await,
-                    TuiAction::Restart => self.run_action(ServiceOperationKind::Restart, self.state.selection.selected_name.clone(), client, false).await,
+                    TuiAction::Start => {
+                        self.run_action(
+                            ServiceOperationKind::Start,
+                            self.state.selection.selected_name.clone(),
+                            client,
+                            false,
+                        )
+                        .await
+                    }
+                    TuiAction::Stop => {
+                        self.run_action(
+                            ServiceOperationKind::Stop,
+                            self.state.selection.selected_name.clone(),
+                            client,
+                            false,
+                        )
+                        .await
+                    }
+                    TuiAction::Restart => {
+                        self.run_action(
+                            ServiceOperationKind::Restart,
+                            self.state.selection.selected_name.clone(),
+                            client,
+                            false,
+                        )
+                        .await
+                    }
                     TuiAction::Reclaim => self.reclaim(selected.as_ref(), client).await,
                 }
             }
@@ -334,7 +419,8 @@ impl TuiApp {
                 if !self.state.current(fence) {
                     return;
                 }
-                self.state.notice = format!("Manager unavailable: {}", safe_message(&error.message));
+                self.state.notice =
+                    format!("Manager unavailable: {}", safe_message(&error.message));
                 self.draw();
             }
         }
@@ -365,7 +451,14 @@ impl TuiApp {
     }
 
     async fn refresh_operation(&mut self, client: &ManagerTuiClient, fence: TuiFence) {
-        let Some(operation_id) = self.state.selection.selected().and_then(|s| s.current_operation_id.clone()) else { return };
+        let Some(operation_id) = self
+            .state
+            .selection
+            .selected()
+            .and_then(|s| s.current_operation_id.clone())
+        else {
+            return;
+        };
         match client.operation(&operation_id).await {
             Ok(operation) => {
                 if self.state.apply_operation(fence, operation) {
@@ -391,7 +484,10 @@ impl TuiApp {
         self.state.notice = "start all…".to_string();
         self.draw();
         let accepted = match client.bulk_start(&self.all_targets).await {
-            Ok(operation) => client.connection().await.map(|connection| (operation, connection)),
+            Ok(operation) => client
+                .connection()
+                .await
+                .map(|connection| (operation, connection)),
             Err(error) => Err(error),
         };
         self.busy = false;
@@ -402,7 +498,10 @@ impl TuiApp {
                 self.draw();
                 let events = self.events.clone();
                 tokio::spawn(async move {
-                    let outcome = connection.wait(&operation.id, None).await.map_err(|e| e.message);
+                    let outcome = connection
+                        .wait(&operation.id, None)
+                        .await
+                        .map_err(|e| e.message);
                     let _ = events.send(WatchEvent::BulkStartFinished(outcome)).await;
                 });
             }
@@ -414,39 +513,66 @@ impl TuiApp {
     }
 
     async fn stop_all(&mut self, client: &ManagerTuiClient) {
-        let services: Vec<String> = self.state.selection.services.iter().map(|s| s.name.clone()).collect();
+        let services: Vec<String> = self
+            .state
+            .selection
+            .services
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
         for service in services {
             if self.disposed {
                 return;
             }
-            self.run_action(ServiceOperationKind::Stop, service, client, false).await;
+            self.run_action(ServiceOperationKind::Stop, service, client, false)
+                .await;
         }
     }
 
     /// First press arms the reclaim (the notice names the holder); a second press on the same
     /// service sends `killUnowned`. Arming is per-service — switching rows re-asks.
-    async fn reclaim(&mut self, selected: Option<&crate::state::Service>, client: &ManagerTuiClient) {
+    async fn reclaim(
+        &mut self,
+        selected: Option<&crate::state::Service>,
+        client: &ManagerTuiClient,
+    ) {
         let Some(selected) = selected else { return };
         let service = selected.name.clone();
         if self.pending_reclaim.as_deref() != Some(service.as_str()) {
             // Lifecycle events don't carry `error`, so refresh the row before naming the holder.
             self.reconcile(client).await;
-            let Some(refreshed) = self.state.selection.services.iter().find(|s| s.name == service && s.state == ActualServiceState::ExternallyOwned) else {
+            let Some(refreshed) = self
+                .state
+                .selection
+                .services
+                .iter()
+                .find(|s| s.name == service && s.state == ActualServiceState::ExternallyOwned)
+            else {
                 self.state.notice = format!("{service} is no longer externally owned");
                 self.draw();
                 return;
             };
-            let holder = refreshed.error.clone().unwrap_or_else(|| format!("{service} is externally owned"));
+            let holder = refreshed
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("{service} is externally owned"));
             self.pending_reclaim = Some(service.clone());
             self.state.notice = format!("{holder} — press again to kill it and start {service}");
             self.draw();
             return;
         }
         self.pending_reclaim = None;
-        self.run_action(ServiceOperationKind::Start, service, client, true).await;
+        self.run_action(ServiceOperationKind::Start, service, client, true)
+            .await;
     }
 
-    async fn run_action(&mut self, action: ServiceOperationKind, service: String, client: &ManagerTuiClient, kill_unowned: bool) {
+    async fn run_action(
+        &mut self,
+        action: ServiceOperationKind,
+        service: String,
+        client: &ManagerTuiClient,
+        kill_unowned: bool,
+    ) {
         if self.busy || service.is_empty() {
             return;
         }
@@ -465,7 +591,10 @@ impl TuiApp {
                 }
             }
             Err(error) => {
-                if self.state.apply_action_failure(&fence, &safe_message(&error.message)) {
+                if self
+                    .state
+                    .apply_action_failure(&fence, &safe_message(&error.message))
+                {
                     self.draw();
                 }
             }
@@ -484,13 +613,37 @@ impl TuiApp {
     /// while it is not — the same rule as `hearth urls`.
     fn focused_urls(&self) -> Vec<String> {
         let selected = &self.state.selection.selected_name;
-        let running = self.state.selection.services.iter().find(|s| &s.name == selected).is_some_and(|s| {
-            matches!(s.state, ActualServiceState::Ready | ActualServiceState::Running | ActualServiceState::RunningUnready | ActualServiceState::Starting | ActualServiceState::Preparing)
-        });
+        let running = self
+            .state
+            .selection
+            .services
+            .iter()
+            .find(|s| &s.name == selected)
+            .is_some_and(|s| {
+                matches!(
+                    s.state,
+                    ActualServiceState::Ready
+                        | ActualServiceState::Running
+                        | ActualServiceState::RunningUnready
+                        | ActualServiceState::Starting
+                        | ActualServiceState::Preparing
+                )
+            });
         self.urls
             .iter()
             .filter(|u| &u.service_id == selected)
-            .map(|u| format!("{}  {}{}", u.label.as_deref().unwrap_or("-"), u.url, if u.requires_running && !running { "  (not running)" } else { "" }))
+            .map(|u| {
+                format!(
+                    "{}  {}{}",
+                    u.label.as_deref().unwrap_or("-"),
+                    u.url,
+                    if u.requires_running && !running {
+                        "  (not running)"
+                    } else {
+                        ""
+                    }
+                )
+            })
             .collect()
     }
 

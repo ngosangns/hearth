@@ -69,7 +69,12 @@ fn scan_escape(bytes: &[u8], start: usize) -> (usize, bool) {
         b'[' => {
             let params_start = i + 1;
             let mut j = params_start;
-            while j < bytes.len() && matches!(bytes[j], b'0'..=b'9' | b';' | b':' | b'<' | b'=' | b'>' | b'?') {
+            while j < bytes.len()
+                && matches!(
+                    bytes[j],
+                    b'0'..=b'9' | b';' | b':' | b'<' | b'=' | b'>' | b'?'
+                )
+            {
                 j += 1;
             }
             let params_end = j;
@@ -79,7 +84,11 @@ fn scan_escape(bytes: &[u8], start: usize) -> (usize, bool) {
             let intermediates_end = j;
             if j < bytes.len() && (0x40..=0x7e).contains(&bytes[j]) {
                 let final_byte = bytes[j];
-                let is_sgr = final_byte == b'm' && intermediates_end == params_end && bytes[params_start..params_end].iter().all(|c| matches!(c, b'0'..=b'9' | b';' | b':'));
+                let is_sgr = final_byte == b'm'
+                    && intermediates_end == params_end
+                    && bytes[params_start..params_end]
+                        .iter()
+                        .all(|c| matches!(c, b'0'..=b'9' | b';' | b':'));
                 return (j + 1 - start, is_sgr);
             }
             (1, false)
@@ -312,10 +321,16 @@ fn apply_extended(mut style: Style, foreground: bool, parts: &[&str], index: &mu
         let Some(red) = parts.get(*index).and_then(|part| part.parse::<u8>().ok()) else {
             return style;
         };
-        let Some(green) = parts.get(*index + 1).and_then(|part| part.parse::<u8>().ok()) else {
+        let Some(green) = parts
+            .get(*index + 1)
+            .and_then(|part| part.parse::<u8>().ok())
+        else {
             return style;
         };
-        let Some(blue) = parts.get(*index + 2).and_then(|part| part.parse::<u8>().ok()) else {
+        let Some(blue) = parts
+            .get(*index + 2)
+            .and_then(|part| part.parse::<u8>().ok())
+        else {
             return style;
         };
         *index += 3;
@@ -358,22 +373,34 @@ mod tests {
 
     #[test]
     fn drops_erase_display_and_cursor_home_sequences_that_would_move_the_paint_cursor() {
-        assert_eq!(sanitize_terminal_text("\x1b[2J\x1b[3J\x1b[Hcompiling"), "compiling");
+        assert_eq!(
+            sanitize_terminal_text("\x1b[2J\x1b[3J\x1b[Hcompiling"),
+            "compiling"
+        );
     }
 
     #[test]
     fn keeps_colour_sequences_so_log_severity_stays_visible() {
-        assert_eq!(sanitize_terminal_text("\x1b[90m1:53 PM\x1b[0m ready"), "\x1b[90m1:53 PM\x1b[0m ready");
+        assert_eq!(
+            sanitize_terminal_text("\x1b[90m1:53 PM\x1b[0m ready"),
+            "\x1b[90m1:53 PM\x1b[0m ready"
+        );
     }
 
     #[test]
     fn drops_cursor_movement_while_keeping_the_surrounding_colour() {
-        assert_eq!(sanitize_terminal_text("\x1b[32mok\x1b[1G\x1b[0K\x1b[0m"), "\x1b[32mok\x1b[0m");
+        assert_eq!(
+            sanitize_terminal_text("\x1b[32mok\x1b[1G\x1b[0K\x1b[0m"),
+            "\x1b[32mok\x1b[0m"
+        );
     }
 
     #[test]
     fn replaces_carriage_returns_with_a_space_instead_of_restarting_the_row() {
-        assert_eq!(sanitize_terminal_text("node compile.js\r"), "node compile.js ");
+        assert_eq!(
+            sanitize_terminal_text("node compile.js\r"),
+            "node compile.js "
+        );
     }
 
     #[test]
@@ -436,9 +463,18 @@ mod tests {
 
     #[test]
     fn truncate_to_width_manages_open_colour_across_a_cut() {
-        assert_eq!(truncate_to_width("\x1b[31mhello world", 7, true), "\x1b[31mhello w\x1b[0m");
-        assert_eq!(truncate_to_width("\x1b[31mhello\x1b[0m world", 7, true), "\x1b[31mhello\x1b[0m w\x1b[0m");
-        assert_eq!(truncate_to_width("\x1b[31mhi\x1b[0mxx", 2, true), "\x1b[31mhi\x1b[0m");
+        assert_eq!(
+            truncate_to_width("\x1b[31mhello world", 7, true),
+            "\x1b[31mhello w\x1b[0m"
+        );
+        assert_eq!(
+            truncate_to_width("\x1b[31mhello\x1b[0m world", 7, true),
+            "\x1b[31mhello\x1b[0m w\x1b[0m"
+        );
+        assert_eq!(
+            truncate_to_width("\x1b[31mhi\x1b[0mxx", 2, true),
+            "\x1b[31mhi\x1b[0m"
+        );
         assert_eq!(truncate_to_width("hi\x1b[0m more", 2, true), "hi");
     }
 }
