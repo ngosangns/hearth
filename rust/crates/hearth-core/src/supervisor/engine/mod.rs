@@ -2,6 +2,7 @@
 //! OS only through the `ProcessAdapter`/`ProbeAdapter`/`PreparationAdapter`/`Host` traits, so it
 //! runs against fakes in its unit tests; `default_adapters.rs` is the production implementation.
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,7 +20,8 @@ use crate::state::{
 
 use crate::sync::KeyedLock;
 
-use super::fingerprint::normalize_command_fingerprint;
+use super::duplicates::{executable_matches, paths_equal};
+use super::fingerprint::{normalize_command_fingerprint, normalize_observed_command_fingerprint};
 use super::process_tree::{
     process_tree_alive, secondary_process_groups, ProcessTreeEntry, ProcessTreeSnapshot,
 };
@@ -52,6 +54,10 @@ const EXTERNAL_LOG_BACKLOG_LINES: u64 = 200;
 /// can appear after spawn; the snapshot used when the leader exits has to be from while it was
 /// still alive, because the tree walk refuses a pid whose start identity is already gone.
 const TREE_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// After a one-shot task exits 0, how long the probe may still be catching up. The task already
+/// waited for the instance; the pack-sized readiness budget must not keep running after that.
+const TASK_EXIT_SETTLE_MS: i64 = 5_000;
 
 /// A "task" command has no long-lived managed process to track — it runs once to bring external
 /// state into the desired shape (generalizes a tailnet-serve-config runner).
@@ -266,7 +272,21 @@ impl ProcessSupervisor {
         let op = operation_id.clone();
         self.queues
             .run(service_id, || async move {
-                sup.stop_locked(&id, op.clone()).await?;
+                // Captured before stop clears the identity. An `exec` service's live command is
+                // the settled program, not the shell text, and a duplicate of that program has
+                // the same fingerprint.
+                let fingerprints = sup.duplicate_fingerprints(&id);
+                let cwd = sup.service_cwd(&id);
+                // A row with no process and no `stop` command used to fail here, so a group
+                // restart of `externally-owned` services only reported the error and never
+                // started them. Stop still refuses that case on its own. Restart starts it.
+                // A holder that is this service is recorded first so the stop below actually
+                // replaces it; a different program is not signalled.
+                if sup.restart_needs_stop(&id) || sup.note_service_holder(&id).await {
+                    sup.stop_locked(&id, op.clone()).await?;
+                }
+                sup.reap_duplicate_service_processes(&id, &fingerprints, &cwd)
+                    .await?;
                 sup.start_locked(&id, op, StartOptions::default()).await
             })
             .await
@@ -468,6 +488,26 @@ impl ProcessSupervisor {
 
     pub async fn reconcile(self: &Arc<Self>) {
         for state in self.host.service_states() {
+            // A persisted `externally-owned` row has no identity, so the loop below skips it.
+            // Daemon startup only reconciles. Without this pass a dead holder leaves
+            // "Port N is held by pid …" on screen forever, and a holder that is this service
+            // (the program `exec` settled into) stays an error instead of being adopted.
+            if state.actual_state == ActualServiceState::ExternallyOwned {
+                let sup = self.clone();
+                let service_id = state.service_id.clone();
+                self.queues
+                    .run(&service_id.clone(), || async move {
+                        let Some(state) = sup.state(&service_id) else {
+                            return;
+                        };
+                        if state.actual_state != ActualServiceState::ExternallyOwned {
+                            return;
+                        }
+                        sup.reconcile_externally_owned(&state).await;
+                    })
+                    .await;
+                continue;
+            }
             if state.identity.is_none() || !is_active_state(state.actual_state) {
                 continue;
             }
@@ -583,6 +623,188 @@ impl ProcessSupervisor {
                 })
                 .await;
         }
+    }
+
+    /// Re-read an `externally-owned` row. The port check that wrote it is not re-run on daemon
+    /// startup otherwise, so a holder that has already exited stays on screen, and a holder that
+    /// is this service's own `exec`'d program is never adopted.
+    async fn reconcile_externally_owned(self: &Arc<Self>, state: &ServiceLifecycleState) {
+        let Ok(profile) = profile_for(&self.host.catalog(), &state.service_id) else {
+            return;
+        };
+        let Some(port) = readiness_tcp_port(&profile.readiness) else {
+            return;
+        };
+        match self.options.probes.port_in_use(port).await {
+            None => {}
+            Some(false) => {
+                let running = state.desired_state == DesiredServiceState::Running;
+                self.transition(
+                    &state.service_id,
+                    state.generation,
+                    if running {
+                        ActualServiceState::Failed
+                    } else {
+                        ActualServiceState::Stopped
+                    },
+                    if running {
+                        ServiceReadiness::Failed
+                    } else {
+                        ServiceReadiness::Unknown
+                    },
+                    Changes {
+                        error: if running {
+                            Patch::Set("Managed process is no longer alive".to_string())
+                        } else {
+                            Patch::Clear
+                        },
+                        identity: Patch::Clear,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+            Some(true) => {
+                let Some(holders) = self.options.probes.port_holders(port).await else {
+                    return;
+                };
+                for holder in &holders {
+                    if self.holder_is_service(holder, &profile).await {
+                        self.adopt_port_holder(
+                            &state.service_id,
+                            state.generation,
+                            &profile,
+                            holder,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                if holders.is_empty() {
+                    return;
+                }
+                let message = format!(
+                    "Port {port} is held by {}",
+                    self.describe_port_holders(port).await
+                );
+                if state.error.as_deref() != Some(message.as_str()) {
+                    self.transition(
+                        &state.service_id,
+                        state.generation,
+                        ActualServiceState::ExternallyOwned,
+                        ServiceReadiness::Failed,
+                        Changes {
+                            error: Patch::Set(message),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// The listener is this service when its command is the `exec` target (same directory), or
+    /// when a Gradle start script has become `java` and the install directory from
+    /// `cd && exec build/install/<name>/bin/<name>` is still in that command line.
+    async fn holder_is_service(
+        &self,
+        holder: &crate::supervisor::types::PortHolder,
+        profile: &VerifiedProfile,
+    ) -> bool {
+        if holder.pid <= 1 {
+            return false;
+        }
+        let fingerprints = exec_target_fingerprints(&profile.command);
+        let cwd = process_cwd(&profile.command);
+        if !fingerprints.is_empty() {
+            if let Some(matches) = self
+                .options
+                .process
+                .command_matches(&fingerprints, &[], &cwd)
+                .await
+            {
+                if matches.iter().any(|matched| {
+                    matched.pid == holder.pid && matched.start_identity == holder.start_identity
+                }) {
+                    return true;
+                }
+            }
+        }
+        install_dir_marker(&profile.command).is_some_and(|marker| holder.command.contains(&marker))
+    }
+
+    async fn adopt_port_holder(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        generation: u64,
+        profile: &VerifiedProfile,
+        holder: &crate::supervisor::types::PortHolder,
+    ) {
+        let stub = ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+            manager_instance_id: self.host.instance_id(),
+            service_id: service_id.clone(),
+            generation,
+            started_at: self.options.clock.now(),
+            pid: holder.pid,
+            pgid: holder.pgid,
+            start_identity: holder.start_identity.clone(),
+            command_fingerprint: String::new(),
+        });
+        let Inspection::Observed(ObservedProcess {
+            alive: true,
+            record: ProcessRecord::Posix(record),
+        }) = self.options.process.inspect(&stub).await
+        else {
+            return;
+        };
+        if record.pid != holder.pid || record.start_identity != holder.start_identity {
+            return;
+        }
+        let identity = ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+            manager_instance_id: self.host.instance_id(),
+            service_id: service_id.clone(),
+            generation,
+            started_at: self.options.clock.now(),
+            pid: record.pid,
+            pgid: record.pgid,
+            start_identity: record.start_identity,
+            command_fingerprint: record.command_fingerprint,
+        });
+        let token = self.current_token(service_id);
+        self.transition(
+            service_id,
+            generation,
+            ActualServiceState::RunningUnready,
+            ServiceReadiness::NotReady,
+            Changes {
+                identity: Patch::Set(identity.clone()),
+                error: Patch::Clear,
+                ..Default::default()
+            },
+        )
+        .await;
+        if !self.has_live_output_tail(service_id) {
+            self.attach_output(service_id, output_source(&identity, true));
+        }
+        self.arm_adopted_watch(
+            service_id,
+            identity.clone(),
+            profile.command.clone(),
+            generation,
+            token,
+        );
+        let _ = self
+            .readiness_with_adopted(
+                service_id,
+                profile,
+                generation,
+                Some(identity),
+                token,
+                None,
+                true,
+            )
+            .await;
     }
 
     /// Polls readiness of every `ownership: External` service and adopts/releases it into this
@@ -734,7 +956,7 @@ impl ProcessSupervisor {
                 return Ok(());
             }
         }
-        let retained_identity = match &current {
+        let mut retained_identity = match &current {
             Some(state) if self.identity_matches_state(state) => match &state.identity {
                 Some(ProcessIdentity::Posix(_)) => {
                     if self
@@ -751,6 +973,11 @@ impl ProcessSupervisor {
             },
             _ => None,
         };
+        // The stored identity missed (gone, or overwritten by a start that could not bind).
+        // A title-rewritten copy of this binary in this directory is still the service.
+        if retained_identity.is_none() {
+            retained_identity = self.untracked_same_executable(service_id, &profile).await;
+        }
         let generation = match &retained_identity {
             Some(ProcessIdentity::Posix(p)) => p.generation,
             _ => current.as_ref().map(|s| s.generation).unwrap_or(0) + 1,
@@ -1018,8 +1245,9 @@ impl ProcessSupervisor {
         }
         if let ReadinessSpec::Tcp { port } = &profile.readiness {
             if let Some(true) = self.options.probes.port_in_use(*port).await {
-                // `killUnowned` is the client's echo of "yes, kill whatever holds my port" — the
-                // ONLY path in this engine that signals a process it does not own.
+                // `killUnowned` is the client's echo of "yes, kill whatever holds my port".
+                // A restart already reaped processes that match this service's command and cwd.
+                // A holder that does not match is signalled only through this confirmed path.
                 let error = if options.kill_unowned {
                     self.reclaim_port(*port).await.err()
                 } else {
@@ -1120,6 +1348,340 @@ impl ProcessSupervisor {
             "Port {port} is still held by {} after SIGKILL",
             self.describe_port_holders(port).await
         )))
+    }
+
+    fn duplicate_fingerprints(&self, service_id: &ServiceId) -> Vec<String> {
+        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else {
+            return Vec::new();
+        };
+        let mut fingerprints = vec![normalize_command_fingerprint(&profile.command)];
+        if let Some(identity) = self.state(service_id).and_then(|state| state.identity) {
+            let extra = identity.command_fingerprint().to_string();
+            if !extra.is_empty() && !fingerprints.iter().any(|fingerprint| fingerprint == &extra) {
+                fingerprints.push(extra);
+            }
+        }
+        fingerprints
+    }
+
+    fn service_cwd(&self, service_id: &ServiceId) -> String {
+        profile_for(&self.host.catalog(), service_id)
+            .map(|profile| profile.command.cwd)
+            .unwrap_or_else(|_| ".".to_string())
+    }
+
+    /// Absolute argv0 of an argv command. A shell command and a bare name (`node`) are not
+    /// usable as a title-rewrite identity: the settled fingerprint covers `shell` + `exec`,
+    /// and a shared interpreter would pull in every other script in the directory.
+    fn absolute_argv0(command: &ServiceCommand) -> Option<String> {
+        match &command.command {
+            CommandSpec::Argv { argv } => {
+                let exe = argv.first()?;
+                exe.starts_with('/').then(|| exe.clone())
+            }
+            CommandSpec::Shell { .. } => None,
+        }
+    }
+
+    /// The service executable, when no other catalog service runs that same binary from the
+    /// same directory. Redis rewrites `redis-server {dataDir}/redis.conf` into
+    /// `redis-server 127.0.0.1:port`; the binary and the cwd are still the service.
+    fn duplicate_executables(&self, service_id: &ServiceId) -> Vec<String> {
+        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else {
+            return Vec::new();
+        };
+        let Some(exe) = Self::absolute_argv0(&profile.command) else {
+            return Vec::new();
+        };
+        let catalog = self.host.catalog();
+        let cwd = profile.command.cwd;
+        let shared = catalog.services.iter().any(|other| {
+            &other.id != service_id
+                && profile_for(&catalog, &other.id).is_ok_and(|other_profile| {
+                    Self::absolute_argv0(&other_profile.command).is_some_and(|other_exe| {
+                        paths_equal(Path::new(&other_exe), Path::new(&exe))
+                    }) && paths_equal(Path::new(&other_profile.command.cwd), Path::new(&cwd))
+                })
+        });
+        if shared {
+            Vec::new()
+        } else {
+            vec![exe]
+        }
+    }
+
+    /// A live process of this service whose identity was lost (a title rewrite made the stored
+    /// fingerprint miss, then a failed start overwrote it). Adopting it is what keeps a second
+    /// copy from dying on `bind: Address already in use`. `None` when there is nothing to adopt
+    /// or the table could not be read — a wedged `ps` must not fail an ordinary start.
+    async fn untracked_same_executable(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+    ) -> Option<ProcessIdentity> {
+        let executables = self.duplicate_executables(service_id);
+        if executables.is_empty() {
+            return None;
+        }
+        let matches = self
+            .options
+            .process
+            .command_matches(&[], &executables, &profile.command.cwd)
+            .await?;
+        let matched = matches.into_iter().find(|matched| matched.pid > 1)?;
+        let generation = self
+            .state(service_id)
+            .map(|state| state.generation)
+            .unwrap_or(0)
+            + 1;
+        let stub = ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+            manager_instance_id: self.host.instance_id(),
+            service_id: service_id.clone(),
+            generation,
+            started_at: self.options.clock.now(),
+            pid: matched.pid,
+            pgid: matched.pid,
+            start_identity: matched.start_identity.clone(),
+            command_fingerprint: String::new(),
+        });
+        let Inspection::Observed(ObservedProcess {
+            alive: true,
+            record: ProcessRecord::Posix(record),
+        }) = self.options.process.inspect(&stub).await
+        else {
+            return None;
+        };
+        if record.pid != matched.pid || record.start_identity != matched.start_identity {
+            return None;
+        }
+        if !executable_matches(&record.command_line, &executables) {
+            return None;
+        }
+        Some(ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+            manager_instance_id: self.host.instance_id(),
+            service_id: service_id.clone(),
+            generation,
+            started_at: self.options.clock.now(),
+            pid: record.pid,
+            pgid: record.pgid,
+            start_identity: record.start_identity,
+            command_fingerprint: record.command_fingerprint,
+        }))
+    }
+
+    /// After the owned process is stopped: kill every other host process that is this same
+    /// service (command fingerprint or the same absolute executable, plus cwd), including
+    /// children that moved into their own process group. Each pid is signalled on its own.
+    /// A shared pgid is not a group we own.
+    async fn reap_duplicate_service_processes(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        fingerprints: &[String],
+        cwd: &str,
+    ) -> Result<(), SupervisorError> {
+        let executables = self.duplicate_executables(service_id);
+        if fingerprints.is_empty() && executables.is_empty() {
+            return Ok(());
+        }
+        let Some(matches) = self
+            .options
+            .process
+            .command_matches(fingerprints, &executables, cwd)
+            .await
+        else {
+            return Err(SupervisorError(format!(
+                "{service_id}: could not list processes; refusing to start beside an unchecked duplicate"
+            )));
+        };
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for matched in matches {
+            if matched.pid <= 1 {
+                continue;
+            }
+            match self
+                .process_tree(matched.pid, &matched.start_identity)
+                .await
+            {
+                ProcessTreeSnapshot::Unknown => {
+                    return Err(SupervisorError(format!(
+                        "{service_id}: the process tree could not be read; refusing to start beside an unchecked duplicate"
+                    )));
+                }
+                ProcessTreeSnapshot::Absent => {}
+                ProcessTreeSnapshot::Present(tree) => {
+                    for entry in tree {
+                        if seen.insert(entry.pid) {
+                            entries.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.signal_entries(&entries, ProcessSignal::Sigterm).await;
+        let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
+        loop {
+            if self.options.clock.now_millis() >= deadline {
+                break;
+            }
+            match self.process_tree_alive(&entries).await {
+                Some(false) => return Ok(()),
+                Some(true) => {
+                    self.options
+                        .clock
+                        .sleep(self.options.readiness_backoff_ms)
+                        .await
+                }
+                None => {
+                    return Err(SupervisorError(format!(
+                        "{service_id}: a duplicate process's liveness could not be verified"
+                    )));
+                }
+            }
+        }
+        match self.process_tree_alive(&entries).await {
+            Some(false) => Ok(()),
+            None => Err(SupervisorError(format!(
+                "{service_id}: a duplicate process's liveness could not be verified"
+            ))),
+            Some(true) => {
+                self.signal_entries(&entries, ProcessSignal::Sigkill).await;
+                match self.process_tree_alive(&entries).await {
+                    Some(false) => Ok(()),
+                    Some(true) => {
+                        let pids: Vec<String> =
+                            entries.iter().map(|entry| entry.pid.to_string()).collect();
+                        Err(SupervisorError(format!(
+                            "{service_id} still has a duplicate process (pid {})",
+                            pids.join(", ")
+                        )))
+                    }
+                    None => Err(SupervisorError(format!(
+                        "{service_id}: a duplicate process's liveness could not be verified"
+                    ))),
+                }
+            }
+        }
+    }
+
+    async fn signal_entries(&self, entries: &[ProcessTreeEntry], signal: ProcessSignal) {
+        for entry in entries {
+            if entry.pid <= 1 {
+                continue;
+            }
+            self.options
+                .process
+                .signal_pid(entry.pid, &entry.start_identity, signal)
+                .await;
+        }
+    }
+
+    /// True when restart has something to stop: an in-flight start, a recorded process, or a
+    /// catalog `stop` command. An `externally-owned` or failed row with none of those is not a
+    /// stop — restart goes on to start.
+    fn restart_needs_stop(&self, service_id: &ServiceId) -> bool {
+        let Some(state) = self.state(service_id) else {
+            return false;
+        };
+        if state.actual_state == ActualServiceState::Stopped {
+            return false;
+        }
+        if matches!(
+            state.actual_state,
+            ActualServiceState::QueuedStart
+                | ActualServiceState::Preparing
+                | ActualServiceState::Starting
+        ) {
+            return true;
+        }
+        if state.identity.is_some() {
+            return true;
+        }
+        profile_for(&self.host.catalog(), service_id)
+            .is_ok_and(|profile| profile.command.docker_stop_command.is_some())
+    }
+
+    /// The process listening on this service's port is the service itself (`exec` target in its
+    /// directory, or the install directory in a Java command line). Record that identity so the
+    /// following stop replaces it. A different program, or a port that is free, records nothing
+    /// and is not signalled.
+    async fn note_service_holder(&self, service_id: &ServiceId) -> bool {
+        let Ok(profile) = profile_for(&self.host.catalog(), service_id) else {
+            return false;
+        };
+        let Some(state) = self.state(service_id) else {
+            return false;
+        };
+        if state.identity.is_some() {
+            return false;
+        }
+        let Some(port) = readiness_tcp_port(&profile.readiness) else {
+            return false;
+        };
+        if self.options.probes.port_in_use(port).await != Some(true) {
+            return false;
+        }
+        let Some(holders) = self.options.probes.port_holders(port).await else {
+            return false;
+        };
+        let mut chosen = None;
+        for holder in holders {
+            if self.holder_is_service(&holder, &profile).await {
+                chosen = Some(holder);
+                break;
+            }
+        }
+        let Some(holder) = chosen else {
+            return false;
+        };
+        let stub = ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+            manager_instance_id: self.host.instance_id(),
+            service_id: service_id.clone(),
+            generation: state.generation,
+            started_at: self.options.clock.now(),
+            pid: holder.pid,
+            pgid: holder.pgid,
+            start_identity: holder.start_identity.clone(),
+            command_fingerprint: String::new(),
+        });
+        let Inspection::Observed(ObservedProcess {
+            alive: true,
+            record: ProcessRecord::Posix(record),
+        }) = self.options.process.inspect(&stub).await
+        else {
+            return false;
+        };
+        if record.pid != holder.pid || record.start_identity != holder.start_identity {
+            return false;
+        }
+        let identity = ProcessIdentity::Posix(crate::state::PosixProcessIdentity {
+            manager_instance_id: self.host.instance_id(),
+            service_id: service_id.clone(),
+            generation: state.generation,
+            started_at: self.options.clock.now(),
+            pid: record.pid,
+            pgid: record.pgid,
+            start_identity: record.start_identity,
+            command_fingerprint: record.command_fingerprint,
+        });
+        // `Stopped` makes `stop_locked` return before it signals anything. The row has to leave
+        // that state or a restart would adopt the listener and report success without replacing it.
+        self.transition(
+            service_id,
+            state.generation,
+            ActualServiceState::RunningUnready,
+            ServiceReadiness::NotReady,
+            Changes {
+                identity: Patch::Set(identity),
+                error: Patch::Clear,
+                ..Default::default()
+            },
+        )
+        .await;
+        true
     }
 
     async fn stop_locked(
@@ -1316,9 +1878,11 @@ impl ProcessSupervisor {
             .await
         {
             Some(result) => result?,
-            None => return Err(SupervisorError(format!(
+            None => {
+                return Err(SupervisorError(format!(
                 "{service_id} cannot be stopped: this process adapter has no stop command support"
-            ))),
+            )))
+            }
         }
         // An adopted container carries a `docker logs --follow` tail; the container is gone now, so
         // the follower must not be left streaming into a dead pipe.
@@ -1443,7 +2007,14 @@ impl ProcessSupervisor {
             )
             .await;
             let result = self
-                .readiness(service_id, profile, generation, None, token, operation_id)
+                .await_external_task(
+                    service_id,
+                    profile,
+                    generation,
+                    token,
+                    operation_id.clone(),
+                    app.exited,
+                )
                 .await;
             if result.is_err() || !self.valid(service_id, generation, token) {
                 if let Err(error) = self.terminate(&task_identity, &profile.command).await {
@@ -1534,6 +2105,107 @@ impl ProcessSupervisor {
             operation_id,
         )
         .await
+    }
+
+    /// Readiness for a one-shot task (`hearth shared attach`). The long readiness budget applies
+    /// only while that process is still running — an artifact pack can use all of it. Once the
+    /// process exits, a non-zero code fails the service immediately, and exit 0 gets a short
+    /// settle for the probe. Leaving the loop to poll until the pack budget is what made a
+    /// failed shared restart look stuck.
+    async fn await_external_task(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+        generation: u64,
+        token: u64,
+        operation_id: Option<String>,
+        mut exited: tokio::sync::oneshot::Receiver<i32>,
+    ) -> Result<(), SupervisorError> {
+        let readiness = self.readiness(
+            service_id,
+            profile,
+            generation,
+            None,
+            token,
+            operation_id.clone(),
+        );
+        tokio::pin!(readiness);
+        tokio::select! {
+            biased;
+            result = &mut readiness => result,
+            code = &mut exited => {
+                let code = code.unwrap_or(-1);
+                if code != 0 {
+                    let message = format!("{service_id} task exited with code {code}");
+                    self.fail(
+                        service_id,
+                        generation,
+                        token,
+                        None,
+                        &message,
+                        operation_id,
+                        None,
+                    )
+                    .await;
+                    return Err(SupervisorError(message));
+                }
+                self.probe_settled_task(service_id, profile, generation, token, operation_id)
+                    .await
+            }
+        }
+    }
+
+    async fn probe_settled_task(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+        generation: u64,
+        token: u64,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        let budget = TASK_EXIT_SETTLE_MS.min(self.readiness_timeout_ms(service_id));
+        let deadline = self.options.clock.now_millis() + budget.max(0);
+        loop {
+            if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+                return Ok(());
+            }
+            if self.probe(&profile.readiness, service_id).await {
+                self.transition_if_current(
+                    service_id,
+                    generation,
+                    token,
+                    ActualServiceState::Ready,
+                    ServiceReadiness::Ready,
+                    Changes {
+                        readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
+                        readiness_detail: Patch::Set("readiness verified".to_string()),
+                        error: Patch::Clear,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+            if self.options.clock.now_millis() >= deadline {
+                break;
+            }
+            self.options
+                .clock
+                .sleep(self.options.readiness_backoff_ms)
+                .await;
+        }
+        let message = format!("{service_id} task finished but the service is not ready");
+        self.fail(
+            service_id,
+            generation,
+            token,
+            None,
+            &message,
+            operation_id,
+            None,
+        )
+        .await;
+        Err(SupervisorError(message))
     }
 
     async fn readiness(
@@ -2748,14 +3420,36 @@ impl ProcessSupervisor {
         self.owns_identity(state.identity.as_ref().unwrap()).await
     }
 
+    fn same_executable(&self, record: &ProcessRecord, identity: &ProcessIdentity) -> bool {
+        let ProcessRecord::Posix(record) = record else {
+            return false;
+        };
+        let ProcessIdentity::Posix(identity) = identity else {
+            return false;
+        };
+        let Ok(profile) = profile_for(&self.host.catalog(), &identity.service_id) else {
+            return false;
+        };
+        let Some(exe) = Self::absolute_argv0(&profile.command) else {
+            return false;
+        };
+        executable_matches(&record.command_line, &[exe])
+    }
+
     async fn observed_matches(&self, identity: &ProcessIdentity) -> Option<bool> {
         let observed = match self.options.process.inspect(identity).await {
             Inspection::Observed(observed) => observed,
             Inspection::Gone => return Some(false),
             Inspection::Unknown => return None,
         };
-        if !observed.alive
-            || observed.record.command_fingerprint() != identity.command_fingerprint()
+        if !observed.alive {
+            return Some(false);
+        }
+        // Redis `setproctitle` keeps the binary and replaces the arguments
+        // (`redis-server {dataDir}/redis.conf` → `redis-server 127.0.0.1:port`). The pid and
+        // lstart below still have to match, so this is the same process, not a scan of the table.
+        if observed.record.command_fingerprint() != identity.command_fingerprint()
+            && !self.same_executable(&observed.record, identity)
         {
             return Some(false);
         }
@@ -2895,6 +3589,132 @@ impl ProcessSupervisor {
                 .await;
         }
     }
+}
+
+fn readiness_tcp_port(readiness: &ReadinessSpec) -> Option<u16> {
+    match readiness {
+        ReadinessSpec::Tcp { port } => Some(*port),
+        _ => None,
+    }
+}
+
+/// Text after the last `exec` keyword. `exec 'build/install/name/bin/name'` keeps the path;
+/// `exec node dist/main` keeps the program and its arguments.
+fn exec_program(shell: &str) -> Option<String> {
+    let exec_at = last_shell_word(shell, "exec")?;
+    let rest = shell[exec_at + 4..].trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(unquote_exec(rest))
+}
+
+/// Directory from the last `cd` before `exec`. `cd -- 'portal/metadata'` yields that path.
+fn shell_cd_dir(shell: &str) -> Option<String> {
+    let exec_at = last_shell_word(shell, "exec")?;
+    let before = &shell[..exec_at];
+    let cd_at = last_shell_word(before, "cd")?;
+    let mut after = before[cd_at + 2..].trim_start();
+    if let Some(rest) = after.strip_prefix("--") {
+        after = rest.trim_start();
+    }
+    if after.is_empty() {
+        return None;
+    }
+    let quote = after.as_bytes()[0];
+    if quote == b'\'' || quote == b'"' {
+        let body = &after[1..];
+        let end = body.find(quote as char)?;
+        return Some(body[..end].to_string());
+    }
+    Some(after.split_whitespace().next()?.to_string())
+}
+
+fn last_shell_word(text: &str, word: &str) -> Option<usize> {
+    let mut found = None;
+    for (index, _) in text.match_indices(word) {
+        let before_ok = index == 0
+            || text[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+        let after = index + word.len();
+        let after_ok = after >= text.len()
+            || text[after..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+        if before_ok && after_ok {
+            found = Some(index);
+        }
+    }
+    found
+}
+
+fn unquote_exec(rest: &str) -> String {
+    let rest = rest.trim();
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        let inner = &rest[1..rest.len() - 1];
+        if !inner.contains(bytes[0] as char) {
+            return inner.to_string();
+        }
+    }
+    rest.to_string()
+}
+
+/// Where the exec'd program is running. A `cd` inside the shell wins over the command cwd,
+/// because that is the directory `ps` reports after `cd && exec`.
+fn process_cwd(command: &ServiceCommand) -> String {
+    let CommandSpec::Shell { shell, .. } = &command.command else {
+        return command.cwd.clone();
+    };
+    let Some(dir) = shell_cd_dir(shell) else {
+        return command.cwd.clone();
+    };
+    if dir.starts_with('/') || command.cwd == "." || command.cwd.is_empty() {
+        return dir;
+    }
+    format!("{}/{}", command.cwd.trim_end_matches('/'), dir)
+}
+
+/// Logical command, plus the `exec` target as `ps` will show it (`node dist/main`).
+fn exec_target_fingerprints(command: &ServiceCommand) -> Vec<String> {
+    let mut fingerprints = vec![normalize_command_fingerprint(command)];
+    let CommandSpec::Shell { shell, .. } = &command.command else {
+        return fingerprints;
+    };
+    if let Some(program) = exec_program(shell) {
+        let observed = normalize_observed_command_fingerprint(&program);
+        if !fingerprints.contains(&observed) {
+            fingerprints.push(observed);
+        }
+    }
+    fingerprints
+}
+
+/// `cd portal/metadata && exec build/install/portal.metadata/bin/portal.metadata` becomes
+/// `portal/metadata/build/install/portal.metadata`. A Gradle script's `java` command line still
+/// contains that directory. `exec node dist/main` has no install directory.
+fn install_dir_marker(command: &ServiceCommand) -> Option<String> {
+    let CommandSpec::Shell { shell, .. } = &command.command else {
+        return None;
+    };
+    let program = exec_program(shell)?;
+    let first = program.split_whitespace().next()?;
+    let (dir, _) = first.rsplit_once("/bin/")?;
+    if dir.is_empty() || dir == "." || dir == ".." {
+        return None;
+    }
+    let marker = match shell_cd_dir(shell) {
+        Some(cd) if !dir.starts_with('/') => format!("{cd}/{dir}"),
+        _ => dir.to_string(),
+    };
+    let marker = marker.trim_start_matches("./").to_string();
+    marker.contains("build/install/").then_some(marker)
 }
 
 fn with_manager_instance(identity: ProcessIdentity, instance_id: String) -> ProcessIdentity {

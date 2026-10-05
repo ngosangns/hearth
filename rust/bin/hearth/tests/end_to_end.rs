@@ -346,7 +346,12 @@ fn skill_install_writes_the_real_binarys_skill_pack() {
     let written = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
     assert!(written.contains("local_services_manage"), "{written}");
     assert!(written.contains("scripts/manage.sh"), "{written}");
-    for script in ["hearth.sh", "manage.sh", "status.sh", "shared-connection.sh"] {
+    for script in [
+        "hearth.sh",
+        "manage.sh",
+        "status.sh",
+        "shared-connection.sh",
+    ] {
         let path = skill_dir.join("scripts").join(script);
         assert!(path.is_file(), "missing skill script {}", path.display());
     }

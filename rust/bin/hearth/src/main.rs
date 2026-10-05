@@ -124,7 +124,15 @@ fn spawn_detached(args: &[&str], cwd: Option<&Path>) {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let _ = command.spawn();
+    // `process_group` does not reparent. Dropping `Child` does not wait, so when this daemon
+    // exits it stays a zombie of the process that spawned it (the TUI). `kill(pid, 0)` is still
+    // true for that zombie, and `manager restart` then waits out the whole stop timeout on
+    // "restarting daemon…". Reap the child when it exits.
+    if let Ok(mut child) = command.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// `hearth daemon --root <root>`, detached.

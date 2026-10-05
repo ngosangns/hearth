@@ -24,6 +24,8 @@ pub struct PosixProcessRecord {
     pub pgid: i64,
     pub start_identity: String,
     pub command_fingerprint: String,
+    /// Raw `ps` command line. Empty when the adapter did not capture one.
+    pub command_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +186,18 @@ pub trait ProcessAdapter: Send + Sync {
     /// One `pid -> start identity` snapshot of every live process, or `None` when the table could
     /// not be read. What tree members are checked against, so a recycled pid never counts as ours.
     async fn live_start_identities(&self) -> Option<HashMap<i64, String>>;
+    /// Live processes whose cwd is `cwd` (relative to the project root) and whose command is
+    /// either one of `fingerprints` or one of `executables` (absolute argv0, for a server that
+    /// rewrote the rest of its title). `None` means the table could not be read. The default is
+    /// an empty list, so an adapter that does not scan never kills a process by mistake.
+    async fn command_matches(
+        &self,
+        _fingerprints: &[String],
+        _executables: &[String],
+        _cwd: &str,
+    ) -> Option<Vec<CommandMatch>> {
+        Some(Vec::new())
+    }
     /// `None` if unsupported by this adapter (the TS "optional" `stopContainer`/`attachOutput`).
     async fn stop_container(
         &self,
@@ -210,6 +224,14 @@ pub trait PreparationAdapter: Send + Sync {
         service_id: &ServiceId,
         steps: &[String],
     ) -> Result<(), SupervisorError>;
+}
+
+/// A host process whose command and working directory are a service's. `start_identity` is the
+/// `ps lstart` the pid-reuse guard compares before signalling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandMatch {
+    pub pid: i64,
+    pub start_identity: String,
 }
 
 /// One process holding a TCP listen socket on a catalog port — what `port_in_use` reports only as

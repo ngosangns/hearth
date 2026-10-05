@@ -4,5 +4,8 @@
 pub mod client;
 pub mod server;
 
-pub use client::{EventsArguments, HearthMcpClient, LogsArguments, ManageArguments, ManagerApiClient, StatusArguments, TraceArguments};
+pub use client::{
+    EventsArguments, HearthMcpClient, LogsArguments, ManageArguments, ManagerApiClient,
+    StatusArguments, TraceArguments,
+};
 pub use server::{create_hearth_mcp_server, CreateHearthMcpServerOptions, HearthMcpServer};

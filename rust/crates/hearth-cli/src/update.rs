@@ -1607,11 +1607,9 @@ mod tests {
         .await;
         assert_eq!(captured.code, 1);
         assert!(
-            captured
-                .err
-                .iter()
-                .any(|line| line.contains("only replaces")
-                    && line.contains("target/release/hearth")),
+            captured.err.iter().any(
+                |line| line.contains("only replaces") && line.contains("target/release/hearth")
+            ),
             "{:?}",
             captured.err
         );
@@ -1825,10 +1823,7 @@ mod tests {
         let world = world();
         let target = world.layout.versioned("0.16.0");
         let relative = relative_from(world.layout.link.parent().unwrap(), &target);
-        assert_eq!(
-            relative,
-            PathBuf::from("../share/hearth/bin/hearth-0.16.0")
-        );
+        assert_eq!(relative, PathBuf::from("../share/hearth/bin/hearth-0.16.0"));
     }
 
     #[test]

@@ -1503,14 +1503,46 @@ impl App {
         let tx = self.tx.clone();
         let gen = self.gen;
         tokio::spawn(async move {
-            let mut failed = None;
+            let mut failed = Vec::new();
+            let mut accepted = Vec::new();
             for service in &targets {
-                if let Err(error) = client.action(service, action, false).await {
-                    failed = Some(format!("{label}: {}", safe_message(&error.message)));
-                    break;
+                match client.action(service, action, false).await {
+                    Ok(operation) => accepted.push((service.clone(), operation.id)),
+                    Err(error) => {
+                        failed.push(format!("{service}: {}", safe_message(&error.message)))
+                    }
                 }
             }
-            let text = failed.unwrap_or_else(|| format!("{} {label}", action.as_wire_str()));
+            let waits = accepted.into_iter().map(|(service, id)| {
+                let client = Arc::clone(&client);
+                async move {
+                    match client.wait_operation(&id).await {
+                        Ok(done) if done.status == OperationStatus::Failed => {
+                            let message = done
+                                .error
+                                .map(|error| error.message)
+                                .unwrap_or_else(|| "failed".to_string());
+                            Err(format!("{service}: {}", safe_message(&message)))
+                        }
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(format!("{service}: {}", safe_message(&error.message))),
+                    }
+                }
+            });
+            for result in futures_util::future::join_all(waits).await {
+                if let Err(message) = result {
+                    failed.push(message);
+                }
+            }
+            let text = match failed.len() {
+                0 => format!("{} {label}", action.as_wire_str()),
+                1 => format!("{} {label} failed: {}", action.as_wire_str(), failed[0]),
+                n => format!(
+                    "{} {label}: {n} failed — {}",
+                    action.as_wire_str(),
+                    failed[0]
+                ),
+            };
             let _ = tx.send(Msg::Note { gen, text }).await;
             let _ = tx.send(Msg::JobFinished).await;
         });

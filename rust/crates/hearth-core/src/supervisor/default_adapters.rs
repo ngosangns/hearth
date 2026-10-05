@@ -32,10 +32,10 @@ use super::process_tree::{
     build_process_tree, parse_ps_alive_rows, parse_ps_tree_rows, ProcessTreeSnapshot,
 };
 use super::types::{
-    DockerContainerRecord, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource,
-    OutputTail, PortHolder, PosixProcessRecord, ProbeAdapter, ProcessAdapter, ProcessRecord,
-    ProcessSignal, RunBuild, SpawnInput, SupervisorClock, SupervisorError, SupervisorOptions,
-    SystemClock,
+    CommandMatch, DockerContainerRecord, Inspection, ManagedProcess, ObservedProcess, OnOutput,
+    OutputSource, OutputTail, PortHolder, PosixProcessRecord, ProbeAdapter, ProcessAdapter,
+    ProcessRecord, ProcessSignal, RunBuild, SpawnInput, SupervisorClock, SupervisorError,
+    SupervisorOptions, SystemClock,
 };
 
 const RAW_LOG_POLL_MS: u64 = 200;
@@ -187,6 +187,7 @@ async fn observed_system_process_with_command(
             pgid,
             start_identity,
             command_fingerprint,
+            command_line: command_line.clone(),
         },
         command_line,
     )))
@@ -1018,6 +1019,7 @@ impl ProcessAdapter for DefaultProcessAdapter {
                             pgid: 0,
                             start_identity: String::new(),
                             command_fingerprint: id.command_fingerprint.clone(),
+                            command_line: String::new(),
                         }),
                         alive: false,
                     });
@@ -1045,6 +1047,16 @@ impl ProcessAdapter for DefaultProcessAdapter {
 
     async fn live_start_identities(&self) -> Option<HashMap<i64, String>> {
         system_live_start_identities().await
+    }
+
+    async fn command_matches(
+        &self,
+        fingerprints: &[String],
+        executables: &[String],
+        cwd: &str,
+    ) -> Option<Vec<CommandMatch>> {
+        super::duplicates::matching_service_processes(&self.root, fingerprints, executables, cwd)
+            .await
     }
 
     async fn signal_pid(&self, pid: i64, expected_start_identity: &str, signal: ProcessSignal) {
@@ -1951,6 +1963,7 @@ mod tests {
             pgid: pid,
             start_identity: "Mon Jan  1 00:00:00 2026".to_string(),
             command_fingerprint: fingerprint.to_string(),
+            command_line: String::new(),
         }
     }
 

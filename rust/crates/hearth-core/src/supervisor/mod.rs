@@ -5,12 +5,14 @@
 //! pure identity and whole-process-tree logic both sides share.
 
 pub mod default_adapters;
+pub mod duplicates;
 pub mod engine;
 pub mod fingerprint;
 pub mod process_tree;
 pub mod types;
 
 pub use default_adapters::default_supervisor_options;
+pub use duplicates::{pid_is_live, reap_duplicate_daemons};
 pub use engine::ProcessSupervisor;
 pub use fingerprint::{
     command_argv, normalize_command_fingerprint, normalize_observed_command_fingerprint,

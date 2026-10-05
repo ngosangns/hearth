@@ -26,9 +26,9 @@ pub use log_store::{
     CursorLogStore, LogStoreError, DEFAULT_LOG_MAX_BYTES, DEFAULT_LOG_ROTATION_COUNT,
     DEFAULT_LOG_TAIL_BYTES,
 };
-pub use protocol::ShutdownMode;
 pub use operations::{
     OperationExecute, OperationHandle, OperationInput, OperationRejected, OperationScheduler,
     RequestIdConflict,
 };
+pub use protocol::ShutdownMode;
 pub use state_store::AtomicStateStore;

@@ -805,7 +805,11 @@ impl Desk {
     }
 
     fn paint_notice(&self, frame: &mut Frame, inner: Rect, show: bool) -> usize {
-        let notice = if show { self.status_notice() } else { String::new() };
+        let notice = if show {
+            self.status_notice()
+        } else {
+            String::new()
+        };
         if notice.is_empty() || inner.width == 0 || inner.height == 0 {
             return 0;
         }
@@ -3301,9 +3305,10 @@ mod tests {
         let mut bare = row("postgres", ActualServiceState::Ready, false);
         bare.shared = true;
         let bare_line = service_line(&bare, false);
-        assert!(bare_line.spans.iter().any(|span| {
-            span.content.contains("shared") && span.style.fg == Some(Color::Blue)
-        }));
+        assert!(bare_line
+            .spans
+            .iter()
+            .any(|span| { span.content.contains("shared") && span.style.fg == Some(Color::Blue) }));
         let state = bare_line
             .spans
             .iter()

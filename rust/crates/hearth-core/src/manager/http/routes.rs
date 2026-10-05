@@ -138,7 +138,10 @@ async fn get_catalog(State(manager): State<Arc<HearthManager>>) -> Response {
 async fn get_urls(State(manager): State<Arc<HearthManager>>) -> Response {
     let catalog = manager.catalog();
     let resolved = tokio::task::spawn_blocking(move || {
-        crate::catalog::resolve_service_urls(&catalog, crate::manager::service_urls::lookup_placeholder)
+        crate::catalog::resolve_service_urls(
+            &catalog,
+            crate::manager::service_urls::lookup_placeholder,
+        )
     })
     .await;
     match resolved {

@@ -122,7 +122,16 @@ from any dev box here, with the same username.
   to kill, so the operation fails rather than silently succeeding. A finished `readiness: exit`
   row is the exception: stop succeeds immediately and leaves `succeeded` or `failed` in place,
   because there is no process left. Do not send that row through `stop_unowned`.
-- **`killUnowned` is the only path that signals a process the daemon does not own.** It is a
+- Restart is not that stop. A row with no process identity and no catalog `stop` command used to
+  fail inside stop, so restarting a group only showed the verb and never started the members.
+  Restart skips that refusal and starts. When the TCP listener is this service — the `exec` target
+  in its directory, or the install directory still in the command line — restart records that
+  identity and replaces the process with the owned process-tree stop before starting. A different
+  program is not signalled; start reports the port is held. Stop of the same row still fails.
+  `hearth stop` / `hearth restart` of a group waits for each member, so the first failure still
+  stops the rest; `--wait` only makes a single service block. In the TUI, group stop and restart
+  wait for every member and the notice names a failure.
+- **`killUnowned` is the only path that signals an arbitrary process holding a service port.** It is a
   client-supplied flag on `POST /v1/operations` (`action: start` only — every surface rejects it
   otherwise) that must only ever be set after an explicit user confirmation: CLI `--kill-unowned`
   or its TTY `[y/N]` prompt (non-TTY always answers no), TUI's two-keypress arm-then-confirm, and
@@ -133,6 +142,25 @@ from any dev box here, with the same username.
   1 must never be signalled). `signal_pid` re-verifies the resolved `lstart` before sending, so a
   pid recycled between resolve and signal is never killed. `None` from `port_holders` means
   "cannot resolve" — the reclaim fails closed rather than guessing a pid.
+- `manager restart` reaps every other live daemon for that same root before starting the new one.
+  A project root matches `hearth daemon --root <path>` (either argument order; the path may contain
+  spaces; a longer path is not a match). `~/.hearth/shared` matches `hearth smp`. The reap signals
+  those pids only — SIGTERM, then SIGKILL — never the process group, so detached services keep
+  running. A service `restart` reaps host processes in the service cwd whose command fingerprint
+  is the logical command or the last stored identity, or whose argv0 is that service's absolute
+  argv0 when the binary is a dedicated server and no other catalog service uses it from the same
+  directory. Dedicated means not `hearth` and not a shared interpreter (`node`, `python`, `java`,
+  `ruby`, `perl`, a shell, `bun`, `deno`). A start adopts that absolute-argv0 process; the pid
+  already stored stays owned on argv0 even when another service shares the binary. A shell
+  command stays on the settled fingerprint (`shell` + `exec`). Each match's ppid tree is
+  signalled per pid. A process that only shares the port stays on `killUnowned`. If `ps` cannot
+  be read, restart fails closed; a start skips the adopt and continues.
+- A daemon spawned by `ensure` stays a child of that process (`process_group` does not reparent).
+  `kill(pid, 0)` is true for the zombie left when that child exits. `is_pid_alive` must reap an
+  exited child and treat any other zombie as dead — otherwise `manager restart` sits on
+  "restarting daemon…" for the 300s stop timeout, and `claim_lock` spins. The spawn path also
+  waits the child in the background so it does not linger as a zombie. Do not weaken a *running*
+  pid into "dead" because a health check timed out.
 
 **Daemon / state**
 
@@ -143,10 +171,15 @@ from any dev box here, with the same username.
   `state.json`.
 - `reloadCatalog` stops a removed-but-active service using the **old** catalog and only swaps the
   catalog afterward — the supervisor needs the old definition to know how to stop it.
-- A persisted `externally-owned` (from a port held by an unowned process) is only re-evaluated on
-  the next `start` — `sync_external_services` only polls `ownership: external` units, and `cleanup`
-  does not touch it, so a dead squatter leaves a phantom "Port N is held" row in the UI forever.
-  The same blind spot hits a **renamed-ownership id**: removing a `shared:` key and re-adding it as
+- A persisted `externally-owned` row is re-checked when the daemon reconciles, including startup.
+  A free TCP port with desired `running` becomes `failed` ("Managed process is no longer alive")
+  and is not started again; desired `stopped` becomes `stopped` and the error is cleared. A holder
+  that is this service — the `exec` target running in this service's directory, or a command line
+  that still contains the `cd && exec build/install/.../bin/...` install directory — is adopted and
+  probed. A different program stays `externally-owned` until a confirmed `killUnowned` start.
+  `None` from the port probe leaves the row unchanged. `sync_external_services` still only polls
+  `ownership: external` units.
+  A **renamed-ownership id** is a separate blind spot: removing a `shared:` key and re-adding it as
   a `services:` entry keeps the old row (`adopted from external state`, `command` readiness) across
   restarts — the new daemon-owned service never installs or spawns because `start` short-circuits
   on the persisted `ready`. Fix: `manager stop`, delete the service's `state.json` row, restart.
@@ -233,6 +266,11 @@ from any dev box here, with the same username.
 - The task semantics depend on a supervisor rule: `ownership: external` + `command` readiness ⇒
   the run command is a one-shot trigger, not the service process (`is_external_task`). A
   daemon-owned `command`-readiness service is still a normal long-lived process — don't widen it.
+  The shared row's readiness budget (script pack + extract + instance probe, ~49 min) applies
+  only while `hearth shared attach` is still running. Once that process exits, a non-zero code
+  fails the row immediately and exit 0 gets at most five seconds of probes. Do not keep polling
+  `hearth shared probe` for the pack budget after attach has finished: a failed instance does
+  not become ready on its own.
 - **`smp` = `hearth smp`** — the same binary, rooted at `~/.hearth/shared`, catalog *synthesized*
   from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
@@ -249,6 +287,9 @@ from any dev box here, with the same username.
   and then `exec`s is adopted as the wrapper and orphaned once the real server replaces it. A
   server that rewrites its own title (nginx's `nginx: master process …`) has to be started with
   `shell` + `exec: true` so the stored identity is that settled line, not the pre-title argv.
+  A dedicated argv binary that keeps the same absolute executable (Redis `setproctitle`) stays
+  owned without that wrapper; a start adopts an untracked copy instead of spawning one that
+  cannot bind.
   `{projectBucket}` is `h-<projectId>` — S3 bucket names reject the underscore in `{projectDb}`.
 - Install = tarball + sha256 into `installs/<name>/<version>` (atomic rename; `.hearth-installed`
   marker last). The catalog artifact is either a `url` (download that archive) or a `script`

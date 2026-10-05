@@ -6,19 +6,28 @@
 use std::sync::{Arc, RwLock};
 
 use regex::Regex;
-use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 
 use hearth_core::state::ServiceOperationKind;
 
-use crate::client::{EventsArguments, HearthMcpClient, LogsArguments, ManageArguments, StatusArguments, TraceArguments};
+use crate::client::{
+    EventsArguments, HearthMcpClient, LogsArguments, ManageArguments, StatusArguments,
+    TraceArguments,
+};
 
 fn secret_key_pattern() -> &'static Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)authorization|token|ownership(?:key|proof)|secret|password|api[_-]?key").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)authorization|token|ownership(?:key|proof)|secret|password|api[_-]?key")
+            .unwrap()
+    })
 }
 
 /// Strips anything that looks like a credential out of a value before it reaches the model —
@@ -33,7 +42,9 @@ fn redact(value: &Value) -> Value {
 fn redact_tool_result(tool: &str, value: &Value) -> Value {
     let mut redacted = redact(value);
     if tool == "shared_connection" {
-        if let (Some(object), Some(connection)) = (redacted.as_object_mut(), value.get("connection")) {
+        if let (Some(object), Some(connection)) =
+            (redacted.as_object_mut(), value.get("connection"))
+        {
             object.insert("connection".to_string(), connection.clone());
         }
     }
@@ -45,8 +56,18 @@ fn redact_at_depth(value: &Value, depth: u32) -> Value {
         return Value::String("[truncated]".to_string());
     }
     match value {
-        Value::Array(items) => Value::Array(items.iter().map(|entry| redact_at_depth(entry, depth + 1)).collect()),
-        Value::Object(map) => Value::Object(map.iter().filter(|(key, _)| !secret_key_pattern().is_match(key)).map(|(key, entry)| (key.clone(), redact_at_depth(entry, depth + 1))).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|entry| redact_at_depth(entry, depth + 1))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !secret_key_pattern().is_match(key))
+                .map(|(key, entry)| (key.clone(), redact_at_depth(entry, depth + 1)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -74,7 +95,13 @@ pub struct CreateHearthMcpServerOptions {
 
 impl Default for CreateHearthMcpServerOptions {
     fn default() -> Self {
-        Self { name: "hearth".to_string(), version: None, tool_prefix: String::new(), require_confirm: true, known_service_ids: Vec::new() }
+        Self {
+            name: "hearth".to_string(),
+            version: None,
+            tool_prefix: String::new(),
+            require_confirm: true,
+            known_service_ids: Vec::new(),
+        }
     }
 }
 
@@ -85,18 +112,32 @@ pub struct HearthMcpServer {
     service_ids: Arc<RwLock<Vec<String>>>,
 }
 
-pub fn create_hearth_mcp_server(client: Arc<dyn HearthMcpClient>, options: CreateHearthMcpServerOptions) -> HearthMcpServer {
+pub fn create_hearth_mcp_server(
+    client: Arc<dyn HearthMcpClient>,
+    options: CreateHearthMcpServerOptions,
+) -> HearthMcpServer {
     let service_ids = Arc::new(RwLock::new(options.known_service_ids.clone()));
-    HearthMcpServer { client, options: Arc::new(options), service_ids }
+    HearthMcpServer {
+        client,
+        options: Arc::new(options),
+        service_ids,
+    }
 }
 
 fn require_only_keys(value: &JsonObject, allowed: &[&str]) -> Result<(), String> {
-    let unexpected: Vec<&str> = value.keys().map(String::as_str).filter(|key| !allowed.contains(key)).collect();
+    let unexpected: Vec<&str> = value
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
     if unexpected.is_empty() {
         Ok(())
     } else {
         let suffix = if unexpected.len() > 1 { "s" } else { "" };
-        Err(format!("unexpected argument{suffix}: {}", unexpected.join(", ")))
+        Err(format!(
+            "unexpected argument{suffix}: {}",
+            unexpected.join(", ")
+        ))
     }
 }
 
@@ -112,7 +153,12 @@ fn required_string(value: Option<&Value>, name: &str) -> Result<String, String> 
     optional_string(value, name)?.ok_or_else(|| format!("{name} is required"))
 }
 
-fn optional_integer(value: Option<&Value>, name: &str, minimum: i64, maximum: Option<i64>) -> Result<Option<i64>, String> {
+fn optional_integer(
+    value: Option<&Value>,
+    name: &str,
+    minimum: i64,
+    maximum: Option<i64>,
+) -> Result<Option<i64>, String> {
     let range_error = || {
         let range = match maximum {
             Some(max) => format!("between {minimum} and {max}"),
@@ -129,10 +175,19 @@ fn optional_integer(value: Option<&Value>, name: &str, minimum: i64, maximum: Op
         Some(Value::Number(number)) => {
             let candidate = match number.as_i64() {
                 Some(int) => Some(int),
-                None => number.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64),
+                None => number
+                    .as_f64()
+                    .filter(|f| f.fract() == 0.0)
+                    .map(|f| f as i64),
             };
             match candidate {
-                Some(int) if int.abs() <= MAX_SAFE_INTEGER && int >= minimum && maximum.is_none_or(|max| int <= max) => Ok(Some(int)),
+                Some(int)
+                    if int.abs() <= MAX_SAFE_INTEGER
+                        && int >= minimum
+                        && maximum.is_none_or(|max| int <= max) =>
+                {
+                    Ok(Some(int))
+                }
                 _ => Err(range_error()),
             }
         }
@@ -159,13 +214,21 @@ impl HearthMcpServer {
         if known.iter().any(|id| id == &service) {
             Ok(service)
         } else {
-            Err(format!("unknown service: {service}. Known services: {}", known.join(", ")))
+            Err(format!(
+                "unknown service: {service}. Known services: {}",
+                known.join(", ")
+            ))
         }
     }
 
     fn parse_status(&self, arguments: &JsonObject) -> Result<StatusArguments, String> {
         require_only_keys(arguments, &["service"])?;
-        Ok(StatusArguments { service: arguments.get("service").map(|value| self.require_service(Some(value))).transpose()? })
+        Ok(StatusArguments {
+            service: arguments
+                .get("service")
+                .map(|value| self.require_service(Some(value)))
+                .transpose()?,
+        })
     }
 
     fn parse_logs(&self, arguments: &JsonObject) -> Result<LogsArguments, String> {
@@ -173,23 +236,34 @@ impl HearthMcpServer {
         Ok(LogsArguments {
             service: self.require_service(arguments.get("service"))?,
             cursor: optional_integer(arguments.get("cursor"), "cursor", 0, None)?.map(|v| v as u64),
-            generation: optional_integer(arguments.get("generation"), "generation", 0, None)?.map(|v| v as u64),
-            limit: optional_integer(arguments.get("limit"), "limit", 1, Some(64 * 1024))?.map(|v| v as u64),
+            generation: optional_integer(arguments.get("generation"), "generation", 0, None)?
+                .map(|v| v as u64),
+            limit: optional_integer(arguments.get("limit"), "limit", 1, Some(64 * 1024))?
+                .map(|v| v as u64),
         })
     }
 
     fn parse_trace(&self, arguments: &JsonObject) -> Result<TraceArguments, String> {
         require_only_keys(arguments, &["operationId"])?;
-        Ok(TraceArguments { operation_id: required_string(arguments.get("operationId"), "operationId")? })
+        Ok(TraceArguments {
+            operation_id: required_string(arguments.get("operationId"), "operationId")?,
+        })
     }
 
     fn parse_events(&self, arguments: &JsonObject) -> Result<EventsArguments, String> {
         require_only_keys(arguments, &["after", "epoch"])?;
-        Ok(EventsArguments { after: optional_integer(arguments.get("after"), "after", 0, None)?.map(|v| v as u64), epoch: optional_string(arguments.get("epoch"), "epoch")? })
+        Ok(EventsArguments {
+            after: optional_integer(arguments.get("after"), "after", 0, None)?.map(|v| v as u64),
+            epoch: optional_string(arguments.get("epoch"), "epoch")?,
+        })
     }
 
     fn parse_manage(&self, arguments: &JsonObject) -> Result<ManageArguments, String> {
-        let allowed: &[&str] = if self.options.require_confirm { &["service", "action", "confirm", "killUnowned"] } else { &["service", "action", "killUnowned"] };
+        let allowed: &[&str] = if self.options.require_confirm {
+            &["service", "action", "confirm", "killUnowned"]
+        } else {
+            &["service", "action", "killUnowned"]
+        };
         require_only_keys(arguments, allowed)?;
         if self.options.require_confirm && arguments.get("confirm") != Some(&Value::Bool(true)) {
             return Err("manage requires confirm=true (explicit user approval) — never call this speculatively".to_string());
@@ -209,13 +283,21 @@ impl HearthMcpServer {
         if kill_unowned && action != ServiceOperationKind::Start {
             return Err("killUnowned only applies to action=start".to_string());
         }
-        Ok(ManageArguments { service, action, kill_unowned })
+        Ok(ManageArguments {
+            service,
+            action,
+            kill_unowned,
+        })
     }
 
     /// The daemon-lifecycle tools take no arguments beyond the confirm gate — one daemon per
     /// project root means there is nothing to select.
     fn parse_daemon_lifecycle(&self, tool: &str, arguments: &JsonObject) -> Result<(), String> {
-        let allowed: &[&str] = if self.options.require_confirm { &["confirm"] } else { &[] };
+        let allowed: &[&str] = if self.options.require_confirm {
+            &["confirm"]
+        } else {
+            &[]
+        };
         require_only_keys(arguments, allowed)?;
         if self.options.require_confirm && arguments.get("confirm") != Some(&Value::Bool(true)) {
             return Err(format!("{tool} requires confirm=true (explicit user approval) — never call this speculatively"));
@@ -255,7 +337,9 @@ impl HearthMcpServer {
             }
             "shared_connection" => {
                 require_only_keys(&arguments, &["service"])?;
-                self.client.shared_connection(required_string(arguments.get("service"), "service")?).await
+                self.client
+                    .shared_connection(required_string(arguments.get("service"), "service")?)
+                    .await
             }
             _ => Err(format!("unknown tool: {}{tool}", self.options.tool_prefix)),
         }
@@ -265,7 +349,9 @@ impl HearthMcpServer {
         let prefix = &self.options.tool_prefix;
         let require_confirm = self.options.require_confirm;
         let service_ids = &self.known_service_ids();
-        let schema = |value: Value| -> Arc<JsonObject> { Arc::new(value.as_object().cloned().unwrap_or_default()) };
+        let schema = |value: Value| -> Arc<JsonObject> {
+            Arc::new(value.as_object().cloned().unwrap_or_default())
+        };
 
         let mut manage_properties = json!({
             "service": { "type": "string", "enum": service_ids },
@@ -277,7 +363,11 @@ impl HearthMcpServer {
             manage_properties["confirm"] = json!({ "type": "boolean", "description": "Must be true; the user must have explicitly asked for this action" });
             manage_required.push("confirm");
         }
-        let manage_description = if require_confirm { "Start/stop/restart a local dev service. Requires confirm=true (explicit user approval) — never call this speculatively." } else { "Start/stop/restart a local dev service. MCP hosts should require approval for this tool." };
+        let manage_description = if require_confirm {
+            "Start/stop/restart a local dev service. Requires confirm=true (explicit user approval) — never call this speculatively."
+        } else {
+            "Start/stop/restart a local dev service. MCP hosts should require approval for this tool."
+        };
 
         let mut restart_properties = json!({});
         let mut restart_required: Vec<&str> = Vec::new();
@@ -346,15 +436,31 @@ impl HearthMcpServer {
 
 impl ServerHandler for HearthMcpServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(Implementation::new(self.options.name.clone(), self.options.version.clone().unwrap_or_else(|| "1.0.0".to_string())))
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new(
+                self.options.name.clone(),
+                self.options
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| "1.0.0".to_string()),
+            ),
+        )
     }
 
-    async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, McpError> {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
         self.refresh_service_ids().await;
         Ok(ListToolsResult::with_all_items(self.tool_definitions()))
     }
 
-    async fn call_tool(&self, request: CallToolRequestParams, _context: RequestContext<RoleServer>) -> Result<CallToolResponse, McpError> {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.unwrap_or_default();
         let tool = request.name.strip_prefix(self.options.tool_prefix.as_str());
         let dispatched = match tool {
@@ -362,8 +468,13 @@ impl ServerHandler for HearthMcpServer {
             None => Err(format!("unknown tool: {}", request.name)),
         };
         let result = match dispatched {
-            Ok(value) => CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&redact_tool_result(tool.unwrap_or_default(), &value)).unwrap())]),
-            Err(message) => CallToolResult::error(vec![ContentBlock::text(safe_error_message(&message))]),
+            Ok(value) => CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&redact_tool_result(tool.unwrap_or_default(), &value))
+                    .unwrap(),
+            )]),
+            Err(message) => {
+                CallToolResult::error(vec![ContentBlock::text(safe_error_message(&message))])
+            }
         };
         Ok(result.into())
     }
@@ -412,7 +523,8 @@ mod tests {
             Ok(json!({ "operation": "accepted" }))
         }
         async fn restart_daemon(&self) -> Result<Value, String> {
-            self.restarts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.restarts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({ "instanceId": "restarted-instance" }))
         }
         async fn stop_daemon(&self) -> Result<Value, String> {
@@ -420,7 +532,9 @@ mod tests {
             Ok(json!({ "operation": "accepted" }))
         }
         async fn shared_connection(&self, service: String) -> Result<Value, String> {
-            Ok(json!({ "service": service, "projectId": "p", "connection": { "env": { "AWS_SECRET_ACCESS_KEY": "minioadmin" } }, "token": "must-not-leak" }))
+            Ok(
+                json!({ "service": service, "projectId": "p", "connection": { "env": { "AWS_SECRET_ACCESS_KEY": "minioadmin" } }, "token": "must-not-leak" }),
+            )
         }
         async fn service_ids(&self) -> Option<Vec<String>> {
             self.service_ids.lock().unwrap().clone()
@@ -428,29 +542,51 @@ mod tests {
     }
 
     fn base_options() -> CreateHearthMcpServerOptions {
-        CreateHearthMcpServerOptions { name: "test-hearth".to_string(), tool_prefix: "local_services_".to_string(), known_service_ids: vec!["metadata".to_string(), "mongo".to_string()], ..Default::default() }
+        CreateHearthMcpServerOptions {
+            name: "test-hearth".to_string(),
+            tool_prefix: "local_services_".to_string(),
+            known_service_ids: vec!["metadata".to_string(), "mongo".to_string()],
+            ..Default::default()
+        }
     }
 
     fn args(value: Value) -> JsonObject {
         value.as_object().cloned().unwrap_or_default()
     }
 
-    type Connected = (rmcp::service::RunningService<RoleServer, HearthMcpServer>, rmcp::service::RunningService<rmcp::RoleClient, NoopClientHandler>);
+    type Connected = (
+        rmcp::service::RunningService<RoleServer, HearthMcpServer>,
+        rmcp::service::RunningService<rmcp::RoleClient, NoopClientHandler>,
+    );
 
-    async fn connect(client: Arc<dyn HearthMcpClient>, options: CreateHearthMcpServerOptions) -> Connected {
+    async fn connect(
+        client: Arc<dyn HearthMcpClient>,
+        options: CreateHearthMcpServerOptions,
+    ) -> Connected {
         let server = create_hearth_mcp_server(client, options);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         // The initialize handshake is a round trip: each side's `.serve()` blocks until it hears
         // from the other, so both must run concurrently rather than one after the other.
-        let (server_result, client_result) = tokio::join!(server.serve(server_io), NoopClientHandler.serve(client_io));
-        (server_result.expect("server should initialize"), client_result.expect("client should initialize"))
+        let (server_result, client_result) =
+            tokio::join!(server.serve(server_io), NoopClientHandler.serve(client_io));
+        (
+            server_result.expect("server should initialize"),
+            client_result.expect("client should initialize"),
+        )
     }
 
     #[tokio::test]
     async fn routes_focused_application_management_through_the_ordinary_manager_client() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "metadata", "action": "restart", "confirm": true })))).await.unwrap();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_manage").with_arguments(args(
+                    json!({ "service": "metadata", "action": "restart", "confirm": true }),
+                )),
+            )
+            .await
+            .unwrap();
         assert_ne!(response.is_error, Some(true));
         let managed = fake.managed.lock().unwrap().clone().unwrap();
         assert_eq!(managed.service, "metadata");
@@ -463,7 +599,14 @@ mod tests {
     async fn routes_focused_infrastructure_management_through_the_ordinary_manager_client() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "mongo", "action": "restart", "confirm": true })))).await.unwrap();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_manage").with_arguments(args(
+                    json!({ "service": "mongo", "action": "restart", "confirm": true }),
+                )),
+            )
+            .await
+            .unwrap();
         assert_ne!(response.is_error, Some(true));
         let managed = fake.managed.lock().unwrap().clone().unwrap();
         assert_eq!(managed.service, "mongo");
@@ -500,7 +643,11 @@ mod tests {
                 .call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "metadata", "action": action, "confirm": true, "killUnowned": true }))))
                 .await
                 .unwrap();
-            assert_eq!(response.is_error, Some(true), "killUnowned on action={action} must be rejected");
+            assert_eq!(
+                response.is_error,
+                Some(true),
+                "killUnowned on action={action} must be rejected"
+            );
         }
         assert!(fake.managed.lock().unwrap().is_none());
         let _ = client.cancel().await;
@@ -531,7 +678,13 @@ mod tests {
     async fn manage_requires_confirm_true_by_default() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "metadata", "action": "restart" })))).await.unwrap();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_manage")
+                    .with_arguments(args(json!({ "service": "metadata", "action": "restart" }))),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.is_error, Some(true));
         assert!(fake.managed.lock().unwrap().is_none());
         let _ = client.cancel().await;
@@ -541,9 +694,18 @@ mod tests {
     #[tokio::test]
     async fn manage_skips_the_confirm_requirement_when_disabled() {
         let fake = Arc::new(FakeClient::default());
-        let options = CreateHearthMcpServerOptions { require_confirm: false, ..base_options() };
+        let options = CreateHearthMcpServerOptions {
+            require_confirm: false,
+            ..base_options()
+        };
         let (server, client) = connect(fake.clone(), options).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "metadata", "action": "restart" })))).await.unwrap();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_manage")
+                    .with_arguments(args(json!({ "service": "metadata", "action": "restart" }))),
+            )
+            .await
+            .unwrap();
         assert_ne!(response.is_error, Some(true));
         let managed = fake.managed.lock().unwrap().clone().unwrap();
         assert_eq!(managed.service, "metadata");
@@ -557,7 +719,10 @@ mod tests {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake, base_options()).await;
         let tools = client.list_all_tools().await.unwrap();
-        let names: Vec<String> = tools.into_iter().map(|tool| tool.name.to_string()).collect();
+        let names: Vec<String> = tools
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -573,7 +738,10 @@ mod tests {
                 "local_services_shared_connection"
             ]
         );
-        let response = client.call_tool(CallToolRequestParams::new("local_services_status")).await.unwrap();
+        let response = client
+            .call_tool(CallToolRequestParams::new("local_services_status"))
+            .await
+            .unwrap();
         assert_ne!(response.is_error, Some(true));
         let _ = client.cancel().await;
         let _ = server.cancel().await;
@@ -583,8 +751,19 @@ mod tests {
     async fn restart_daemon_routes_through_the_client_and_returns_its_payload() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_restart_daemon").with_arguments(args(json!({ "confirm": true })))).await.unwrap();
-        assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_restart_daemon")
+                    .with_arguments(args(json!({ "confirm": true }))),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.is_error,
+            Some(true),
+            "{:?}",
+            response.content.first()
+        );
         assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
         let text = response.content[0].as_text().unwrap().text.clone();
         assert!(text.contains("restarted-instance"), "{text}");
@@ -596,9 +775,16 @@ mod tests {
     async fn restart_daemon_requires_confirm_true_by_default() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_restart_daemon")).await.unwrap();
+        let response = client
+            .call_tool(CallToolRequestParams::new("local_services_restart_daemon"))
+            .await
+            .unwrap();
         assert_eq!(response.is_error, Some(true));
-        assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 0, "an unconfirmed call must never reach the daemon");
+        assert_eq!(
+            fake.restarts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unconfirmed call must never reach the daemon"
+        );
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }
@@ -606,10 +792,21 @@ mod tests {
     #[tokio::test]
     async fn restart_daemon_skips_the_confirm_requirement_when_disabled() {
         let fake = Arc::new(FakeClient::default());
-        let options = CreateHearthMcpServerOptions { require_confirm: false, ..base_options() };
+        let options = CreateHearthMcpServerOptions {
+            require_confirm: false,
+            ..base_options()
+        };
         let (server, client) = connect(fake.clone(), options).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_restart_daemon")).await.unwrap();
-        assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+        let response = client
+            .call_tool(CallToolRequestParams::new("local_services_restart_daemon"))
+            .await
+            .unwrap();
+        assert_ne!(
+            response.is_error,
+            Some(true),
+            "{:?}",
+            response.content.first()
+        );
         assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = client.cancel().await;
         let _ = server.cancel().await;
@@ -621,8 +818,19 @@ mod tests {
     async fn stop_daemon_routes_through_the_client() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_stop_daemon").with_arguments(args(json!({ "confirm": true })))).await.unwrap();
-        assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_stop_daemon")
+                    .with_arguments(args(json!({ "confirm": true }))),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.is_error,
+            Some(true),
+            "{:?}",
+            response.content.first()
+        );
         assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = client.cancel().await;
         let _ = server.cancel().await;
@@ -632,9 +840,16 @@ mod tests {
     async fn stop_daemon_requires_confirm_true_by_default() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_stop_daemon")).await.unwrap();
+        let response = client
+            .call_tool(CallToolRequestParams::new("local_services_stop_daemon"))
+            .await
+            .unwrap();
         assert_eq!(response.is_error, Some(true));
-        assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 0, "an unconfirmed call must never reach the daemon");
+        assert_eq!(
+            fake.stops.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unconfirmed call must never reach the daemon"
+        );
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }
@@ -642,10 +857,21 @@ mod tests {
     #[tokio::test]
     async fn stop_daemon_skips_the_confirm_requirement_when_disabled() {
         let fake = Arc::new(FakeClient::default());
-        let options = CreateHearthMcpServerOptions { require_confirm: false, ..base_options() };
+        let options = CreateHearthMcpServerOptions {
+            require_confirm: false,
+            ..base_options()
+        };
         let (server, client) = connect(fake.clone(), options).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_stop_daemon")).await.unwrap();
-        assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
+        let response = client
+            .call_tool(CallToolRequestParams::new("local_services_stop_daemon"))
+            .await
+            .unwrap();
+        assert_ne!(
+            response.is_error,
+            Some(true),
+            "{:?}",
+            response.content.first()
+        );
         assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = client.cancel().await;
         let _ = server.cancel().await;
@@ -657,13 +883,37 @@ mod tests {
     async fn a_reloaded_catalog_is_picked_up_without_a_restart() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake.clone(), base_options()).await;
-        *fake.service_ids.lock().unwrap() = Some(vec!["metadata".to_string(), "mongo".to_string(), "search".to_string()]);
-        let response = client.call_tool(CallToolRequestParams::new("local_services_manage").with_arguments(args(json!({ "service": "search", "action": "start", "confirm": true })))).await.unwrap();
-        assert_ne!(response.is_error, Some(true), "{:?}", response.content.first());
-        assert_eq!(fake.managed.lock().unwrap().clone().unwrap().service, "search");
+        *fake.service_ids.lock().unwrap() = Some(vec![
+            "metadata".to_string(),
+            "mongo".to_string(),
+            "search".to_string(),
+        ]);
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_manage").with_arguments(args(
+                    json!({ "service": "search", "action": "start", "confirm": true }),
+                )),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.is_error,
+            Some(true),
+            "{:?}",
+            response.content.first()
+        );
+        assert_eq!(
+            fake.managed.lock().unwrap().clone().unwrap().service,
+            "search"
+        );
         let tools = client.list_all_tools().await.unwrap();
-        let manage = tools.iter().find(|tool| tool.name == "local_services_manage").unwrap();
-        assert!(serde_json::to_string(&manage.input_schema).unwrap().contains("search"));
+        let manage = tools
+            .iter()
+            .find(|tool| tool.name == "local_services_manage")
+            .unwrap();
+        assert!(serde_json::to_string(&manage.input_schema)
+            .unwrap()
+            .contains("search"));
         let _ = client.cancel().await;
         let _ = server.cancel().await;
     }
@@ -674,7 +924,13 @@ mod tests {
     async fn shared_connection_keeps_its_connection_env_but_redacts_everything_else() {
         let fake = Arc::new(FakeClient::default());
         let (server, client) = connect(fake, base_options()).await;
-        let response = client.call_tool(CallToolRequestParams::new("local_services_shared_connection").with_arguments(args(json!({ "service": "minio" })))).await.unwrap();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("local_services_shared_connection")
+                    .with_arguments(args(json!({ "service": "minio" }))),
+            )
+            .await
+            .unwrap();
         let text = response.content[0].as_text().unwrap().text.clone();
         assert!(text.contains("AWS_SECRET_ACCESS_KEY"), "{text}");
         assert!(!text.contains("must-not-leak"), "{text}");

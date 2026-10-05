@@ -19,9 +19,8 @@ use crate::catalog::{validate_catalog, ServiceCatalog, ServiceId, ServiceOwnersh
 use crate::file_io::{create_file_io, FileIo};
 use crate::platform::{is_supported_hearth_platform, unsupported_platform_message};
 use crate::state::{
-    ActualServiceState, ManagerInfo, ManagerMetadata,
-    PersistedManagerState, ServiceLifecycleState, PROTOCOL_VERSION,
-    STATE_VERSION,
+    ActualServiceState, ManagerInfo, ManagerMetadata, PersistedManagerState, ServiceLifecycleState,
+    PROTOCOL_VERSION, STATE_VERSION,
 };
 use crate::supervisor::engine::ACTIVE_STATES;
 use crate::supervisor::types::{format_iso8601_millis, Host, SupervisorOptions};

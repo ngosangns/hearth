@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::manager::{
-    bootstrap, BootstrapError, ClaimLockError, HearthManager, HearthManagerOptions, ShutdownMode};
+    bootstrap, BootstrapError, ClaimLockError, HearthManager, HearthManagerOptions, ShutdownMode,
+};
 use crate::paths::metadata_path;
 
 const DAEMON_LOG_MAX_BYTES: u64 = 512 * 1024;

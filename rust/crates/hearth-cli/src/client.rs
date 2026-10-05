@@ -9,18 +9,30 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use hearth_core::catalog::ServiceCatalog;
-use hearth_core::state::{LogSlice, Operation, OperationStatus, ServiceLifecycleState, ServiceOperationKind, PROTOCOL_VERSION};
+use hearth_core::state::{
+    LogSlice, Operation, OperationStatus, ServiceLifecycleState, ServiceOperationKind,
+    PROTOCOL_VERSION,
+};
 
-use crate::{encode_path_segment, http_client, operation_id, require_client_for, request, Client, LocalctlError, LocalctlResult, EXIT_FAILED, EXIT_UNAVAILABLE};
+use crate::{
+    encode_path_segment, http_client, operation_id, request, require_client_for, Client,
+    LocalctlError, LocalctlResult, EXIT_FAILED, EXIT_UNAVAILABLE,
+};
 
 const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn unavailable(message: String) -> LocalctlError {
-    LocalctlError { exit_code: EXIT_UNAVAILABLE, message }
+    LocalctlError {
+        exit_code: EXIT_UNAVAILABLE,
+        message,
+    }
 }
 
 fn malformed(error: serde_json::Error) -> LocalctlError {
-    LocalctlError { exit_code: EXIT_FAILED, message: error.to_string() }
+    LocalctlError {
+        exit_code: EXIT_FAILED,
+        message: error.to_string(),
+    }
 }
 
 /// The error shapes `request` produces when the connection itself is unusable — the daemon went
@@ -36,11 +48,15 @@ fn is_connection_failure(message: &str) -> bool {
 
 impl Client {
     async fn get(&self, path: &str) -> LocalctlResult<Value> {
-        request(self, path, reqwest::Method::GET, None, None).await.map_err(unavailable)
+        request(self, path, reqwest::Method::GET, None, None)
+            .await
+            .map_err(unavailable)
     }
 
     async fn post(&self, path: &str, body: &Value) -> LocalctlResult<Value> {
-        request(self, path, reqwest::Method::POST, Some(body), None).await.map_err(unavailable)
+        request(self, path, reqwest::Method::POST, Some(body), None)
+            .await
+            .map_err(unavailable)
     }
 
     /// `GET /v1/manager`.
@@ -67,22 +83,55 @@ impl Client {
     }
 
     /// `GET /v1/logs/:id`.
-    pub async fn log(&self, service_id: &str, cursor: Option<u64>, generation: Option<u64>, limit: Option<u64>) -> LocalctlResult<LogSlice> {
-        let query: Vec<String> = [("cursor", cursor), ("generation", generation), ("limit", limit)].iter().filter_map(|(key, value)| value.map(|v| format!("{key}={v}"))).collect();
-        let suffix = if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) };
-        let body = self.get(&format!("/v1/logs/{}{suffix}", encode_path_segment(service_id))).await?;
+    pub async fn log(
+        &self,
+        service_id: &str,
+        cursor: Option<u64>,
+        generation: Option<u64>,
+        limit: Option<u64>,
+    ) -> LocalctlResult<LogSlice> {
+        let query: Vec<String> = [
+            ("cursor", cursor),
+            ("generation", generation),
+            ("limit", limit),
+        ]
+        .iter()
+        .filter_map(|(key, value)| value.map(|v| format!("{key}={v}")))
+        .collect();
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        let body = self
+            .get(&format!(
+                "/v1/logs/{}{suffix}",
+                encode_path_segment(service_id)
+            ))
+            .await?;
         serde_json::from_value(body).map_err(malformed)
     }
 
     /// `GET /v1/operations/:id`.
     pub async fn operation(&self, id: &str) -> LocalctlResult<Operation> {
-        let body = self.get(&format!("/v1/operations/{}", encode_path_segment(&operation_id(id)?))).await?;
+        let body = self
+            .get(&format!(
+                "/v1/operations/{}",
+                encode_path_segment(&operation_id(id)?)
+            ))
+            .await?;
         serde_json::from_value(body["operation"].clone()).map_err(malformed)
     }
 
     /// `POST /v1/operations`. `kill_unowned` must only ever be set after an explicit user
     /// confirmation, and only for `start` — the daemon rejects it otherwise.
-    pub async fn submit(&self, action: ServiceOperationKind, service_id: &str, kill_unowned: bool, request_id: &str) -> LocalctlResult<Operation> {
+    pub async fn submit(
+        &self,
+        action: ServiceOperationKind,
+        service_id: &str,
+        kill_unowned: bool,
+        request_id: &str,
+    ) -> LocalctlResult<Operation> {
         let mut body = json!({ "requestId": request_id, "serviceId": service_id, "action": action.as_wire_str() });
         if kill_unowned {
             body["killUnowned"] = json!(true);
@@ -92,7 +141,12 @@ impl Client {
     }
 
     /// `POST /v1/operations/bulk-start`. `kill_unowned` applies to every target.
-    pub async fn bulk_start(&self, targets: &[String], kill_unowned: bool, request_id: &str) -> LocalctlResult<Operation> {
+    pub async fn bulk_start(
+        &self,
+        targets: &[String],
+        kill_unowned: bool,
+        request_id: &str,
+    ) -> LocalctlResult<Operation> {
         let mut body = json!({ "requestId": request_id, "targets": targets });
         if kill_unowned {
             body["killUnowned"] = json!(true);
@@ -103,10 +157,18 @@ impl Client {
 
     /// Polls an operation until it is terminal, or until `deadline` passes — in which case the
     /// last (still queued/running) snapshot is returned so the caller can hand out its id.
-    pub async fn wait(&self, id: &str, deadline: Option<tokio::time::Instant>) -> LocalctlResult<Operation> {
+    pub async fn wait(
+        &self,
+        id: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> LocalctlResult<Operation> {
         loop {
             let operation = self.operation(id).await?;
-            if matches!(operation.status, OperationStatus::Succeeded | OperationStatus::Failed) || deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            if matches!(
+                operation.status,
+                OperationStatus::Succeeded | OperationStatus::Failed
+            ) || deadline.is_some_and(|d| tokio::time::Instant::now() >= d)
+            {
                 return Ok(operation);
             }
             tokio::time::sleep(OPERATION_POLL_INTERVAL).await;
@@ -114,7 +176,11 @@ impl Client {
     }
 
     /// Opens `GET /v1/events/stream` (SSE) and returns the response for the caller to read.
-    pub async fn event_stream(&self, after: Option<u64>, epoch: Option<&str>) -> LocalctlResult<reqwest::Response> {
+    pub async fn event_stream(
+        &self,
+        after: Option<u64>,
+        epoch: Option<&str>,
+    ) -> LocalctlResult<reqwest::Response> {
         let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(after) = after {
             query.push(("after", after.to_string()));
@@ -123,7 +189,10 @@ impl Client {
             query.push(("epoch", epoch.to_string()));
         }
         let response = http_client()
-            .get(format!("http://127.0.0.1:{}/v1/events/stream", self.metadata.port))
+            .get(format!(
+                "http://127.0.0.1:{}/v1/events/stream",
+                self.metadata.port
+            ))
             .query(&query)
             .bearer_auth(&self.token)
             .header("x-hearth-protocol", PROTOCOL_VERSION.to_string())
@@ -132,7 +201,10 @@ impl Client {
             .await
             .map_err(|_| unavailable("manager unavailable".to_string()))?;
         if !response.status().is_success() {
-            return Err(unavailable(format!("event stream failed: {}", response.status())));
+            return Err(unavailable(format!(
+                "event stream failed: {}",
+                response.status()
+            )));
         }
         Ok(response)
     }
@@ -149,7 +221,11 @@ pub struct ManagerClient {
 impl ManagerClient {
     /// `catalog` only locates the daemon (its runtime directory); it is never sent anywhere.
     pub fn new(root: PathBuf, catalog: ServiceCatalog) -> Self {
-        Self { root, catalog, cached: Mutex::new(None) }
+        Self {
+            root,
+            catalog,
+            cached: Mutex::new(None),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -205,26 +281,45 @@ impl ManagerClient {
         self.with(|c| async move { c.catalog().await }).await
     }
 
-    pub async fn log(&self, service_id: &str, cursor: Option<u64>, generation: Option<u64>, limit: Option<u64>) -> LocalctlResult<LogSlice> {
-        self.with(|c| async move { c.log(service_id, cursor, generation, limit).await }).await
+    pub async fn log(
+        &self,
+        service_id: &str,
+        cursor: Option<u64>,
+        generation: Option<u64>,
+        limit: Option<u64>,
+    ) -> LocalctlResult<LogSlice> {
+        self.with(|c| async move { c.log(service_id, cursor, generation, limit).await })
+            .await
     }
 
     pub async fn operation(&self, id: &str) -> LocalctlResult<Operation> {
         self.with(|c| async move { c.operation(id).await }).await
     }
 
-    pub async fn submit(&self, action: ServiceOperationKind, service_id: &str, kill_unowned: bool) -> LocalctlResult<Operation> {
+    pub async fn submit(
+        &self,
+        action: ServiceOperationKind,
+        service_id: &str,
+        kill_unowned: bool,
+    ) -> LocalctlResult<Operation> {
         // Minted once so the retry after a timeout reuses the id. The daemon dedupes on requestId;
         // a second id would start the service twice when the first request actually landed.
         let request_id = uuid::Uuid::new_v4().to_string();
         self.with(|c| {
             let request_id = request_id.clone();
-            async move { c.submit(action, service_id, kill_unowned, &request_id).await }
+            async move {
+                c.submit(action, service_id, kill_unowned, &request_id)
+                    .await
+            }
         })
         .await
     }
 
-    pub async fn bulk_start(&self, targets: &[String], kill_unowned: bool) -> LocalctlResult<Operation> {
+    pub async fn bulk_start(
+        &self,
+        targets: &[String],
+        kill_unowned: bool,
+    ) -> LocalctlResult<Operation> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.with(|c| {
             let request_id = request_id.clone();
@@ -233,19 +328,38 @@ impl ManagerClient {
         .await
     }
 
-    pub async fn wait(&self, id: &str, deadline: Option<tokio::time::Instant>) -> LocalctlResult<Operation> {
-        self.with(|c| async move { c.wait(id, deadline).await }).await
+    pub async fn wait(
+        &self,
+        id: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> LocalctlResult<Operation> {
+        self.with(|c| async move { c.wait(id, deadline).await })
+            .await
     }
 
-    pub async fn event_stream(&self, after: Option<u64>, epoch: Option<&str>) -> LocalctlResult<reqwest::Response> {
-        self.with(|c| async move { c.event_stream(after, epoch).await }).await
+    pub async fn event_stream(
+        &self,
+        after: Option<u64>,
+        epoch: Option<&str>,
+    ) -> LocalctlResult<reqwest::Response> {
+        self.with(|c| async move { c.event_stream(after, epoch).await })
+            .await
     }
 
     /// A raw `request` against the cached connection, for endpoints without a typed method.
-    pub async fn request(&self, path: &str, method: reqwest::Method, body: Option<&Value>) -> LocalctlResult<Value> {
+    pub async fn request(
+        &self,
+        path: &str,
+        method: reqwest::Method,
+        body: Option<&Value>,
+    ) -> LocalctlResult<Value> {
         self.with(|c| {
             let method = method.clone();
-            async move { request(&c, path, method, body, None).await.map_err(unavailable) }
+            async move {
+                request(&c, path, method, body, None)
+                    .await
+                    .map_err(unavailable)
+            }
         })
         .await
     }
@@ -259,9 +373,15 @@ mod tests {
     fn only_transport_and_auth_failures_drop_the_cached_connection() {
         assert!(is_connection_failure("manager unavailable"));
         assert!(is_connection_failure("manager request timed out"));
-        assert!(is_connection_failure("unauthorized:Bearer authentication is required"));
+        assert!(is_connection_failure(
+            "unauthorized:Bearer authentication is required"
+        ));
         assert!(is_connection_failure("request_failed:502"));
-        assert!(!is_connection_failure("service_not_found:Service is not in the catalog"));
-        assert!(!is_connection_failure("manager_closing:Manager is shutting down"));
+        assert!(!is_connection_failure(
+            "service_not_found:Service is not in the catalog"
+        ));
+        assert!(!is_connection_failure(
+            "manager_closing:Manager is shutting down"
+        ));
     }
 }

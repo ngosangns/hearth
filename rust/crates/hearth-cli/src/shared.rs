@@ -8,13 +8,16 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use hearth_core::catalog::{ServiceCatalog, StartFailurePolicy};
-use hearth_core::shared::{project_id, registry::SharedRegistry, shared_root, RemoteCatalog, SHARED_RUNTIME_DIRECTORY_NAME};
 use hearth_core::file_io::create_file_io;
+use hearth_core::shared::{
+    project_id, registry::SharedRegistry, shared_root, RemoteCatalog, SHARED_RUNTIME_DIRECTORY_NAME,
+};
 use hearth_core::state::{OperationStatus, ServiceOperationKind};
 
 use crate::{
-    discover, ensure, fail_err, parse_command_flags, request, request_with_timeout, usage_err, wait_operation, Client, Discovery, FlagName, Io,
-    LocalctlError, LocalctlOptions, LocalctlResult, EXIT_FAILED, EXIT_UNAVAILABLE,
+    discover, ensure, fail_err, parse_command_flags, request, request_with_timeout, usage_err,
+    wait_operation, Client, Discovery, FlagName, Io, LocalctlError, LocalctlOptions,
+    LocalctlResult, EXIT_FAILED, EXIT_UNAVAILABLE,
 };
 
 /// The catalog `discover()`/`ensure()` run against for smp — no services (they're synthesized
@@ -55,7 +58,12 @@ fn live_smp_client(discovery: Discovery) -> Option<Client> {
     }
 }
 
-async fn smp_request(client: &Client, path: &str, method: reqwest::Method, body: Option<&Value>) -> Result<Value, String> {
+async fn smp_request(
+    client: &Client,
+    path: &str,
+    method: reqwest::Method,
+    body: Option<&Value>,
+) -> Result<Value, String> {
     request(client, path, method, body, None).await
 }
 
@@ -79,11 +87,22 @@ fn parse_shared_id(raw: Option<&String>) -> LocalctlResult<String> {
 
 /// `smp` `/v1/shared` instance row for `id`, or None (unknown id / smp down).
 async fn shared_instance(client: &Client, id: &str) -> Option<Value> {
-    let body = smp_request(client, "/v1/shared", reqwest::Method::GET, None).await.ok()?;
-    body["instances"].as_array()?.iter().find(|i| i["id"].as_str() == Some(id)).cloned()
+    let body = smp_request(client, "/v1/shared", reqwest::Method::GET, None)
+        .await
+        .ok()?;
+    body["instances"]
+        .as_array()?
+        .iter()
+        .find(|i| i["id"].as_str() == Some(id))
+        .cloned()
 }
 
-pub async fn run(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: Arc<dyn Fn(&Path) + Send + Sync>) -> i32 {
+pub async fn run(
+    root: &Path,
+    args: &[String],
+    io: &mut Io<'_>,
+    spawn_smp: Arc<dyn Fn(&Path) + Send + Sync>,
+) -> i32 {
     match run_inner(root, args, io, &spawn_smp).await {
         Ok(code) => code,
         Err(error) => {
@@ -116,7 +135,12 @@ fn split_passthrough(args: &[String]) -> (&[String], &[String]) {
     (args, &[])
 }
 
-async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Arc<dyn Fn(&Path) + Send + Sync>) -> LocalctlResult<i32> {
+async fn run_inner(
+    root: &Path,
+    args: &[String],
+    io: &mut Io<'_>,
+    spawn_smp: &Arc<dyn Fn(&Path) + Send + Sync>,
+) -> LocalctlResult<i32> {
     let (parsed, passthrough) = split_passthrough(args);
     let flags = parse_command_flags(parsed, &[FlagName::Json, FlagName::Force])?;
     let Some(subcommand) = flags.positionals.first().cloned() else {
@@ -128,7 +152,12 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
     let mut rest: Vec<String> = flags.positionals[1..].to_vec();
     // `attach <id> -- ...`: the split for attach happens AT the id, so a `--` separator written
     // after it would otherwise be forwarded verbatim into the recipe's provision argv.
-    let passthrough = if subcommand == "attach" && passthrough.first().map(|a| a.as_str()) == Some("--") { &passthrough[1..] } else { passthrough };
+    let passthrough =
+        if subcommand == "attach" && passthrough.first().map(|a| a.as_str()) == Some("--") {
+            &passthrough[1..]
+        } else {
+            passthrough
+        };
     rest.extend_from_slice(passthrough);
     let rest = rest.as_slice();
     match subcommand.as_str() {
@@ -136,20 +165,36 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
         // the connection a client needs to talk to it directly.
         "ensure" => {
             let client = ensure_smp(spawn_smp).await?;
-            (io.out)(&crate::print_value(&crate::ensure_payload(&client), flags.json));
+            (io.out)(&crate::print_value(
+                &crate::ensure_payload(&client),
+                flags.json,
+            ));
             Ok(0)
         }
         // The remote registry — readable without smp running.
         "list" => {
-            let remote = RemoteCatalog::new(&shared_root(), std::env::var("HEARTH_SHARED_CATALOG_URL").ok());
-            let doc = remote.load(true).await.map_err(|e| LocalctlError { exit_code: EXIT_UNAVAILABLE, message: e.0 })?;
+            let remote = RemoteCatalog::new(
+                &shared_root(),
+                std::env::var("HEARTH_SHARED_CATALOG_URL").ok(),
+            );
+            let doc = remote.load(true).await.map_err(|e| LocalctlError {
+                exit_code: EXIT_UNAVAILABLE,
+                message: e.0,
+            })?;
             if flags.json {
                 (io.out)(&serde_json::to_string_pretty(&doc.as_ref()).unwrap());
             } else {
                 for (name, family) in &doc.services {
                     let mut versions: Vec<&String> = family.versions.keys().collect();
                     versions.sort();
-                    (io.out)(&format!("{name}  {}", versions.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", ")));
+                    (io.out)(&format!(
+                        "{name}  {}",
+                        versions
+                            .iter()
+                            .map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
                 }
             }
             Ok(0)
@@ -157,37 +202,55 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
         // The local registry — what this machine has installed/running.
         "installed" => {
             let io_files = create_file_io(false);
-            let registry = SharedRegistry::load(std::sync::Arc::from(io_files), &shared_root()).map_err(|e| LocalctlError { exit_code: EXIT_UNAVAILABLE, message: e.0 })?;
+            let registry = SharedRegistry::load(std::sync::Arc::from(io_files), &shared_root())
+                .map_err(|e| LocalctlError {
+                    exit_code: EXIT_UNAVAILABLE,
+                    message: e.0,
+                })?;
             let instances = registry.list();
             if flags.json {
-                (io.out)(&serde_json::to_string_pretty(&json!({ "instances": instances })).unwrap());
+                (io.out)(
+                    &serde_json::to_string_pretty(&json!({ "instances": instances })).unwrap(),
+                );
             } else {
                 for i in &instances {
-                    (io.out)(&format!("{}  port {}  {}  ({} project(s) attached)", i.id(), i.port, i.install_state.as_wire_str(), i.attachments.len()));
+                    (io.out)(&format!(
+                        "{}  port {}  {}  ({} project(s) attached)",
+                        i.id(),
+                        i.port,
+                        i.install_state.as_wire_str(),
+                        i.attachments.len()
+                    ));
                 }
             }
             Ok(0)
         }
-        "status" => {
-            match live_smp_client(discover_smp().await) {
-                None => {
-                    (io.err)("smp is not running");
-                    Ok(EXIT_UNAVAILABLE)
-                }
-                Some(client) => {
-                    let body = smp_request(&client, "/v1/shared", reqwest::Method::GET, None).await.or_else(|e| fail_err(EXIT_UNAVAILABLE, e))?;
-                    if flags.json {
-                        (io.out)(&serde_json::to_string_pretty(&body).unwrap());
-                    } else {
-                        for i in body["instances"].as_array().cloned().unwrap_or_default() {
-                            let state = i["state"]["actualState"].as_str().unwrap_or("stopped");
-                            (io.out)(&format!("{}  {}  port {}  {}", i["id"].as_str().unwrap_or(""), state, i["port"], i["installState"].as_str().unwrap_or("")));
-                        }
-                    }
-                    Ok(0)
-                }
+        "status" => match live_smp_client(discover_smp().await) {
+            None => {
+                (io.err)("smp is not running");
+                Ok(EXIT_UNAVAILABLE)
             }
-        }
+            Some(client) => {
+                let body = smp_request(&client, "/v1/shared", reqwest::Method::GET, None)
+                    .await
+                    .or_else(|e| fail_err(EXIT_UNAVAILABLE, e))?;
+                if flags.json {
+                    (io.out)(&serde_json::to_string_pretty(&body).unwrap());
+                } else {
+                    for i in body["instances"].as_array().cloned().unwrap_or_default() {
+                        let state = i["state"]["actualState"].as_str().unwrap_or("stopped");
+                        (io.out)(&format!(
+                            "{}  {}  port {}  {}",
+                            i["id"].as_str().unwrap_or(""),
+                            state,
+                            i["port"],
+                            i["installState"].as_str().unwrap_or("")
+                        ));
+                    }
+                }
+                Ok(0)
+            }
+        },
         "attach" => {
             let id = parse_shared_id(rest.first())?;
             // Everything after the id is forwarded verbatim to the recipe's provision argv (e.g. the
@@ -196,13 +259,21 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
             let attach_args: Vec<String> = rest.iter().skip(1).cloned().collect();
             let client = ensure_smp(spawn_smp).await?;
             let body = json!({ "service": id, "projectRoot": root, "args": attach_args });
-            let result = smp_request_slow(&client, "/v1/shared/attach", &body).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e })?;
+            let result = smp_request_slow(&client, "/v1/shared/attach", &body)
+                .await
+                .map_err(|e| LocalctlError {
+                    exit_code: EXIT_FAILED,
+                    message: e,
+                })?;
             if flags.json {
                 (io.out)(&serde_json::to_string_pretty(&result).unwrap());
             } else {
                 // Human/agent-readable summary — the attach run command's stdout lands in the
                 // project's service log, so keep it terse but complete.
-                (io.out)(&format!("attached {}", result["service"].as_str().unwrap_or(&id)));
+                (io.out)(&format!(
+                    "attached {}",
+                    result["service"].as_str().unwrap_or(&id)
+                ));
                 if let Some(conn) = result["attachment"]["connection"].as_object() {
                     for (k, v) in conn {
                         (io.out)(&format!("  {k}: {}", v.as_str().unwrap_or(&v.to_string())));
@@ -218,7 +289,17 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
                 return Ok(0);
             };
             let body = json!({ "service": id, "projectRoot": root });
-            smp_request(&client, "/v1/shared/detach", reqwest::Method::POST, Some(&body)).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e })?;
+            smp_request(
+                &client,
+                "/v1/shared/detach",
+                reqwest::Method::POST,
+                Some(&body),
+            )
+            .await
+            .map_err(|e| LocalctlError {
+                exit_code: EXIT_FAILED,
+                message: e,
+            })?;
             (io.out)(&format!("detached {id}"));
             Ok(0)
         }
@@ -232,17 +313,32 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
             let pid = project_id(root);
             let ready = shared_instance(&client, &id).await.is_some_and(|i| {
                 i["state"]["actualState"].as_str() == Some("ready")
-                    && i["attachments"].as_array().map(|a| {
-                        a.iter().any(|att| att["projectId"].as_str() == Some(pid.as_str()) && att["provisioned"].as_bool() == Some(true))
-                    }).unwrap_or(false)
+                    && i["attachments"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter().any(|att| {
+                                att["projectId"].as_str() == Some(pid.as_str())
+                                    && att["provisioned"].as_bool() == Some(true)
+                            })
+                        })
+                        .unwrap_or(false)
             });
             Ok(if ready { 0 } else { 1 })
         }
         "install" => {
             let id = parse_shared_id(rest.first())?;
             let client = ensure_smp(spawn_smp).await?;
-            let result = smp_request_slow(&client, "/v1/shared/install", &json!({ "service": id })).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e })?;
-            (io.out)(&format!("installed {} (port {})", result["service"].as_str().unwrap_or(&id), result["port"]));
+            let result = smp_request_slow(&client, "/v1/shared/install", &json!({ "service": id }))
+                .await
+                .map_err(|e| LocalctlError {
+                    exit_code: EXIT_FAILED,
+                    message: e,
+                })?;
+            (io.out)(&format!(
+                "installed {} (port {})",
+                result["service"].as_str().unwrap_or(&id),
+                result["port"]
+            ));
             Ok(0)
         }
         "start" => {
@@ -250,7 +346,12 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
             let client = ensure_smp(spawn_smp).await?;
             // install first (the service only enters smp's catalog once registered), then drive a
             // normal service start through the operations API.
-            smp_request_slow(&client, "/v1/shared/install", &json!({ "service": id })).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e })?;
+            smp_request_slow(&client, "/v1/shared/install", &json!({ "service": id }))
+                .await
+                .map_err(|e| LocalctlError {
+                    exit_code: EXIT_FAILED,
+                    message: e,
+                })?;
             run_operation(&client, ServiceOperationKind::Start, &id, io).await
         }
         "stop" => {
@@ -269,7 +370,17 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
             // The server refuses (409 `shared_service_attached`) an instance that still has
             // project attachments unless the caller explicitly confirms the data wipe with force —
             // its error message already says to retry with force.
-            smp_request(&client, "/v1/shared/remove", reqwest::Method::POST, Some(&json!({ "service": id, "force": flags.force }))).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e })?;
+            smp_request(
+                &client,
+                "/v1/shared/remove",
+                reqwest::Method::POST,
+                Some(&json!({ "service": id, "force": flags.force })),
+            )
+            .await
+            .map_err(|e| LocalctlError {
+                exit_code: EXIT_FAILED,
+                message: e,
+            })?;
             (io.out)(&format!("removed {id}"));
             Ok(0)
         }
@@ -278,10 +389,26 @@ async fn run_inner(root: &Path, args: &[String], io: &mut Io<'_>, spawn_smp: &Ar
 }
 
 /// Submits one operation to smp, waits for it, prints its outcome, and fails when it failed.
-async fn run_operation(client: &Client, action: ServiceOperationKind, id: &str, io: &mut Io<'_>) -> LocalctlResult<i32> {
-    let accepted = client.submit(action, id, false, &uuid::Uuid::new_v4().to_string()).await.map_err(|e| LocalctlError { exit_code: EXIT_FAILED, message: e.message })?;
+async fn run_operation(
+    client: &Client,
+    action: ServiceOperationKind,
+    id: &str,
+    io: &mut Io<'_>,
+) -> LocalctlResult<i32> {
+    let accepted = client
+        .submit(action, id, false, &uuid::Uuid::new_v4().to_string())
+        .await
+        .map_err(|e| LocalctlError {
+            exit_code: EXIT_FAILED,
+            message: e.message,
+        })?;
     let operation = wait_operation(client, &accepted.id).await?;
-    (io.out)(&format!("{} {} {}", operation.status.as_wire_str(), id, operation.id));
+    (io.out)(&format!(
+        "{} {} {}",
+        operation.status.as_wire_str(),
+        id,
+        operation.id
+    ));
     if operation.status == OperationStatus::Failed {
         return fail_err(EXIT_FAILED, "service operation failed");
     }
