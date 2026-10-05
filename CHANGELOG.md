@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.20.0
 
 - Restarting a service or a group no longer stops at "cannot be stopped" when the row has no process and no `stop` command. The service is started. A listener that is the service itself is replaced first. Another program on the port is left alone. `hearth stop <group>` and `hearth restart <group>` run without `--wait`. In `hearth tui`, a group stop or restart waits for every member and the notice names a failure instead of only showing the verb.
 - Daemon startup re-checks a service stuck on `external` / "Port N is held". A free port no longer keeps that error: desired running becomes failed ("Managed process is no longer alive") and is not started. A holder that is the service itself (the exec program in that directory, or the install directory in a Java command line) is adopted. Another program on the port is left alone.
