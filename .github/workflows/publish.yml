@@ -1,0 +1,114 @@
+name: Publish
+
+# Manual release path: bumps rust/bin/hearth/Cargo.toml (+ Cargo.lock) to `version`, pushes the
+# bump commit to main, gates it on the full CI suite, then tags `v<version>` and publishes the
+# release asset. Run it from Actions → Publish → Run workflow, or:
+#   gh workflow run publish.yml -f version=0.19.0
+# Re-running with a version whose tag already exists skips the bump and republishes that tag.
+#
+# Self-contained on purpose: a tag pushed by GITHUB_TOKEN fires no push event, so the usual
+# tag → CI → release chain (release.yml) would never see a token-pushed tag. The tag is pushed
+# only after the gate passes, keeping "a red tag never publishes".
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v prefix (e.g. 0.19.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  cut:
+    runs-on: [self-hosted, macmini]
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.bump.outputs.sha }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      # A PAT in RELEASE_TOKEN pushes the bump commit to a protected main and gives it a normal
+      # main-branch CI run; without the secret the built-in GITHUB_TOKEN still works on open repos.
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+      - uses: ./.github/actions/toolchain-path
+        with:
+          tools: cargo
+      - id: bump
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_name }}" != "main" ]; then
+            echo "dispatch Publish from the main branch, not '${{ github.ref_name }}'" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must be X.Y.Z without the v prefix, got '$VERSION'" >&2
+            exit 1
+          fi
+          tag="v$VERSION"
+          # `^{}` peels an annotated tag to its commit; lightweight tags only match the first.
+          existing="$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" | tail -1 | cut -f1)"
+          if [ -n "$existing" ]; then
+            echo "tag $tag already exists — republishing that commit"
+            echo "sha=$existing" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          manifest="rust/bin/hearth/Cargo.toml"
+          current="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' "$manifest")"
+          latest="$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -1)"
+          if [ "$VERSION" = "$current" ] || [ "$latest" != "$VERSION" ]; then
+            echo "refusing to release $VERSION over current $current" >&2
+            exit 1
+          fi
+          # First `version = ` line only, same anchor `task install` uses.
+          awk -v v="$VERSION" \
+            '!done && $1=="version" && $2=="=" { sub(/"[^"]*"/, "\"" v "\""); done=1 } { print }' \
+            "$manifest" > "$manifest.next" && mv "$manifest.next" "$manifest"
+          # Refresh the matching hearth entry in Cargo.lock without compiling.
+          (cd rust && cargo metadata --format-version 1 --quiet > /dev/null)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$manifest" rust/Cargo.lock
+          git commit -m "release $tag"
+          git push origin HEAD:main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  gate:
+    needs: cut
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.cut.outputs.sha }}
+
+  publish:
+    needs: [cut, gate]
+    runs-on: [self-hosted, macmini]
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ needs.cut.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.cut.outputs.sha }}
+      # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as cargo's.
+      - uses: ./.github/actions/toolchain-path
+        with:
+          tools: cargo gh
+      - name: Push the release tag
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "tag $RELEASE_TAG already exists"
+          else
+            git tag "$RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+      - uses: ./.github/actions/release-asset
+        with:
+          tag: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}

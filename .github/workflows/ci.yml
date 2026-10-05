@@ -5,6 +5,14 @@ on:
   push:
     branches: [main]
     tags: ["v*.*.*"]
+  # publish.yml calls this as the release gate: an empty ref checks out the event as usual.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Ref to test (empty = the caller's ref)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -21,6 +29,8 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
       # The runner service has no login-shell PATH; see the action for why.
       - uses: ./.github/actions/toolchain-path
         with:

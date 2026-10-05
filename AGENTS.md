@@ -49,13 +49,24 @@ file or a file already in the versioned directory, refuses anything but darwin-a
 not replace an equal version unless `--force`. It does not downgrade.
 
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags
-(`timeout-minutes: 90`; tool `cargo`). Pushing a `v*.*.*` tag runs CI, and a successful tag CI run
-triggers `.github/workflows/release.yml` (`workflow_run`, so a red tag never publishes; tag/sha
-come from `github.event.workflow_run`, not `github.ref`) on the self-hosted runner
-(`timeout-minutes: 60`): `cargo build --release -p hearth` → ad-hoc `codesign` →
-`gh release create --generate-notes` (idempotent — a re-run uploads `--clobber` over the existing
-`hearth-<tag>` asset). The version string lives only in `rust/bin/hearth/Cargo.toml` (and the
-matching `hearth` entry in `rust/Cargo.lock`).
+(`timeout-minutes: 90`; tool `cargo`), and is also `workflow_call`-able with an optional `ref`
+input so other workflows can gate on it. Pushing a `v*.*.*` tag runs CI, and a successful tag CI
+run triggers `.github/workflows/release.yml` (`workflow_run`, so a red tag never publishes;
+tag/sha come from `github.event.workflow_run`, not `github.ref`) on the self-hosted runner
+(`timeout-minutes: 60`). The build + ad-hoc `codesign` + `gh release create --generate-notes`
+step is the composite action `.github/actions/release-asset` (idempotent — a re-run uploads
+`--clobber` over the existing `hearth-<tag>` asset). The version string lives only in
+`rust/bin/hearth/Cargo.toml` (and the matching `hearth` entry in `rust/Cargo.lock`).
+
+The hands-off path is `.github/workflows/publish.yml` (`workflow_dispatch`):
+`gh workflow run publish.yml -f version=0.19.0`, or Actions → Publish → Run workflow from `main`.
+It bumps `Cargo.toml`/`Cargo.lock`, pushes a `release v*` commit to main, calls `ci.yml` on that
+sha, then pushes the `v` tag and publishes. It is self-contained because a `GITHUB_TOKEN` push
+fires no push events — a token-pushed tag can never reach `release.yml`'s `workflow_run` trigger.
+Dispatching a version whose tag already exists republishes that tag (`--clobber`); equal or lower
+versions are refused, matching `hearth update`'s no-downgrade rule. The bump commit is pushed
+with the `RELEASE_TOKEN` repo secret when present (a PAT can push to a protected `main`), else
+`GITHUB_TOKEN`.
 
 `PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
 bump there must be treated as breaking for every client.

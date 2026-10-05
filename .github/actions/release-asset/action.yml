@@ -1,0 +1,43 @@
+name: Build and publish the release asset
+description: >
+  Builds the release `hearth` binary, ad-hoc signs it (macOS kills an unsigned replacement at
+  launch), and attaches it to the GitHub Release for `tag`. Idempotent: a re-run uploads over
+  the existing asset. Shared by release.yml (tag push) and publish.yml (manual dispatch).
+
+inputs:
+  tag:
+    description: "Release tag, e.g. v0.19.0"
+    required: true
+  token:
+    description: "Token for `gh release` calls (secrets.GITHUB_TOKEN)"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Build hearth
+      shell: bash
+      working-directory: rust
+      env:
+        RELEASE_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        cargo build --release -p hearth
+        # Ad-hoc sign after the copy-equivalent link, or macOS kills the binary on launch.
+        codesign --sign - --force target/release/hearth
+        cp target/release/hearth "hearth-${RELEASE_TAG}"
+    - name: Publish GitHub Release
+      shell: bash
+      working-directory: rust
+      env:
+        RELEASE_TAG: ${{ inputs.tag }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        # Idempotent so a re-run of a failed/partial release job still lands the asset.
+        if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          gh release upload "$RELEASE_TAG" "hearth-${RELEASE_TAG}" --clobber
+        else
+          gh release create "$RELEASE_TAG" "hearth-${RELEASE_TAG}" \
+            --title "$RELEASE_TAG" --generate-notes --verify-tag
+        fi
