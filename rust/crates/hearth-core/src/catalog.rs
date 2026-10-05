@@ -53,8 +53,8 @@ pub enum ReadinessSpec {
     Container,
     Tailnet,
     /// A declarative, JSON-serializable stand-in for a custom probe (exit code 0 = ready, anything
-    /// else = not-ready-yet — never "failed", so it retries the same way tcp/http do until the
-    /// readiness timeout). `cwd` is relative to the manager's root; omitted defaults to the root
+    /// else = not-ready-yet — never "failed"). The supervisor keeps probing on a fixed interval
+    /// for as long as the process runs. `cwd` is relative to the manager's root; omitted defaults to the root
     /// itself.
     Command {
         command: CommandSpec,

@@ -744,13 +744,14 @@ async fn start_selected_dag(
                         // `succeeded` is the success state of `readiness: exit`. Treating only `ready`
                         // as settled made a finished job report "did not become ready". A one-time
                         // command never becomes `ready`; its trace says succeeded.
+                        // `running-unready` is also settled: the process is up and the probe loop
+                        // is running. Waiting for the first passing probe has no deadline.
                         if s.actual_state == ActualServiceState::Succeeded {
                             Some("Succeeded")
-                        } else if s.actual_state == ActualServiceState::Ready
-                            || (s.actual_state == ActualServiceState::RunningUnready
-                                && s.readiness_kind == Some(crate::state::ReadinessKind::Process))
-                        {
+                        } else if s.actual_state == ActualServiceState::Ready {
                             Some("Ready")
+                        } else if s.actual_state == ActualServiceState::RunningUnready {
+                            Some("Running")
                         } else {
                             None
                         }

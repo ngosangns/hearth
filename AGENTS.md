@@ -99,14 +99,14 @@ from any dev box here, with the same username.
   by an unowned process`. The snapshot is only walked while the OS table still shows the recorded
   `startIdentity` for the leader pid, so a stale/reused pid can never pull an unrelated live tree
   into a signal or into the wait-for-death loop.
-- An adopted identity is kept only while it still answers its readiness probe; an alive-but-
-  unresponsive one (air survives its child) is terminated and replaced, rather than re-adopted on
-  every start into a permanent `Readiness timed out`.
+- An adopted process that is still alive is kept. A failing probe leaves it `running-unready`
+  and the 1.5s loop keeps checking; start does not kill it. Restart replaces it. A process that
+  is already gone is spawned again.
 - `ProcessAdapter::inspect` is tri-state (`Inspection::Observed|Gone|Unknown`) — a probe that fails
   to spawn or times out is `Unknown`, and callers must never read it as "gone": a wedged `docker`
   or `ps` would otherwise let `stop` record `stopped` over a running container and `reconcile` mark
   a live service `Failed` (spawning a duplicate). Unknown ⇒ stop/terminate fail loudly, `status`
-  and `reconcile` skip, the readiness loop keeps waiting.
+  and `reconcile` skip, and the continuous probe keeps running.
 - `ProcessSupervisor.shutdown()` does two passes: an "active state" stop pass, then a reap pass for
   daemon-owned services holding a stale POSIX identity in a non-active state (e.g. `externally-owned`
   after a port conflict). Don't collapse these into one.
@@ -209,7 +209,11 @@ from any dev box here, with the same username.
 **Catalog**
 
 - `{ kind: "command" }` readiness is the JSON-serializable stand-in for a custom probe. Exit 0 means
-  ready; anything else keeps retrying until the readiness timeout.
+  ready; anything else is `running-unready`. The probe repeats every 1.5s (`readiness_backoff_ms`)
+  until stop, restart, process exit, or daemon shutdown. It does not fail the service.
+  `readinessTimeoutMs` is still parsed. It no longer ends a long-lived start. It bounds one
+  command probe, and the one-shot shared-attach wait. `hearth start --wait`, bulk start, and MCP
+  `manage` settle at `ready` or `running-unready` once the process is up. `status` does not probe.
 - `{ kind: "exit" }` means the run command is the job. While it runs the state is `running` — not
   `ready` and not `running-unready`. Exit 0 records `succeeded` and sets desired back to `stopped`,
   so reconcile does not run it again; any other exit is `failed` with desired `stopped` (no
@@ -372,6 +376,11 @@ from any dev box here, with the same username.
   `terminal.draw`. The escape must stay out-of-band — inside a `Span` it lands as literal cell text.
   A Cmd-click is not delivered while reporting is on (Command is not in the SGR mouse report), so
   the shell copies the URL itself.
+- A `requiresRunning` URL (the default) is shown while its row is up *or* `succeeded`. A finished
+  `readiness: exit` row has no process by design, so hiding its link after success (Viclass `fe`)
+  read as "no URL registered". `url_visible` carries that rule; do not fold `Succeeded` into
+  `is_up`, which also picks Stop vs Start and group Restart. `hearth urls` does not flag a
+  succeeded row `(not running)`, but its `--json` `running` stays false.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
   catalog reloads. `display_state` collapses `running`/`running-unready` → `running` and

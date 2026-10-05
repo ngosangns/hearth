@@ -49,7 +49,7 @@ services:
     build: { argv: [go, build, ./...], timeoutMs: 120000, serializationKey: go }
     run: { shell: "air -c .air.toml", exec: true }
     readiness: { kind: tcp, port: 8080 }
-    readinessTimeoutMs: 30000
+    readinessTimeoutMs: 30000 # accepted; does not fail the service
     ports: [{ port: 6060, label: pprof }]
     urls:
       - http://127.0.0.1:8080
@@ -79,17 +79,17 @@ services:
     readiness: { kind: exit }
 ```
 
-Readiness is the completion signal, not the deadline. Pick the kind that matches what the process actually does:
+Readiness is a probe, not a deadline. After the process is up, hearth probes every 1.5s until the service is stopped or restarted, the process exits, or the daemon shuts down. A passing probe is `ready`. A failing probe is `running-unready` and leaves the process running. `hearth start --wait` returns once the process is up, whether or not the probe has passed yet. `readinessTimeoutMs` is still accepted. It does not fail a long-lived service. It bounds a single `command` probe, and a one-shot shared attach.
 
 | Kind | Ready when | Write it |
 |---|---|---|
-| `http` | `GET` returns 2xx | `{ kind: http }` is `http://127.0.0.1:<port>/health`. Set `path` for any other path (`/metrics`, `/minio/health/live`). Set `url` when the host or port is not that default. `url` cannot be combined with `path` or `port`. |
-| `tcp` | the port accepts a connection | `{ kind: tcp, port: 4222 }`, or `{ kind: tcp }` when `ports:` already names the port |
-| `command` | the command exits 0 | a real protocol check (`redis-cli ping`, `pg_isready`). Retries until `readinessTimeoutMs` |
-| `exit` | the run command itself exits | one-shot builds. The row is `running` until exit. Exit 0 is `succeeded`. No readiness deadline |
-| `container` | the named container is running | docker compose services |
-| `process` | the process is alive | no port and no HTTP |
-| `tailnet` | Tailscale serve is up | tailnet tasks |
+| `http` | `GET` returns 2xx | `{ kind: http }` is `http://127.0.0.1:<port>/health`. Set `path` for any other path (`/metrics`, `/minio/health/live`). Set `url` when the host or port is not that default. `url` cannot be combined with `path` or `port`. Probed every 1.5s |
+| `tcp` | the port accepts a connection | `{ kind: tcp, port: 4222 }`, or `{ kind: tcp }` when `ports:` already names the port. Probed every 1.5s |
+| `command` | the command exits 0 | a real protocol check (`redis-cli ping`, `pg_isready`). Probed every 1.5s. One probe is bounded by `readinessTimeoutMs` |
+| `exit` | the run command itself exits | one-shot builds. The row is `running` until exit. Exit 0 is `succeeded`. No readiness probe and no deadline. The wait polls every 1.5s |
+| `container` | the named container is running | docker compose services. Probed every 1.5s |
+| `process` | the process is alive | no port and no HTTP. No probe after start |
+| `tailnet` | Tailscale serve is up | tailnet tasks. Probed every 1.5s |
 
 `http` and `tcp` with no port use the first `ports:` entry. Omitting both is a load error (`needs a port`). Do not point `http` at `/health` unless that process serves the path.
 

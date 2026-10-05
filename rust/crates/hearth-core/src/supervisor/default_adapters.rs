@@ -484,7 +484,7 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// SIGKILLs a still-running child's process group when the future driving it is dropped — how a
-/// caller-side timeout (the engine bounds a `command` readiness probe by its readiness timeout)
+/// caller-side timeout (the engine bounds one `command` readiness probe by `readinessTimeoutMs`)
 /// actually ends the probe instead of leaving it running in the background.
 struct KillGroupOnDrop(Option<i64>);
 
@@ -1303,7 +1303,7 @@ pub fn default_supervisor_options(
         preparation: None,
         clock,
         readiness_timeout_ms: 10_000,
-        readiness_backoff_ms: 100,
+        readiness_backoff_ms: 1_500,
         termination_grace_ms: 5_000,
         is_closing: Arc::new(|| false),
     }

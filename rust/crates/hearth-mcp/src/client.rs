@@ -15,7 +15,8 @@ use hearth_core::shared::{project_id, shared_root, RemoteCatalog};
 use hearth_core::state::{OperationStatus, ServiceOperationKind};
 
 /// How long `manage` waits for its operation before handing the agent the operation id to
-/// `trace` instead — an MCP tool call must not hang for a whole readiness timeout.
+/// `trace` instead. A probed start settles when the process is up (`ready` or `running-unready`),
+/// not when the probe first passes.
 const MANAGE_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default)]

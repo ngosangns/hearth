@@ -1101,15 +1101,21 @@ async fn stop_signals_a_child_that_moved_into_its_own_process_group() {
 }
 
 #[tokio::test]
-async fn status_upgrades_a_recovered_service_back_to_ready() {
+async fn continuous_probe_drops_ready_then_recovers_without_status() {
     let h = build_harness(one_service_catalog(argv_verified(
         "api",
         ReadinessSpec::Tcp { port: 8080 },
     )));
     h.probes.set_tcp_ready(8080, true);
     h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Ready
+    );
 
     h.probes.set_tcp_ready(8080, false);
+    wait_until_actual(&h.host, "api", ActualServiceState::RunningUnready).await;
+    // `status` no longer probes. The continuous loop owns this edge.
     h.supervisor.status(&"api".to_string()).await.unwrap();
     assert_eq!(
         h.host.state_of("api").unwrap().actual_state,
@@ -1117,10 +1123,14 @@ async fn status_upgrades_a_recovered_service_back_to_ready() {
     );
 
     h.probes.set_tcp_ready(8080, true);
-    h.supervisor.status(&"api".to_string()).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
     let state = h.host.state_of("api").unwrap();
     assert_eq!(state.actual_state, ActualServiceState::Ready);
     assert_eq!(state.readiness, ServiceReadiness::Ready);
+    assert!(
+        h.process.signals().is_empty(),
+        "a failed probe must not kill the process"
+    );
 }
 
 #[tokio::test]
@@ -1306,25 +1316,60 @@ async fn stop_on_an_orphaned_service_refuses_instead_of_reporting_success() {
 }
 
 #[tokio::test]
-async fn readiness_timeout_transitions_to_failed_with_detail() {
+async fn a_never_ready_service_stays_running_unready_and_keeps_probing() {
     let h = build_harness_with_timeout(
         one_service_catalog(argv_verified("api", ReadinessSpec::Tcp { port: 8080 })),
         30,
     );
     // tcp never reports ready — probes.set_tcp_ready is never called for 8080.
-    let err = h
-        .supervisor
-        .start(&"api".to_string(), None)
-        .await
-        .unwrap_err();
-    assert_eq!(err.0, "Readiness timed out");
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
     let state = h.host.state_of("api").unwrap();
-    assert_eq!(state.actual_state, ActualServiceState::Failed);
-    assert!(state
-        .readiness_detail
-        .as_deref()
-        .unwrap()
-        .contains("timed out"));
+    assert_eq!(state.actual_state, ActualServiceState::RunningUnready);
+    assert_eq!(state.readiness, ServiceReadiness::NotReady);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_none_or(|error| !error.contains("timed out")),
+        "{state:?}"
+    );
+    let pid = match state.identity.unwrap() {
+        ProcessIdentity::Posix(posix) => posix.pid,
+        _ => panic!("expected a posix identity"),
+    };
+    assert!(h.process.is_alive(pid));
+    assert!(
+        h.process.signals().is_empty(),
+        "a failing probe must not signal the process"
+    );
+
+    // The loop is still the start's token: flipping the probe reaches ready without a restart.
+    h.probes.set_tcp_ready(8080, true);
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+    assert!(h.process.is_alive(pid));
+}
+
+#[tokio::test]
+async fn stop_cancels_the_continuous_probe_loop() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::RunningUnready
+    );
+    h.supervisor.stop(&"api".to_string(), None).await.unwrap();
+    h.probes.set_tcp_ready(8080, true);
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Stopped,
+        "a stopped service must not become ready from a leftover probe"
+    );
 }
 
 #[tokio::test]
@@ -1852,7 +1897,7 @@ async fn build_serialization_by_key_runs_one_at_a_time() {
 }
 
 #[tokio::test]
-async fn command_readiness_with_no_adapter_never_throws_times_out_normally() {
+async fn command_readiness_with_no_adapter_stays_running_unready() {
     let readiness = ReadinessSpec::Command {
         command: CommandSpec::Argv {
             argv: vec!["check".to_string()],
@@ -1860,12 +1905,16 @@ async fn command_readiness_with_no_adapter_never_throws_times_out_normally() {
         cwd: None,
     };
     let h = build_harness_with_timeout(one_service_catalog(argv_verified("api", readiness)), 20);
-    let err = h
-        .supervisor
-        .start(&"api".to_string(), None)
-        .await
-        .unwrap_err();
-    assert_eq!(err.0, "Readiness timed out");
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let state = h.host.state_of("api").unwrap();
+    assert_eq!(state.actual_state, ActualServiceState::RunningUnready);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_none_or(|error| !error.contains("timed out")),
+        "{state:?}"
+    );
 }
 
 #[tokio::test]
@@ -2108,7 +2157,7 @@ async fn preparation_command_failure_fails_the_start_not_just_readiness() {
 
 #[tokio::test]
 async fn preparation_command_with_no_command_probe_configured_fails_the_start_immediately() {
-    // Unlike command *readiness* (which degrades to a normal timeout with no adapter), a
+    // Unlike command readiness (which stays `running-unready` and keeps probing), a
     // preparation command with no way to run it can never succeed by waiting longer, so it
     // fails the start right away instead.
     let h = build_harness_with_timeout(preparation_catalog(), 20);
@@ -2875,6 +2924,22 @@ fn with_exit_timeout(mut service: ServiceDefinition, timeout_ms: u64) -> Service
         *readiness_timeout_ms = Some(timeout_ms);
     }
     service
+}
+
+async fn wait_until_actual(host: &FakeHost, service_id: &str, expected: ActualServiceState) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if host.state_of(service_id).map(|state| state.actual_state) == Some(expected) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {service_id} to become {expected:?}, last state: {:?}",
+                host.state_of(service_id).map(|state| state.actual_state)
+            );
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 async fn wait_for_posix_pid(host: &FakeHost, service_id: &str) -> i64 {

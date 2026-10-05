@@ -134,9 +134,9 @@ struct Active {
     command: ServiceCommand,
     identity: ProcessIdentity,
     stopped: bool,
-    /// Set by the spawned process's exit watcher the moment it exits. `on_exit` itself waits for the
-    /// per-service lock — which an in-flight start holds through readiness — so the readiness loop
-    /// reads this instead of spawning `ps`/`docker inspect` on every iteration to notice an exit.
+    /// Set by the spawned process's exit watcher the moment it exits. `on_exit` waits for the
+    /// per-service lock. A `readiness: exit` start holds that lock until the process exits, so it
+    /// reads this flag instead of `ps`. The continuous probe loop does not hold the lock across a tick.
     exited: Arc<AtomicBool>,
     /// Written by the watcher *before* `exited` flips. The readiness wait holds the per-service
     /// queue, so it can read the code here; `on_exit` only runs once that wait releases the queue.
@@ -192,7 +192,24 @@ enum ReadinessOutcome {
     Ready,
     Superseded,
     Exited { message: String },
-    Timeout { message: String, detail: String },
+}
+
+/// Removes this service's continuous-probe registration when the loop task ends, including
+/// when the runtime drops it. A later arm can start a new loop; an older loop must not clear
+/// a newer token.
+struct ProbeLoopGuard {
+    supervisor: Arc<ProcessSupervisor>,
+    service_id: ServiceId,
+    token: u64,
+}
+
+impl Drop for ProbeLoopGuard {
+    fn drop(&mut self) {
+        let mut loops = self.supervisor.probe_loops.lock().unwrap();
+        if loops.get(&self.service_id) == Some(&self.token) {
+            loops.remove(&self.service_id);
+        }
+    }
 }
 
 pub struct ProcessSupervisor {
@@ -210,6 +227,9 @@ pub struct ProcessSupervisor {
     /// order — so two chunks emitted in order could land in the log file reversed, or interleaved
     /// mid-line. A single draining task per service preserves emission order by construction.
     log_forwarders: Mutex<HashMap<ServiceId, LogForwarder>>,
+    /// Token of the continuous readiness loop, so a second arm for the same start (reconcile
+    /// after the loop is already running) does not probe twice.
+    probe_loops: Mutex<HashMap<ServiceId, u64>>,
     compose_start_tail: tokio::sync::Mutex<()>,
 }
 
@@ -226,6 +246,7 @@ impl ProcessSupervisor {
             preparation_serials: KeyedLock::new(),
             output_tails: Mutex::new(HashMap::new()),
             log_forwarders: Mutex::new(HashMap::new()),
+            probe_loops: Mutex::new(HashMap::new()),
             compose_start_tail: tokio::sync::Mutex::new(()),
         })
     }
@@ -438,48 +459,10 @@ impl ProcessSupervisor {
                     return Ok(());
                 }
                 // `== Some(false)`: an unverifiable probe must not orphan a live process.
+                // Ready ↔ running-unready belongs to the continuous probe loop. Probing here
+                // would race it and publish a second transition for the same tick.
                 if sup.owns(&state).await == Some(false) {
                     sup.orphan(&state, None).await;
-                    return Ok(());
-                }
-                let profile = profile_for(&sup.host.catalog(), &id)?;
-                if matches!(
-                    profile.readiness,
-                    ReadinessSpec::Process | ReadinessSpec::Exit
-                ) {
-                    return Ok(());
-                }
-                if !sup.probe(&profile.readiness, &id).await {
-                    sup.transition(
-                        &id,
-                        state.generation,
-                        ActualServiceState::RunningUnready,
-                        ServiceReadiness::NotReady,
-                        Changes {
-                            readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
-                            readiness_detail: Patch::Set(
-                                "Readiness probe is currently unavailable".to_string(),
-                            ),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                } else if state.actual_state == ActualServiceState::RunningUnready {
-                    // The way back: a probe that failed earlier and passes now. Without it a service
-                    // stayed `running-unready` after recovering, until something restarted it.
-                    sup.transition(
-                        &id,
-                        state.generation,
-                        ActualServiceState::Ready,
-                        ServiceReadiness::Ready,
-                        Changes {
-                            readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
-                            readiness_detail: Patch::Set("readiness verified".to_string()),
-                            error: Patch::Clear,
-                            ..Default::default()
-                        },
-                    )
-                    .await;
                 }
                 Ok(())
             })
@@ -986,100 +969,59 @@ impl ProcessSupervisor {
 
         if let Some(retained) = retained_identity {
             let identity = with_manager_instance(retained, self.host.instance_id());
-            let exit_job = matches!(profile.readiness, ReadinessSpec::Exit);
-            self.transition(
-                service_id,
-                generation,
-                if exit_job {
-                    ActualServiceState::Running
-                } else {
-                    ActualServiceState::RunningUnready
-                },
-                if exit_job {
-                    ServiceReadiness::Unknown
-                } else {
-                    ServiceReadiness::NotReady
-                },
-                Changes {
-                    desired_state: Some(DesiredServiceState::Running),
-                    current_operation_id: operation_id
-                        .clone()
-                        .map(Patch::Set)
-                        .unwrap_or(Patch::Keep),
-                    identity: Patch::Set(identity.clone()),
-                    error: Patch::Clear,
-                    exit_code: Patch::Clear,
-                    exited_at: Patch::Clear,
-                    ..Default::default()
-                },
-            )
-            .await;
-            self.attach_output(service_id, output_source(&identity, true));
-            // An adopted identity is only worth keeping while it still answers its readiness probe.
-            let outcome = self
-                .await_readiness(
+            // A live process is this service. A failing probe leaves it `running-unready` and
+            // the continuous loop keeps checking; start does not kill it to force a fresh one.
+            // A process that is already gone falls through and is spawned again.
+            if self.owns_identity(&identity).await != Some(false) {
+                let exit_job = matches!(profile.readiness, ReadinessSpec::Exit);
+                self.transition(
                     service_id,
-                    &profile,
                     generation,
-                    Some(identity.clone()),
-                    token,
-                    true,
+                    if exit_job {
+                        ActualServiceState::Running
+                    } else {
+                        ActualServiceState::RunningUnready
+                    },
+                    if exit_job {
+                        ServiceReadiness::Unknown
+                    } else {
+                        ServiceReadiness::NotReady
+                    },
+                    Changes {
+                        desired_state: Some(DesiredServiceState::Running),
+                        current_operation_id: operation_id
+                            .clone()
+                            .map(Patch::Set)
+                            .unwrap_or(Patch::Keep),
+                        identity: Patch::Set(identity.clone()),
+                        error: Patch::Clear,
+                        exit_code: Patch::Clear,
+                        exited_at: Patch::Clear,
+                        ..Default::default()
+                    },
                 )
                 .await;
-            match outcome {
-                ReadinessOutcome::Ready => {
-                    self.arm_adopted_watch(
+                self.attach_output(service_id, output_source(&identity, true));
+                self.arm_adopted_watch(
+                    service_id,
+                    identity.clone(),
+                    profile.command.clone(),
+                    generation,
+                    token,
+                );
+                return self
+                    .readiness_with_adopted(
                         service_id,
-                        identity,
-                        profile.command.clone(),
+                        &profile,
                         generation,
+                        Some(identity),
                         token,
-                    );
-                    return Ok(());
-                }
-                ReadinessOutcome::Superseded => return Ok(()),
-                _ => {}
-            }
-            token = self.cancel(service_id);
-            // Replacement is only safe once terminate has actually stopped the old process. An
-            // unverified liveness check used to be swallowed, and the next spawn ran beside it.
-            match self.terminate(&identity, &profile.command).await {
-                Err(error) => {
-                    self.transition(
-                        service_id,
-                        generation,
-                        ActualServiceState::Failed,
-                        ServiceReadiness::Failed,
-                        Changes {
-                            error: Patch::Set(error.0.clone()),
-                            identity: Patch::Set(identity),
-                            ..Default::default()
-                        },
+                        operation_id,
+                        true,
                     )
                     .await;
-                    return Err(error);
-                }
-                Ok(()) => {
-                    if self.owns_identity(&identity).await != Some(false) {
-                        let error = SupervisorError(format!(
-                            "{service_id} was not replaced: the adopted process is still alive"
-                        ));
-                        self.transition(
-                            service_id,
-                            generation,
-                            ActualServiceState::Failed,
-                            ServiceReadiness::Failed,
-                            Changes {
-                                error: Patch::Set(error.0.clone()),
-                                identity: Patch::Set(identity.clone()),
-                                ..Default::default()
-                            },
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                }
             }
+            token = self.cancel(service_id);
         }
 
         self.transition(
@@ -2121,14 +2063,8 @@ impl ProcessSupervisor {
         operation_id: Option<String>,
         mut exited: tokio::sync::oneshot::Receiver<i32>,
     ) -> Result<(), SupervisorError> {
-        let readiness = self.readiness(
-            service_id,
-            profile,
-            generation,
-            None,
-            token,
-            operation_id.clone(),
-        );
+        let readiness =
+            self.await_task_probe(service_id, profile, generation, token, operation_id.clone());
         tokio::pin!(readiness);
         tokio::select! {
             biased;
@@ -2153,6 +2089,71 @@ impl ProcessSupervisor {
                     .await
             }
         }
+    }
+
+    /// Deadline for a one-shot external task (`hearth shared attach`) while that process is
+    /// still running. A daemon-owned service does not use this: its probe loop has no deadline.
+    /// The task's start is the operation, so a probe that never passes has to end the operation
+    /// or `--wait` would hang for as long as the trigger process stays up.
+    async fn await_task_probe(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+        generation: u64,
+        token: u64,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        let timeout = profile
+            .readiness_timeout_ms
+            .map(|v| v as i64)
+            .unwrap_or(self.options.readiness_timeout_ms);
+        let deadline = self.options.clock.now_millis() + timeout;
+        loop {
+            if self.options.clock.now_millis() > deadline {
+                break;
+            }
+            if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+                return Ok(());
+            }
+            if self.probe(&profile.readiness, service_id).await {
+                self.transition_if_current(
+                    service_id,
+                    generation,
+                    token,
+                    ActualServiceState::Ready,
+                    ServiceReadiness::Ready,
+                    Changes {
+                        readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
+                        readiness_detail: Patch::Set("readiness verified".to_string()),
+                        error: Patch::Clear,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+            self.options
+                .clock
+                .sleep(self.options.readiness_backoff_ms)
+                .await;
+        }
+        let message = "Readiness timed out".to_string();
+        let detail = format!(
+            "Readiness {} probe timed out after {}ms",
+            readiness_kind_of(&profile.readiness).as_wire_str(),
+            timeout
+        );
+        self.fail(
+            service_id,
+            generation,
+            token,
+            None,
+            &message,
+            operation_id,
+            Some((readiness_kind_of(&profile.readiness), detail)),
+        )
+        .await;
+        Err(SupervisorError(message))
     }
 
     async fn probe_settled_task(
@@ -2240,90 +2241,192 @@ impl ProcessSupervisor {
         operation_id: Option<String>,
         adopted: bool,
     ) -> Result<(), SupervisorError> {
-        let outcome = self
-            .await_readiness(
-                service_id,
-                profile,
-                generation,
-                identity.clone(),
-                token,
-                adopted,
-            )
-            .await;
-        match outcome {
-            ReadinessOutcome::Ready | ReadinessOutcome::Superseded => Ok(()),
-            ReadinessOutcome::Exited { message } => {
-                // `await_exit` already recorded `failed` for a command whose exit it observed.
-                // `fail` again would terminate a process that is already gone and drop the code.
-                let already_settled = self.state(service_id).is_some_and(|s| {
-                    matches!(
-                        s.actual_state,
-                        ActualServiceState::Failed
-                            | ActualServiceState::Succeeded
-                            | ActualServiceState::Stopped
-                    )
-                });
-                if !already_settled {
-                    self.fail(
-                        service_id,
-                        generation,
-                        token,
-                        identity,
-                        &message,
-                        operation_id,
-                        None,
-                    )
-                    .await;
+        if matches!(profile.readiness, ReadinessSpec::Exit) {
+            let outcome = self
+                .await_exit(
+                    service_id,
+                    profile,
+                    generation,
+                    identity.clone(),
+                    token,
+                    adopted,
+                )
+                .await;
+            return match outcome {
+                ReadinessOutcome::Ready | ReadinessOutcome::Superseded => Ok(()),
+                ReadinessOutcome::Exited { message } => {
+                    // `await_exit` already recorded `failed` for a command whose exit it observed.
+                    // `fail` again would terminate a process that is already gone and drop the code.
+                    let already_settled = self.state(service_id).is_some_and(|s| {
+                        matches!(
+                            s.actual_state,
+                            ActualServiceState::Failed
+                                | ActualServiceState::Succeeded
+                                | ActualServiceState::Stopped
+                        )
+                    });
+                    if !already_settled {
+                        self.fail(
+                            service_id,
+                            generation,
+                            token,
+                            identity,
+                            &message,
+                            operation_id,
+                            None,
+                        )
+                        .await;
+                    }
+                    Err(SupervisorError(message))
                 }
-                Err(SupervisorError(message))
-            }
-            ReadinessOutcome::Timeout { message, detail } => {
+            };
+        }
+        if matches!(profile.readiness, ReadinessSpec::Process) {
+            return self
+                .settle_process_liveness(service_id, generation, identity, token, operation_id)
+                .await;
+        }
+        self.begin_continuous_probe(
+            service_id,
+            profile,
+            generation,
+            identity,
+            token,
+            operation_id,
+            adopted,
+        )
+        .await
+    }
+
+    /// `readiness: process` has no probe. The start is done once the process is alive.
+    async fn settle_process_liveness(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        generation: u64,
+        identity: Option<ProcessIdentity>,
+        token: u64,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+            return Ok(());
+        }
+        if let Some(identity) = &identity {
+            if self.owns_identity(identity).await == Some(false) {
+                if !self.valid(service_id, generation, token) {
+                    return Ok(());
+                }
+                let message = "Process exited before liveness check".to_string();
                 self.fail(
                     service_id,
                     generation,
                     token,
-                    identity,
+                    Some(identity.clone()),
                     &message,
                     operation_id,
-                    Some((readiness_kind_of(&profile.readiness), detail)),
+                    None,
                 )
                 .await;
-                Err(SupervisorError(message))
+                return Err(SupervisorError(message));
             }
         }
+        self.transition_if_current(
+            service_id,
+            generation,
+            token,
+            ActualServiceState::RunningUnready,
+            ServiceReadiness::NotReady,
+            Changes {
+                identity: identity.map(Patch::Set).unwrap_or(Patch::Keep),
+                readiness_kind: Patch::Set(ReadinessKind::Process),
+                readiness_detail: Patch::Set("process-liveness-only".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        Ok(())
     }
 
-    /// Non-throwing readiness wait. `Superseded` means a newer operation (or a closing manager) took
-    /// over this service's token, so the caller must stop quietly instead of reporting a failure.
-    async fn await_readiness(
+    /// One probe now, then a background loop at `readiness_backoff_ms`. The start returns as soon
+    /// as the process is alive: waiting for the first passing probe had no deadline and would
+    /// hang `--wait`. A failing probe stays `running-unready` and does not fail or kill the service.
+    /// `readinessTimeoutMs` is not a service deadline here. It still bounds one `command` probe.
+    #[allow(clippy::too_many_arguments)] // the full per-start context; bundling it would only move the list
+    async fn begin_continuous_probe(
         self: &Arc<Self>,
         service_id: &ServiceId,
         profile: &VerifiedProfile,
         generation: u64,
         identity: Option<ProcessIdentity>,
         token: u64,
+        operation_id: Option<String>,
         adopted: bool,
-    ) -> ReadinessOutcome {
-        if matches!(profile.readiness, ReadinessSpec::Exit) {
-            return self
-                .await_exit(service_id, profile, generation, identity, token, adopted)
-                .await;
+    ) -> Result<(), SupervisorError> {
+        if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+            return Ok(());
         }
-        if matches!(profile.readiness, ReadinessSpec::Process) {
-            if !self.valid(service_id, generation, token) {
-                return ReadinessOutcome::Superseded;
-            }
-            if let Some(identity) = &identity {
-                if self.owns_identity(identity).await == Some(false) {
-                    return if self.valid(service_id, generation, token) {
-                        ReadinessOutcome::Exited {
-                            message: "Process exited before liveness check".to_string(),
-                        }
-                    } else {
-                        ReadinessOutcome::Superseded
-                    };
+        if let Some(identity) = &identity {
+            if !self.still_running(service_id, identity, adopted).await {
+                if !self.valid(service_id, generation, token) {
+                    return Ok(());
                 }
+                let message = "Process exited before readiness".to_string();
+                self.fail(
+                    service_id,
+                    generation,
+                    token,
+                    Some(identity.clone()),
+                    &message,
+                    operation_id,
+                    None,
+                )
+                .await;
+                return Err(SupervisorError(message));
             }
+        }
+        let passed = self.probe(&profile.readiness, service_id).await;
+        if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
+            return Ok(());
+        }
+        if let Some(identity) = &identity {
+            if !self.still_running(service_id, identity, adopted).await {
+                if !self.valid(service_id, generation, token) {
+                    return Ok(());
+                }
+                let message = "Process exited before readiness".to_string();
+                self.fail(
+                    service_id,
+                    generation,
+                    token,
+                    Some(identity.clone()),
+                    &message,
+                    operation_id,
+                    None,
+                )
+                .await;
+                return Err(SupervisorError(message));
+            }
+        }
+        let kind = readiness_kind_of(&profile.readiness);
+        if passed {
+            self.transition_if_current(
+                service_id,
+                generation,
+                token,
+                ActualServiceState::Ready,
+                ServiceReadiness::Ready,
+                Changes {
+                    readiness_kind: Patch::Set(kind),
+                    readiness_detail: Patch::Set(if adopted {
+                        "adopted readiness verified".to_string()
+                    } else {
+                        "readiness verified".to_string()
+                    }),
+                    error: Patch::Clear,
+                    ..Default::default()
+                },
+            )
+            .await;
+        } else {
             self.transition_if_current(
                 service_id,
                 generation,
@@ -2331,73 +2434,145 @@ impl ProcessSupervisor {
                 ActualServiceState::RunningUnready,
                 ServiceReadiness::NotReady,
                 Changes {
-                    identity: identity.map(Patch::Set).unwrap_or(Patch::Keep),
-                    readiness_kind: Patch::Set(ReadinessKind::Process),
-                    readiness_detail: Patch::Set("process-liveness-only".to_string()),
+                    readiness_kind: Patch::Set(kind),
+                    readiness_detail: Patch::Set(
+                        "Readiness probe is currently unavailable".to_string(),
+                    ),
                     ..Default::default()
                 },
             )
             .await;
-            return ReadinessOutcome::Ready;
         }
-        let timeout = profile
-            .readiness_timeout_ms
-            .map(|v| v as i64)
-            .unwrap_or(self.options.readiness_timeout_ms);
-        let deadline = self.options.clock.now_millis() + timeout;
-        loop {
-            if self.options.clock.now_millis() > deadline {
-                break;
+        self.spawn_continuous_probe(service_id, profile, generation, identity, token, adopted);
+        Ok(())
+    }
+
+    /// Sleeps one interval before the first tick. The caller already probed once, and this task
+    /// must not take the per-service queue while that caller still holds it.
+    #[allow(clippy::too_many_arguments)] // the full per-start context; bundling it would only move the list
+    fn spawn_continuous_probe(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+        generation: u64,
+        identity: Option<ProcessIdentity>,
+        token: u64,
+        adopted: bool,
+    ) {
+        if matches!(
+            profile.readiness,
+            ReadinessSpec::Process | ReadinessSpec::Exit
+        ) {
+            return;
+        }
+        {
+            let mut loops = self.probe_loops.lock().unwrap();
+            if loops.get(service_id) == Some(&token) {
+                return;
             }
-            if !self.valid(service_id, generation, token) {
-                return ReadinessOutcome::Superseded;
-            }
-            if let Some(identity) = &identity {
-                if !self.still_running(service_id, identity, adopted).await {
-                    return if self.valid(service_id, generation, token) {
-                        ReadinessOutcome::Exited {
-                            message: "Process exited before readiness".to_string(),
+            loops.insert(service_id.clone(), token);
+        }
+        let sup = self.clone();
+        let service_id = service_id.clone();
+        let readiness = profile.readiness.clone();
+        tokio::spawn(async move {
+            let _guard = ProbeLoopGuard {
+                supervisor: sup.clone(),
+                service_id: service_id.clone(),
+                token,
+            };
+            loop {
+                sup.options
+                    .clock
+                    .sleep(sup.options.readiness_backoff_ms)
+                    .await;
+                if sup.continuous_probe_stopped(&service_id, generation, token) {
+                    return;
+                }
+                if let Some(identity) = &identity {
+                    if !sup.still_running(&service_id, identity, adopted).await {
+                        return;
+                    }
+                }
+                let passed = sup.probe(&readiness, &service_id).await;
+                let sup_tick = sup.clone();
+                let sid = service_id.clone();
+                let identity_tick = identity.clone();
+                let readiness_tick = readiness.clone();
+                let stop = sup
+                    .queues
+                    .run(&service_id, || async move {
+                        if sup_tick.continuous_probe_stopped(&sid, generation, token) {
+                            return true;
                         }
-                    } else {
-                        ReadinessOutcome::Superseded
-                    };
+                        if let Some(identity) = &identity_tick {
+                            if !sup_tick.still_running(&sid, identity, adopted).await {
+                                return true;
+                            }
+                        }
+                        let Some(state) = sup_tick.state(&sid) else {
+                            return true;
+                        };
+                        if !matches!(
+                            state.actual_state,
+                            ActualServiceState::Ready | ActualServiceState::RunningUnready
+                        ) {
+                            return true;
+                        }
+                        let kind = readiness_kind_of(&readiness_tick);
+                        if passed && state.actual_state != ActualServiceState::Ready {
+                            sup_tick
+                                .transition(
+                                    &sid,
+                                    generation,
+                                    ActualServiceState::Ready,
+                                    ServiceReadiness::Ready,
+                                    Changes {
+                                        readiness_kind: Patch::Set(kind),
+                                        readiness_detail: Patch::Set(
+                                            "readiness verified".to_string(),
+                                        ),
+                                        error: Patch::Clear,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                        } else if !passed
+                            && state.actual_state != ActualServiceState::RunningUnready
+                        {
+                            sup_tick
+                                .transition(
+                                    &sid,
+                                    generation,
+                                    ActualServiceState::RunningUnready,
+                                    ServiceReadiness::NotReady,
+                                    Changes {
+                                        readiness_kind: Patch::Set(kind),
+                                        readiness_detail: Patch::Set(
+                                            "Readiness probe is currently unavailable".to_string(),
+                                        ),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                        }
+                        false
+                    })
+                    .await;
+                if stop {
+                    return;
                 }
             }
-            if self.probe(&profile.readiness, service_id).await {
-                self.transition_if_current(
-                    service_id,
-                    generation,
-                    token,
-                    ActualServiceState::Ready,
-                    ServiceReadiness::Ready,
-                    Changes {
-                        identity: identity.clone().map(Patch::Set).unwrap_or(Patch::Keep),
-                        readiness_kind: Patch::Set(readiness_kind_of(&profile.readiness)),
-                        readiness_detail: Patch::Set(if adopted {
-                            "adopted readiness verified".to_string()
-                        } else {
-                            "readiness verified".to_string()
-                        }),
-                        error: Patch::Clear,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                return ReadinessOutcome::Ready;
-            }
-            self.options
-                .clock
-                .sleep(self.options.readiness_backoff_ms)
-                .await;
-        }
-        ReadinessOutcome::Timeout {
-            message: "Readiness timed out".to_string(),
-            detail: format!(
-                "Readiness {} probe timed out after {}ms",
-                readiness_kind_of(&profile.readiness).as_wire_str(),
-                timeout
-            ),
-        }
+        });
+    }
+
+    fn continuous_probe_stopped(
+        &self,
+        service_id: &ServiceId,
+        generation: u64,
+        token: u64,
+    ) -> bool {
+        !self.valid(service_id, generation, token) || (self.options.is_closing)()
     }
 
     /// Wait until a `readiness: exit` command's process exits. The command has no ready state and
@@ -3269,9 +3444,10 @@ impl ProcessSupervisor {
             ReadinessSpec::Tcp { port } => self.options.probes.tcp(*port).await,
             ReadinessSpec::Http { url } => self.options.probes.http(url).await,
             ReadinessSpec::Tailnet => self.options.probes.tailnet().await,
-            // Bounded by the service's readiness timeout: a hung probe script runs under the
-            // per-service lock and would otherwise make the service unstoppable. Dropping the
-            // probe future kills its process group (see `default_adapters::run_command`).
+            // One probe, not a service deadline. `readinessTimeoutMs` (else the supervisor
+            // default) bounds this command so a hung script ends. Dropping the future kills its
+            // process group (see `default_adapters::run_command`). The continuous loop runs the
+            // probe outside the per-service queue, so stop is not stuck behind it.
             ReadinessSpec::Command { command, cwd } => {
                 let budget =
                     Duration::from_millis(self.readiness_timeout_ms(service_id).max(1) as u64);

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Readiness probes run every 1.5s for as long as the process is up, including after `ready`. A failing probe becomes `running-unready` and does not kill or fail the service. The probe stops when the service is stopped or restarted, the process exits, or the daemon shuts down. `readiness: process` still has no probe. `readiness: exit` still waits for the process to exit, polling at the same interval.
+- `hearth start --wait`, a bulk start, and MCP `manage` settle when the process is up (`ready` or `running-unready`), not when the probe first passes. `readinessTimeoutMs` is still accepted and still bounds a single command probe and a one-shot shared attach. It no longer fails a long-lived service.
+
 ## 0.20.0
 
 - Restarting a service or a group no longer stops at "cannot be stopped" when the row has no process and no `stop` command. The service is started. A listener that is the service itself is replaced first. Another program on the port is left alone. `hearth stop <group>` and `hearth restart <group>` run without `--wait`. In `hearth tui`, a group stop or restart waits for every member and the notice names a failure instead of only showing the verb.

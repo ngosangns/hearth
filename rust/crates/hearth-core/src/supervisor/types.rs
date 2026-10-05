@@ -263,8 +263,9 @@ pub trait ProbeAdapter: Send + Sync {
         None
     }
     /// Backs `{ kind: "command" }` readiness. `None` (not just `Some(false)`) means "no adapter
-    /// configured" — `ProcessSupervisor::probe` degrades that to `false` (normal readiness-timeout
-    /// path), matching the TS optional-adapter sharp edge (never throws).
+    /// configured" — `ProcessSupervisor::probe` degrades that to `false` (the service stays
+    /// `running-unready` and the probe loop keeps retrying), matching the optional-adapter edge
+    /// (never throws).
     async fn command(&self, _command: &CommandSpec, _cwd: Option<&str>) -> Option<bool> {
         None
     }
