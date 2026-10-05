@@ -510,11 +510,9 @@ impl Desk {
             self.link_selection = None;
             return;
         }
-        let notice = self.status_notice();
-        let (header_h, notice_h, footer_h) = chrome_heights(area.height, !notice.is_empty());
-        let [header, notice_area, body, footer] = Layout::vertical([
+        let (header_h, footer_h) = chrome_heights(area.height);
+        let [header, body, footer] = Layout::vertical([
             Constraint::Length(header_h),
-            Constraint::Length(notice_h),
             Constraint::Min(0),
             Constraint::Length(footer_h),
         ])
@@ -524,9 +522,6 @@ impl Desk {
                 Paragraph::new(title_line(&self.summary, self.daemon_pid)).style(theme::title()),
                 header,
             );
-        }
-        if notice_h > 0 {
-            frame.render_widget(Paragraph::new(notice).style(theme::notice()), notice_area);
         }
         if footer_h > 0 {
             frame.render_widget(
@@ -762,7 +757,7 @@ impl Desk {
         let [left, right] =
             Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(0)]).areas(body);
         let (height, offset) = self.fit_workspace(block_inner_height(left), self.workspaces.len());
-        self.paint_workspaces(frame, left, height, offset);
+        self.paint_workspaces(frame, left, height, offset, false);
         let main = if self.shared_open {
             Pane::Shared
         } else {
@@ -774,9 +769,12 @@ impl Desk {
     fn draw_narrow(&mut self, frame: &mut Frame, body: Rect) {
         match self.focus {
             Pane::Workspaces => {
-                let (height, offset) =
-                    self.fit_workspace(block_inner_height(body), self.workspaces.len());
-                self.paint_workspaces(frame, body, height, offset);
+                let notice_rows = self.notice_rows();
+                let (height, offset) = self.fit_workspace(
+                    block_inner_height(body).saturating_sub(notice_rows),
+                    self.workspaces.len(),
+                );
+                self.paint_workspaces(frame, body, height, offset, true);
                 self.geometry.main = Pane::Workspaces;
             }
             Pane::Services | Pane::Shared => {
@@ -801,21 +799,40 @@ impl Desk {
         (height, self.workspace_offset)
     }
 
+    /// The status notice is one row at the top of the visible pane, not a banner over it.
+    fn notice_rows(&self) -> usize {
+        usize::from(!self.status_notice().is_empty())
+    }
+
+    fn paint_notice(&self, frame: &mut Frame, inner: Rect, show: bool) -> usize {
+        let notice = if show { self.status_notice() } else { String::new() };
+        if notice.is_empty() || inner.width == 0 || inner.height == 0 {
+            return 0;
+        }
+        let line = Line::styled(notice, theme::notice());
+        frame
+            .buffer_mut()
+            .set_line(inner.x, inner.y, &line, inner.width);
+        1
+    }
+
     fn paint_workspaces(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         item_slots: usize,
         offset: usize,
+        show_notice: bool,
     ) {
         let focused = self.focus == Pane::Workspaces;
         let block = pane_block("WORKSPACES", focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let rows = item_slots.min(inner.height as usize);
+        let notice_rows = self.paint_notice(frame, inner, show_notice);
+        let rows = item_slots.min((inner.height as usize).saturating_sub(notice_rows));
         self.geometry.workspace_items = Rect {
             x: inner.x,
-            y: inner.y,
+            y: inner.y + notice_rows as u16,
             width: inner.width,
             height: rows as u16,
         };
@@ -833,7 +850,7 @@ impl Desk {
             paint_line(
                 buf,
                 inner.x,
-                inner.y + slot as u16,
+                inner.y + notice_rows as u16 + slot as u16,
                 inner.width,
                 &line,
                 focused && current,
@@ -858,6 +875,12 @@ impl Desk {
         let block = pane_block(&title, focused);
         let inner = block.inner(list_area);
         frame.render_widget(block, list_area);
+        let notice_rows = self.paint_notice(frame, inner, true);
+        let inner = Rect {
+            y: inner.y + notice_rows as u16,
+            height: inner.height.saturating_sub(notice_rows as u16),
+            ..inner
+        };
         let url_rows = if pane == Pane::Services {
             self.urls.len().min(3).min(inner.height as usize)
         } else {
@@ -1452,18 +1475,12 @@ fn plain_cell(text: &str) -> String {
         .collect()
 }
 
-fn chrome_heights(height: u16, show_notice: bool) -> (u16, u16, u16) {
-    if height == 0 {
-        return (0, 0, 0);
+fn chrome_heights(height: u16) -> (u16, u16) {
+    match height {
+        0 => (0, 0),
+        1 => (1, 0),
+        _ => (1, 1),
     }
-    if height == 1 {
-        return (1, 0, 0);
-    }
-    let notice = u16::from(show_notice);
-    if height <= notice + 1 {
-        return (1, 0, height - 1);
-    }
-    (1, notice, 1)
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
@@ -3642,5 +3659,43 @@ mod tests {
             desk.hit(service_at.x as usize, service_at.y as usize),
             Some(Hit::Service(0))
         );
+    }
+
+    #[test]
+    fn a_notice_paints_at_the_top_of_the_service_pane() {
+        let mut desk = Desk {
+            focus: Pane::Services,
+            workspaces: vec![workspace("1", "viclass", true)],
+            notice: "Manager unavailable".to_string(),
+            ..Desk::default()
+        };
+        desk.sections = group_sections(&[meta("api", false, false)], &[], &[live("api", "ready")]);
+        let buffer = paint(&mut desk, 120, 24);
+        let text = buffer_text(&buffer);
+        let (row, _) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Manager unavailable"))
+            .expect("notice row");
+        // Inside the SERVICES block, right of the sidebar — not a full-width banner row.
+        let inner_x = desk.geometry.main_items.x;
+        let row16 = row as u16;
+        assert_eq!(
+            buffer.cell((inner_x, row16)).unwrap().symbol(),
+            "M",
+            "{text}"
+        );
+        assert_eq!(
+            buffer.cell((inner_x - 1, row16)).unwrap().symbol(),
+            "│",
+            "{text}"
+        );
+        assert!(
+            text.lines().nth(row - 1).unwrap().contains("SERVICES"),
+            "{text}"
+        );
+        // Items start below the notice; a click on it hits nothing.
+        assert_eq!(desk.geometry.main_items.y, row16 + 1, "{text}");
+        assert_eq!(desk.hit(inner_x as usize, row), None);
     }
 }

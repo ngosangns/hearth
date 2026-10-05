@@ -3,7 +3,7 @@
 //! running. Enter on a trusted workspace is what spawns one. An untrusted folder takes a second
 //! enter, and that is the confirm.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,6 +75,9 @@ struct SharedSnapshot {
 enum Msg {
     Discover {
         gen: u64,
+        /// Workspace the outcome belongs to. A `gen` made stale by a workspace switch still
+        /// names its workspace, so a finished daemon job can settle the view it started from.
+        workspace: String,
         outcome: Box<DiscoverOutcome>,
     },
     Watch {
@@ -89,6 +92,13 @@ enum Msg {
         snapshot: SharedSnapshot,
     },
     JobFinished,
+}
+
+/// A daemon start/restart still in flight, keyed by its `gen`: the workspace it serves and
+/// the notice the view shows while that workspace is selected before the job lands.
+struct DaemonJob {
+    workspace: String,
+    label: String,
 }
 
 struct Session {
@@ -143,6 +153,7 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
         session: None,
         gen: 0,
         stopped: HashSet::new(),
+        starting: HashMap::new(),
         acting: false,
         jobs: 0,
         config_revision: None,
@@ -183,6 +194,7 @@ struct App {
     session: Option<Session>,
     gen: u64,
     stopped: HashSet<String>,
+    starting: HashMap<u64, DaemonJob>,
     acting: bool,
     jobs: u32,
     config_revision: Option<u64>,
@@ -830,8 +842,26 @@ impl App {
 
     async fn on_msg(&mut self, message: Msg) {
         match message {
-            Msg::Discover { gen, outcome } => {
+            Msg::Discover {
+                gen,
+                workspace,
+                outcome,
+            } => {
+                let finished = self.starting.remove(&gen).is_some();
                 if gen != self.gen {
+                    // A daemon job that landed after the view moved still settles its own
+                    // workspace: re-attach it when that workspace is the one on screen.
+                    if finished
+                        && self
+                            .desk
+                            .selected_workspace()
+                            .is_some_and(|selected| selected.id == workspace)
+                    {
+                        self.drop_session();
+                        self.gen += 1;
+                        let gen = self.gen;
+                        self.attach_outcome(gen, *outcome).await;
+                    }
                     return;
                 }
                 self.attach_outcome(gen, *outcome).await;
@@ -886,15 +916,20 @@ impl App {
             return;
         };
         self.config_revision = config_revision(&path);
-        self.desk.notice = format!("opening {}…", workspace.name);
+        self.desk.notice = self
+            .starting_label(&workspace.id)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("opening {}…", workspace.name));
         self.desk.log_title = workspace.name;
         self.desk.log = "Loading…".to_string();
         let tx = self.tx.clone();
+        let workspace_id = workspace.id.clone();
         tokio::spawn(async move {
             let outcome = discover_project(path).await;
             let _ = tx
                 .send(Msg::Discover {
                     gen,
+                    workspace: workspace_id,
                     outcome: Box::new(outcome),
                 })
                 .await;
@@ -918,14 +953,23 @@ impl App {
         self.config_revision = config_revision(&path);
         self.begin_job();
         self.desk.notice = format!("starting daemon for {}…", workspace.name);
+        self.starting.insert(
+            gen,
+            DaemonJob {
+                workspace: workspace.id.clone(),
+                label: self.desk.notice.clone(),
+            },
+        );
         self.draw();
         let spawn = self.spawn_daemon.clone();
         let tx = self.tx.clone();
+        let workspace_id = workspace.id.clone();
         tokio::spawn(async move {
             let outcome = ensure_project(path, spawn).await;
             let _ = tx
                 .send(Msg::Discover {
                     gen,
+                    workspace: workspace_id,
                     outcome: Box::new(outcome),
                 })
                 .await;
@@ -1010,6 +1054,14 @@ impl App {
         self.gen += 1;
         let gen = self.gen;
         self.begin_job();
+        self.starting.insert(
+            gen,
+            DaemonJob {
+                workspace: id.to_string(),
+                label: self.desk.notice.clone(),
+            },
+        );
+        let workspace_id = id.to_string();
         tokio::spawn(async move {
             let outcome = match load_options(&path, &spawn) {
                 Ok(options) => match restart_manager(&path, &options).await {
@@ -1027,6 +1079,7 @@ impl App {
             let _ = tx
                 .send(Msg::Discover {
                     gen,
+                    workspace: workspace_id,
                     outcome: Box::new(outcome),
                 })
                 .await;
@@ -1113,7 +1166,13 @@ impl App {
                     format!("{name} ({path})")
                 };
                 self.desk.attached = false;
-                self.desk.notice = if message.is_empty() {
+                let in_flight = workspace
+                    .as_ref()
+                    .and_then(|workspace| self.starting_label(&workspace.id))
+                    .map(str::to_string);
+                self.desk.notice = if let Some(label) = in_flight {
+                    label
+                } else if message.is_empty() {
                     if trusted {
                         format!("{named} — enter starts the daemon")
                     } else {
@@ -1913,6 +1972,14 @@ impl App {
             .selected_workspace()
             .map(|workspace| workspace.id.clone())
             != selected
+    }
+
+    /// The notice an in-flight daemon job shows for `id`, when one is running for it.
+    fn starting_label(&self, id: &str) -> Option<&str> {
+        self.starting
+            .values()
+            .find(|job| job.workspace == id)
+            .map(|job| job.label.as_str())
     }
 
     fn workspace_path(&self, id: &str) -> Option<PathBuf> {
