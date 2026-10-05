@@ -4,6 +4,7 @@
 
 - Readiness probes run every 1.5s for as long as the process is up, including after `ready`. A failing probe becomes `running-unready` and does not kill or fail the service. The probe stops when the service is stopped or restarted, the process exits, or the daemon shuts down. `readiness: process` still has no probe. `readiness: exit` still waits for the process to exit, polling at the same interval.
 - `hearth start --wait`, a bulk start, and MCP `manage` settle when the process is up (`ready` or `running-unready`), not when the probe first passes. `readinessTimeoutMs` is still accepted and still bounds a single command probe and a one-shot shared attach. It no longer fails a long-lived service.
+- A `readiness: exit` service that finished (`succeeded`) shows its URLs in `hearth tui`, including ones that default to `requiresRunning: true`. `hearth urls` no longer marks them `(not running)`; its `--json` `running` field stays `false`.
 
 ## 0.20.0
 

@@ -1101,7 +1101,9 @@ async fn wait_for_daemon_exit(
 
 /// `urls [target] [--json]`: every registered URL of the selected services, placeholders resolved
 /// by the daemon. A URL that only works while its service runs is marked `(not running)` when the
-/// service is not up, so a dead link is recognisable before anyone clicks it; URLs whose
+/// service is not up, so a dead link is recognisable before anyone clicks it. A finished one-shot
+/// (`succeeded`) is not flagged — it has no process left by design — though `running` stays false
+/// in `--json`. URLs whose
 /// placeholder has no value on this machine go to stderr with the reason rather than vanishing.
 async fn urls_command(
     root: &Path,
@@ -1127,6 +1129,9 @@ async fn urls_command(
             text_state(rows.iter().find(|r| r.service_id == service_id)),
             "ready" | "running"
         )
+    };
+    let is_finished = |service_id: &str| {
+        text_state(rows.iter().find(|r| r.service_id == service_id)) == "succeeded"
     };
     let in_selection = |entry: &&Value| {
         entry["serviceId"]
@@ -1163,8 +1168,9 @@ async fn urls_command(
         return Ok(0);
     }
     for entry in &urls {
-        let stale =
-            entry["requiresRunning"].as_bool() != Some(false) && entry["running"] == json!(false);
+        let stale = entry["requiresRunning"].as_bool() != Some(false)
+            && entry["running"] == json!(false)
+            && !is_finished(entry["serviceId"].as_str().unwrap_or_default());
         (io.out)(&format!(
             "{}  {}  {}{}",
             entry["serviceId"].as_str().unwrap_or_default(),

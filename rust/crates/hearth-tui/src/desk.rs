@@ -2310,9 +2310,11 @@ pub fn stop_all_targets(sections: &[Section]) -> Vec<String> {
         .collect()
 }
 
-/// A URL that requires the process is hidden until the row is ready or running.
+/// A URL that requires the process is hidden until the row is ready or running. A finished
+/// `readiness: exit` row (`succeeded`) shows its URLs too: a one-shot build/export has no process
+/// left by design, and what it produced is what the link points at.
 pub fn url_visible(requires_running: bool, state: ActualServiceState) -> bool {
-    !requires_running || is_up(state)
+    !requires_running || is_up(state) || state == ActualServiceState::Succeeded
 }
 
 /// The first observed catalog mtime is recorded. A later change reloads once.
@@ -3103,8 +3105,10 @@ mod tests {
     fn urls_hide_until_the_service_is_up_and_a_catalog_change_reloads_once() {
         assert!(!url_visible(true, ActualServiceState::Starting));
         assert!(!url_visible(true, ActualServiceState::Stopped));
+        assert!(!url_visible(true, ActualServiceState::Failed));
         assert!(url_visible(true, ActualServiceState::Ready));
         assert!(url_visible(true, ActualServiceState::RunningUnready));
+        assert!(url_visible(true, ActualServiceState::Succeeded));
         assert!(url_visible(false, ActualServiceState::Stopped));
         assert!(!should_reload_catalog(None, Some(1)));
         assert!(!should_reload_catalog(Some(1), Some(1)));

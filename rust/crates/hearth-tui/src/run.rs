@@ -610,7 +610,8 @@ impl TuiApp {
     }
 
     /// The focused service's URLs as screen rows, flagging the ones that need the service running
-    /// while it is not — the same rule as `hearth urls`.
+    /// while it is not — the same rule as `hearth urls`. A finished one-shot (`succeeded`) is not
+    /// flagged: it has no process left by design.
     fn focused_urls(&self) -> Vec<String> {
         let selected = &self.state.selection.selected_name;
         let running = self
@@ -627,6 +628,7 @@ impl TuiApp {
                         | ActualServiceState::RunningUnready
                         | ActualServiceState::Starting
                         | ActualServiceState::Preparing
+                        | ActualServiceState::Succeeded
                 )
             });
         self.urls
