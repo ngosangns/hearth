@@ -130,6 +130,29 @@ pub fn synthesize_service(
 pub const SHARED_READINESS_TIMEOUT_MS: u64 =
     45 * 60 * 1000 + 120_000 + SHARED_INSTANCE_READINESS_TIMEOUT_MS;
 
+/// The flag `manager stop` appends to a `shared:` service's `hearth shared detach` stop command,
+/// so the smp instance is stopped too once no project is attached to it.
+pub const DETACH_STOP_IF_UNUSED_FLAG: &str = "--stop-if-unused";
+
+/// The stop command a `stop-services` shutdown (`hearth manager stop`) runs for an external
+/// service: the catalog's own, plus [`DETACH_STOP_IF_UNUSED_FLAG`] when it is the
+/// `hearth shared detach <id>` of a `shared:` entry.
+pub fn shutdown_stop_command(command: &CommandSpec) -> CommandSpec {
+    match command {
+        CommandSpec::Argv { argv }
+            if argv
+                .windows(2)
+                .any(|pair| pair[0] == "shared" && pair[1] == "detach")
+                && !argv.iter().any(|a| a == DETACH_STOP_IF_UNUSED_FLAG) =>
+        {
+            let mut argv = argv.clone();
+            argv.push(DETACH_STOP_IF_UNUSED_FLAG.to_string());
+            CommandSpec::Argv { argv }
+        }
+        other => other.clone(),
+    }
+}
+
 /// The project-side service a `shared:` yaml entry expands to (see `docs/shared-services.md`).
 /// `ownership: external` + `command` readiness makes its run command a one-shot task
 /// (`hearth shared attach`) and its probe (`hearth shared probe`, exit 0 iff the instance is

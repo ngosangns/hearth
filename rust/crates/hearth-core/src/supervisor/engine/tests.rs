@@ -61,6 +61,8 @@ struct FakeProcessAdapterState {
     tail_dones: HashMap<ServiceId, Arc<std::sync::atomic::AtomicBool>>,
     tails_stopped: Vec<ServiceId>,
     stop_container_calls: Vec<String>,
+    /// Text of every `stop:` command run, container or not.
+    stop_commands: Vec<String>,
     /// `ps` could not be read. Distinct from an empty tree (leader gone).
     tree_unknown: bool,
     /// `command_matches` could not read the process table.
@@ -98,6 +100,9 @@ impl FakeProcessAdapter {
             .tails_stopped
             .iter()
             .any(|id| id == service_id)
+    }
+    fn stop_commands(&self) -> Vec<String> {
+        self.state.lock().unwrap().stop_commands.clone()
     }
     fn stop_container_calls(&self) -> Vec<String> {
         self.state.lock().unwrap().stop_container_calls.clone()
@@ -445,8 +450,17 @@ impl ProcessAdapter for FakeProcessAdapter {
         command: &ServiceCommand,
         _on_output: OnOutput,
     ) -> Option<Result<(), SupervisorError>> {
-        let name = command.container_name.clone()?;
         let mut state = self.state.lock().unwrap();
+        if let Some(stop) = &command.docker_stop_command {
+            state.stop_commands.push(match stop {
+                CommandSpec::Shell { shell, .. } => shell.clone(),
+                CommandSpec::Argv { argv } => argv.join(" "),
+            });
+        }
+        let Some(name) = command.container_name.clone() else {
+            // A non-container `stop:` command (a `shared:` detach) just runs.
+            return command.docker_stop_command.as_ref().map(|_| Ok(()));
+        };
         state.stop_container_calls.push(name.clone());
         state.container_records.remove(&name);
         Some(Ok(()))
@@ -2008,6 +2022,77 @@ fn external_container_service(id: &str, container: &str, stop: Option<&str>) -> 
         preparation_command: None,
     };
     service
+}
+
+/// `manager stop` stops the project's external services that are up and have a `stop:` command,
+/// after its own processes. One with no `stop:` command, or one already stopped, is left alone.
+#[tokio::test]
+async fn stop_services_shutdown_stops_external_services_with_a_stop_command() {
+    let catalog = ServiceCatalog {
+        services: vec![
+            external_container_service("jitsi", "jitsi-web", Some("docker compose stop web")),
+            external_container_service("observed", "observed-db", None),
+            external_container_service("idle", "idle-db", Some("docker compose stop idle")),
+        ],
+        groups: HashMap::new(),
+        group_tree: Vec::new(),
+        compose_file: None,
+        runtime_directory: None,
+        start_failure_policy: StartFailurePolicy::StopOnFirstFailureKeepStarted,
+        private_file_guard: None,
+    };
+    let h = build_harness(catalog);
+    h.host.seed(adopted_external_state("jitsi"));
+    h.host.seed(adopted_external_state("observed"));
+
+    h.supervisor.shutdown().await;
+
+    assert_eq!(h.process.stop_commands(), vec!["docker compose stop web"]);
+    assert_eq!(
+        h.host.state_of("jitsi").unwrap().actual_state,
+        ActualServiceState::Stopped
+    );
+    assert_eq!(
+        h.host.state_of("observed").unwrap().actual_state,
+        ActualServiceState::Ready,
+        "an external service with no stop command is only observed"
+    );
+}
+
+/// A `shared:` entry's stop is `hearth shared detach <id>`; `manager stop` adds
+/// `--stop-if-unused`, so smp stops the instance once no project is attached. A plain
+/// `hearth stop` of the same service only detaches.
+#[tokio::test]
+async fn stop_services_shutdown_detaches_shared_entries_with_stop_if_unused() {
+    let service = crate::shared::synthesize::project_service_entry(
+        "postgres".to_string(),
+        "postgres@16.4",
+        std::path::Path::new("/opt/hearth"),
+        None,
+        Vec::new(),
+        None,
+    );
+    let h = build_harness(one_service_catalog(service));
+    h.host.seed(adopted_external_state("postgres"));
+    h.supervisor
+        .stop(&"postgres".to_string(), None)
+        .await
+        .unwrap();
+    h.host.seed(adopted_external_state("postgres"));
+
+    h.supervisor.shutdown().await;
+
+    assert_eq!(
+        h.process.stop_commands(),
+        vec![
+            "/opt/hearth shared detach postgres@16.4",
+            "/opt/hearth shared detach postgres@16.4 --stop-if-unused",
+        ]
+    );
+    assert_eq!(
+        h.host.state_of("postgres").unwrap().actual_state,
+        ActualServiceState::Stopped
+    );
 }
 
 /// The state `sync_external_services` leaves behind for an adopted external unit: ready, no

@@ -128,6 +128,7 @@ pub enum FlagName {
     Key,
     KillUnowned,
     Force,
+    StopIfUnused,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -142,6 +143,7 @@ pub struct Flags {
     pub key: Option<String>,
     pub kill_unowned: bool,
     pub force: bool,
+    pub stop_if_unused: bool,
 }
 
 pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> LocalctlResult<Flags> {
@@ -166,6 +168,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
             "key" => (FlagName::Key, "key"),
             "kill-unowned" => (FlagName::KillUnowned, "kill-unowned"),
             "force" => (FlagName::Force, "force"),
+            "stop-if-unused" => (FlagName::StopIfUnused, "stop-if-unused"),
             _ => return usage_err(format!("unknown flag: {argument}")),
         };
         if !allowed.contains(&flag) {
@@ -202,6 +205,7 @@ pub fn parse_command_flags(arguments: &[String], allowed: &[FlagName]) -> Localc
             }
             FlagName::KillUnowned => result.kill_unowned = true,
             FlagName::Force => result.force = true,
+            FlagName::StopIfUnused => result.stop_if_unused = true,
             FlagName::Key => {
                 index += 1;
                 match arguments.get(index).filter(|v| !v.is_empty()) {

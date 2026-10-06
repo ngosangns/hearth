@@ -67,7 +67,9 @@ pub trait HearthMcpClient: Send + Sync {
     /// Restarts this project's daemon. Takes no arguments: there is exactly one daemon per project
     /// root, so there is nothing to select.
     async fn restart_daemon(&self) -> Result<Value, String>;
-    /// Stops this project's daemon AND every service it manages (`stop-services`). Takes no
+    /// Stops this project's daemon and its services (`stop-services`): daemon-owned processes,
+    /// external services with a `stop` command, and `shared:` entries, which detach (smp stops the
+    /// instance only when no project is left attached). Takes no
     /// arguments for the same reason — afterwards every other tool fails until a new daemon is
     /// ensured by a client that can spawn one (this MCP server deliberately cannot).
     async fn stop_daemon(&self) -> Result<Value, String>;

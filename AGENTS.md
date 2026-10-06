@@ -131,9 +131,14 @@ from any dev box here, with the same username.
   or `ps` would otherwise let `stop` record `stopped` over a running container and `reconcile` mark
   a live service `Failed` (spawning a duplicate). Unknown ⇒ stop/terminate fail loudly, `status`
   and `reconcile` skip, and the continuous probe keeps running.
-- `ProcessSupervisor.shutdown()` does two passes: an "active state" stop pass, then a reap pass for
-  daemon-owned services holding a stale POSIX identity in a non-active state (e.g. `externally-owned`
-  after a port conflict). Don't collapse these into one.
+- `ProcessSupervisor.shutdown()` (only `stop-services`, i.e. `hearth manager stop`) does three
+  passes: an "active state" stop pass for daemon-owned services, then the project's
+  `ownership: external` services that are up and declare a `stop:` command (a `shared:` entry's
+  `hearth shared detach` gets `--stop-if-unused`, so smp stops the instance only when no other
+  project is attached — `shutdown_stop_command`), then a reap pass for daemon-owned services
+  holding a stale POSIX identity in a non-active state (e.g. `externally-owned` after a port
+  conflict). Don't collapse these into one, and keep the external pass after the first so apps
+  release a shared database before it goes. `manager restart` and SIGTERM never run it.
 - A failed container stop must propagate, not be swallowed — the caller transitions the service to
   `stopped` immediately after, which would record a stopped service whose container is still running.
 - **A stop must never report success without stopping something.** A service the daemon holds no

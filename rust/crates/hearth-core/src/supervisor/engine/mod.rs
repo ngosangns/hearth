@@ -314,6 +314,39 @@ impl ProcessSupervisor {
             .await
     }
 
+    /// The `stop-services` shutdown's stop for an external service: the catalog's `stop:` command
+    /// through [`shutdown_stop_command`](crate::shared::synthesize::shutdown_stop_command), so a
+    /// `shared:` detach also stops an instance no project uses any more. A row with a process
+    /// identity (a running external task) takes the normal stop.
+    async fn stop_external_on_shutdown(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+    ) -> Result<(), SupervisorError> {
+        self.cancel(service_id);
+        self.abort_build(service_id);
+        let sup = self.clone();
+        let id = service_id.clone();
+        self.queues
+            .run(service_id, || async move {
+                let Some(state) = sup.state(&id) else {
+                    return Ok(());
+                };
+                if !is_active_state(state.actual_state) {
+                    return Ok(());
+                }
+                if state.identity.is_some() {
+                    return sup.stop_locked(&id, None).await;
+                }
+                let profile = profile_for(&sup.host.catalog(), &id)?;
+                if profile.command.docker_stop_command.is_none() {
+                    // Observed only: nothing this project can stop.
+                    return Ok(());
+                }
+                sup.stop_unowned_with(&id, &state, None, true).await
+            })
+            .await
+    }
+
     pub async fn stop(
         self: &Arc<Self>,
         service_id: &ServiceId,
@@ -385,6 +418,33 @@ impl ProcessSupervisor {
             .collect();
         for id in to_stop {
             let _ = self.stop(&id, None).await;
+        }
+
+        // `manager stop` also stops this project's `ownership: external` services that are up and
+        // declare a `stop:` command (a docker compose unit it started or adopted). A `shared:`
+        // entry's stop is `hearth shared detach`, run here with `--stop-if-unused`: the project
+        // detaches, and smp stops the instance only when no other project is still attached.
+        // After the daemon-owned pass, so apps let go of a shared database before it goes.
+        // `manager restart` and SIGTERM are leave-services and never come here.
+        let catalog = self.host.catalog();
+        let external: Vec<ServiceId> = self
+            .host
+            .service_states()
+            .into_iter()
+            .filter(|s| is_active_state(s.actual_state))
+            .filter(|s| {
+                catalog.services.iter().any(|definition| {
+                    definition.id == s.service_id
+                        && matches!(definition.ownership, Some(ServiceOwnership::External))
+                })
+            })
+            .map(|s| s.service_id)
+            .collect();
+        for id in external {
+            if let Err(error) = self.stop_external_on_shutdown(&id).await {
+                self.host
+                    .record_background_error("supervisor.shutdown", &format!("{id}: {}", error.0));
+            }
         }
 
         // A service can carry a verified POSIX identity from a prior generation while its current
@@ -1920,7 +1980,24 @@ impl ProcessSupervisor {
         state: &ServiceLifecycleState,
         operation_id: Option<String>,
     ) -> Result<(), SupervisorError> {
-        let profile = profile_for(&self.host.catalog(), service_id)?;
+        self.stop_unowned_with(service_id, state, operation_id, false)
+            .await
+    }
+
+    async fn stop_unowned_with(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        state: &ServiceLifecycleState,
+        operation_id: Option<String>,
+        for_shutdown: bool,
+    ) -> Result<(), SupervisorError> {
+        let mut profile = profile_for(&self.host.catalog(), service_id)?;
+        if for_shutdown {
+            if let Some(command) = &profile.command.docker_stop_command {
+                profile.command.docker_stop_command =
+                    Some(crate::shared::synthesize::shutdown_stop_command(command));
+            }
+        }
         if profile.command.docker_stop_command.is_none() {
             let reason = match state.actual_state {
                 ActualServiceState::ExternallyOwned => state.error.clone().unwrap_or_else(|| {

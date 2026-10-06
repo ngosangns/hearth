@@ -15,6 +15,7 @@
 - `hearth status` no longer prints a pid for a stopped, queued, preparing, failed, finished, or externally-owned row. That pid was the last recorded process, which was gone or could belong to something else.
 - `hearth logs <name>` with a name that is not a service prints `unknown service: <name>` (exit 2) instead of the usage line.
 - A start that fails because another process holds the service's port now says so: `hearth start` prints `<service>: Port N is held by pid P (command)` and a `--kill-unowned` hint instead of only "service operation failed". Other failed operations print their own error too. A service with a build, `preparation`, or `preparationCommand` checks the port before that step, so a held port fails in seconds instead of after the build.
+- `hearth manager stop` (and the MCP `stop_daemon` tool) now also stops the project's `ownership: external` services that are up and declare a `stop:` command, such as a docker compose unit, and detaches the project from its `shared:` services. A shared instance is stopped too when no other project is still attached to it; one another project uses keeps running. `manager restart` and SIGTERM still leave every service running. `hearth shared detach <id> --stop-if-unused` and the `stopIfUnused` field on `POST /v1/shared/detach` are the new way to ask for this; a `manager stop` against an older smp falls back to a plain detach.
 
 ## 0.21.0
 

@@ -225,7 +225,9 @@ ports are pinned anyway, so project confs can hardcode 80/443.
   canonical project root, derived from the probe's cwd). This makes detach→release work through
   plain `syncExternalServices`.
 - `stop`: `argv [hearth, "shared", "detach", "postgres@16.4"]` — releases the attachment; the
-  instance keeps running.
+  instance keeps running. `hearth manager stop` (a `stop-services` shutdown) runs it with
+  `--stop-if-unused` appended, so smp also stops the instance once no project is attached to it.
+  `hearth stop`, `manager restart`, and SIGTERM never stop the instance.
 - `readinessTimeoutMs`: 49 min default. The project-side probe has to out-wait a script artifact pack (45 min) plus extract and the instance readiness budget. The instance server itself stays at 2 min.
 - Joins group `all` when it exists. A `shared` key colliding with a `services` id is a validation
   error via the existing duplicate-service check.
@@ -243,8 +245,10 @@ Mounted only when `HearthManagerOptions.shared` is set:
   install (state `installing` in `registry.json`) → ensure in catalog (`reload_catalog`) →
   `supervisor.start` → wait ready → provision → return rendered `connection`. Serialized per
   instance, idempotent per `(service, projectId)`.
-- `POST /v1/shared/detach` `{service, projectRoot}` — drop attachment (+ `deprovision` if the
-  recipe declares it); instance keeps running.
+- `POST /v1/shared/detach` `{service, projectRoot, stopIfUnused?}` — drop attachment (+
+  `deprovision` if the recipe declares it); instance keeps running. With `stopIfUnused: true` the
+  instance is stopped when no attachment is left (checked under the instance lock, so a
+  concurrent attach for another project is never cut off). The reply carries `stopped`.
 - `POST /v1/shared/install` `{service}` — install without attaching (pre-warm).
 - `POST /v1/shared/remove` `{service}` — stop, remove dirs and registry entry (manual GC).
 
@@ -253,6 +257,7 @@ catalog needed.
 
 ## CLI — `hearth shared …` (no project catalog required)
 
+`detach <name@ver> --stop-if-unused` also stops the instance when this was its last attachment.
 `ensure --json` (the `manager ensure --json` contract for smp — prints the `ManagerConnection`
 for `~/.hearth/shared`, used by `hearth tui`) · `list [--json]` (remote registry, no daemon
 needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attach|detach|probe

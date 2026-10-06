@@ -142,12 +142,18 @@ async fn run_inner(
     spawn_smp: &Arc<dyn Fn(&Path) + Send + Sync>,
 ) -> LocalctlResult<i32> {
     let (parsed, passthrough) = split_passthrough(args);
-    let flags = parse_command_flags(parsed, &[FlagName::Json, FlagName::Force])?;
+    let flags = parse_command_flags(
+        parsed,
+        &[FlagName::Json, FlagName::Force, FlagName::StopIfUnused],
+    )?;
     let Some(subcommand) = flags.positionals.first().cloned() else {
         return usage_err("usage: hearth shared ensure|list|installed|status|attach|detach|probe|install|start|stop|remove [--json] [--force] [<name>@<version>] [attach-args...]");
     };
     if flags.force && subcommand != "remove" {
         return usage_err("--force is only supported by `shared remove`");
+    }
+    if flags.stop_if_unused && subcommand != "detach" {
+        return usage_err("--stop-if-unused is only supported by `shared detach`");
     }
     let mut rest: Vec<String> = flags.positionals[1..].to_vec();
     // `attach <id> -- ...`: the split for attach happens AT the id, so a `--` separator written
@@ -288,19 +294,42 @@ async fn run_inner(
                 // smp down means the probe already reports not-ready — detach is a no-op.
                 return Ok(0);
             };
-            let body = json!({ "service": id, "projectRoot": root });
-            smp_request(
+            let mut body = json!({ "service": id, "projectRoot": root });
+            if flags.stop_if_unused {
+                body["stopIfUnused"] = json!(true);
+            }
+            let mut result = smp_request(
                 &client,
                 "/v1/shared/detach",
                 reqwest::Method::POST,
                 Some(&body),
             )
-            .await
-            .map_err(|e| LocalctlError {
+            .await;
+            // An smp from before `stopIfUnused` rejects the unknown field. Detaching still
+            // matters more than the stop, so fall back to a plain detach.
+            if flags.stop_if_unused
+                && matches!(&result, Err(error) if error.starts_with("invalid_request"))
+            {
+                let plain = json!({ "service": id, "projectRoot": root });
+                result = smp_request(
+                    &client,
+                    "/v1/shared/detach",
+                    reqwest::Method::POST,
+                    Some(&plain),
+                )
+                .await;
+            }
+            let result = result.map_err(|e| LocalctlError {
                 exit_code: EXIT_FAILED,
                 message: e,
             })?;
-            (io.out)(&format!("detached {id}"));
+            if result["stopped"].as_bool() == Some(true) {
+                (io.out)(&format!(
+                    "detached {id}; stopped it (no project is attached)"
+                ));
+            } else {
+                (io.out)(&format!("detached {id}"));
+            }
             Ok(0)
         }
         // The readiness probe the generated `shared:` service polls: exit 0 iff the instance is
@@ -430,6 +459,22 @@ mod tests {
         assert_eq!(parsed, &argv[..3]);
         assert_eq!(passthrough, &argv[3..]);
         assert!(parse_command_flags(parsed, &[FlagName::Json]).unwrap().json);
+    }
+
+    /// `manager stop` runs the synthesized `shared detach <id>` with `--stop-if-unused` appended
+    /// after the id; it must parse as this command's flag, not pass through.
+    #[test]
+    fn detach_parses_stop_if_unused_after_the_id() {
+        let argv = args(&["detach", "postgres@16.4", "--stop-if-unused"]);
+        let (parsed, passthrough) = split_passthrough(&argv);
+        assert!(passthrough.is_empty());
+        let flags = parse_command_flags(
+            parsed,
+            &[FlagName::Json, FlagName::Force, FlagName::StopIfUnused],
+        )
+        .unwrap();
+        assert!(flags.stop_if_unused);
+        assert_eq!(flags.positionals, vec!["detach", "postgres@16.4"]);
     }
 
     #[test]

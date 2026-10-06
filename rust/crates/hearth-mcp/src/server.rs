@@ -388,9 +388,9 @@ impl HearthMcpServer {
             stop_daemon_required.push("confirm");
         }
         let stop_daemon_description = if require_confirm {
-            "Stop this project's hearth daemon AND every service it manages. Nothing keeps running afterwards — every tool call then fails until a new daemon is started by a client that can spawn one. Requires confirm=true (explicit user approval) — never call this speculatively."
+            "Stop this project's hearth daemon and the services it runs: its own processes, its external services that declare a `stop` command (e.g. a docker compose unit), and its shared services, which are detached from this project; a shared instance is stopped only when no other project is still attached. Externally owned services with no `stop` command keep running. Every tool call then fails until a new daemon is started by a client that can spawn one. Requires confirm=true (explicit user approval) — never call this speculatively."
         } else {
-            "Stop this project's hearth daemon AND every service it manages. Nothing keeps running afterwards. MCP hosts should require approval for this tool."
+            "Stop this project's hearth daemon and the services it runs: its own processes, its external services that declare a `stop` command (e.g. a docker compose unit), and its shared services, which are detached from this project; a shared instance is stopped only when no other project is still attached. Externally owned services with no `stop` command keep running. MCP hosts should require approval for this tool."
         };
 
         vec![

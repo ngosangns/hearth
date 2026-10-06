@@ -118,7 +118,8 @@ A `shared:` block registers machine-global singletons (postgres, redis, …) ins
 under `~/.hearth/shared` and run by a separate global daemon (`hearth smp`). Every repo that
 registers the same `name@version` shares one instance; different versions run side by side.
 Shared entries show up as ordinary `infrastructure` services — `start` attaches this project
-(first start installs the service), `stop` only detaches, and connection info is read via the
+(first start installs the service), `stop` only detaches (`manager stop` also stops an instance
+no other project is attached to), and connection info is read via the
 `local_services_shared_*` MCP tools or `hearth shared status`. See `docs/shared-services.md`.
 
 ```yaml
@@ -170,7 +171,9 @@ hearth --root /path/to/project mcp
 is running for `--root` and prints `{instanceId, port, token, protocolVersion, runtimeDirectory,
 root}`. `hearth manager restart --json` prints the same payload for a freshly started daemon,
 replacing the old one *without* stopping its services — they are detached, and the new daemon
-re-adopts them from their persisted identities.
+re-adopts them from their persisted identities. `hearth manager stop` stops the daemon and its
+services: its own processes, `external` services that declare a `stop:` command (a docker compose
+unit), and `shared:` entries, which detach.
 
 ## Build and test
 

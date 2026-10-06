@@ -595,7 +595,7 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     let ctx = shared_ctx(manager)?;
     let body = strict_body(
         bytes,
-        &["service", "projectRoot"],
+        &["service", "projectRoot", "stopIfUnused"],
         &["service", "projectRoot"],
     )?;
     let (name, version) = parse_instance_id(body.get("service").unwrap_or(&Value::Null))?;
@@ -606,6 +606,19 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
             "invalid_request",
             "projectRoot must be a non-empty string",
         ));
+    };
+    // `manager stop` in a project: also stop the instance once no project is attached to it.
+    // Never while another project still is.
+    let stop_if_unused = match body.get("stopIfUnused") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(ManagerHttpError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "stopIfUnused must be a boolean",
+            ))
+        }
     };
     let pid = project_id(&project_root);
 
@@ -620,7 +633,10 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
     };
     if !instance.attachments.contains_key(&pid) {
         // Detaching what was never attached is a no-op — `stop` in a project must be idempotent.
-        return Ok(json!({ "detached": id, "projectId": pid }));
+        let stopped = stop_if_unused
+            && instance.attachments.is_empty()
+            && stop_unused_instance(manager, &id).await?;
+        return Ok(json!({ "detached": id, "projectId": pid, "stopped": stopped }));
     }
 
     // Best-effort deprovision: a failing teardown must not block the detach itself — the project
@@ -649,7 +665,42 @@ async fn shared_detach(manager: &Arc<HearthManager>, bytes: &Bytes) -> HttpResul
         "shared.detach",
         json!({ "service": id, "projectId": pid }),
     );
-    Ok(json!({ "detached": id, "projectId": pid }))
+    // Re-read under the same instance lock: an attach for another project cannot slip in
+    // between this check and the stop.
+    let unused = ctx
+        .registry
+        .get(&id)
+        .is_some_and(|instance| instance.attachments.is_empty());
+    let stopped = stop_if_unused && unused && stop_unused_instance(manager, &id).await?;
+    Ok(json!({ "detached": id, "projectId": pid, "stopped": stopped }))
+}
+
+/// Stops a shared instance nobody is attached to. `false` when it was not running.
+async fn stop_unused_instance(manager: &Arc<HearthManager>, id: &str) -> HttpResult<bool> {
+    let id = id.to_string();
+    let running = manager.service_state(&id).is_some_and(|state| {
+        crate::supervisor::engine::ACTIVE_STATES.contains(&state.actual_state)
+    });
+    if !running {
+        return Ok(false);
+    }
+    manager
+        .supervisor()
+        .stop(&id, None)
+        .await
+        .map_err(|error| {
+            ManagerHttpError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "shared_stop_failed",
+                format!("{id} was detached but could not be stopped: {}", error.0),
+            )
+        })?;
+    publish(
+        manager,
+        "shared.stop",
+        json!({ "service": id, "reason": "unused" }),
+    );
+    Ok(true)
 }
 
 /// Runs one rendered recipe command (provision/deprovision) with a bounded timeout and its output
@@ -892,6 +943,77 @@ mod tests {
             "detach must not stop the shared instance"
         );
 
+        manager.close().await;
+    }
+
+    /// `manager stop` detaches with `stopIfUnused`: the instance keeps running while another
+    /// project is attached, and stops when the last one leaves.
+    #[tokio::test]
+    async fn detach_stop_if_unused_stops_only_the_last_users_instance() {
+        let src = tempfile::tempdir().unwrap();
+        let (archive, sha) = make_tarball(src.path());
+        let shared_root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            shared_root.path().join("catalog.json"),
+            catalog_json(&archive, &sha),
+        )
+        .unwrap();
+        let manager = boot_smp(shared_root.path()).await;
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
+        let http = client();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for project in [&first, &second] {
+            let attach: Value =
+                authed(&http, &manager, reqwest::Method::POST, "/v1/shared/attach")
+                    .json(&json!({ "service": "fakesvc@1.0", "projectRoot": project.path().display().to_string() }))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            assert_eq!(attach["service"], json!("fakesvc@1.0"), "{attach}");
+        }
+        let state = |manager: &Arc<HearthManager>| {
+            manager
+                .service_state(&"fakesvc@1.0".to_string())
+                .unwrap()
+                .actual_state
+        };
+        let detach = |project: &tempfile::TempDir| {
+            authed(&http, &manager, reqwest::Method::POST, "/v1/shared/detach")
+                .json(&json!({ "service": "fakesvc@1.0", "projectRoot": project.path().display().to_string(), "stopIfUnused": true }))
+        };
+
+        let left: Value = detach(&first).send().await.unwrap().json().await.unwrap();
+        assert_eq!(left["stopped"], json!(false), "{left}");
+        assert_eq!(state(&manager), ActualServiceState::Ready);
+
+        let last: Value = detach(&second).send().await.unwrap().json().await.unwrap();
+        assert_eq!(last["stopped"], json!(true), "{last}");
+        assert_eq!(state(&manager), ActualServiceState::Stopped);
+        let shared: Value = authed(&http, &manager, reqwest::Method::GET, "/v1/shared")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(shared["instances"][0]["attachments"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let bad: Value = authed(&http, &manager, reqwest::Method::POST, "/v1/shared/detach")
+            .json(&json!({ "service": "fakesvc@1.0", "projectRoot": first.path().display().to_string(), "stopIfUnused": "yes" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(bad["error"]["code"], json!("invalid_request"), "{bad}");
         manager.close().await;
     }
 
