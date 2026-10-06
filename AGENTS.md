@@ -20,6 +20,11 @@ because a process started outside a login shell inherits launchd's bare `PATH`.
 `mod.rs` owns `HearthManager` / bootstrap / shutdown; `routes.rs` is the axum route table
 (handlers stay a child module so they can use private manager fields without widening crate visibility).
 
+`OperationScheduler` serializes per service id. A bulk start locks every id in
+`target_service_ids` (sorted, to avoid deadlock). Disjoint bulks run in parallel; overlapping
+ones wait only on the shared services. `__manager__` is reserved for manager-wide work such as
+shutdown — not for ordinary multi-service start/restart.
+
 `ShutdownMode` (`LeaveServices` | `StopServices`) in `manager/protocol.rs` replaces the old `stop_services: bool` on manager/daemon shutdown.
 
 `ProcessSupervisor` lives under `supervisor/engine/` (`mod.rs` + `tests.rs`); adapters remain in `default_adapters.rs`. A deeper owned-vs-external backend split is still deferred.

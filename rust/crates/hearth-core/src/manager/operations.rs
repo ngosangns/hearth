@@ -1,6 +1,7 @@
-//! `OperationScheduler` — schedules and serializes operations per target (`serviceId`, or
-//! `"__manager__"` for manager-wide operations like shutdown), publishing
-//! `operation.accepted`/`operation.updated` events as they progress.
+//! `OperationScheduler` — schedules and serializes operations per target service (`serviceId`,
+//! or every id in `target_service_ids` for a bulk start), publishing
+//! `operation.accepted`/`operation.updated` events as they progress. Manager-wide work such as
+//! shutdown still serializes on `"__manager__"`; ordinary multi-service starts do not.
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,10 +61,10 @@ pub struct OperationScheduler {
     closing: AtomicBool,
     operations: Mutex<HashMap<String, OperationHandle>>,
     request_ids: Mutex<HashMap<String, OperationHandle>>,
-    /// `target -> id of the operation currently occupying that target's queue slot`. Membership
-    /// (not just presence in `operations`, which keeps every operation ever scheduled) is what
-    /// `is_queued`/`drain_services` need — the *current* occupant, not some earlier completed
-    /// operation that happened to share the same target.
+    /// `target -> id of the operation currently occupying that target's queue slot`. A bulk op
+    /// registers every service it touches. Membership (not just presence in `operations`, which
+    /// keeps every operation ever scheduled) is what `is_queued`/`drain_services` need — the
+    /// *current* occupant, not some earlier completed operation that happened to share a target.
     active_targets: Mutex<HashMap<String, String>>,
     queues: KeyedLock<String>,
     /// One `watch` cell per scheduled operation, flipped to `true` once its spawned task finishes.
@@ -80,10 +81,32 @@ pub struct OperationScheduler {
     settled: Mutex<VecDeque<(Instant, String)>>,
 }
 
-fn target_of(service_id: &Option<ServiceId>) -> String {
-    service_id
-        .clone()
-        .unwrap_or_else(|| MANAGER_TARGET.to_string())
+/// Lock keys for an operation, sorted and deduped so overlapping multi-target ops cannot
+/// deadlock. A single-service op locks that service. A bulk op locks every target service.
+/// Manager-wide work (shutdown) with neither still uses `__manager__`.
+fn targets_for(
+    service_id: &Option<ServiceId>,
+    target_service_ids: Option<&[ServiceId]>,
+) -> Vec<String> {
+    if let Some(id) = service_id {
+        return vec![id.clone()];
+    }
+    if let Some(ids) = target_service_ids {
+        if !ids.is_empty() {
+            let mut keys: Vec<String> = ids.to_vec();
+            keys.sort();
+            keys.dedup();
+            return keys;
+        }
+    }
+    vec![MANAGER_TARGET.to_string()]
+}
+
+fn targets_of(operation: &Operation) -> Vec<String> {
+    targets_for(
+        &operation.service_id,
+        operation.target_service_ids.as_deref(),
+    )
 }
 
 fn same_service_ids(left: &Option<Vec<ServiceId>>, right: &Option<Vec<ServiceId>>) -> bool {
@@ -157,10 +180,11 @@ impl OperationScheduler {
     }
 
     pub fn is_queued(&self, operation: &Operation) -> bool {
-        self.active_targets
-            .lock()
-            .unwrap()
-            .contains_key(&target_of(&operation.service_id))
+        let targets = targets_of(operation);
+        let active = self.active_targets.lock().unwrap();
+        targets
+            .iter()
+            .any(|target| active.get(target).map(String::as_str) == Some(operation.id.as_str()))
     }
 
     pub fn close_mutations(&self) {
@@ -170,7 +194,7 @@ impl OperationScheduler {
     /// Waits for every currently in-flight *service-targeted* operation to finish (excludes the
     /// manager-wide target) — used by shutdown to let in-flight work settle before stopping services.
     pub async fn drain_services(&self) {
-        let ids: Vec<String> = self
+        let mut ids: Vec<String> = self
             .active_targets
             .lock()
             .unwrap()
@@ -178,6 +202,9 @@ impl OperationScheduler {
             .filter(|(target, _)| *target != MANAGER_TARGET)
             .map(|(_, id)| id.clone())
             .collect();
+        // A bulk op registers every target service; wait once per operation.
+        ids.sort();
+        ids.dedup();
         let waits = ids.iter().map(|id| self.wait_for_id(id));
         futures::future::join_all(waits).await;
     }
@@ -303,11 +330,16 @@ impl OperationScheduler {
         );
         self.events.publish("operation.accepted", event_data);
 
-        let target = target_of(&operation.service_id);
-        self.active_targets
-            .lock()
-            .unwrap()
-            .insert(target.clone(), operation.id.clone());
+        let targets = targets_for(
+            &operation.service_id,
+            operation.target_service_ids.as_deref(),
+        );
+        {
+            let mut active = self.active_targets.lock().unwrap();
+            for target in &targets {
+                active.insert(target.clone(), operation.id.clone());
+            }
+        }
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         self.done
             .lock()
@@ -321,7 +353,7 @@ impl OperationScheduler {
         };
         let scheduler = self.clone();
         let kind = operation.kind;
-        let target_for_task = target.clone();
+        let targets_for_task = targets.clone();
         let operation_id_for_task = operation.id.clone();
         let handle_for_task = handle.clone();
         tokio::spawn(async move {
@@ -337,10 +369,12 @@ impl OperationScheduler {
                     );
                     {
                         let mut active = scheduler.active_targets.lock().unwrap();
-                        if active.get(&target_for_task).map(String::as_str)
-                            == Some(operation_id_for_task.as_str())
-                        {
-                            active.remove(&target_for_task);
+                        for target in &targets_for_task {
+                            if active.get(target).map(String::as_str)
+                                == Some(operation_id_for_task.as_str())
+                            {
+                                active.remove(target);
+                            }
                         }
                     }
                     let _ = done_tx.send(true);
@@ -348,7 +382,12 @@ impl OperationScheduler {
                     return;
                 }
             }
-            let guard = scheduler.queues.lock(&target_for_task).await;
+            // Acquire every target lock in sorted order (see `targets_for`) so overlapping
+            // multi-service ops cannot deadlock. Disjoint sets run in parallel.
+            let mut guards = Vec::with_capacity(targets_for_task.len());
+            for target in &targets_for_task {
+                guards.push(scheduler.queues.lock(target).await);
+            }
             let is_closing = scheduler.closing.load(Ordering::SeqCst);
             if is_closing && matches!(kind, OperationKind::Service | OperationKind::BulkStart) {
                 if let Some(rejected) = rejected {
@@ -382,20 +421,22 @@ impl OperationScheduler {
                     }
                 }
             }
-            // Only clear the slot if it is still OURS. A later operation on the same target
-            // overwrites this entry, and removing it unconditionally made `drain_services()` see an
+            // Only clear slots that are still OURS. A later operation on a shared target
+            // overwrites that entry, and removing it unconditionally made `drain_services()` see an
             // empty map and return while that newer operation was still running — so
             // `HearthManager::shutdown` raced a start in flight. Mirrors the TS source's
             // `if (this.queues.get(target) === current)` guard.
             {
                 let mut active = scheduler.active_targets.lock().unwrap();
-                if active.get(&target_for_task).map(String::as_str)
-                    == Some(operation_id_for_task.as_str())
-                {
-                    active.remove(&target_for_task);
+                for target in &targets_for_task {
+                    if active.get(target).map(String::as_str)
+                        == Some(operation_id_for_task.as_str())
+                    {
+                        active.remove(target);
+                    }
                 }
             }
-            drop(guard);
+            drop(guards);
             let _ = done_tx.send(true);
             scheduler.settle(&operation_id_for_task);
         });
@@ -468,6 +509,26 @@ mod tests {
             service_id: Some(service_id.to_string()),
             target_service_ids: None,
             action: Some(action),
+        }
+    }
+
+    fn bulk_input(request_id: &str, targets: &[&str]) -> OperationInput {
+        OperationInput {
+            request_id: request_id.to_string(),
+            kind: OperationKind::BulkStart,
+            service_id: None,
+            target_service_ids: Some(targets.iter().map(|s| (*s).to_string()).collect()),
+            action: None,
+        }
+    }
+
+    fn manager_input(request_id: &str) -> OperationInput {
+        OperationInput {
+            request_id: request_id.to_string(),
+            kind: OperationKind::ManagerShutdown,
+            service_id: None,
+            target_service_ids: None,
+            action: None,
         }
     }
 
@@ -823,5 +884,290 @@ mod tests {
             .unwrap();
         scheduler.drain_services().await;
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn disjoint_bulk_starts_run_concurrently() {
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let started_a = Arc::new(tokio::sync::Notify::new());
+        let started_b = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started_a2 = started_a.clone();
+        let release_a = release.clone();
+        let op_a = scheduler
+            .schedule(
+                bulk_input("bulk-a", &["a1", "a2"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        started_a2.notify_one();
+                        release_a.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        let started_b2 = started_b.clone();
+        let release_b = release.clone();
+        let op_b = scheduler
+            .schedule(
+                bulk_input("bulk-b", &["b1", "b2"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        started_b2.notify_one();
+                        release_b.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), started_a.notified())
+            .await
+            .expect("bulk a should start promptly");
+        tokio::time::timeout(Duration::from_millis(500), started_b.notified())
+            .await
+            .expect("bulk b should start promptly on a disjoint set");
+        release.notify_waiters();
+        scheduler.wait(&op_a).await;
+        scheduler.wait(&op_b).await;
+        assert_eq!(
+            scheduler.get(&op_a.id).unwrap().status,
+            OperationStatus::Succeeded
+        );
+        assert_eq!(
+            scheduler.get(&op_b.id).unwrap().status,
+            OperationStatus::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_bulk_starts_serialize_on_shared_services() {
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_hold = Arc::new(tokio::sync::Notify::new());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let order1 = order.clone();
+        let hold1 = first_hold.clone();
+        let started1 = first_started.clone();
+        let op1 = scheduler
+            .schedule(
+                bulk_input("bulk-1", &["shared", "left"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        order1.lock().unwrap().push(1);
+                        started1.notify_one();
+                        hold1.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), first_started.notified())
+            .await
+            .expect("first overlapping bulk should start");
+        let order2 = order.clone();
+        let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_flag = second_started.clone();
+        let op2 = scheduler
+            .schedule(
+                bulk_input("bulk-2", &["shared", "right"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        second_flag.store(true, Ordering::SeqCst);
+                        order2.lock().unwrap().push(2);
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "second bulk must wait on the shared service lock"
+        );
+        first_hold.notify_one();
+        scheduler.wait(&op1).await;
+        scheduler.wait(&op2).await;
+        assert!(second_started.load(Ordering::SeqCst));
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn overlapping_bulks_with_reversed_key_order_do_not_deadlock() {
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started_a = started.clone();
+        let release_a = release.clone();
+        let op_a = scheduler
+            .schedule(
+                // Deliberately reverse lexicographic order in the input — locks must still
+                // acquire sorted so the pair cannot deadlock against the other bulk.
+                bulk_input("bulk-rev-a", &["z", "a"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        started_a.fetch_add(1, Ordering::SeqCst);
+                        release_a.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        let started_b = started.clone();
+        let op_b = scheduler
+            .schedule(
+                bulk_input("bulk-rev-b", &["a", "z"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        started_b.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        // One holds both keys (sorted a then z); the other waits on the first key. Releasing
+        // the holder must let the waiter finish — no deadlock from input order.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_millis(500), scheduler.wait(&op_a))
+            .await
+            .expect("bulk a must finish without deadlock");
+        tokio::time::timeout(Duration::from_millis(500), scheduler.wait(&op_b))
+            .await
+            .expect("bulk b must finish without deadlock");
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_and_single_service_on_the_same_id_serialize() {
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let order1 = order.clone();
+        let hold1 = hold.clone();
+        let started1 = started.clone();
+        let bulk = scheduler
+            .schedule(
+                bulk_input("bulk-same", &["api", "web"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        order1.lock().unwrap().push("bulk");
+                        started1.notify_one();
+                        hold1.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), started.notified())
+            .await
+            .expect("bulk should start");
+        let order2 = order.clone();
+        let single_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let single_flag = single_started.clone();
+        let single = scheduler
+            .schedule(
+                service_input("single-api", "api", ServiceOperationKind::Start),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        single_flag.store(true, Ordering::SeqCst);
+                        order2.lock().unwrap().push("single");
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !single_started.load(Ordering::SeqCst),
+            "single-service start must wait while a bulk holds that service"
+        );
+        hold.notify_one();
+        scheduler.wait(&bulk).await;
+        scheduler.wait(&single).await;
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["bulk".to_string(), "single".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_still_uses_the_manager_target() {
+        let scheduler = OperationScheduler::new(ManagerEventStore::new(None, None));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let hold1 = hold.clone();
+        let started1 = started.clone();
+        let first = scheduler
+            .schedule(
+                manager_input("shutdown-1"),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        started1.notify_one();
+                        hold1.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), started.notified())
+            .await
+            .expect("first manager op should start");
+        let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = second_started.clone();
+        let second = scheduler
+            .schedule(
+                manager_input("shutdown-2"),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "manager-wide ops must still serialize on __manager__"
+        );
+        // A bulk on ordinary services must not wait on the manager lock.
+        let bulk_started = Arc::new(tokio::sync::Notify::new());
+        let bulk_flag = bulk_started.clone();
+        let release_bulk = Arc::new(tokio::sync::Notify::new());
+        let release_bulk2 = release_bulk.clone();
+        let bulk = scheduler
+            .schedule(
+                bulk_input("bulk-during-shutdown", &["x", "y"]),
+                Box::new(move |_h| {
+                    Box::pin(async move {
+                        bulk_flag.notify_one();
+                        release_bulk2.notified().await;
+                        Ok(())
+                    })
+                }),
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), bulk_started.notified())
+            .await
+            .expect("bulk start must not queue behind __manager__");
+        hold.notify_one();
+        release_bulk.notify_one();
+        scheduler.wait(&first).await;
+        scheduler.wait(&second).await;
+        scheduler.wait(&bulk).await;
+        assert!(second_started.load(Ordering::SeqCst));
     }
 }

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Bulk, group, and multi-service `start` no longer serialize on a shared `__manager__` lock. Each operation locks only the services it touches (acquired in sorted order), so disjoint starts run in parallel and overlapping ones wait only on the shared services. `queued-start` still appears when a service is waiting on its own lock. Manager shutdown still uses `__manager__`.
 - Scrolling the service list, the log, and the mouse wheel in `hearth tui` no longer waits on a log or snapshot request. Those fetches run in the background, at most one of each at a time, and a selected log refetches at most ten times a second. The screen redraws immediately after a key or the wheel, and at most once per frame otherwise.
 - Readiness probes run every 1.5s for as long as the process is up, including after `ready`. A failing probe becomes `running-unready` and does not kill or fail the service. The probe stops when the service is stopped or restarted, the process exits, or the daemon shuts down. `readiness: process` still has no probe. `readiness: exit` still waits for the process to exit, polling at the same interval.
 - `hearth start --wait`, a bulk start, and MCP `manage` settle when the process is up (`ready` or `running-unready`), not when the probe first passes. `readinessTimeoutMs` is still accepted and still bounds a single command probe and a one-shot shared attach. It no longer fails a long-lived service.
