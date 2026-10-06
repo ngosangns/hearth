@@ -784,6 +784,7 @@ mod tests {
         .unwrap();
 
         let manager = boot_smp(shared_root.path()).await;
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let http = client();
         let project = tempfile::tempdir().unwrap();
 
@@ -939,6 +940,7 @@ mod tests {
                 .unwrap();
         }
         let manager = boot_smp(shared_root.path()).await;
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let http = client();
 
         let refused = authed(&http, &manager, reqwest::Method::POST, "/v1/shared/remove")
@@ -982,6 +984,7 @@ mod tests {
         )
         .unwrap();
         let manager = boot_smp(shared_root.path()).await;
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let http = client();
         for path in ["/v1/shared/attach", "/v1/shared/detach"] {
             let resp = authed(&http, &manager, reqwest::Method::POST, path)
@@ -1003,6 +1006,7 @@ mod tests {
         )
         .unwrap();
         let manager = boot_smp(shared_root.path()).await;
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let http = client();
         let resp = authed(&http, &manager, reqwest::Method::POST, "/v1/shared/attach")
             .json(&json!({ "service": "nope@1.0", "projectRoot": "/tmp/x" }))

@@ -1776,6 +1776,7 @@ mod tests {
         let port = free_port();
         let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         let out = Arc::new(Mutex::new(Vec::new()));
         let out2 = out.clone();
@@ -1809,6 +1810,7 @@ mod tests {
         let port = free_port();
         let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         let out = Arc::new(Mutex::new(Vec::new()));
         let out2 = out.clone();
@@ -1880,6 +1882,7 @@ mod tests {
         let mut squatter = PortSquatter::hold(port).await;
         let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         // Without the flag the same start must refuse and leave the squatter alone.
         let out = Arc::new(Mutex::new(Vec::new()));
@@ -1953,6 +1956,7 @@ mod tests {
         let squatter = PortSquatter::hold(port).await;
         let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let prompts2 = prompts.clone();
@@ -2006,6 +2010,7 @@ mod tests {
         let mut squatter = PortSquatter::hold(port).await;
         let catalog = test_catalog(dir.path(), vec![tcp_service("api", port)]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let prompts2 = prompts.clone();
@@ -2108,6 +2113,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = test_catalog(dir.path(), vec![]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         let out = Arc::new(Mutex::new(Vec::new()));
         let out2 = out.clone();
@@ -2686,6 +2692,7 @@ mod tests {
         ]);
         let catalog = test_catalog(dir.path(), vec![api]);
         let manager = bootstrap_manager(catalog.clone()).await;
+        let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
         let run = |extra: &'static [&'static str]| {
             let catalog = catalog.clone();

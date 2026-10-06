@@ -15,7 +15,7 @@ pub mod state_store;
 pub use event_store::{ManagerEventStore, Replay, DEFAULT_EVENT_CAPACITY};
 pub use http::{
     bootstrap, router, BootstrapError, HearthManager, HearthManagerOptions, ManagerHttpError,
-    ReloadError, ReloadOutcome,
+    ReloadError, ReloadOutcome, StopServicesOnDrop,
 };
 pub use lock::{
     claim_lock, create_lock_ownership_proof, is_stale_lock_marker, random_token,

@@ -437,6 +437,60 @@ impl HearthManager {
     }
 }
 
+/// Stops every service a manager still runs when dropped. Meant for tests and embedders that boot
+/// a [`HearthManager`] in-process: a test that panics before its shutdown, or ends with
+/// [`HearthManager::close`] (which leaves services running for re-adoption), otherwise leaves its
+/// real processes (`nc -lk` listeners) running under launchd after the test binary exits.
+///
+/// Drop first runs a [`ShutdownMode::StopServices`] shutdown on a thread of its own, bounded to
+/// 15 s, then SIGKILLs the group of any recorded POSIX identity whose leader still shows its
+/// recorded start time, so a reused pid is never signalled.
+pub struct StopServicesOnDrop(pub Arc<HearthManager>);
+
+impl Drop for StopServicesOnDrop {
+    fn drop(&mut self) {
+        let manager = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                runtime.block_on(async {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        manager.shutdown(ShutdownMode::StopServices),
+                    )
+                    .await;
+                });
+            }
+        })
+        .join();
+        for state in <HearthManager as Host>::service_states(&self.0) {
+            if let Some(crate::state::ProcessIdentity::Posix(posix)) = &state.identity {
+                kill_group_if_same_process(posix.pid, posix.pgid, &posix.start_identity);
+            }
+        }
+    }
+}
+
+fn kill_group_if_same_process(pid: i64, pgid: i64, start_identity: &str) {
+    if pid <= 1 || pgid <= 1 || start_identity.is_empty() {
+        return;
+    }
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return;
+    };
+    if String::from_utf8_lossy(&output.stdout).trim() == start_identity {
+        // SAFETY: plain syscall; the group was just verified to still hold the recorded process.
+        unsafe {
+            libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Host for HearthManager {
     fn instance_id(&self) -> String {
@@ -819,6 +873,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
 
         let base = manager.base_url();
         let token = manager.bearer_token().to_string();
@@ -1050,6 +1105,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         manager
             .supervisor()
             .start(&"api".to_string(), None)
@@ -1145,6 +1201,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let client = reqwest::Client::new();
         let response = client
             .get(format!("{}/v1/does-not-exist", manager.base_url()))
@@ -1183,6 +1240,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         manager
             .supervisor()
             .start(&"api".to_string(), None)
@@ -1233,6 +1291,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         // "Ready" with no process identity and no catalog `stop:` — there is nothing the daemon can
         // stop, so the stop fails.
         let timestamp = now();
@@ -1294,6 +1353,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let client = reqwest::Client::new();
         let post = |body: Value| {
             client
@@ -1364,6 +1424,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
 
         let base = manager.base_url();
         let token = manager.bearer_token().to_string();
@@ -1444,6 +1505,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
         let base = manager.base_url();
         let token = manager.bearer_token().to_string();
         let client = reqwest::Client::new();
@@ -1545,6 +1607,7 @@ mod tests {
         })
         .await
         .unwrap();
+        let _stop_services = crate::manager::StopServicesOnDrop(manager.clone());
 
         let body: Value = reqwest::Client::new()
             .get(format!("{}/v1/urls", manager.base_url()))

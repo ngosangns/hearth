@@ -94,6 +94,7 @@ async fn full_tool_lifecycle_over_a_real_bootstrapped_manager() {
     })
     .await
     .unwrap();
+    let _stop_services = hearth_core::manager::StopServicesOnDrop(manager.clone());
 
     let options = LocalctlOptions {
         catalog,

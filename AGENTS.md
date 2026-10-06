@@ -36,6 +36,12 @@ Also `task test` / `task clippy`.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
+A test that boots a `HearthManager` in-process must hold `StopServicesOnDrop(manager.clone())`
+for its whole body. `manager.close()` is a leave-services shutdown, and a panic skips the explicit
+shutdown, so either way its real services (`exec nc -lk {port}`) outlived the test binary under
+launchd, about six per `cargo test --workspace`. A clean full run leaves no `nc -lk` behind; check
+with `ps -axo ppid,command | grep 'nc -lk'` before and after.
+
 **Installing/refreshing `hearth`** — `task install` builds the release binary into
 `~/.local/share/hearth/bin/hearth-<version>`, ad-hoc signs that file (never the live path), and
 points `~/.local/bin/hearth` at it with a symlink. `hearth update` downloads the GitHub asset
