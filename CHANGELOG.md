@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.22.0
+
 - Stopping a service also kills a child that a double fork reparented to launchd while it stayed in the service's process group (`(cmd &)`), including one that ignores SIGTERM. It used to survive: the stop saw the leader die, treated the tree as gone, and never sent SIGKILL.
 - Stopping a service also kills a descendant that moved into its own session and was then orphaned (`setsid` plus a fork), as long as the 200 ms tree sampler saw it while it was still a child. A descendant that escapes before the first sample (about one second after spawn, while the identity settles) is still not tracked.
 - A service whose main process exits no longer leaves its children running. `sleep 1000 & exit 1` used to record `failed` while `sleep` ran on with nothing tracking it. Children are now sent SIGTERM, then SIGKILL after the grace period, like children in their own process group already were.
