@@ -171,6 +171,29 @@ impl FakeProcessAdapter {
         state.parents.insert(pid, parent);
         pid
     }
+    /// A live child of `parent` that stays in `parent`'s process group.
+    fn fork_in_group(&self, parent: i64) -> i64 {
+        let mut state = self.state.lock().unwrap();
+        let pgid = state.alive.get(&parent).map(|r| r.pgid).unwrap_or(parent);
+        let pid = state.next_pid;
+        state.next_pid += 1;
+        state.alive.insert(
+            pid,
+            PosixProcessRecord {
+                pid,
+                pgid,
+                start_identity: format!("Child Jan  1 00:00:{:02} 2024", pid % 60),
+                command_fingerprint: "child".to_string(),
+                command_line: String::new(),
+            },
+        );
+        state.parents.insert(pid, parent);
+        pid
+    }
+    /// The parent exited and launchd adopted `pid` (ppid 1): a double fork.
+    fn reparent_to_launchd(&self, pid: i64) {
+        self.state.lock().unwrap().parents.insert(pid, 1);
+    }
     fn is_alive(&self, pid: i64) -> bool {
         self.state.lock().unwrap().alive.contains_key(&pid)
     }
@@ -293,6 +316,7 @@ impl ProcessAdapter for FakeProcessAdapter {
             .values()
             .filter(|r| r.pgid == pgid)
             .map(|r| r.pid)
+            .filter(|pid| !(signal == ProcessSignal::Sigterm && state.term_immune.contains(pid)))
             .collect();
         for pid in members {
             state.alive.remove(&pid);
@@ -3681,5 +3705,128 @@ async fn restart_of_an_external_unit_still_runs_its_stop_command() {
     assert_eq!(
         h.host.state_of("cache").unwrap().actual_state,
         ActualServiceState::Ready
+    );
+}
+
+fn posix_pid(h: &Harness, service_id: &str) -> i64 {
+    match h.host.state_of(service_id).unwrap().identity.unwrap() {
+        ProcessIdentity::Posix(p) => p.pid,
+        _ => panic!("expected posix identity"),
+    }
+}
+
+async fn wait_dead(h: &Harness, pid: i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && h.process.is_alive(pid) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `sleep 1000 & exit 1`: the leader is gone and the row is `failed`, so nothing would ever stop
+/// the child it left in its group.
+#[tokio::test]
+async fn a_leader_exit_reaps_a_child_it_left_in_its_own_group() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let leader = posix_pid(&h, "api");
+    let child = h.process.fork_in_group(leader);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    h.process.kill_externally(leader, 1);
+    wait_dead(&h, child).await;
+    assert!(
+        !h.process.is_alive(child),
+        "a child left in the dead leader's group must be reaped"
+    );
+    assert!(
+        h.process
+            .signals()
+            .contains(&(leader, ProcessSignal::Sigterm)),
+        "the group is signalled while a member of it is alive: {:?}",
+        h.process.signals()
+    );
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Failed
+    );
+}
+
+/// `(trap '' TERM; cmd &)`: `cmd` is reparented to launchd but stays in the service's group, and
+/// it ignores SIGTERM. It is not reachable by ppid, so the stop used to see the leader die, call
+/// the tree dead, and skip SIGKILL.
+#[tokio::test]
+async fn stop_sigkills_a_double_forked_group_member_that_ignores_sigterm() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let leader = posix_pid(&h, "api");
+    let child = h.process.fork_in_group(leader);
+    h.process.reparent_to_launchd(child);
+    h.process.mark_term_immune(child);
+
+    h.supervisor.stop(&"api".to_string(), None).await.unwrap();
+    assert!(!h.process.is_alive(leader));
+    assert!(
+        !h.process.is_alive(child),
+        "the double-forked member must get SIGKILL: {:?}",
+        h.process.signals()
+    );
+    assert!(h
+        .process
+        .signals()
+        .contains(&(leader, ProcessSignal::Sigkill)));
+}
+
+/// A descendant that moved into its own group and was then orphaned (`setsid` plus a double
+/// fork) has no ppid path and no group in common with the leader. The sampler saw it while it
+/// was still a child, so the stop signals it too.
+#[tokio::test]
+async fn stop_signals_an_escaped_descendant_the_sampler_saw() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let leader = posix_pid(&h, "api");
+    let escaped = h.process.fork_into_own_group(leader);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    h.process.reparent_to_launchd(escaped);
+    // A few more samples after it left the tree: it must stay remembered while alive.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    h.supervisor.stop(&"api".to_string(), None).await.unwrap();
+    assert!(
+        !h.process.is_alive(escaped),
+        "the escaped descendant must be stopped with its service: {:?}",
+        h.process.signals()
+    );
+    assert!(h
+        .process
+        .signals()
+        .contains(&(escaped, ProcessSignal::Sigterm)));
+}
+
+/// A leave-services shutdown keeps the services but must stop the followers it spawned for them.
+#[tokio::test]
+async fn detach_all_output_stops_every_log_follower() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    assert!(!h.process.tail_was_stopped("api"));
+    h.supervisor.detach_all_output();
+    assert!(h.process.tail_was_stopped("api"));
+    assert!(
+        h.process.is_alive(posix_pid(&h, "api")),
+        "the service itself keeps running"
     );
 }

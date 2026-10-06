@@ -68,19 +68,25 @@ pub fn parse_ps_tree_rows(stdout: &str) -> Vec<PsTreeRow> {
 /// Returns an empty tree (refusing to walk anything) unless the OS table's row for `leader_pid`
 /// still shows `leader_start_identity` — a caller-supplied pid that no longer matches must never
 /// pull an unrelated live tree (pid reuse) into a signal or into the wait-for-death loop.
+///
+/// When the leader leads its own process group (every spawned service: `process_group(0)`), every
+/// other member of that group is part of the tree too, even with no ppid path to the leader. A
+/// double fork (`(cmd &)`) reparents `cmd` to launchd but leaves it in the group; without this it
+/// is missing from the wait-for-death set, and if it ignores SIGTERM the SIGKILL pass never comes.
+/// Membership is trustworthy while the leader is alive: its pid is the pgid, so the group cannot
+/// have been recycled.
 pub fn build_process_tree(
     rows: &[PsTreeRow],
     leader_pid: i64,
     leader_start_identity: &str,
 ) -> Vec<ProcessTreeEntry> {
-    let leader_matches = rows
+    let Some(leader) = rows
         .iter()
-        .find(|row| row.pid == leader_pid)
-        .map(|row| row.start_identity == leader_start_identity)
-        .unwrap_or(false);
-    if !leader_matches {
+        .find(|row| row.pid == leader_pid && row.start_identity == leader_start_identity)
+    else {
         return Vec::new();
-    }
+    };
+    let own_group = (leader.pgid == leader_pid && leader_pid > 1).then_some(leader_pid);
 
     let by_pid: HashMap<i64, &PsTreeRow> = rows.iter().map(|r| (r.pid, r)).collect();
     let mut by_parent: HashMap<i64, Vec<&PsTreeRow>> = HashMap::new();
@@ -91,6 +97,7 @@ pub fn build_process_tree(
     let mut tree = Vec::new();
     let mut seen: HashSet<i64> = HashSet::from([leader_pid]);
     let mut queue: VecDeque<i64> = VecDeque::from([leader_pid]);
+    let mut group_scanned = false;
     while let Some(pid) = queue.pop_front() {
         if let Some(row) = by_pid.get(&pid) {
             tree.push(ProcessTreeEntry {
@@ -104,8 +111,59 @@ pub fn build_process_tree(
                 queue.push_back(child.pid);
             }
         }
+        if queue.is_empty() && !group_scanned {
+            group_scanned = true;
+            // Group members the ppid walk did not reach, and their descendants.
+            if let Some(pgid) = own_group {
+                for row in rows {
+                    if row.pgid == pgid && seen.insert(row.pid) {
+                        queue.push_back(row.pid);
+                    }
+                }
+            }
+        }
     }
     tree
+}
+
+/// The sampler's running view of a service's tree. `fresh` is the latest snapshot; a member of
+/// `previous` that is no longer in it stays only while `alive` still shows it with the same start
+/// identity. That is how a descendant that left both the ppid tree and the group (`setsid` plus a
+/// double fork: a dev server's detached watcher) is still stopped with the service it came from.
+/// `alive` of `None` (the table could not be read) keeps those members for the next sample.
+pub fn merge_known_descendants(
+    previous: &[ProcessTreeEntry],
+    fresh: Vec<ProcessTreeEntry>,
+    alive: Option<&HashMap<i64, String>>,
+) -> Vec<ProcessTreeEntry> {
+    let mut merged = fresh;
+    let present: HashSet<(i64, String)> = merged
+        .iter()
+        .map(|entry| (entry.pid, entry.start_identity.clone()))
+        .collect();
+    for entry in previous {
+        if present.contains(&(entry.pid, entry.start_identity.clone())) {
+            continue;
+        }
+        let still_alive = match alive {
+            Some(alive) => alive.get(&entry.pid) == Some(&entry.start_identity),
+            None => true,
+        };
+        if still_alive {
+            merged.push(entry.clone());
+        }
+    }
+    merged
+}
+
+/// Whether `previous` has members `fresh` does not — the only case the sampler needs a second
+/// `ps` (liveness) for.
+pub fn has_departed_members(previous: &[ProcessTreeEntry], fresh: &[ProcessTreeEntry]) -> bool {
+    previous.iter().any(|entry| {
+        !fresh
+            .iter()
+            .any(|f| f.pid == entry.pid && f.start_identity == entry.start_identity)
+    })
 }
 
 fn alive_row_re() -> &'static Regex {
@@ -216,6 +274,66 @@ mod tests {
         let rows = vec![row(200, 1, 200, LSTART_A)];
         let tree = build_process_tree(&rows, 100, LSTART_A);
         assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn a_double_forked_member_of_the_leaders_group_is_in_the_tree() {
+        // `(cmd &)`: the subshell exits, `cmd` is reparented to launchd (ppid 1) but stays in the
+        // leader's group, and its own child comes along.
+        let rows = vec![
+            row(100, 1, 100, LSTART_A),
+            row(300, 1, 100, LSTART_B),
+            row(301, 300, 301, LSTART_B),
+            row(400, 1, 400, LSTART_B),
+        ];
+        let pids: Vec<i64> = build_process_tree(&rows, 100, LSTART_A)
+            .iter()
+            .map(|entry| entry.pid)
+            .collect();
+        assert_eq!(pids, vec![100, 300, 301], "an unrelated group stays out");
+    }
+
+    #[test]
+    fn group_members_are_not_pulled_in_when_the_leader_does_not_lead_its_group() {
+        // An adopted process started from a terminal shares the shell's job group; its siblings
+        // are not its tree.
+        let rows = vec![
+            row(100, 50, 50, LSTART_A),
+            row(50, 1, 50, LSTART_A),
+            row(60, 50, 50, LSTART_B),
+        ];
+        let pids: Vec<i64> = build_process_tree(&rows, 100, LSTART_A)
+            .iter()
+            .map(|entry| entry.pid)
+            .collect();
+        assert_eq!(pids, vec![100]);
+    }
+
+    #[test]
+    fn merged_descendants_keep_a_live_member_that_left_the_tree_and_drop_a_dead_one() {
+        let entry = |pid: i64, start: &str| ProcessTreeEntry {
+            pid,
+            pgid: pid,
+            start_identity: start.to_string(),
+        };
+        let previous = vec![
+            entry(100, LSTART_A),
+            entry(200, LSTART_B),
+            entry(300, LSTART_B),
+        ];
+        let fresh = vec![entry(100, LSTART_A)];
+        assert!(has_departed_members(&previous, &fresh));
+        let mut alive = HashMap::new();
+        alive.insert(100, LSTART_A.to_string());
+        alive.insert(200, LSTART_B.to_string());
+        // 300 is gone; a recycled 300 would carry a different lstart and is dropped the same way.
+        alive.insert(300, "a recycled pid's own start".to_string());
+        let merged = merge_known_descendants(&previous, fresh.clone(), Some(&alive));
+        let pids: Vec<i64> = merged.iter().map(|e| e.pid).collect();
+        assert_eq!(pids, vec![100, 200]);
+        assert!(!has_departed_members(&merged, &merged));
+        let unknown = merge_known_descendants(&previous, fresh, None);
+        assert_eq!(unknown.len(), 3, "an unreadable table forgets nothing");
     }
 
     #[test]

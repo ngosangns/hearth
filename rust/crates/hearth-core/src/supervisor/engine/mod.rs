@@ -23,7 +23,8 @@ use crate::sync::KeyedLock;
 use super::duplicates::{executable_matches, paths_equal};
 use super::fingerprint::{normalize_command_fingerprint, normalize_observed_command_fingerprint};
 use super::process_tree::{
-    process_tree_alive, secondary_process_groups, ProcessTreeEntry, ProcessTreeSnapshot,
+    has_departed_members, merge_known_descendants, process_tree_alive, secondary_process_groups,
+    ProcessTreeEntry, ProcessTreeSnapshot,
 };
 use super::types::{
     Host, Inspection, ManagedProcess, ObservedProcess, OnOutput, OutputSource, OutputTail,
@@ -401,8 +402,14 @@ impl ProcessSupervisor {
                 .await;
         }
 
-        // Container log followers are real child processes (`docker logs -f`) in their own process
-        // group — they would outlive the daemon as orphans streaming to a dead pipe.
+        self.detach_all_output();
+    }
+
+    /// Stops every log follower. Container followers are real child processes (`docker logs -f`)
+    /// in their own process group — they would outlive the daemon as orphans streaming to a dead
+    /// pipe. Every shutdown runs this, including the leave-services one: the next daemon attaches
+    /// its own followers to the services it re-adopts.
+    pub fn detach_all_output(&self) {
         let tails: Vec<OutputTail> = self
             .output_tails
             .lock()
@@ -436,8 +443,9 @@ impl ProcessSupervisor {
         let ProcessIdentity::Posix(posix) = identity else {
             return;
         };
+        let known = self.known_descendants(&posix.service_id, posix.pid);
         if let Err(error) = self
-            .terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid)
+            .terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid, &known)
             .await
         {
             self.host.record_background_error(
@@ -2946,7 +2954,8 @@ impl ProcessSupervisor {
             }
             ProcessIdentity::Posix(posix) => {
                 self.detach_output(&posix.service_id);
-                self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid)
+                let known = self.known_descendants(&posix.service_id, posix.pid);
+                self.terminate_posix_tree(posix.pid, &posix.start_identity, posix.pgid, &known)
                     .await?;
             }
         }
@@ -2990,24 +2999,6 @@ impl ProcessSupervisor {
         Some(process_tree_alive(tree, &alive))
     }
 
-    async fn secondary_groups_alive(
-        &self,
-        tree: &[ProcessTreeEntry],
-        leader_pgid: i64,
-    ) -> Option<bool> {
-        let groups = secondary_process_groups(tree, leader_pgid);
-        if groups.is_empty() {
-            return Some(false);
-        }
-        let alive = self.options.process.live_start_identities().await?;
-        Some(
-            groups
-                .values()
-                .flatten()
-                .any(|member| alive.get(&member.pid) == Some(&member.start_identity)),
-        )
-    }
-
     /// Signals the leader's group, then every other process group in the snapshot — the `air`
     /// case, where the real server runs in its own group and survives a leader-only signal.
     /// Nothing is signalled when the snapshot is missing or the fresh table cannot be read, and a
@@ -3023,16 +3014,6 @@ impl ProcessSupervisor {
             return;
         };
         self.signal_verified_members(tree, leader_pgid, signal, true)
-            .await;
-    }
-
-    async fn signal_secondary_groups(
-        &self,
-        tree: &[ProcessTreeEntry],
-        leader_pgid: i64,
-        signal: ProcessSignal,
-    ) {
-        self.signal_verified_members(tree, leader_pgid, signal, false)
             .await;
     }
 
@@ -3071,6 +3052,7 @@ impl ProcessSupervisor {
         pid: i64,
         start_identity: &str,
         pgid: i64,
+        known: &[ProcessTreeEntry],
     ) -> Result<(), SupervisorError> {
         let snapshot = self.process_tree(pid, start_identity).await;
         let tree = match &snapshot {
@@ -3080,8 +3062,22 @@ impl ProcessSupervisor {
                 ));
             }
             ProcessTreeSnapshot::Absent => return Ok(()),
-            ProcessTreeSnapshot::Present(tree) => tree.clone(),
+            ProcessTreeSnapshot::Present(tree) => {
+                // Descendants the sampler saw that are no longer reachable from the leader (a
+                // `setsid` double fork). Signalling verifies each one's start identity first.
+                let mut tree = tree.clone();
+                for entry in known {
+                    if !tree
+                        .iter()
+                        .any(|t| t.pid == entry.pid && t.start_identity == entry.start_identity)
+                    {
+                        tree.push(entry.clone());
+                    }
+                }
+                tree
+            }
         };
+        let snapshot = ProcessTreeSnapshot::Present(tree.clone());
         self.signal_process_tree(&snapshot, pgid, ProcessSignal::Sigterm)
             .await;
         let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
@@ -3121,20 +3117,30 @@ impl ProcessSupervisor {
         }
     }
 
-    /// After the leader has exited: signal only secondary groups from the last snapshot taken
-    /// while it was alive. Never `killpg` the dead leader's pgid.
+    /// After the leader has exited: SIGTERM, grace, SIGKILL whatever of its last tree (sampled
+    /// while it was alive) is still running — children in their own groups, and children it left
+    /// behind in its own group (`sleep 1000 & exit 1`: the row is `failed` while `sleep` runs on,
+    /// tracked by nobody). A group is only signalled while one of its snapshotted members still
+    /// shows the same start identity, so the dead leader's pgid is never signalled once the group
+    /// is empty, and never after it could have been recycled.
     async fn reap_secondary_groups(&self, tree: &[ProcessTreeEntry], leader_pgid: i64) {
-        if secondary_process_groups(tree, leader_pgid).is_empty() {
+        // The dead leader stays in the list: its start identity no longer shows, so it neither
+        // counts as alive nor vouches for its group.
+        let survivors = tree;
+        if survivors.is_empty() {
             return;
         }
-        self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigterm)
+        if self.process_tree_alive(survivors).await != Some(true) {
+            return;
+        }
+        self.signal_verified_members(survivors, leader_pgid, ProcessSignal::Sigterm, true)
             .await;
         let deadline = self.options.clock.now_millis() + self.options.termination_grace_ms;
         loop {
             if self.options.clock.now_millis() >= deadline {
                 break;
             }
-            match self.secondary_groups_alive(tree, leader_pgid).await {
+            match self.process_tree_alive(survivors).await {
                 Some(true) => {
                     self.options
                         .clock
@@ -3144,9 +3150,38 @@ impl ProcessSupervisor {
                 Some(false) | None => return,
             }
         }
-        if self.secondary_groups_alive(tree, leader_pgid).await == Some(true) {
-            self.signal_secondary_groups(tree, leader_pgid, ProcessSignal::Sigkill)
+        if self.process_tree_alive(survivors).await == Some(true) {
+            self.signal_verified_members(survivors, leader_pgid, ProcessSignal::Sigkill, true)
                 .await;
+        }
+    }
+
+    /// Folds one sampler snapshot into the running tree — see `merge_known_descendants`. The
+    /// liveness `ps` only runs when a member has left the snapshot.
+    async fn record_tree_sample(
+        &self,
+        last_tree: &Arc<Mutex<Vec<ProcessTreeEntry>>>,
+        fresh: Vec<ProcessTreeEntry>,
+    ) {
+        let previous = last_tree.lock().unwrap().clone();
+        let merged = if has_departed_members(&previous, &fresh) {
+            let alive = self.options.process.live_start_identities().await;
+            merge_known_descendants(&previous, fresh, alive.as_ref())
+        } else {
+            fresh
+        };
+        *last_tree.lock().unwrap() = merged;
+    }
+
+    /// The sampled tree of the active process at `pid`, for a stop to signal alongside a fresh
+    /// snapshot.
+    fn known_descendants(&self, service_id: &ServiceId, pid: i64) -> Vec<ProcessTreeEntry> {
+        let active = self.active.lock().unwrap();
+        match active.get(service_id) {
+            Some(entry) if matches!(&entry.identity, ProcessIdentity::Posix(posix) if posix.pid == pid) => {
+                entry.last_tree.lock().unwrap().clone()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -3207,7 +3242,7 @@ impl ProcessSupervisor {
                 if let ProcessTreeSnapshot::Present(tree) =
                     sup.options.process.process_tree(pid, &start_identity).await
                 {
-                    *last_tree.lock().unwrap() = tree;
+                    sup.record_tree_sample(&last_tree, tree).await;
                 }
                 tokio::time::sleep(TREE_SAMPLE_INTERVAL).await;
             }
@@ -3305,7 +3340,7 @@ impl ProcessSupervisor {
                                 .process_tree(posix.pid, &posix.start_identity)
                                 .await
                             {
-                                *last_tree.lock().unwrap() = tree;
+                                sup.record_tree_sample(&last_tree, tree).await;
                             }
                         }
                     }
