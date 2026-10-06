@@ -104,6 +104,19 @@ from any dev box here, with the same username.
   by an unowned process`. The snapshot is only walked while the OS table still shows the recorded
   `startIdentity` for the leader pid, so a stale/reused pid can never pull an unrelated live tree
   into a signal or into the wait-for-death loop.
+  The tree also holds every member of the leader's own group (a double fork reparents to
+  launchd but stays in the group), and every descendant the 200 ms sampler (`last_tree`) saw that
+  is still alive with the same `lstart` — how a `setsid` escapee is still stopped. When the leader
+  exits on its own, its leftover children are reaped the same way, including those in its group;
+  that group is only signalled while a snapshotted member of it is still alive.
+- Helper commands (`run_command`, builds, `shared::output_with_timeout`) end when the leader
+  exits **and** the output pipes close. A pipe still open one second after the leader exits is a
+  leftover child: SIGKILL the group. The group guard stays armed until then — a reaped leader does
+  not mean the group is gone (`capture_command`'s 5s timeout kills the group for the same reason).
+  A child that redirected its output is left alone.
+- Anything the daemon must kill when it exits lives in a destructor (`KillGroupOnDrop`,
+  `kill_on_drop`), so `main` shuts the runtime down before `process::exit`. A leave-services
+  shutdown still calls `detach_all_output` so `docker logs` followers do not outlive the daemon.
 - An adopted process that is still alive is kept. A failing probe leaves it `running-unready`
   and the 1.5s loop keeps checking; start does not kill it. Restart replaces it. A process that
   is already gone is spawned again.

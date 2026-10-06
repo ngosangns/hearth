@@ -96,9 +96,12 @@ async fn capture_command_output(argv: &[&str]) -> (i32, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    cmd.kill_on_drop(true);
     let Ok(mut child) = cmd.spawn() else {
         return (-1, String::new(), String::new());
     };
+    // Dropped with the caller (a stop or sync racing its own deadline): the probe's group goes too.
+    let mut group = KillGroupOnDrop(child.id().map(i64::from));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let read_stdout = async move {
@@ -120,18 +123,23 @@ async fn capture_command_output(argv: &[&str]) -> (i32, String, String) {
     })
     .await;
     match finished {
-        Ok((out, err, Ok(status))) => (
-            status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out).into_owned(),
-            String::from_utf8_lossy(&err).into_owned(),
-        ),
-        Ok((_, _, Err(_))) => (-1, String::new(), String::new()),
-        Err(_) => {
-            // `id()` is only `Some` while the child is unreaped, which is what keeps its pid (and so
-            // its pgid) from having been recycled — never signal a group we can't vouch for.
-            if let Some(pid) = child.id() {
-                send_signal_to_group(pid as i64, ProcessSignal::Sigkill);
+        Ok((out, err, status)) => {
+            // Both pipes reached EOF and the leader is reaped: nothing of the group holds them.
+            group.0 = None;
+            match status {
+                Ok(status) => (
+                    status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out).into_owned(),
+                    String::from_utf8_lossy(&err).into_owned(),
+                ),
+                Err(_) => (-1, String::new(), String::new()),
             }
+        }
+        Err(_) => {
+            // Either the leader is still running, or it was reaped and something it started still
+            // holds a pipe — either way the group is still populated. `group` SIGKILLs it on drop;
+            // reap the leader if it is still ours.
+            drop(group);
             let _ = child.kill().await;
             (-1, String::new(), String::new())
         }
@@ -483,9 +491,11 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// SIGKILLs a still-running child's process group when the future driving it is dropped — how a
-/// caller-side timeout (the engine bounds one `command` readiness probe by `readinessTimeoutMs`)
-/// actually ends the probe instead of leaving it running in the background.
+/// SIGKILLs a helper's process group when the future driving it is dropped — how a caller-side
+/// timeout (the engine bounds one `command` readiness probe by `readinessTimeoutMs`) actually ends
+/// the probe instead of leaving it running in the background. It stays armed after the leader is
+/// reaped for as long as the helper's output pipes are open: a pipe still open means a process the
+/// helper started is alive, and unless it moved itself out, the group (and its pgid) still exists.
 struct KillGroupOnDrop(Option<i64>);
 
 impl Drop for KillGroupOnDrop {
@@ -494,6 +504,47 @@ impl Drop for KillGroupOnDrop {
             send_signal_to_group(pgid, ProcessSignal::Sigkill);
         }
     }
+}
+
+/// How long a helper's output may stay open after its leader exits before what holds it is killed.
+const HELPER_OUTPUT_DRAIN: Duration = Duration::from_secs(1);
+
+/// Aborts a forwarder task when dropped, so an abandoned helper cannot leave one reading forever.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The leader of a helper command (a readiness probe, `preparationCommand`, a `stop:` or compose
+/// command, a build) has been reaped. Its output forwarders end at EOF. A pipe still open after
+/// `HELPER_OUTPUT_DRAIN` is held by something the helper started in its group and left running
+/// (`sleep 1000 & exit 0`): every continuous probe tick used to leave one more of those behind,
+/// and a preparation step that did it hung the start forever. SIGKILL the group, then give the
+/// forwarders a moment to read the last bytes. A child that redirected its output elsewhere and
+/// left the group is not ours to find here.
+async fn finish_helper_output(group: &mut KillGroupOnDrop, forwarders: [AbortOnDrop; 2]) {
+    let mut forwarders = forwarders.map(|forwarder| (forwarder, false));
+    // A `JoinHandle` must not be polled again once it has completed, and a timeout can end the
+    // wait after one forwarder finished and before the other did.
+    async fn join_all(forwarders: &mut [(AbortOnDrop, bool); 2]) {
+        for (forwarder, done) in forwarders.iter_mut() {
+            if !*done {
+                let _ = (&mut forwarder.0).await;
+                *done = true;
+            }
+        }
+    }
+    let drained = tokio::time::timeout(HELPER_OUTPUT_DRAIN, join_all(&mut forwarders)).await;
+    if drained.is_err() {
+        if let Some(pgid) = group.0.take() {
+            send_signal_to_group(pgid, ProcessSignal::Sigkill);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(500), join_all(&mut forwarders)).await;
+    }
+    group.0 = None;
 }
 
 /// Spawns `argv` (cwd/env applied, own process group), forwards both stdout and stderr to
@@ -522,13 +573,12 @@ async fn run_command(
     let mut kill_on_drop = KillGroupOnDrop(child.id().map(i64::from));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_task = tokio::spawn(forward_stream(stdout, on_output.clone()));
-    let stderr_task = tokio::spawn(forward_stream(stderr, on_output));
+    let forwarders = [
+        AbortOnDrop(tokio::spawn(forward_stream(stdout, on_output.clone()))),
+        AbortOnDrop(tokio::spawn(forward_stream(stderr, on_output))),
+    ];
     let status = child.wait().await;
-    // Reaped: its pid may now be recycled, so the group is no longer ours to signal.
-    kill_on_drop.0 = None;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    finish_helper_output(&mut kill_on_drop, forwarders).await;
     status.ok().and_then(|s| s.code()).unwrap_or(-1)
 }
 
@@ -758,11 +808,16 @@ fn tail_container_logs(
         if let Some(tail) = tail {
             cmd.arg("--tail").arg(tail.to_string());
         }
+        // `kill_on_drop`: when the daemon exits with this task still running (a leave-services
+        // shutdown, `manager restart`), the follower must go with it. It used to be reparented to
+        // launchd and run until its container wrote again or stopped — one more per restart.
         cmd.arg(&container_name)
             .env_clear()
             .envs(&env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
             .process_group(0);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -1209,14 +1264,17 @@ impl RunBuild for DefaultRunBuild {
         let mut kill_on_drop = KillGroupOnDrop(pid);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(forward_stream(stdout, Some(on_output.clone())));
-        let stderr_task = tokio::spawn(forward_stream(stderr, Some(on_output)));
+        let forwarders = [
+            AbortOnDrop(tokio::spawn(forward_stream(
+                stdout,
+                Some(on_output.clone()),
+            ))),
+            AbortOnDrop(tokio::spawn(forward_stream(stderr, Some(on_output)))),
+        ];
 
         tokio::select! {
             status = child.wait() => {
-                kill_on_drop.0 = None;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                finish_helper_output(&mut kill_on_drop, forwarders).await;
                 let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
                 if code != 0 { Err(SupervisorError(format!("Build command exited with {code}"))) } else { Ok(()) }
             }
@@ -1227,9 +1285,7 @@ impl RunBuild for DefaultRunBuild {
                     if let Some(pid) = pid { send_signal_to_group(pid, ProcessSignal::Sigkill); }
                     let _ = child.wait().await;
                 }
-                kill_on_drop.0 = None;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                finish_helper_output(&mut kill_on_drop, forwarders).await;
                 Err(SupervisorError("Build cancelled".to_string()))
             }
         }
@@ -2039,5 +2095,348 @@ mod tests {
             "expected-fingerprint",
             Some(&first)
         ));
+    }
+
+    // --- Process-leak regressions: real processes, real signals. ---
+
+    fn os_pid_alive(pid: i64) -> bool {
+        crate::platform::is_pid_alive(pid)
+    }
+
+    async fn read_pid_file(path: &Path) -> i64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i64>() {
+                    return pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} was never written",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_gone(pid: i64, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if !os_pid_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        !os_pid_alive(pid)
+    }
+
+    fn kill_pid(pid: i64) {
+        if pid > 1 {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    fn sh(script: String) -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), script]
+    }
+
+    /// A probe or preparation step that backgrounds a child without redirecting it: the child holds
+    /// the output pipe. `run_command` used to wait on that pipe forever (a preparation step hung the
+    /// start), and a readiness timeout dropping it left the child running — one more per tick.
+    #[tokio::test]
+    async fn run_command_kills_a_background_child_holding_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let started = std::time::Instant::now();
+        let code = run_command(
+            &sh(format!(
+                "sleep 300 & echo $! > '{}'; exit 0",
+                pid_file.display()
+            )),
+            dir.path(),
+            &std::env::vars().collect(),
+            None,
+        )
+        .await;
+        let bg = read_pid_file(&pid_file).await;
+        let gone = wait_gone(bg, Duration::from_secs(3)).await;
+        kill_pid(bg);
+        assert_eq!(code, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "returned once the drain window passed"
+        );
+        assert!(gone, "the backgrounded pipe holder must be killed");
+    }
+
+    /// A child that redirected its output away holds nothing of ours: a preparation step that
+    /// starts a helper with `>/dev/null 2>&1 &` keeps it.
+    #[tokio::test]
+    async fn run_command_leaves_a_background_child_that_redirected_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let code = run_command(
+            &sh(format!(
+                "sleep 300 >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+                pid_file.display()
+            )),
+            dir.path(),
+            &std::env::vars().collect(),
+            None,
+        )
+        .await;
+        let bg = read_pid_file(&pid_file).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let alive = os_pid_alive(bg);
+        kill_pid(bg);
+        assert_eq!(code, 0);
+        assert!(
+            alive,
+            "a detached helper with its own output is not ours to kill"
+        );
+    }
+
+    /// The engine bounds one readiness probe with a timeout. Dropping `run_command` after the
+    /// leader exited (while its child still held the pipe) used to skip the group kill, because the
+    /// guard was disarmed at reap.
+    #[tokio::test]
+    async fn dropping_run_command_after_its_leader_exits_kills_the_pipe_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let argv = sh(format!(
+            "sleep 300 & echo $! > '{}'; exit 0",
+            pid_file.display()
+        ));
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(600),
+            run_command(&argv, dir.path(), &env, None),
+        )
+        .await;
+        assert!(dropped.is_err(), "still draining when the caller gave up");
+        let bg = read_pid_file(&pid_file).await;
+        let gone = wait_gone(bg, Duration::from_secs(3)).await;
+        kill_pid(bg);
+        assert!(
+            gone,
+            "dropping the probe must kill what it left in its group"
+        );
+    }
+
+    fn shell_service(id: &str, cwd: &Path, shell: String) -> ServiceDefinition {
+        use crate::catalog::{
+            CommandSpec as Spec, ReadinessSpec, ServiceCommand as Cmd, ServiceKind,
+            ServiceProfiles, ServiceRunProfile,
+        };
+        ServiceDefinition {
+            id: id.to_string(),
+            label: None,
+            kind: Some(ServiceKind::Application),
+            ownership: None,
+            disabled: false,
+            profiles: ServiceProfiles {
+                run: ServiceRunProfile::Verified {
+                    command: Cmd {
+                        command: Spec::Shell { shell, exec: None },
+                        cwd: cwd.to_string_lossy().to_string(),
+                        environment: None,
+                        container_name: None,
+                        docker_stop_command: None,
+                    },
+                    readiness: ReadinessSpec::Process,
+                    readiness_timeout_ms: Some(5_000),
+                    preparation: None,
+                    preparation_command: None,
+                },
+                build: None,
+            },
+            ports: None,
+            urls: None,
+            artifact: None,
+        }
+    }
+
+    fn real_supervisor(
+        name: &'static str,
+        service: ServiceDefinition,
+        dir: &Path,
+    ) -> (Arc<TestHost>, Arc<ProcessSupervisor>) {
+        let host = TestHost::new(name, service);
+        let mut options = default_supervisor_options(
+            dir.to_path_buf(),
+            Some(dir.join("runtime")),
+            Some(std::env::vars().collect()),
+        );
+        options.termination_grace_ms = 1_000;
+        (host.clone(), ProcessSupervisor::new(host, options))
+    }
+
+    /// `(trap '' TERM; sleep &)`: reparented to launchd, still in the service's group, and deaf to
+    /// SIGTERM. Stop used to see the leader die, call the tree dead, and never send SIGKILL.
+    #[tokio::test]
+    async fn stop_kills_a_double_forked_child_that_ignores_sigterm() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("orphan.pid");
+        let service = shell_service(
+            "dfork",
+            dir.path(),
+            format!(
+                "(trap '' TERM; sleep 300 & echo $! > '{}'); sleep 301",
+                pid_file.display()
+            ),
+        );
+        let (_host, supervisor) = real_supervisor("dfork-test", service, dir.path());
+        supervisor.start(&"dfork".to_string(), None).await.unwrap();
+        let orphan = read_pid_file(&pid_file).await;
+        supervisor.stop(&"dfork".to_string(), None).await.unwrap();
+        let gone = wait_gone(orphan, Duration::from_secs(3)).await;
+        kill_pid(orphan);
+        assert!(
+            gone,
+            "the double-forked, SIGTERM-ignoring child must not survive stop"
+        );
+    }
+
+    /// `sleep & exit 3`: the leader dies, the row fails, and the child it left in its group used
+    /// to run on with nothing tracking it.
+    #[tokio::test]
+    async fn a_service_leader_exit_reaps_the_child_it_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("left.pid");
+        let service = shell_service(
+            "crash",
+            dir.path(),
+            format!(
+                "sleep 300 & echo $! > '{}'; sleep 2; exit 3",
+                pid_file.display()
+            ),
+        );
+        let (host, supervisor) = real_supervisor("crash-test", service, dir.path());
+        supervisor.start(&"crash".to_string(), None).await.unwrap();
+        let left = read_pid_file(&pid_file).await;
+        let gone = wait_gone(left, Duration::from_secs(15)).await;
+        kill_pid(left);
+        assert!(
+            gone,
+            "the leader's leftover child must be reaped when it exits"
+        );
+        // The exit is recorded after the reap.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let failed = loop {
+            let state = host
+                .service_states()
+                .into_iter()
+                .next()
+                .unwrap()
+                .actual_state;
+            if state == ActualServiceState::Failed || std::time::Instant::now() >= deadline {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(failed, ActualServiceState::Failed);
+    }
+
+    /// A child that `setsid`s and is then orphaned leaves both the ppid tree and the group. The
+    /// tree sampler saw it while it was still a child, so the stop still reaches it.
+    #[tokio::test]
+    async fn stop_kills_a_setsid_descendant_the_sampler_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("escaped.pid");
+        let service = shell_service(
+            "escaped",
+            dir.path(),
+            format!(
+                "perl -MPOSIX -e 'if (fork() == 0) {{ POSIX::setsid(); open(my $f, q(>), $ARGV[0]); print $f $$; close $f; exec q(sleep), 300 }} sleep 3' '{}'; sleep 301",
+                pid_file.display()
+            ),
+        );
+        let (_host, supervisor) = real_supervisor("escaped-test", service, dir.path());
+        supervisor
+            .start(&"escaped".to_string(), None)
+            .await
+            .unwrap();
+        let escaped = read_pid_file(&pid_file).await;
+        // Past the point where perl exits and launchd adopts the escaped child.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        supervisor.stop(&"escaped".to_string(), None).await.unwrap();
+        let gone = wait_gone(escaped, Duration::from_secs(3)).await;
+        kill_pid(escaped);
+        assert!(
+            gone,
+            "the setsid'd descendant must be stopped with its service"
+        );
+    }
+
+    /// The daemon exits with its follower task still running (leave-services shutdown): dropping
+    /// the task must end `docker logs --follow`, not hand it to launchd until the container speaks.
+    #[test]
+    fn a_dropped_container_log_follower_kills_docker_logs() {
+        let name = format!("hearth-core-logdrop-{}", uuid::Uuid::new_v4().simple());
+        let run = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &name,
+                "alpine:latest",
+                "sleep",
+                "300",
+            ])
+            .output();
+        let cleanup = || {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &name])
+                .output();
+        };
+        if !matches!(&run, Ok(output) if output.status.success()) {
+            cleanup();
+            panic!("docker run must succeed for this test: {run:?}");
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let follower_pid = runtime.block_on(async {
+            let tail = tail_container_logs(
+                name.clone(),
+                None,
+                Some(0),
+                std::env::vars().collect(),
+                Arc::new(|_: &str| {}),
+            );
+            std::mem::forget(tail);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let (_, out) =
+                    capture_command(&["pgrep", "-f", &format!("docker logs --follow.*{name}")])
+                        .await;
+                if let Some(pid) = out
+                    .split_whitespace()
+                    .next()
+                    .and_then(|p| p.parse::<i64>().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "docker logs never started"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && os_pid_alive(follower_pid) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let alive = os_pid_alive(follower_pid);
+        kill_pid(follower_pid);
+        cleanup();
+        assert!(!alive, "docker logs must die with the task that owns it");
     }
 }

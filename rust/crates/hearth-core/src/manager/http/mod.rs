@@ -406,6 +406,9 @@ impl HearthManager {
         self.operations.drain_services().await;
         if mode.stops_services() {
             self.supervisor().shutdown().await;
+        } else {
+            // Services stay up; the `docker logs` followers this daemon spawned for them do not.
+            self.supervisor().detach_all_output();
         }
         let _guard = self.lifecycle.lock().await;
         self.close_locked().await;

@@ -376,5 +376,11 @@ fn main() {
             run_cli(root, rest).await
         }
     });
+    // Drop every task before exiting. `process::exit` with the runtime still alive skips their
+    // destructors, and those are what end in-flight helpers: a readiness probe or preparation
+    // command (`KillGroupOnDrop`), a `docker logs` follower (`kill_on_drop`). Without this a
+    // daemon shutting down mid-probe left the probe's process group running, reparented to
+    // launchd. Bounded, so a blocking-pool read (stdin) cannot hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     std::process::exit(code);
 }

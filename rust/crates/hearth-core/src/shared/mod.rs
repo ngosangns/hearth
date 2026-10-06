@@ -89,53 +89,109 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// How long a command's output may stay open after it exits before what holds it is killed.
+const OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// SIGKILLs a process group on drop unless disarmed.
+struct KillGroupGuard(Option<u32>);
+
+impl KillGroupGuard {
+    fn fire(&mut self) {
+        if let Some(pgid) = self.0.take().filter(|pgid| *pgid > 1) {
+            // SAFETY: plain syscall on our own child's process group. Only fired while the leader
+            // is unreaped or something it started still holds its output (see below).
+            unsafe {
+                libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+impl Drop for KillGroupGuard {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
 /// Spawns `command` in its own process group and waits up to `limit` for it. On timeout the whole
 /// group — a packaging script's or recipe's grandchildren included — is SIGKILLed and `Ok(None)`
-/// returned, but only while the leader is still unreaped: `child.id()` goes `None` once it is
-/// reaped, and a group whose leader pid may have been recycled is never signalled. `kill_on_drop`
-/// covers a caller whose future is itself dropped mid-wait.
+/// returned. Once the leader exits, its output gets `OUTPUT_DRAIN` to close; a pipe still open
+/// after that is held by something it left running in its group (`server &`), which is
+/// SIGKILLed with the group, and the output read so far is returned. The wait used to sit on that
+/// pipe until `limit` (49 minutes for a pack script) and then skip the kill, because `child.id()`
+/// is `None` once the leader is reaped — the grandchild outlived the daemon. The group is only
+/// signalled while the leader is unreaped or a pipe is open, so it is still populated and its pgid
+/// cannot have been recycled. The same guard covers a caller whose future is dropped mid-wait.
 pub(crate) async fn output_with_timeout(
     mut command: tokio::process::Command,
     limit: std::time::Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
     command.kill_on_drop(true).process_group(0);
     let mut child = command.spawn()?;
-    let out_pipe = child.stdout.take();
-    let err_pipe = child.stderr.take();
+    let mut group = KillGroupGuard(child.id());
+    let mut read_out = AbortOnDrop(tokio::spawn(read_pipe(child.stdout.take())));
+    let mut read_err = AbortOnDrop(tokio::spawn(read_pipe(child.stderr.take())));
     let wait = async {
-        let read_out = async move {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = out_pipe {
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
-            }
-            buf
-        };
-        let read_err = async move {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = err_pipe {
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
-            }
-            buf
-        };
-        let (status, stdout, stderr) = tokio::join!(child.wait(), read_out, read_err);
-        status.map(|status| std::process::Output {
+        let status = child.wait().await?;
+        let mut stdout = None;
+        let mut stderr = None;
+        let drained = tokio::time::timeout(OUTPUT_DRAIN, async {
+            collect_read(&mut read_out, &mut stdout).await;
+            collect_read(&mut read_err, &mut stderr).await;
+        })
+        .await;
+        if drained.is_err() {
+            group.fire();
+            // The holders were just killed: collect what was read, briefly.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                collect_read(&mut read_out, &mut stdout).await;
+                collect_read(&mut read_err, &mut stderr).await;
+            })
+            .await;
+        }
+        let stdout = stdout.unwrap_or_default();
+        let stderr = stderr.unwrap_or_default();
+        Ok::<_, std::io::Error>(std::process::Output {
             status,
             stdout,
             stderr,
         })
     };
     match tokio::time::timeout(limit, wait).await {
-        Ok(result) => result.map(Some),
+        Ok(result) => {
+            group.0 = None;
+            result.map(Some)
+        }
         Err(_) => {
-            if let Some(pid) = child.id() {
-                // SAFETY: plain syscall; `pid` is our own unreaped child's process group.
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+            group.fire();
             let _ = child.kill().await;
             Ok(None)
         }
+    }
+}
+
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut buf).await;
+    }
+    buf
+}
+
+/// Awaits `reader` into `slot` unless it already completed: a finished `JoinHandle` must not be
+/// polled again.
+async fn collect_read(reader: &mut AbortOnDrop<Vec<u8>>, slot: &mut Option<Vec<u8>>) {
+    if slot.is_none() {
+        *slot = Some((&mut reader.0).await.unwrap_or_default());
+    }
+}
+
+/// Aborts a reader task when dropped.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -220,5 +276,87 @@ impl SharedContext {
     /// `name@version` keys a machine ever registers, which is tiny.
     pub fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.instance_locks.get(&id.to_string())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn alive(pid: i64) -> bool {
+        crate::platform::is_pid_alive(pid)
+    }
+
+    /// A packaging script that leaves `server &` holding its stdout: the wait used to run out the
+    /// whole limit and then skip the kill, because the leader was already reaped.
+    #[tokio::test]
+    async fn output_with_timeout_kills_a_child_left_holding_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "echo packed; sleep 300 & echo $! > '{}'; exit 0",
+                pid_file.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let started = Instant::now();
+        let output = output_with_timeout(command, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the command itself finished");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "packed");
+        let bg: i64 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && alive(bg) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let survived = alive(bg);
+        if survived {
+            unsafe {
+                libc::kill(bg as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        assert!(!survived, "the leftover pipe holder must be killed");
+    }
+
+    #[tokio::test]
+    async fn output_with_timeout_kills_the_whole_group_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 300 >/dev/null 2>&1 & echo $! > '{}'; sleep 300",
+                pid_file.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let result = output_with_timeout(command, Duration::from_millis(800))
+            .await
+            .unwrap();
+        assert!(result.is_none(), "timed out");
+        let bg: i64 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && alive(bg) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(!alive(bg), "the timeout must take the grandchild too");
     }
 }
