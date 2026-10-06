@@ -33,7 +33,8 @@ async fn run_manager(
         Some(runtime_directory.clone()),
         Some(base_environment),
     );
-    let started = hearth_core::daemon::run_daemon(
+    let display_root = root.display().to_string();
+    let outcome = hearth_core::daemon::run_daemon(
         hearth_core::manager::HearthManagerOptions {
             runtime_directory: Some(runtime_directory),
             root: Some(root),
@@ -48,10 +49,15 @@ async fn run_manager(
         hearth_core::manager::ShutdownMode::LeaveServices,
     )
     .await;
-    if started {
-        0
-    } else {
-        1
+    match outcome {
+        hearth_core::daemon::DaemonOutcome::Stopped => 0,
+        hearth_core::daemon::DaemonOutcome::AlreadyRunning { pid, port } => {
+            eprintln!(
+                "hearth: a daemon for {display_root} is already running (pid {pid}, port {port}); not starting another"
+            );
+            3
+        }
+        hearth_core::daemon::DaemonOutcome::Failed => 1,
     }
 }
 

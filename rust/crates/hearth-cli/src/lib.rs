@@ -376,7 +376,30 @@ async fn discover_probed(root: &Path, catalog: &ServiceCatalog) -> (Discovery, b
     }
 }
 
+/// How long `ensure` polls a freshly spawned daemon that has not claimed the lock yet.
+const ENSURE_SPAWN_WAIT: Duration = Duration::from_secs(5);
+/// Upper bound for a daemon that holds the lock and is still bootstrapping. It records `port: 0`
+/// until it has loaded state and re-adopted every service, which took ~7 s with 25 services.
+const ENSURE_BOOTSTRAP_WAIT: Duration = Duration::from_secs(120);
+
+/// The pid of a live daemon that holds `root`'s lock but has not published its port yet.
+fn bootstrapping_daemon(root: &Path, catalog: &ServiceCatalog) -> Option<i64> {
+    let io = create_file_io(catalog.private_file_guard != Some(false));
+    let runtime_directory = resolve_runtime_directory(root, catalog.runtime_directory.as_deref());
+    let raw = io
+        .read_file(&runtime_directory.join("manager.lock").join("metadata.json"))
+        .ok()
+        .flatten()?;
+    let metadata = serde_json::from_str::<ManagerMetadata>(&raw).ok()?;
+    (metadata.port == 0 && metadata.pid > 0 && hearth_core::platform::is_pid_alive(metadata.pid))
+        .then_some(metadata.pid)
+}
+
 /// Discovers a live daemon, spawning one (via `options.spawn_daemon`) and polling if none is found.
+///
+/// A daemon that holds the lock but is still bootstrapping (`port: 0`, pid alive) is waited for,
+/// up to [`ENSURE_BOOTSTRAP_WAIT`], instead of being reported unavailable after a fixed 5 s, and is
+/// never joined by a second spawn. The wait ends as soon as that pid exits.
 pub async fn ensure(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Client> {
     let discovered = discover(root, &options.catalog).await;
     match discovered {
@@ -391,8 +414,12 @@ pub async fn ensure(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Cl
         }
         _ => {}
     }
-    (options.spawn_daemon)(root);
-    for _ in 0..100 {
+    if bootstrapping_daemon(root, &options.catalog).is_none() {
+        (options.spawn_daemon)(root);
+    }
+    let started = tokio::time::Instant::now();
+    let mut last_bootstrapping = None;
+    loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let discovered = discover(root, &options.catalog).await;
         if let Discovery::Live { client } = discovered {
@@ -400,8 +427,35 @@ pub async fn ensure(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Cl
         } else if let Discovery::Incompatible { .. } = discovered {
             return fail_err(EXIT_PROTOCOL, "hearth manager protocol is incompatible");
         }
+        let elapsed = started.elapsed();
+        match bootstrapping_daemon(root, &options.catalog) {
+            Some(pid) if elapsed < ENSURE_BOOTSTRAP_WAIT => last_bootstrapping = Some(pid),
+            Some(pid) => {
+                return fail_err(
+                    EXIT_UNAVAILABLE,
+                    format!(
+                        "hearth manager (pid {pid}) is still starting after {}s",
+                        ENSURE_BOOTSTRAP_WAIT.as_secs()
+                    ),
+                )
+            }
+            None => {
+                if let Some(pid) = last_bootstrapping {
+                    // One more look: it may have published its port between the two reads.
+                    if let Discovery::Live { client } = discover(root, &options.catalog).await {
+                        return Ok(client);
+                    }
+                    return fail_err(
+                        EXIT_UNAVAILABLE,
+                        format!("hearth manager (pid {pid}) exited before it started listening; see its log in the runtime directory"),
+                    );
+                }
+                if elapsed >= ENSURE_SPAWN_WAIT {
+                    return fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable");
+                }
+            }
+        }
     }
-    fail_err(EXIT_UNAVAILABLE, "hearth manager is unavailable")
 }
 
 pub async fn require_client(root: &Path, options: &LocalctlOptions) -> LocalctlResult<Client> {
@@ -610,6 +664,33 @@ async fn service_rows(client: &Client) -> LocalctlResult<Vec<ServiceLifecycleSta
 /// The state `hearth status` prints. In-flight states collapse into "running", but a state that
 /// means something went wrong or is out of this daemon's hands is NEVER collapsed into "stopped" —
 /// a crashed service must not read as one nobody started.
+/// The daemon's own state name (`running-unready`, `preparing`, …). A missing row is `stopped`.
+fn actual_state_name(state: Option<&ServiceLifecycleState>) -> &'static str {
+    state.map_or("stopped", |s| s.actual_state.as_wire_str())
+}
+
+/// The pid `hearth status` shows: only while the recorded process can still be running. A stopped,
+/// queued, preparing, failed, or finished row keeps the last identity it had, and printing it
+/// named a process that was gone (or, after pid reuse, someone else's).
+fn status_pid(state: Option<&ServiceLifecycleState>) -> Option<i64> {
+    let state = state?;
+    let live = matches!(
+        state.actual_state,
+        ActualServiceState::Starting
+            | ActualServiceState::Running
+            | ActualServiceState::RunningUnready
+            | ActualServiceState::Ready
+            | ActualServiceState::Stopping
+            | ActualServiceState::Orphaned
+    );
+    match state.identity.as_ref()? {
+        hearth_core::state::ProcessIdentity::Posix(posix) if live => Some(posix.pid),
+        _ => None,
+    }
+}
+
+/// The coarse state vocabulary of `status --json`'s `state` field and of `urls`, kept for scripts
+/// written against it. `hearth status` prints [`actual_state_name`].
 fn text_state(state: Option<&ServiceLifecycleState>) -> &'static str {
     match state.map(|s| s.actual_state) {
         Some(ActualServiceState::Ready) => "ready",
@@ -876,16 +957,15 @@ async fn main_inner(
                 .iter()
                 .map(|service_id| {
                     let row = rows.iter().find(|r| &r.service_id == service_id);
-                    let pid =
-                        row.and_then(|r| r.identity.as_ref())
-                            .and_then(|identity| match identity {
-                                hearth_core::state::ProcessIdentity::Posix(p) => Some(p.pid),
-                                hearth_core::state::ProcessIdentity::Docker(_) => None,
-                            });
                     // `pid` is omitted, never null, when there isn't one — consumers test for
-                    // the key's presence.
-                    let mut entry = json!({ "serviceId": service_id, "state": text_state(row) });
-                    if let Some(pid) = pid {
+                    // the key's presence. `state` keeps its coarse 0.21 vocabulary (`running`
+                    // covers preparing/starting/running-unready); `actualState` is the daemon's.
+                    let mut entry = json!({
+                        "serviceId": service_id,
+                        "state": text_state(row),
+                        "actualState": actual_state_name(row),
+                    });
+                    if let Some(pid) = status_pid(row) {
                         entry["pid"] = json!(pid);
                     }
                     entry
@@ -901,7 +981,7 @@ async fn main_inner(
                         .unwrap_or_default();
                     (io.out)(&format!(
                         "{} {}{}",
-                        row["state"].as_str().unwrap(),
+                        row["actualState"].as_str().unwrap(),
                         row["serviceId"].as_str().unwrap(),
                         pid_suffix
                     ));
@@ -935,14 +1015,12 @@ async fn main_inner(
         "logs" => {
             let flags =
                 parse_command_flags(rest, &[FlagName::Tail, FlagName::Follow, FlagName::Json])?;
-            let service_ok = flags.positionals.len() == 1
-                && options
-                    .catalog
-                    .services
-                    .iter()
-                    .any(|s| Some(&s.id) == flags.positionals.first());
-            if !service_ok {
+            if flags.positionals.len() != 1 {
                 return usage_err("usage: hearth logs <service> [--tail N] [--follow] [--json]");
+            }
+            let name = &flags.positionals[0];
+            if !options.catalog.services.iter().any(|s| &s.id == name) {
+                return usage_err(format!("unknown service: {name}"));
             }
             let client = require_client(&root, options).await?;
             logs(
@@ -1748,6 +1826,55 @@ mod tests {
         }
     }
 
+    /// A lock held by a daemon still bootstrapping (`port: 0`). `ensure` must neither spawn a
+    /// second daemon nor give up after the old fixed 5 s while that pid is alive, and must stop
+    /// waiting once it exits.
+    #[tokio::test]
+    async fn ensure_waits_for_a_bootstrapping_daemon_and_fails_fast_when_it_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = test_catalog(dir.path(), vec![]);
+        let root = PathBuf::from("/tmp");
+        let lock = resolve_runtime_directory(&root, catalog.runtime_directory.as_deref())
+            .join("manager.lock");
+        std::fs::create_dir_all(&lock).unwrap();
+        let mut slow = std::process::Command::new("sleep")
+            .arg("6.5")
+            .spawn()
+            .unwrap();
+        let metadata = ManagerMetadata {
+            version: 1,
+            protocol_version: PROTOCOL_VERSION,
+            instance_id: "booting".to_string(),
+            pid: slow.id() as i64,
+            port: 0,
+            started_at: "2026-01-01T00:00:00.000Z".to_string(),
+        };
+        std::fs::write(
+            lock.join("metadata.json"),
+            serde_json::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        let reaper = std::thread::spawn(move || slow.wait());
+        let options = LocalctlOptions {
+            catalog,
+            spawn_daemon: Box::new(|_| panic!("a bootstrapping daemon must not get a second one")),
+        };
+        let started = std::time::Instant::now();
+        let error = ensure(&root, &options).await.unwrap_err();
+        let waited = started.elapsed();
+        let _ = reaper.join();
+        assert_eq!(error.exit_code, EXIT_UNAVAILABLE);
+        assert!(
+            error.message.contains("exited before it started listening"),
+            "{error:?}"
+        );
+        assert!(waited >= Duration::from_secs(6), "gave up after {waited:?}");
+        assert!(
+            waited < Duration::from_secs(10),
+            "kept waiting after the exit: {waited:?}"
+        );
+    }
+
     fn never_spawn() -> SpawnDaemon {
         Box::new(|_root| {
             panic!("spawn_daemon should not be called when a manager is already running")
@@ -1801,6 +1928,8 @@ mod tests {
         assert_eq!(code, 0, "{:?}", out.lock().unwrap());
         let printed: Value = serde_json::from_str(&out.lock().unwrap()[0]).unwrap();
         assert_eq!(printed["services"][0]["state"], "stopped");
+        assert_eq!(printed["services"][0]["actualState"], "stopped");
+        assert!(printed["services"][0].get("pid").is_none(), "{printed}");
         manager.close().await;
     }
 
@@ -2618,6 +2747,19 @@ mod tests {
             .is_file());
     }
 
+    /// `hearth logs <typo>` used to print the usage line, as if the syntax were wrong.
+    #[tokio::test]
+    async fn logs_for_an_unknown_service_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (code, _out, err) = run_cli(dir.path(), &["logs", "nope"]).await;
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err[0].contains("unknown service: nope"), "{err:?}");
+        assert!(!err[0].contains("usage:"), "{err:?}");
+        let (code, _out, err) = run_cli(dir.path(), &["logs"]).await;
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err[0].contains("usage: hearth logs"), "{err:?}");
+    }
+
     #[tokio::test]
     async fn skill_install_requires_a_dest_flag() {
         let dir = tempfile::tempdir().unwrap();
@@ -2670,6 +2812,60 @@ mod tests {
             assert_eq!(text_state(Some(&state(actual))), printed, "{actual:?}");
         }
         assert_eq!(text_state(None), "stopped");
+    }
+
+    #[test]
+    fn status_shows_the_real_state_and_a_pid_only_for_a_live_process() {
+        use hearth_core::state::{DesiredServiceState, PosixProcessIdentity, ServiceReadiness};
+        let state = |actual: ActualServiceState| ServiceLifecycleState {
+            service_id: "svc".to_string(),
+            desired_state: DesiredServiceState::Running,
+            actual_state: actual,
+            readiness: ServiceReadiness::Unknown,
+            generation: 1,
+            identity: Some(hearth_core::state::ProcessIdentity::Posix(
+                PosixProcessIdentity {
+                    manager_instance_id: "i".to_string(),
+                    service_id: "svc".to_string(),
+                    generation: 1,
+                    pid: 4242,
+                    pgid: 4242,
+                    started_at: "t".to_string(),
+                    start_identity: "s".to_string(),
+                    command_fingerprint: "f".to_string(),
+                },
+            )),
+            readiness_kind: None,
+            readiness_detail: None,
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+            exited_at: None,
+            exit_code: None,
+            error: None,
+            current_operation_id: None,
+        };
+        for actual in ActualServiceState::ALL {
+            assert_eq!(
+                actual_state_name(Some(&state(actual))),
+                actual.as_wire_str()
+            );
+        }
+        assert_eq!(actual_state_name(None), "stopped");
+        for (actual, pid) in [
+            (ActualServiceState::Stopped, None),
+            (ActualServiceState::QueuedStart, None),
+            (ActualServiceState::Preparing, None),
+            (ActualServiceState::Failed, None),
+            (ActualServiceState::Succeeded, None),
+            (ActualServiceState::ExternallyOwned, None),
+            (ActualServiceState::Starting, Some(4242)),
+            (ActualServiceState::RunningUnready, Some(4242)),
+            (ActualServiceState::Ready, Some(4242)),
+            (ActualServiceState::Stopping, Some(4242)),
+            (ActualServiceState::Orphaned, Some(4242)),
+        ] {
+            assert_eq!(status_pid(Some(&state(actual))), pid, "{actual:?}");
+        }
     }
 
     /// A URL that needs its service running is flagged while the service is stopped, so a dead link

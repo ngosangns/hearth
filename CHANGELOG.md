@@ -9,6 +9,11 @@
 - `hearth manager restart`, SIGTERM, and Ctrl+C still leave services running, but no longer leave the daemon's `docker logs --follow` followers behind. Each one used to be reparented to launchd and run until its container wrote again or stopped, one more per restart. The next daemon attaches its own.
 - `hearth stop`, restart, and a `stop-services` shutdown now stop an `orphaned` service whose process still has the recorded pid and start time. A shell that runs setup and then `exec`s into its server (`sh -c 'setup; exec server'`) is marked `orphaned` once its command line changes, and used to fail with "no longer owned by this manager" and keep running. It now gets the same SIGTERM, then SIGKILL, to its whole process tree as an owned service. A pid whose start time differs (reused by another program) is still refused, and is not signalled.
 - A daemon that exits (any shutdown) now kills a readiness probe or preparation command that is still running. It used to be left running under launchd. A daemon killed with SIGKILL still cannot clean up its in-flight probe.
+- `hearth manager restart` and `manager ensure` no longer report "hearth manager is unavailable" while the new daemon is still starting. A daemon holds the lock with no port while it loads state and re-adopts services, which took about 7 s with 25 services, and `ensure` gave up after a fixed 5 s. It now waits for that daemon as long as its pid is alive (up to 120 s), does not spawn a second one meanwhile, and fails at once with "exited before it started listening" if it dies.
+- A `hearth daemon` (or `hearth smp`) that loses the lock to a daemon already serving the same root now exits with status 3 and prints which pid and port hold it. It used to exit 0, which read as a successful start.
+- `hearth status` prints the daemon's real state (`preparing`, `starting`, `running-unready`) instead of folding them into `running`. `status --json` keeps `state` as before and adds `actualState` with the real state.
+- `hearth status` no longer prints a pid for a stopped, queued, preparing, failed, finished, or externally-owned row. That pid was the last recorded process, which was gone or could belong to something else.
+- `hearth logs <name>` with a name that is not a service prints `unknown service: <name>` (exit 2) instead of the usage line.
 
 ## 0.21.0
 

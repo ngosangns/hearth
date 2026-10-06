@@ -220,14 +220,24 @@ pub fn install_panic_log(log: DaemonLog) {
     });
 }
 
+/// How a [`run_daemon`] call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonOutcome {
+    /// Served until shutdown, then closed cleanly.
+    Stopped,
+    /// Another daemon already holds this root's lock and answers its health check, so this one
+    /// never started. The caller exits non-zero and says so: it used to exit 0 with only a
+    /// `daemon.log` line, which read as a successful start.
+    AlreadyRunning { pid: i64, port: u16 },
+    /// Bootstrap failed; the reason is in `daemon.log`.
+    Failed,
+}
+
 /// Boots a `HearthManager`, wires SIGINT/SIGTERM to a graceful `DaemonLifecycle` shutdown,
 /// and resolves once the manager has fully closed. A raced `ClaimLockError::AlreadyRunning`
-/// (another daemon won the lock claim first) is treated as a clean, silent exit.
-///
-/// Returns `false` when bootstrap failed, so the caller can exit non-zero. Losing a race to another
-/// daemon is a normal, successful outcome (`true`) — that daemon is now serving this root.
+/// (another daemon won the lock claim first) is [`DaemonOutcome::AlreadyRunning`].
 #[cfg(unix)]
-pub async fn run_daemon(options: HearthManagerOptions, mode: ShutdownMode) -> bool {
+pub async fn run_daemon(options: HearthManagerOptions, mode: ShutdownMode) -> DaemonOutcome {
     let root = options
         .root
         .clone()
@@ -240,13 +250,19 @@ pub async fn run_daemon(options: HearthManagerOptions, mode: ShutdownMode) -> bo
 
     let manager = match bootstrap(options).await {
         Ok(manager) => manager,
-        Err(BootstrapError::ClaimLock(ClaimLockError::AlreadyRunning { .. })) => {
-            log("bootstrap raced another daemon");
-            return true;
+        Err(BootstrapError::ClaimLock(ClaimLockError::AlreadyRunning { metadata, port })) => {
+            log(&format!(
+                "bootstrap raced another daemon: pid {} already serves this root on port {port}",
+                metadata.pid
+            ));
+            return DaemonOutcome::AlreadyRunning {
+                pid: metadata.pid,
+                port,
+            };
         }
         Err(error) => {
             log(&format!("bootstrap failed: {error}"));
-            return false;
+            return DaemonOutcome::Failed;
         }
     };
     log(&format!(
@@ -312,7 +328,7 @@ pub async fn run_daemon(options: HearthManagerOptions, mode: ShutdownMode) -> bo
     });
 
     lifecycle.wait_for_manager_shutdown().await;
-    true
+    DaemonOutcome::Stopped
 }
 
 #[cfg(test)]
@@ -445,6 +461,42 @@ mod tests {
             0,
             "an unreadable (not missing) lock file must not be treated as lost"
         );
+    }
+
+    /// A second daemon for a root that already has a live one must report the loser, not a start.
+    #[tokio::test]
+    async fn a_daemon_that_loses_the_lock_race_reports_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = || HearthManagerOptions {
+            runtime_directory: Some(dir.path().join("runtime")),
+            root: Some(dir.path().to_path_buf()),
+            catalog: crate::catalog::ServiceCatalog {
+                services: Vec::new(),
+                groups: std::collections::HashMap::new(),
+                group_tree: Vec::new(),
+                compose_file: None,
+                runtime_directory: None,
+                start_failure_policy:
+                    crate::catalog::StartFailurePolicy::StopOnFirstFailureKeepStarted,
+                private_file_guard: Some(false),
+            },
+            event_capacity: None,
+            log_tail_bytes: None,
+            log_max_bytes: None,
+            log_rotation_count: None,
+            supervisor: None,
+            shared: None,
+        };
+        let winner = bootstrap(options()).await.unwrap();
+        let outcome = run_daemon(options(), ShutdownMode::LeaveServices).await;
+        assert_eq!(
+            outcome,
+            DaemonOutcome::AlreadyRunning {
+                pid: std::process::id() as i64,
+                port: winner.info().port,
+            }
+        );
+        winner.close().await;
     }
 
     #[tokio::test]
