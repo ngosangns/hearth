@@ -1124,6 +1124,15 @@ impl ProcessSupervisor {
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
             return Ok(());
         }
+        let slow_setup = profile.preparation.as_ref().is_some_and(|p| !p.is_empty())
+            || profile.preparation_command.is_some()
+            || definition
+                .as_ref()
+                .is_some_and(|def| def.profiles.build.is_some());
+        if slow_setup {
+            self.claim_tcp_port(service_id, &profile, generation, options.kill_unowned)
+                .await?;
+        }
         let mut preparation_failed = false;
         if let Some(preparation) = &profile.preparation {
             if !preparation.is_empty() {
@@ -1199,18 +1208,36 @@ impl ProcessSupervisor {
         if !self.valid(service_id, generation, token) || (self.options.is_closing)() {
             return Ok(());
         }
+        self.claim_tcp_port(service_id, &profile, generation, options.kill_unowned)
+            .await?;
+        self.spawn_and_wait(service_id, &profile, generation, token, operation_id)
+            .await
+    }
+
+    /// A `tcp` service's port must be free before it spawns. A held port records
+    /// `externally-owned` with the holder ("Port N is held by pid P (cmd)") and fails the start,
+    /// unless the client confirmed `killUnowned`, which reclaims it. Runs before the preparation
+    /// step and build as well as just before the spawn, so a held port fails in seconds instead of
+    /// after a long build.
+    async fn claim_tcp_port(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        profile: &VerifiedProfile,
+        generation: u64,
+        kill_unowned: bool,
+    ) -> Result<(), SupervisorError> {
         if let ReadinessSpec::Tcp { port } = &profile.readiness {
             if let Some(true) = self.options.probes.port_in_use(*port).await {
                 // `killUnowned` is the client's echo of "yes, kill whatever holds my port".
                 // A restart already reaped processes that match this service's command and cwd.
                 // A holder that does not match is signalled only through this confirmed path.
-                let error = if options.kill_unowned {
+                let error = if kill_unowned {
                     self.reclaim_port(*port).await.err()
                 } else {
                     None
                 };
                 match error {
-                    None if !options.kill_unowned => {
+                    None if !kill_unowned => {
                         let held_by = self.describe_port_holders(*port).await;
                         self.transition(
                             service_id,
@@ -1223,7 +1250,9 @@ impl ProcessSupervisor {
                             },
                         )
                         .await;
-                        return Err(SupervisorError(format!("Port {port} is externally owned")));
+                        return Err(SupervisorError(format!(
+                            "{service_id}: port {port} is externally owned (held by {held_by})"
+                        )));
                     }
                     None => {}
                     Some(error) => {
@@ -1243,8 +1272,7 @@ impl ProcessSupervisor {
                 }
             }
         }
-        self.spawn_and_wait(service_id, &profile, generation, token, operation_id)
-            .await
+        Ok(())
     }
 
     /// Human-readable "pid 91600 (node dist/main)" for the refusal error and the client-side kill

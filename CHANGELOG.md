@@ -14,6 +14,7 @@
 - `hearth status` prints the daemon's real state (`preparing`, `starting`, `running-unready`) instead of folding them into `running`. `status --json` keeps `state` as before and adds `actualState` with the real state.
 - `hearth status` no longer prints a pid for a stopped, queued, preparing, failed, finished, or externally-owned row. That pid was the last recorded process, which was gone or could belong to something else.
 - `hearth logs <name>` with a name that is not a service prints `unknown service: <name>` (exit 2) instead of the usage line.
+- A start that fails because another process holds the service's port now says so: `hearth start` prints `<service>: Port N is held by pid P (command)` and a `--kill-unowned` hint instead of only "service operation failed". Other failed operations print their own error too. A service with a build, `preparation`, or `preparationCommand` checks the port before that step, so a held port fails in seconds instead of after the build.
 
 ## 0.21.0
 

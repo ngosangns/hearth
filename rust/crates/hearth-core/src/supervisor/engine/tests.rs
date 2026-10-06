@@ -2092,6 +2092,52 @@ async fn build_failure_short_circuits_spawn() {
     );
 }
 
+/// A held port fails the start before the build runs, not after it: the build can take minutes
+/// and its result cannot be used while something else owns the port.
+#[tokio::test]
+async fn a_held_port_fails_the_start_before_the_build_runs() {
+    let mut service = argv_verified("api", ReadinessSpec::Tcp { port: 8080 });
+    service.profiles.build = Some(ServiceBuildProfile {
+        command: ServiceCommand {
+            command: CommandSpec::Shell {
+                shell: "slow-build".to_string(),
+                exec: None,
+            },
+            cwd: ".".to_string(),
+            environment: None,
+            container_name: None,
+            docker_stop_command: None,
+        },
+        timeout_ms: None,
+        serialization_key: None,
+    });
+    let h = build_harness(one_service_catalog(service));
+    h.probes.set_port_in_use(8080, true);
+
+    let error = h
+        .supervisor
+        .start(&"api".to_string(), None)
+        .await
+        .unwrap_err();
+
+    assert!(error.0.contains("externally owned"), "{error:?}");
+    assert!(error.0.contains("held by"), "{error:?}");
+    assert!(
+        h.run_build.timeline().is_empty(),
+        "the build must not run while the port is held"
+    );
+    let state = h.host.state_of("api").unwrap();
+    assert_eq!(state.actual_state, ActualServiceState::ExternallyOwned);
+    assert!(
+        state
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Port 8080 is held by"),
+        "{state:?}"
+    );
+}
+
 #[tokio::test]
 async fn build_serialization_by_key_runs_one_at_a_time() {
     fn service_with_build(id: &str, key: &str) -> ServiceDefinition {

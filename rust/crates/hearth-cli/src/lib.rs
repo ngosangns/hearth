@@ -1347,7 +1347,7 @@ async fn start_stop_restart_command(
             ));
         }
         if operation.status == OperationStatus::Failed {
-            return fail_err(EXIT_FAILED, "service operation failed");
+            return Err(operation_failure(&client, &[&operation], target).await);
         }
         return Ok(0);
     }
@@ -1444,13 +1444,70 @@ async fn start_stop_restart_command(
             ));
         }
     }
-    if operations
+    let failed: Vec<&Operation> = operations
         .iter()
-        .any(|o| o.status == OperationStatus::Failed)
-    {
-        return fail_err(EXIT_FAILED, "service operation failed");
+        .filter(|o| o.status == OperationStatus::Failed)
+        .collect();
+    if !failed.is_empty() {
+        return Err(operation_failure(&client, &failed, target).await);
     }
     Ok(0)
+}
+
+/// Why a start/stop/restart failed, instead of a bare "service operation failed": each failed
+/// operation's own error and, for a service whose port another process holds, that holder (the
+/// row's `externally-owned` error names its pid and command) and the `--kill-unowned` way out.
+async fn operation_failure(client: &Client, failed: &[&Operation], target: &str) -> LocalctlError {
+    let rows = service_rows(client).await.unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    let mut port_held = false;
+    for operation in failed {
+        let ids: Vec<ServiceId> = match (&operation.service_id, &operation.target_service_ids) {
+            (Some(id), _) => vec![id.clone()],
+            (None, Some(ids)) => ids.clone(),
+            (None, None) => Vec::new(),
+        };
+        let mut explained = false;
+        for id in &ids {
+            let Some(row) = rows.iter().find(|r| &r.service_id == id) else {
+                continue;
+            };
+            if row.actual_state == ActualServiceState::ExternallyOwned {
+                port_held = true;
+                explained = true;
+                lines.push(format!(
+                    "{id}: {}",
+                    row.error
+                        .as_deref()
+                        .unwrap_or("its port is held by a process this manager does not own")
+                ));
+            }
+        }
+        if !explained {
+            if let Some(error) = &operation.error {
+                let label = operation.service_id.as_deref().unwrap_or(target);
+                let message = &error.message;
+                lines.push(if message.starts_with(&format!("{label}:")) {
+                    message.clone()
+                } else {
+                    format!("{label}: {message}")
+                });
+            }
+        }
+    }
+    if port_held {
+        lines.push(format!(
+            "hint: `hearth start {target} --kill-unowned` stops the process holding the port and starts the service"
+        ));
+    }
+    LocalctlError {
+        exit_code: EXIT_FAILED,
+        message: if lines.is_empty() {
+            "service operation failed".to_string()
+        } else {
+            lines.join("\n")
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2017,7 +2074,9 @@ mod tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let out2 = out.clone();
         let mut out_fn = move |s: &str| out2.lock().unwrap().push(s.to_string());
-        let mut err_fn = move |_: &str| {};
+        let err = Arc::new(Mutex::new(Vec::<String>::new()));
+        let err2 = err.clone();
+        let mut err_fn = move |s: &str| err2.lock().unwrap().push(s.to_string());
         let options = LocalctlOptions {
             catalog: catalog.clone(),
             spawn_daemon: never_spawn(),
@@ -2035,6 +2094,20 @@ mod tests {
         )
         .await;
         assert_ne!(code, 0, "a held port must refuse a plain start");
+        // The reason, not "service operation failed": who holds the port, and the way out.
+        let printed_err = err.lock().unwrap().join("\n");
+        assert!(
+            printed_err.contains(&format!(
+                "api: Port {port} is held by pid {}",
+                squatter.child.id()
+            )),
+            "{printed_err}"
+        );
+        assert!(printed_err.contains("--kill-unowned"), "{printed_err}");
+        assert!(
+            !printed_err.contains("service operation failed"),
+            "{printed_err}"
+        );
         assert_eq!(
             manager.service_states()[0].actual_state,
             hearth_core::state::ActualServiceState::ExternallyOwned
