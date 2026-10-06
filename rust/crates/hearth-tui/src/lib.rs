@@ -4,7 +4,9 @@
 pub mod actions;
 pub mod client;
 pub mod desk;
+mod profile;
 pub mod run;
+mod schedule;
 pub mod screen;
 pub mod shell;
 pub mod state;

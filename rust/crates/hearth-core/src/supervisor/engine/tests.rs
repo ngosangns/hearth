@@ -12,7 +12,7 @@ use crate::supervisor::types::{
     SupervisorOptions,
 };
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 
 // --- Fake clock: sleeps advance a virtual clock instantly, so readiness-timeout tests run in
@@ -715,6 +715,7 @@ struct FakeHost {
     states: Mutex<HashMap<ServiceId, ServiceLifecycleState>>,
     logs: Mutex<Vec<(String, String)>>,
     events: Mutex<Vec<(String, serde_json::Value)>>,
+    state_writes: AtomicU64,
 }
 impl FakeHost {
     fn new(catalog: ServiceCatalog) -> Arc<Self> {
@@ -724,7 +725,12 @@ impl FakeHost {
             states: Mutex::new(HashMap::new()),
             logs: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
+            state_writes: AtomicU64::new(0),
         })
+    }
+
+    fn state_writes(&self) -> u64 {
+        self.state_writes.load(Ordering::SeqCst)
     }
     fn state_of(&self, service_id: &str) -> Option<ServiceLifecycleState> {
         self.states.lock().unwrap().get(service_id).cloned()
@@ -762,6 +768,7 @@ impl Host for FakeHost {
             .collect()
     }
     async fn set_service_state(&self, next: ServiceLifecycleState) {
+        self.state_writes.fetch_add(1, Ordering::SeqCst);
         self.states
             .lock()
             .unwrap()
@@ -1130,6 +1137,48 @@ async fn continuous_probe_drops_ready_then_recovers_without_status() {
     assert!(
         h.process.signals().is_empty(),
         "a failed probe must not kill the process"
+    );
+}
+
+/// A probe that keeps passing must not call `set_service_state`. That write is what publishes
+/// `service.lifecycle` and persists the row. Steady `ready` services would otherwise emit an
+/// event every backoff interval.
+#[tokio::test]
+async fn continuous_probe_does_not_write_state_while_the_probe_keeps_passing() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Ready
+    );
+    let writes = h.host.state_writes();
+    let started = h.clock.now_millis();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if h.clock.now_millis() >= started + 50 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "the continuous probe did not advance the clock (last {}, writes {})",
+                h.clock.now_millis(),
+                h.host.state_writes()
+            );
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        h.host.state_writes(),
+        writes,
+        "a passing probe must not rewrite an already-ready service"
+    );
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Ready
     );
 }
 

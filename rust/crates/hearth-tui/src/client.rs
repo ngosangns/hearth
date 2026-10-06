@@ -75,14 +75,20 @@ impl ManagerTuiClient {
     }
 
     pub async fn snapshot(&self) -> Result<Vec<ServiceLifecycleState>, LocalctlError> {
-        self.api.services().await
+        let started = std::time::Instant::now();
+        let result = self.api.services().await;
+        crate::profile::http("snapshot", started.elapsed());
+        result
     }
 
     /// Every resolved service URL (`GET /v1/urls`).
     pub async fn urls(
         &self,
     ) -> Result<Vec<hearth_core::catalog::ResolvedServiceUrl>, LocalctlError> {
-        let body = self.api.urls().await?;
+        let started = std::time::Instant::now();
+        let body = self.api.urls().await;
+        crate::profile::http("urls", started.elapsed());
+        let body = body?;
         serde_json::from_value(body["urls"].clone()).map_err(|e| LocalctlError {
             exit_code: EXIT_FAILED,
             message: e.to_string(),
@@ -91,10 +97,13 @@ impl ManagerTuiClient {
 
     /// `GET /v1/daemon/log` — the daemon's own log, not a service id.
     pub async fn daemon_log(&self) -> Result<String, LocalctlError> {
+        let started = std::time::Instant::now();
         let body = self
             .api
             .request("/v1/daemon/log?bytes=16384", reqwest::Method::GET, None)
-            .await?;
+            .await;
+        crate::profile::http("daemon_log", started.elapsed());
+        let body = body?;
         Ok(body
             .get("data")
             .and_then(|v| v.as_str())
@@ -112,10 +121,13 @@ impl ManagerTuiClient {
         cursor: Option<u64>,
         generation: Option<u64>,
     ) -> Result<LogSlice, LocalctlError> {
+        let started = std::time::Instant::now();
         let slice = self
             .api
             .log(service_id, cursor, generation, Some(LOG_TAIL_BYTES))
-            .await?;
+            .await;
+        crate::profile::http("log", started.elapsed());
+        let slice = slice?;
         Ok(LogSlice {
             data: slice.data,
             next_cursor: slice.next_cursor,
@@ -151,12 +163,18 @@ impl ManagerTuiClient {
         method: reqwest::Method,
         body: Option<&Value>,
     ) -> Result<Value, LocalctlError> {
-        self.api.request(path, method, body).await
+        let started = std::time::Instant::now();
+        let result = self.api.request(path, method, body).await;
+        crate::profile::http("request", started.elapsed());
+        result
     }
 
     /// Pid from the daemon lock. Fails when no daemon is up; callers leave the header blank.
     pub async fn daemon_pid(&self) -> Result<i64, LocalctlError> {
-        Ok(self.api.connection().await?.metadata.pid)
+        let started = std::time::Instant::now();
+        let connection = self.api.connection().await;
+        crate::profile::http("daemon_pid", started.elapsed());
+        Ok(connection?.metadata.pid)
     }
 
     /// The current connection, for work that must outlive a borrow of this client (a spawned wait).
@@ -305,6 +323,33 @@ pub fn parse_sse(frame: &str) -> Option<SseFrame> {
     serde_json::from_str(&raw)
         .ok()
         .map(|data| SseFrame { event_type, data })
+}
+
+/// A log read the shell applies on the UI thread. `Replace` is the full tail when the incremental
+/// read filled the byte cap, so appending it would still be truncated.
+pub enum FetchedLog {
+    Append(LogSlice),
+    Replace(LogSlice),
+}
+
+/// Reads the log off the UI thread. The caller applies it with the fence it captured at spawn.
+pub async fn fetch_log(
+    client: &ManagerTuiClient,
+    service: &str,
+    cursor: crate::state::LogCursor,
+) -> Result<FetchedLog, String> {
+    let delta = client
+        .log(service, cursor.cursor, cursor.generation)
+        .await
+        .map_err(|error| error.message)?;
+    if cursor.cursor.is_none() || delta.data.len() < LOG_TAIL_BYTES as usize {
+        return Ok(FetchedLog::Append(delta));
+    }
+    let latest = client
+        .log(service, None, None)
+        .await
+        .map_err(|error| error.message)?;
+    Ok(FetchedLog::Replace(latest))
 }
 
 /// Re-fetches the selected service's log tail at its current cursor, falling back to a

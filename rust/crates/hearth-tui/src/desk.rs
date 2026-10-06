@@ -2683,20 +2683,22 @@ fn visual_index_of_item(visuals: &[Painted], item: usize) -> Option<usize> {
         .position(|row| row.kind == Visual::Item && row.selectable == item)
 }
 
+/// The rows the log pane paints. `scroll` is lines up from the tail and is clamped to the buffer.
+/// Callers parse SGR only for this slice. The stored log is already capped at the tail fetch.
 fn log_window<'a>(log: &'a str, height: usize, scroll: &mut usize) -> Vec<&'a str> {
     if height == 0 {
         return Vec::new();
     }
-    let all: Vec<&str> = if log.is_empty() {
-        vec![" "]
-    } else {
-        log.split('\n').collect()
-    };
-    let max_scroll = all.len().saturating_sub(height);
+    if log.is_empty() {
+        *scroll = 0;
+        return vec![" "];
+    }
+    let total = log.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let max_scroll = total.saturating_sub(height);
     *scroll = (*scroll).min(max_scroll);
-    let end = all.len().saturating_sub(*scroll);
+    let end = total - *scroll;
     let start = end.saturating_sub(height);
-    all[start..end].to_vec()
+    log.split('\n').skip(start).take(end - start).collect()
 }
 
 const HELP: &[&str] = &[
@@ -3615,6 +3617,30 @@ mod tests {
             ),
             Some(Command::Quit)
         );
+    }
+
+    #[test]
+    fn log_window_returns_only_the_visible_rows() {
+        let log = (0..1_000)
+            .map(|index| format!("row-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut scroll = 0;
+        let tail = log_window(&log, 8, &mut scroll);
+        assert_eq!(tail.len(), 8);
+        assert_eq!(tail[0], "row-992");
+        assert_eq!(tail[7], "row-999");
+        assert_eq!(scroll, 0);
+        scroll = 10_000;
+        let head = log_window(&log, 8, &mut scroll);
+        assert_eq!(head.len(), 8);
+        assert_eq!(head[0], "row-0");
+        assert_eq!(head[7], "row-7");
+        assert_eq!(scroll, 992);
+        assert!(log_window(&log, 0, &mut scroll).is_empty());
+        let mut scroll = 4;
+        assert_eq!(log_window("", 3, &mut scroll), vec![" "]);
+        assert_eq!(scroll, 0);
     }
 
     #[test]

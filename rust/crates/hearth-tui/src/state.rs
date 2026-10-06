@@ -421,13 +421,16 @@ impl TuiState {
         }
     }
 
+    pub fn cached_log(&self, service: &str) -> String {
+        self.logs
+            .get(service)
+            .map(|stream| stream.data.clone())
+            .filter(|data| !data.is_empty())
+            .unwrap_or_else(|| "Loading…".to_string())
+    }
+
     fn sync_selected_log(&mut self) {
-        self.log = self
-            .logs
-            .get(&self.selection.selected_name)
-            .map(|s| s.data.clone())
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| "Loading…".to_string());
+        self.log = self.cached_log(&self.selection.selected_name);
     }
 }
 

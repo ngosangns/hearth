@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
@@ -28,7 +28,7 @@ use hearth_core::workspaces::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{refresh_selected_log, safe_message, ManagerTuiClient, WatchEvent};
+use crate::client::{fetch_log, safe_message, FetchedLog, ManagerTuiClient, WatchEvent};
 use crate::desk::{
     activation, classify_attachments, group_is_up, group_sections, group_targets,
     instance_shared_notice, join_names, key_command, link_overlay, metas_from_catalog,
@@ -36,6 +36,7 @@ use crate::desk::{
     unchecked_shared_notice, url_visible, Act, Command, Desk, Hit, ImpactFollow, InstanceLine,
     KnownRoot, Link, LinkSelection, Pane, Pending, RecipeLine, RowId, SharedTouch, WorkspaceLine,
 };
+use crate::schedule::{FetchCoalescer, FrameScheduler, LogAction, LogRefresh};
 use crate::state::{Service, TuiFence, TuiState};
 
 pub type SpawnHook = Arc<dyn Fn(&Path) + Send + Sync>;
@@ -92,6 +93,38 @@ enum Msg {
         snapshot: SharedSnapshot,
     },
     JobFinished,
+    LogReady {
+        gen: u64,
+        key: RowId,
+        body: LogBody,
+    },
+    SnapshotReady {
+        gen: u64,
+        services: Result<Vec<hearth_core::state::ServiceLifecycleState>, String>,
+    },
+    UrlsReady {
+        gen: u64,
+        urls: Result<Vec<ResolvedServiceUrl>, String>,
+    },
+    PidReady {
+        gen: u64,
+        pid: Option<i64>,
+    },
+    SharedLogReady {
+        gen: u64,
+        cursor: usize,
+        id: String,
+        text: Result<String, String>,
+    },
+}
+
+enum LogBody {
+    Daemon(Result<String, String>),
+    Service {
+        id: String,
+        fence: TuiFence,
+        fetched: Result<FetchedLog, String>,
+    },
 }
 
 /// A daemon start/restart still in flight, keyed by its `gen`: the workspace it serves and
@@ -164,6 +197,15 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
         link_drag: None,
         link_paint: None,
         painted_size: None,
+        input_at: None,
+        input_pending_present: false,
+        logs: LogRefresh::default(),
+        log_wait: None,
+        snap_fetch: FetchCoalescer::default(),
+        url_fetch: FetchCoalescer::default(),
+        pid_fetch: FetchCoalescer::default(),
+        shared_log_fetch: FetchCoalescer::default(),
+        frames: FrameScheduler::default(),
     };
     app.sync_workspaces();
     if let Some(id) = adopted {
@@ -206,6 +248,17 @@ struct App {
     /// Last OSC 8 rewrite. Equal links are left untouched so a native selection survives refresh.
     link_paint: Option<(Vec<Link>, Option<LinkSelection>)>,
     painted_size: Option<(u16, u16)>,
+    /// Set when a key or wheel is dequeued. Cleared by the next `draw`, which records latency.
+    input_at: Option<(Instant, &'static str)>,
+    /// Scroll and wheel paint once, after pending watch messages have been applied.
+    input_pending_present: bool,
+    logs: LogRefresh,
+    log_wait: Option<Instant>,
+    snap_fetch: FetchCoalescer,
+    url_fetch: FetchCoalescer,
+    pid_fetch: FetchCoalescer,
+    shared_log_fetch: FetchCoalescer,
+    frames: FrameScheduler,
 }
 
 struct LinkDrag {
@@ -219,16 +272,45 @@ impl App {
         let mut events = EventStream::new();
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + refresh, refresh);
         loop {
+            let queued = self.msg_queued();
+            let wake = self.next_wake();
             tokio::select! {
+                biased;
                 maybe = events.next() => {
+                    let started = Instant::now();
                     if let Some(Ok(event)) = maybe {
+                        self.input_pending_present = false;
                         self.on_terminal(event).await;
+                        if self.input_pending_present {
+                            while let Ok(message) = rx.try_recv() {
+                                self.on_msg(message).await;
+                            }
+                            self.input_pending_present = false;
+                            self.draw();
+                        } else {
+                            self.drop_armed_input();
+                        }
                     }
+                    crate::profile::branch("terminal", started.elapsed(), self.msg_queued());
                 }
-                _ = interval.tick() => self.refresh().await,
+                _ = tokio::time::sleep_until(wake.unwrap_or_else(tokio::time::Instant::now)), if wake.is_some() => {
+                    let started = Instant::now();
+                    self.on_wake();
+                    crate::profile::branch("wake", started.elapsed(), self.msg_queued());
+                }
+                _ = interval.tick() => {
+                    let started = Instant::now();
+                    self.refresh().await;
+                    crate::profile::branch("refresh", started.elapsed(), self.msg_queued());
+                }
                 message = rx.recv() => {
+                    let started = Instant::now();
                     let Some(message) = message else { break };
                     self.on_msg(message).await;
+                    while let Ok(more) = rx.try_recv() {
+                        self.on_msg(more).await;
+                    }
+                    crate::profile::branch("msg", started.elapsed(), queued.max(self.msg_queued()));
                 }
             }
             if self.disposed {
@@ -246,12 +328,12 @@ impl App {
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    self.on_wheel(mouse.column as usize, mouse.row as usize, -1)
-                        .await
+                    self.arm_input("wheel");
+                    self.on_wheel(mouse.column as usize, mouse.row as usize, -1);
                 }
                 MouseEventKind::ScrollDown => {
-                    self.on_wheel(mouse.column as usize, mouse.row as usize, 1)
-                        .await
+                    self.arm_input("wheel");
+                    self.on_wheel(mouse.column as usize, mouse.row as usize, 1);
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     self.on_mouse_down(mouse.column, mouse.row).await
@@ -269,6 +351,7 @@ impl App {
                     }
                     return;
                 };
+                self.arm_input("key");
                 self.on_command(command).await;
             }
             _ => {}
@@ -294,21 +377,26 @@ impl App {
                 self.draw();
             }
             Command::FocusNext => {
+                let before = self.desk.selected_service();
                 self.desk.focus_next();
-                self.refresh_log().await;
-                self.draw();
+                if self.desk.selected_service() != before {
+                    self.request_log(true);
+                }
+                self.input_pending_present = true;
             }
             Command::Move(delta) => {
                 let pane = self.desk.focus;
+                let before = self.desk.selected_service();
                 if self.desk.nudge(delta) && pane == Pane::Workspaces {
                     self.open_selected();
+                } else if self.desk.selected_service() != before {
+                    self.request_log(true);
                 }
-                self.refresh_log().await;
-                self.draw();
+                self.input_pending_present = true;
             }
             Command::ScrollLog(delta) => {
                 self.desk.scroll_log(delta);
-                self.draw();
+                self.input_pending_present = true;
             }
             Command::ToggleShared => {
                 self.desk.toggle_shared();
@@ -380,7 +468,7 @@ impl App {
             Act::StartDaemon(_) => self.start_daemon().await,
             Act::FocusServices => {
                 self.desk.focus = Pane::Services;
-                self.refresh_log().await;
+                self.request_log(true);
                 self.draw();
             }
             Act::StartService(id) => {
@@ -736,7 +824,7 @@ impl App {
         };
     }
 
-    async fn on_wheel(&mut self, column: usize, row: usize, delta: i64) {
+    fn on_wheel(&mut self, column: usize, row: usize, delta: i64) {
         let before = self
             .desk
             .selected_workspace()
@@ -750,9 +838,9 @@ impl App {
         if before != after {
             self.open_selected();
         } else if moved && service != self.desk.service_cursor {
-            self.refresh_log().await;
+            self.request_log(true);
         }
-        self.draw();
+        self.input_pending_present = true;
     }
 
     async fn on_click(&mut self, column: usize, row: usize) {
@@ -775,7 +863,7 @@ impl App {
                 self.desk.focus = Pane::Services;
                 self.desk.service_cursor = cursor;
                 if changed {
-                    self.refresh_log().await;
+                    self.request_log(true);
                 }
             }
             Hit::Shared(cursor) => {
@@ -783,11 +871,11 @@ impl App {
                 self.desk.focus = Pane::Shared;
                 self.desk.shared_cursor = cursor;
                 if changed {
-                    self.refresh_shared_log().await;
+                    self.request_shared_log();
                 }
             }
         }
-        self.draw();
+        self.input_pending_present = true;
     }
 
     async fn refresh(&mut self) {
@@ -808,36 +896,20 @@ impl App {
                 self.open_selected();
             }
         }
-        let client = self
-            .session
-            .as_ref()
-            .map(|session| Arc::clone(&session.client));
-        let root = self.session.as_ref().map(|session| session.root.clone());
-        if let Some(client) = client {
-            let gen = self.gen;
-            match client.daemon_pid().await {
-                Ok(pid) => self.desk.daemon_pid = Some(pid),
-                Err(_) => self.desk.daemon_pid = None,
-            }
+        if self.session.is_some() {
+            self.spawn_pid();
             if !self.acting {
-                if let Ok(services) = client.snapshot().await {
-                    self.apply_services(gen, &services).await;
-                }
-                if let Ok(urls) = client.urls().await {
-                    if let Some(session) = &mut self.session {
-                        session.urls = urls;
-                    }
-                    self.sync_urls();
-                }
+                self.spawn_snapshot();
+                self.spawn_urls();
             }
         }
-        if let Some(root) = root {
+        if let Some(root) = self.session.as_ref().map(|session| session.root.clone()) {
             self.maybe_reload_catalog(&root).await;
         }
         if self.desk.shared_open {
             self.load_shared();
         }
-        self.draw();
+        self.mark_frame();
     }
 
     async fn on_msg(&mut self, message: Msg) {
@@ -870,7 +942,7 @@ impl App {
                 if gen != self.gen {
                     return;
                 }
-                self.on_watch(event).await;
+                self.on_watch(event);
             }
             Msg::Note { gen, text } => {
                 if gen == self.gen || self.desk.shared_open {
@@ -886,6 +958,16 @@ impl App {
                 }
                 self.draw();
             }
+            Msg::LogReady { gen, key, body } => self.on_log_ready(gen, key, body),
+            Msg::SnapshotReady { gen, services } => self.on_snapshot_ready(gen, services),
+            Msg::UrlsReady { gen, urls } => self.on_urls_ready(gen, urls),
+            Msg::PidReady { gen, pid } => self.on_pid_ready(gen, pid),
+            Msg::SharedLogReady {
+                gen,
+                cursor,
+                id,
+                text,
+            } => self.on_shared_log_ready(gen, cursor, id, text),
         }
     }
 
@@ -1190,22 +1272,26 @@ impl App {
         }
     }
 
-    async fn on_watch(&mut self, event: WatchEvent) {
-        let Some(session) = &mut self.session else {
+    fn on_watch(&mut self, event: WatchEvent) {
+        if self.session.is_none() {
             return;
-        };
+        }
         match event {
             WatchEvent::BeginConnection => {
-                session.fence = session.state.begin_connection();
+                if let Some(session) = &mut self.session {
+                    session.fence = session.state.begin_connection();
+                }
             }
             WatchEvent::Snapshot(services) => {
                 let gen = self.gen;
-                self.apply_services(gen, &services).await;
-                self.draw();
+                if self.apply_services(gen, &services) {
+                    self.mark_frame();
+                }
             }
             // Replay only advances the event cursor. The service list comes from the snapshot.
             WatchEvent::Replay(_) => {}
             WatchEvent::ManagerEvent(event) => {
+                crate::profile::sse(&event.event_type, self.msg_queued());
                 let fence = self
                     .session
                     .as_ref()
@@ -1223,8 +1309,7 @@ impl App {
                             .apply_event(fence, &event.event_type, &event.data)
                     });
                     if connected && service_id.as_deref() == self.selected_service_id().as_deref() {
-                        self.refresh_log().await;
-                        self.draw();
+                        self.request_log(false);
                     }
                 } else if TuiState::event_requires_services_snapshot(&event.event_type) {
                     let connected = self.session.as_mut().is_some_and(|session| {
@@ -1232,26 +1317,8 @@ impl App {
                             .state
                             .apply_event(fence, &event.event_type, &event.data)
                     });
-                    if !connected {
-                        return;
-                    }
-                    let Some(client) = self.session.as_ref().map(|session| session.client.clone())
-                    else {
-                        return;
-                    };
-                    let gen = self.gen;
-                    match client.snapshot().await {
-                        Ok(services) => {
-                            self.apply_services(gen, &services).await;
-                            self.draw();
-                        }
-                        Err(error) => {
-                            self.desk.notice = format!(
-                                "Failed to refresh services: {}",
-                                safe_message(&error.message)
-                            );
-                            self.draw();
-                        }
+                    if connected {
+                        self.spawn_snapshot();
                     }
                 }
             }
@@ -1264,32 +1331,36 @@ impl App {
         }
     }
 
-    async fn apply_services(
+    fn apply_services(
         &mut self,
         gen: u64,
         services: &[hearth_core::state::ServiceLifecycleState],
-    ) {
+    ) -> bool {
         if gen != self.gen {
-            return;
+            return false;
         }
         let selected = self.selected_service_id();
-        let Some(session) = &mut self.session else {
-            return;
-        };
-        let fence = session.state.begin_request();
-        if let Some(id) = selected.clone() {
-            session.state.selection.selected_name = id;
+        {
+            let Some(session) = &mut self.session else {
+                return false;
+            };
+            let fence = session.state.begin_request();
+            if let Some(id) = selected.clone() {
+                session.state.selection.selected_name = id;
+            }
+            if !session.state.apply_snapshot(fence, services) {
+                return false;
+            }
+            if let Some(id) = selected {
+                session.state.selection.selected_name = id;
+            }
+            session.fence = fence;
         }
-        if !session.state.apply_snapshot(fence, services) {
-            return;
-        }
-        if let Some(id) = selected {
-            session.state.selection.selected_name = id;
-        }
-        session.fence = fence;
         self.rebuild_from_state();
         self.sync_urls();
-        self.refresh_log().await;
+        self.repaint_selected_log();
+        self.request_log(false);
+        true
     }
 
     fn rebuild_from_state(&mut self) {
@@ -1311,57 +1382,396 @@ impl App {
         }
     }
 
-    async fn refresh_log(&mut self) {
+    fn request_log(&mut self, immediate: bool) {
         self.sync_urls();
         match self.desk.selected_service() {
-            Some(RowId::Daemon) => {
-                self.desk.log_title = "daemon log".to_string();
-                let Some(session) = &self.session else {
-                    self.desk.log = "Daemon log appears after the daemon is running.".to_string();
-                    return;
-                };
-                match session.client.daemon_log().await {
-                    Ok(text) => {
-                        self.desk.log = if text.is_empty() {
-                            "No daemon log yet.".to_string()
-                        } else {
-                            text
-                        }
-                    }
-                    Err(error) => {
-                        self.desk.notice =
-                            format!("Log unavailable: {}", safe_message(&error.message))
-                    }
-                }
-            }
+            Some(RowId::Daemon) => self.request_daemon_log(immediate),
             Some(RowId::Group(name)) => {
-                let verb = if group_is_up(&self.desk.sections, &name) {
-                    "restarts"
-                } else {
-                    "starts"
-                };
-                self.desk.log_title = name;
-                self.desk.log = format!("enter {verb} this group · x stops it · r restarts it");
+                self.stage_group_log(&name);
+                self.logs.cancel();
+                self.log_wait = None;
             }
-            Some(RowId::Service(id)) => {
-                self.desk.log_title = id.clone();
-                let Some(session) = &mut self.session else {
-                    self.desk.log = "Daemon is not running.".to_string();
-                    return;
+            Some(RowId::Service(id)) => self.request_service_log(id, immediate),
+            _ => {
+                self.logs.cancel();
+                self.log_wait = None;
+            }
+        }
+    }
+
+    fn request_daemon_log(&mut self, immediate: bool) {
+        if immediate {
+            self.desk.log_title = "daemon log".to_string();
+            if self.session.is_none() {
+                self.desk.log = "Daemon log appears after the daemon is running.".to_string();
+                self.logs.cancel();
+                self.log_wait = None;
+                return;
+            }
+            self.desk.log = "Loading…".to_string();
+        } else if self.session.is_none() {
+            return;
+        }
+        let action = self.logs.request(Instant::now(), immediate);
+        self.note_log_action(action);
+    }
+
+    fn request_service_log(&mut self, id: String, immediate: bool) {
+        if immediate {
+            self.desk.log_title = id.clone();
+            if self.session.is_none() {
+                self.desk.log = "Daemon is not running.".to_string();
+                self.logs.cancel();
+                self.log_wait = None;
+                return;
+            }
+            if let Some(session) = &mut self.session {
+                session.state.selection.selected_name = id.clone();
+                let detail = session.state.detail();
+                let cached = session.state.cached_log(&id);
+                self.desk.log = format!("{detail}\n{cached}");
+            }
+        } else if self.session.is_none() {
+            return;
+        }
+        let action = self.logs.request(Instant::now(), immediate);
+        self.note_log_action(action);
+    }
+
+    fn stage_group_log(&mut self, name: &str) {
+        let verb = if group_is_up(&self.desk.sections, name) {
+            "restarts"
+        } else {
+            "starts"
+        };
+        self.desk.log_title = name.to_string();
+        self.desk.log = format!("enter {verb} this group · x stops it · r restarts it");
+    }
+
+    /// Keeps the state line current from the snapshot without waiting on a log fetch.
+    fn repaint_selected_log(&mut self) {
+        let Some(RowId::Service(id)) = self.desk.selected_service() else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let detail = session.state.detail();
+        let cached = session.state.cached_log(&id);
+        self.desk.log_title = id;
+        self.desk.log = format!("{detail}\n{cached}");
+    }
+
+    fn note_log_action(&mut self, action: LogAction) {
+        match action {
+            LogAction::Start => {
+                self.log_wait = None;
+                self.spawn_log();
+            }
+            LogAction::Wait(when) => self.log_wait = Some(when),
+            LogAction::Idle => {
+                if self.log_wait.is_some_and(|when| when <= Instant::now()) {
+                    self.log_wait = None;
+                }
+            }
+        }
+    }
+
+    fn spawn_log(&mut self) {
+        match self.desk.selected_service() {
+            Some(RowId::Daemon) if self.session.is_some() => self.spawn_daemon_log(),
+            Some(RowId::Service(id)) if self.session.is_some() => self.spawn_service_log(id),
+            _ => self.release_log_fetch(),
+        }
+    }
+
+    /// `Start` already took the in-flight slot. Release it when this row has nothing to fetch.
+    fn release_log_fetch(&mut self) {
+        self.logs.cancel();
+        let action = self.logs.finish(Instant::now());
+        if matches!(action, LogAction::Start) {
+            self.logs.cancel();
+            let action = self.logs.finish(Instant::now());
+            if matches!(action, LogAction::Start) {
+                self.log_wait = None;
+                return;
+            }
+            self.note_log_action(action);
+            return;
+        }
+        self.note_log_action(action);
+    }
+
+    fn spawn_daemon_log(&mut self) {
+        let Some(client) = self
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.client))
+        else {
+            self.release_log_fetch();
+            return;
+        };
+        let gen = self.gen;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let body = LogBody::Daemon(client.daemon_log().await.map_err(|error| error.message));
+            let _ = tx
+                .send(Msg::LogReady {
+                    gen,
+                    key: RowId::Daemon,
+                    body,
+                })
+                .await;
+        });
+    }
+
+    fn spawn_service_log(&mut self, id: String) {
+        let Some(session) = &mut self.session else {
+            self.release_log_fetch();
+            return;
+        };
+        let fence = session.state.begin_request();
+        let cursor = session.state.log_cursor(&id);
+        let client = Arc::clone(&session.client);
+        let gen = self.gen;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let fetched = fetch_log(&client, &id, cursor).await;
+            let _ = tx
+                .send(Msg::LogReady {
+                    gen,
+                    key: RowId::Service(id.clone()),
+                    body: LogBody::Service { id, fence, fetched },
+                })
+                .await;
+        });
+    }
+
+    fn on_log_ready(&mut self, gen: u64, key: RowId, body: LogBody) {
+        if gen == self.gen && self.desk.selected_service().as_ref() == Some(&key) {
+            self.paint_fetched_log(body);
+        }
+        let action = self.logs.finish(Instant::now());
+        self.note_log_action(action);
+    }
+
+    fn paint_fetched_log(&mut self, body: LogBody) {
+        match body {
+            LogBody::Daemon(Ok(text)) => {
+                self.desk.log_title = "daemon log".to_string();
+                self.desk.log = if text.is_empty() {
+                    "No daemon log yet.".to_string()
+                } else {
+                    text
                 };
-                session.state.selection.selected_name = id;
-                let fence = session.state.begin_request();
-                match refresh_selected_log(&session.client, &mut session.state, fence).await {
-                    Ok(_) => {
-                        let detail = session.state.detail();
-                        self.desk.log = format!("{detail}\n{}", session.state.log);
+                self.mark_frame();
+            }
+            LogBody::Daemon(Err(error)) => {
+                self.desk.notice = format!("Log unavailable: {}", safe_message(&error));
+                self.mark_frame();
+            }
+            LogBody::Service { id, fence, fetched } => {
+                let outcome = {
+                    let Some(session) = &mut self.session else {
+                        return;
+                    };
+                    if session.state.selection.selected_name != id {
+                        return;
                     }
+                    match fetched {
+                        Ok(FetchedLog::Append(slice)) => {
+                            Ok(session.state.apply_log(fence, &id, &slice))
+                        }
+                        Ok(FetchedLog::Replace(slice)) => {
+                            Ok(session.state.replace_log(fence, &id, &slice))
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                match outcome {
+                    Ok(true) => self.show_service_log(&id),
+                    Ok(false) => {}
                     Err(error) => {
-                        self.desk.notice = format!("Log unavailable: {}", safe_message(&error))
+                        self.desk.notice = format!("Log unavailable: {}", safe_message(&error));
+                        self.mark_frame();
                     }
                 }
             }
-            _ => {}
+        }
+    }
+
+    fn show_service_log(&mut self, id: &str) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let detail = session.state.detail();
+        let body = session.state.log.clone();
+        self.desk.log_title = id.to_string();
+        self.desk.log = format!("{detail}\n{body}");
+        self.mark_frame();
+    }
+
+    fn spawn_snapshot(&mut self) {
+        let Some(client) = self
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.client))
+        else {
+            return;
+        };
+        if !self.snap_fetch.try_begin() {
+            return;
+        }
+        let gen = self.gen;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let services = client.snapshot().await.map_err(|error| error.message);
+            let _ = tx.send(Msg::SnapshotReady { gen, services }).await;
+        });
+    }
+
+    fn on_snapshot_ready(
+        &mut self,
+        gen: u64,
+        services: Result<Vec<hearth_core::state::ServiceLifecycleState>, String>,
+    ) {
+        let again = self.snap_fetch.end();
+        if gen == self.gen {
+            match services {
+                Ok(services) => {
+                    if self.apply_services(gen, &services) {
+                        self.mark_frame();
+                    }
+                }
+                Err(error) => {
+                    self.desk.notice =
+                        format!("Failed to refresh services: {}", safe_message(&error));
+                    self.mark_frame();
+                }
+            }
+        }
+        if again {
+            self.spawn_snapshot();
+        }
+    }
+
+    fn spawn_urls(&mut self) {
+        if self.acting {
+            return;
+        }
+        let Some(client) = self
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.client))
+        else {
+            return;
+        };
+        if !self.url_fetch.try_begin() {
+            return;
+        }
+        let gen = self.gen;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let urls = client.urls().await.map_err(|error| error.message);
+            let _ = tx.send(Msg::UrlsReady { gen, urls }).await;
+        });
+    }
+
+    fn on_urls_ready(&mut self, gen: u64, urls: Result<Vec<ResolvedServiceUrl>, String>) {
+        let again = self.url_fetch.end();
+        if gen == self.gen {
+            if let Ok(urls) = urls {
+                if let Some(session) = &mut self.session {
+                    session.urls = urls;
+                }
+                self.sync_urls();
+                self.mark_frame();
+            }
+        }
+        if again {
+            self.spawn_urls();
+        }
+    }
+
+    fn spawn_pid(&mut self) {
+        let Some(client) = self
+            .session
+            .as_ref()
+            .map(|session| Arc::clone(&session.client))
+        else {
+            return;
+        };
+        if !self.pid_fetch.try_begin() {
+            return;
+        }
+        let gen = self.gen;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let pid = client.daemon_pid().await.ok();
+            let _ = tx.send(Msg::PidReady { gen, pid }).await;
+        });
+    }
+
+    fn on_pid_ready(&mut self, gen: u64, pid: Option<i64>) {
+        let again = self.pid_fetch.end();
+        if gen == self.gen && self.session.is_some() {
+            self.desk.daemon_pid = pid;
+            self.mark_frame();
+        }
+        if again {
+            self.spawn_pid();
+        }
+    }
+
+    fn request_shared_log(&mut self) {
+        let Some(RowId::Instance(id)) = self.desk.selected_shared() else {
+            self.desk.log_title = "shared".to_string();
+            return;
+        };
+        self.desk.log_title = id.clone();
+        self.desk.log = "Loading…".to_string();
+        if !self.shared_log_fetch.try_begin() {
+            return;
+        }
+        let gen = self.gen;
+        let cursor = self.desk.shared_cursor;
+        let spawn = self.spawn_smp.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let text = fetch_shared_log(&spawn, &id).await;
+            let _ = tx
+                .send(Msg::SharedLogReady {
+                    gen,
+                    cursor,
+                    id,
+                    text,
+                })
+                .await;
+        });
+    }
+
+    fn on_shared_log_ready(
+        &mut self,
+        gen: u64,
+        cursor: usize,
+        id: String,
+        text: Result<String, String>,
+    ) {
+        let again = self.shared_log_fetch.end();
+        let selected = self.desk.selected_shared();
+        let same = gen == self.gen
+            && self.desk.shared_cursor == cursor
+            && matches!(selected, Some(RowId::Instance(current)) if current == id);
+        if same {
+            self.desk.log_title = id;
+            self.desk.log = match text {
+                Ok(text) => text,
+                Err(error) => error,
+            };
+            self.mark_frame();
+        }
+        if again {
+            self.request_shared_log();
         }
     }
 
@@ -1936,38 +2346,6 @@ impl App {
         });
     }
 
-    async fn refresh_shared_log(&mut self) {
-        let Some(RowId::Instance(id)) = self.desk.selected_shared() else {
-            self.desk.log_title = "shared".to_string();
-            return;
-        };
-        self.desk.log_title = id.clone();
-        let spawn = self.spawn_smp.clone();
-        match shared_client(&spawn).await {
-            Ok(client) => {
-                let path = format!(
-                    "/v1/logs/{}?limit=16384",
-                    hearth_cli::encode_path_segment(&id)
-                );
-                match request(&client, &path, reqwest::Method::GET, None, None).await {
-                    Ok(body) => {
-                        let data = body
-                            .get("data")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("");
-                        self.desk.log = if data.is_empty() {
-                            "No log yet.".to_string()
-                        } else {
-                            data.to_string()
-                        };
-                    }
-                    Err(error) => self.desk.log = safe_message(&error),
-                }
-            }
-            Err(error) => self.desk.log = error,
-        }
-    }
-
     fn sync_workspaces(&mut self) -> bool {
         let selected = self
             .desk
@@ -2032,6 +2410,8 @@ impl App {
         self.desk.attached = false;
         self.desk.daemon_pid = None;
         self.config_revision = None;
+        self.logs.cancel();
+        self.log_wait = None;
     }
 
     fn begin_job(&mut self) {
@@ -2077,7 +2457,46 @@ impl App {
         self.drop_session();
     }
 
+    fn msg_queued(&self) -> usize {
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
+    }
+
+    fn arm_input(&mut self, kind: &'static str) {
+        self.input_at = Some((Instant::now(), kind));
+    }
+
+    fn drop_armed_input(&mut self) {
+        if let Some((_, kind)) = self.input_at.take() {
+            crate::profile::input_dropped(kind);
+        }
+    }
+
+    fn next_wake(&self) -> Option<tokio::time::Instant> {
+        let when = match (self.frames.due(), self.log_wait) {
+            (Some(frame), Some(log)) => Some(frame.min(log)),
+            (Some(frame), None) => Some(frame),
+            (None, Some(log)) => Some(log),
+            (None, None) => None,
+        }?;
+        Some(wake_at(when))
+    }
+
+    fn on_wake(&mut self) {
+        let now = Instant::now();
+        let action = self.logs.poll(now);
+        self.note_log_action(action);
+        if self.frames.poll(now) {
+            self.draw();
+        }
+    }
+
+    fn mark_frame(&mut self) {
+        let _ = self.frames.mark(Instant::now());
+    }
+
     fn draw(&mut self) {
+        self.frames.input(Instant::now());
+        let started = Instant::now();
         if let Ok(size) = self.terminal.size() {
             let next = (size.width, size.height);
             if self.painted_size != Some(next) {
@@ -2088,18 +2507,22 @@ impl App {
         // `CompletedFrame` is the buffer that was just flushed. The current buffer was already
         // swapped and cleared, so link colours have to be read from the completed frame.
         let Ok(completed) = self.terminal.draw(|frame| self.desk.draw(frame)) else {
+            self.finish_draw(started);
             return;
         };
         if self.desk.help || self.desk.composer.is_some() || self.desk.pending.is_some() {
             self.link_paint = None;
+            self.finish_draw(started);
             return;
         }
         let signature = (self.desk.links.clone(), self.desk.link_selection.clone());
         if self.link_paint.as_ref() == Some(&signature) {
+            self.finish_draw(started);
             return;
         }
         self.link_paint = Some(signature);
         if self.desk.links.is_empty() {
+            self.finish_draw(started);
             return;
         }
         let selection = self.desk.link_selection.clone();
@@ -2122,6 +2545,23 @@ impl App {
             let _ = write!(stdout, "{text}");
         }
         let _ = stdout.flush();
+        self.finish_draw(started);
+    }
+
+    fn finish_draw(&mut self, started: Instant) {
+        crate::profile::draw(started.elapsed());
+        if let Some((at, kind)) = self.input_at.take() {
+            crate::profile::input_latency(kind, at.elapsed());
+        }
+    }
+}
+
+fn wake_at(when: Instant) -> tokio::time::Instant {
+    let now = Instant::now();
+    let tokio_now = tokio::time::Instant::now();
+    match when.checked_duration_since(now) {
+        Some(delay) => tokio_now + delay,
+        None => tokio_now,
     }
 }
 
@@ -2396,6 +2836,26 @@ fn local_instances() -> Vec<InstanceLine> {
             install_error: instance.install_error.clone(),
         })
         .collect()
+}
+
+async fn fetch_shared_log(spawn: &SpawnHook, id: &str) -> Result<String, String> {
+    let client = shared_client(spawn).await?;
+    let path = format!(
+        "/v1/logs/{}?limit=16384",
+        hearth_cli::encode_path_segment(id)
+    );
+    let body = request(&client, &path, reqwest::Method::GET, None, None)
+        .await
+        .map_err(|error| safe_message(&error))?;
+    let data = body
+        .get("data")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if data.is_empty() {
+        Ok("No log yet.".to_string())
+    } else {
+        Ok(data.to_string())
+    }
 }
 
 async fn shared_client(spawn: &SpawnHook) -> Result<Client, String> {
