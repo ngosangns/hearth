@@ -2301,6 +2301,65 @@ mod tests {
         );
     }
 
+    /// `sh -c 'setup; exec sleep N'` with no declared `exec`, and a setup that outlasts the
+    /// spawn's identity settle window: the recorded line is the shell's, after the exec it is
+    /// `sleep`, so the row reads `orphaned`. The pid and its start time are unchanged, which is
+    /// this service, so stop must kill it and the child the setup left in its group.
+    #[tokio::test]
+    async fn stop_kills_an_orphaned_service_that_execd_into_its_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let leader_file = dir.path().join("leader.pid");
+        let child_file = dir.path().join("child.pid");
+        let service = shell_service(
+            "execd",
+            dir.path(),
+            format!(
+                "echo $$ > '{}'; sleep 300 & echo $! > '{}'; sleep 3; exec sleep 302",
+                leader_file.display(),
+                child_file.display()
+            ),
+        );
+        let (host, supervisor) = real_supervisor("execd-test", service, dir.path());
+        supervisor.start(&"execd".to_string(), None).await.unwrap();
+        let leader = read_pid_file(&leader_file).await;
+        let child = read_pid_file(&child_file).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let state = loop {
+            let _ = supervisor.status(&"execd".to_string()).await;
+            let state = host
+                .service_states()
+                .into_iter()
+                .next()
+                .unwrap()
+                .actual_state;
+            if state == ActualServiceState::Orphaned || std::time::Instant::now() >= deadline {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let stopped = supervisor.stop(&"execd".to_string(), None).await;
+        let leader_gone = wait_gone(leader, Duration::from_secs(3)).await;
+        let child_gone = wait_gone(child, Duration::from_secs(3)).await;
+        kill_pid(leader);
+        kill_pid(child);
+        assert_eq!(
+            state,
+            ActualServiceState::Orphaned,
+            "the exec reads as orphaned"
+        );
+        assert!(stopped.is_ok(), "{stopped:?}");
+        assert!(leader_gone, "the exec'd server must be stopped");
+        assert!(child_gone, "the setup's child must be stopped with it");
+        assert_eq!(
+            host.service_states()
+                .into_iter()
+                .next()
+                .unwrap()
+                .actual_state,
+            ActualServiceState::Stopped
+        );
+    }
+
     /// `sleep & exit 3`: the leader dies, the row fails, and the child it left in its group used
     /// to run on with nothing tracking it.
     #[tokio::test]

@@ -214,6 +214,14 @@ impl FakeProcessAdapter {
             record.command_fingerprint = new_fingerprint.to_string();
         }
     }
+    /// The pid was recycled: a different process (another start time, another program) now
+    /// sits at it.
+    fn reuse_pid(&self, pid: i64, start_identity: &str, fingerprint: &str) {
+        if let Some(record) = self.state.lock().unwrap().alive.get_mut(&pid) {
+            record.start_identity = start_identity.to_string();
+            record.command_fingerprint = fingerprint.to_string();
+        }
+    }
     /// `ps` after a server rewrites its title: the fingerprint changes with the new line, and
     /// the executable path stays in argv0.
     fn rewrite_command_line(&self, pid: i64, command_line: &str) {
@@ -1351,24 +1359,27 @@ async fn stop_on_an_external_service_without_a_stop_command_fails_loudly() {
     );
 }
 
-/// A stop must never report success for a process it cannot touch: an identity that no longer
-/// matches (a reused pid, or a program that replaced it) is alive, but killing it would be
-/// killing someone else's process.
+/// A stop must never report success for a process it cannot touch: the pid is alive but its start
+/// time differs, so it was reused, and killing it would be killing someone else's process.
 #[tokio::test]
-async fn stop_on_an_orphaned_service_refuses_instead_of_reporting_success() {
+async fn stop_refuses_an_orphaned_pid_whose_start_time_changed() {
     let h = build_harness(one_service_catalog(argv_verified(
         "api",
         ReadinessSpec::Tcp { port: 8080 },
     )));
     h.probes.set_tcp_ready(8080, true);
     h.supervisor.start(&"api".to_string(), None).await.unwrap();
-    let pid = match h.host.state_of("api").unwrap().identity.unwrap() {
-        ProcessIdentity::Posix(posix) => posix.pid,
-        _ => panic!("expected a posix identity"),
-    };
-    // The pid is still alive, but `ps` now reports a different program at it.
-    h.process
-        .mutate_fingerprint(pid, "not-the-same-program-anymore");
+    let pid = api_pid(&h);
+    h.process.reuse_pid(
+        pid,
+        "Other Jan  2 00:00:00 2024",
+        "not-the-same-program-anymore",
+    );
+    h.supervisor.status(&"api".to_string()).await.unwrap();
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Orphaned
+    );
 
     let error = h
         .supervisor
@@ -1380,12 +1391,179 @@ async fn stop_on_an_orphaned_service_refuses_instead_of_reporting_success() {
     assert!(error.0.contains(&format!("pid {pid}")), "{error:?}");
     assert!(
         h.process.signals().is_empty(),
-        "a process this manager does not own must never be signalled"
+        "a reused pid must never be signalled"
     );
+    assert!(h.process.is_alive(pid));
     assert_eq!(
         h.host.state_of("api").unwrap().actual_state,
         ActualServiceState::Orphaned
     );
+}
+
+/// Same start time, same command line changed: restart's stop phase refuses it too, and starts
+/// nothing over it.
+#[tokio::test]
+async fn restart_refuses_an_orphaned_pid_whose_start_time_changed() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let pid = api_pid(&h);
+    h.process
+        .reuse_pid(pid, "Other Jan  2 00:00:00 2024", "someone-else");
+
+    let error = h
+        .supervisor
+        .restart(&"api".to_string(), None)
+        .await
+        .unwrap_err();
+
+    assert!(error.0.contains("cannot be stopped"), "{error:?}");
+    assert!(h.process.signals().is_empty());
+    assert!(h.process.is_alive(pid));
+    assert_eq!(api_pid(&h), pid, "nothing new was spawned");
+}
+
+/// `sh -c 'setup; exec server'`: the pid, group and start time stay, the command line becomes the
+/// server's, and the row turns `orphaned`. That process is still this service, so stop kills it
+/// and every group in its tree.
+#[tokio::test]
+async fn stop_kills_an_orphaned_service_whose_pid_and_start_time_still_match() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let pid = api_pid(&h);
+    let worker = h.process.fork_into_own_group(pid);
+    h.process
+        .rewrite_command_line(pid, "/usr/bin/server --port 8080");
+    h.supervisor.status(&"api".to_string()).await.unwrap();
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Orphaned
+    );
+
+    h.supervisor.stop(&"api".to_string(), None).await.unwrap();
+
+    assert!(
+        !h.process.is_alive(pid),
+        "the exec'd leader must be stopped"
+    );
+    assert!(
+        !h.process.is_alive(worker),
+        "a child in its own group must be stopped with it"
+    );
+    assert!(h.process.signals().contains(&(pid, ProcessSignal::Sigterm)));
+    let state = h.host.state_of("api").unwrap();
+    assert_eq!(state.actual_state, ActualServiceState::Stopped);
+    assert_eq!(state.desired_state, DesiredServiceState::Stopped);
+    assert!(state.error.is_none(), "{state:?}");
+}
+
+/// A verified orphan that ignores SIGTERM gets the same SIGKILL as an owned one.
+#[tokio::test]
+async fn stop_escalates_to_sigkill_on_a_verified_orphan() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let pid = api_pid(&h);
+    h.process.mutate_fingerprint(pid, "exec-target");
+    h.process.mark_term_immune(pid);
+    h.supervisor.status(&"api".to_string()).await.unwrap();
+
+    h.supervisor.stop(&"api".to_string(), None).await.unwrap();
+
+    let signals = h.process.signals();
+    assert!(
+        signals.contains(&(pid, ProcessSignal::Sigterm)),
+        "{signals:?}"
+    );
+    assert!(
+        signals.contains(&(pid, ProcessSignal::Sigkill)),
+        "{signals:?}"
+    );
+    assert!(!h.process.is_alive(pid));
+}
+
+/// Restart's stop phase replaces a verified orphan instead of failing on it.
+#[tokio::test]
+async fn restart_replaces_a_verified_orphan() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let old = api_pid(&h);
+    h.process.mutate_fingerprint(old, "exec-target");
+    h.supervisor.status(&"api".to_string()).await.unwrap();
+
+    h.supervisor
+        .restart(&"api".to_string(), None)
+        .await
+        .unwrap();
+
+    assert!(!h.process.is_alive(old));
+    let new = api_pid(&h);
+    assert_ne!(new, old);
+    assert!(h.process.is_alive(new));
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Ready
+    );
+}
+
+/// `stop-services` shutdown stops a verified orphan too; it used to skip the row as inactive and
+/// leave the exec'd server running past the daemon.
+#[tokio::test]
+async fn shutdown_stops_a_verified_orphan() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let pid = api_pid(&h);
+    h.process.mutate_fingerprint(pid, "exec-target");
+    h.supervisor.status(&"api".to_string()).await.unwrap();
+
+    h.supervisor.shutdown().await;
+
+    assert!(!h.process.is_alive(pid));
+}
+
+/// ...and still leaves a reused pid alone.
+#[tokio::test]
+async fn shutdown_leaves_a_reused_orphan_pid_alone() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Tcp { port: 8080 },
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    let pid = api_pid(&h);
+    h.process
+        .reuse_pid(pid, "Other Jan  2 00:00:00 2024", "someone-else");
+    h.supervisor.status(&"api".to_string()).await.unwrap();
+
+    h.supervisor.shutdown().await;
+
+    assert!(h.process.is_alive(pid));
+    assert!(h.process.signals().is_empty());
+}
+
+fn api_pid(h: &Harness) -> i64 {
+    match h.host.state_of("api").unwrap().identity.unwrap() {
+        ProcessIdentity::Posix(posix) => posix.pid,
+        _ => panic!("expected a posix identity"),
+    }
 }
 
 #[tokio::test]

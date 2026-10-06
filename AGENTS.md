@@ -136,8 +136,15 @@ from any dev box here, with the same username.
   declares none. `externally-owned` used to early-return success, and the identity-less fallthrough
   used to `orphan()` (recording "Process ownership identity no longer matches" for a service that
   never had one): both left the container or process running while every UI showed Stop as done.
-  The same rule applies to an identity that no longer matches — the process is alive but is not ours
-  to kill, so the operation fails rather than silently succeeding. A finished `readiness: exit`
+  An `orphaned` POSIX row (the command line or manager instance no longer matches) is still stopped
+  when its pid **and** start time (`ps` lstart) match the recorded identity: that is the same process,
+  typically a shell that `exec`ed into its server after the spawn settled. It gets the owned stop's
+  escalation (`terminate_posix_tree`: leader group plus sampled descendant groups, TERM, grace,
+  KILL), and restart's stop phase and the `stop-services` shutdown pass take the same path. A
+  different start time is a reused pid, and a Docker identity or one recorded for another
+  service/generation is not ours either: those still refuse with "no longer owned by this manager",
+  rather than silently succeeding. Status and reconcile still *mark* such a row `orphaned` (the
+  ownership check is unchanged); only stop verifies around it. A finished `readiness: exit`
   row is the exception: stop succeeds immediately and leaves `succeeded` or `failed` in place,
   because there is no process left. Do not send that row through `stop_unowned`.
 - Restart is not that stop. A row with no process identity and no catalog `stop` command used to
@@ -306,7 +313,8 @@ from any dev box here, with the same username.
   `additionalPorts` reserves that many extra ports in one contiguous block (`{port2}`, …); every
   port in the block is taken. `prepare` is the idempotent init hook (runs before every start via
   `preparation_command`). `run` must stay the process `ps` keeps showing. A wrapper that does work
-  and then `exec`s is adopted as the wrapper and orphaned once the real server replaces it. A
+  and then `exec`s is adopted as the wrapper and orphaned once the real server replaces it (stop
+  still kills it, since pid and start time still match; start does not re-adopt it). A
   server that rewrites its own title (nginx's `nginx: master process …`) has to be started with
   `shell` + `exec: true` so the stored identity is that settled line, not the pre-title argv.
   A dedicated argv binary that keeps the same absolute executable (Redis `setproctitle`) stays

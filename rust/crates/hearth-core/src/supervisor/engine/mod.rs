@@ -374,7 +374,13 @@ impl ProcessSupervisor {
             .host
             .service_states()
             .into_iter()
-            .filter(|s| daemon_owned.contains(&s.service_id) && is_active_state(s.actual_state))
+            .filter(|s| {
+                daemon_owned.contains(&s.service_id)
+                    && (is_active_state(s.actual_state)
+                        // Stop kills an orphaned row only when its pid and start time still
+                        // match (an `exec`ing shell), and refuses a reused pid.
+                        || (s.actual_state == ActualServiceState::Orphaned && s.identity.is_some()))
+            })
             .map(|s| s.service_id)
             .collect();
         for id in to_stop {
@@ -1709,7 +1715,29 @@ impl ProcessSupervisor {
                 Inspection::Unknown => {
                     return Err(SupervisorError(format!("{service_id} cannot be stopped: the process's liveness could not be verified")));
                 }
-                Inspection::Observed(ObservedProcess { alive: true, .. }) => {}
+                Inspection::Observed(ObservedProcess { alive: true, .. }) => {
+                    // An `orphaned` row whose pid still runs the process it recorded — same pid,
+                    // same start time — is still this service, whatever its command line now
+                    // says: `sh -c 'setup; exec server'` keeps pid, group and lstart and only
+                    // changes argv. Stop it like an owned one (tree, TERM then KILL). A different
+                    // start time is a reused pid and falls through to the refusal below.
+                    if let (true, Some(ProcessIdentity::Posix(posix)), Some(pgid)) = (
+                        self.identity_matches_state(&state),
+                        state.identity.as_ref(),
+                        verified_posix_pgid(state.identity.as_ref().unwrap(), &inspection),
+                    ) {
+                        return self
+                            .stop_verified_posix(
+                                service_id,
+                                &state,
+                                posix,
+                                pgid,
+                                has_active,
+                                operation_id,
+                            )
+                            .await;
+                    }
+                }
                 Inspection::Gone | Inspection::Observed(_) => {
                     // The leader is already gone, so `terminate` will not walk its tree. Children
                     // that forked into their own group are still in the last snapshot taken while
@@ -1748,9 +1776,10 @@ impl ProcessSupervisor {
                     return Ok(());
                 }
             }
-            // The process at this identity is alive but is no longer this manager's — a reused pid,
-            // or a program that replaced it. Killing it would be killing someone else's process, so
-            // the refusal is the answer: recording the mismatch and reporting success is the same
+            // The process at this pid is alive but is not the one this identity recorded — its
+            // start time differs (a reused pid), or the row's identity belongs to another
+            // service/generation. Killing it would be killing someone else's process, so the
+            // refusal is the answer: recording the mismatch and reporting success is the same
             // silent no-op the identity-less path above was fixed for.
             self.orphan(&state, operation_id).await;
             let described = match state.identity.as_ref().unwrap() {
@@ -1778,6 +1807,59 @@ impl ProcessSupervisor {
         }
         let profile = profile_for(&self.host.catalog(), service_id)?;
         self.terminate(state.identity.as_ref().unwrap(), &profile.command)
+            .await?;
+        if has_active {
+            self.active.lock().unwrap().remove(service_id);
+        }
+        self.transition(
+            service_id,
+            state.generation,
+            ActualServiceState::Stopped,
+            ServiceReadiness::Unknown,
+            Changes {
+                desired_state: Some(DesiredServiceState::Stopped),
+                exited_at: Patch::Set(self.options.clock.now()),
+                error: Patch::Clear,
+                exit_code: Patch::Clear,
+                ..Default::default()
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Stops a POSIX service whose identity no longer passes the ownership check (command line or
+    /// manager instance changed) but whose pid and start time were just verified. Same escalation
+    /// as an owned stop: the leader's group, every sampled descendant group, TERM, grace, KILL.
+    async fn stop_verified_posix(
+        self: &Arc<Self>,
+        service_id: &ServiceId,
+        state: &ServiceLifecycleState,
+        posix: &crate::state::PosixProcessIdentity,
+        pgid: i64,
+        has_active: bool,
+        operation_id: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        self.transition(
+            service_id,
+            state.generation,
+            ActualServiceState::Stopping,
+            state.readiness,
+            Changes {
+                desired_state: Some(DesiredServiceState::Stopped),
+                current_operation_id: operation_id.map(Patch::Set).unwrap_or(Patch::Keep),
+                ..Default::default()
+            },
+        )
+        .await;
+        if has_active {
+            if let Some(active) = self.active.lock().unwrap().get_mut(service_id) {
+                active.stopped = true;
+            }
+        }
+        self.detach_output(service_id);
+        let known = self.known_descendants(service_id, posix.pid);
+        self.terminate_posix_tree(posix.pid, &posix.start_identity, pgid, &known)
             .await?;
         if has_active {
             self.active.lock().unwrap().remove(service_id);
@@ -3926,6 +4008,29 @@ fn install_dir_marker(command: &ServiceCommand) -> Option<String> {
     };
     let marker = marker.trim_start_matches("./").to_string();
     marker.contains("build/install/").then_some(marker)
+}
+
+/// The live group of the process a POSIX identity recorded, when `inspection` shows that same
+/// process: same pid and same start time (`ps` lstart). The command line and manager instance are
+/// deliberately not compared — that is the ownership check this verifies around. A reused pid has
+/// a different start time and yields `None`.
+fn verified_posix_pgid(identity: &ProcessIdentity, inspection: &Inspection) -> Option<i64> {
+    let ProcessIdentity::Posix(id) = identity else {
+        return None;
+    };
+    match inspection {
+        Inspection::Observed(ObservedProcess {
+            alive: true,
+            record: ProcessRecord::Posix(record),
+        }) if id.pid > 0
+            && !id.start_identity.is_empty()
+            && record.pid == id.pid
+            && record.start_identity == id.start_identity =>
+        {
+            Some(record.pgid)
+        }
+        _ => None,
+    }
 }
 
 fn with_manager_instance(identity: ProcessIdentity, instance_id: String) -> ProcessIdentity {
