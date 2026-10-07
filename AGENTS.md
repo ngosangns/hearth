@@ -59,6 +59,14 @@ smp separately. The command refuses any current executable that is not that syml
 file or a file already in the versioned directory, refuses anything but darwin-arm64, and does
 not replace an equal version unless `--force`. It does not downgrade.
 
+`task install` rebuilds only the leaf `hearth` bin when workspace code changes, and that
+crate's release codegen was the install bottleneck: the bin instantiates a cross-crate-
+inlinable copy of every reachable callee (~2,700 functions, ~74 MB of LLVM IR; `main`
+alone ~110k lines), so at O3 LLVM's inliner ran ~5 min in a single codegen unit — more
+`codegen-units` does not help. `rust/Cargo.toml` pins `[profile.release.package.hearth]
+opt-level = 2` (bin-only ~47 s; O1 was slower than O2). Deps keep O3. Do not "fix" it
+back to O3 without re-measuring.
+
 **Release.** CI (`.github/workflows/ci.yml`) runs the Rust test + clippy job on PRs and tags
 (`timeout-minutes: 90`; tool `cargo`), and is also `workflow_call`-able with an optional `ref`
 input so other workflows can gate on it. Pushing a `v*.*.*` tag runs CI, and a successful tag CI
