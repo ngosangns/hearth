@@ -70,6 +70,11 @@ struct FakeProcessAdapterState {
     /// When set, `command_matches` requires this cwd. An unset pid keeps older tests matching
     /// any directory.
     cwd_by_pid: HashMap<i64, String>,
+    /// The `on_output` sink each spawned service got — `emit_output` replays process stdout
+    /// through it, which is how `readiness: log` tests reach the engine's matcher.
+    output_sinks: HashMap<ServiceId, OnOutput>,
+    /// Every service id `spawn` was called for, in order — how `restart:` tests count respawns.
+    spawn_log: Vec<ServiceId>,
 }
 struct FakeProcessAdapter {
     state: Arc<Mutex<FakeProcessAdapterState>>,
@@ -147,6 +152,29 @@ impl FakeProcessAdapter {
     /// filled first, so a one-shot test does not race the virtual readiness clock.
     fn set_exit_on_spawn(&self, code: i32) {
         self.state.lock().unwrap().exit_on_spawn = Some(code);
+    }
+    /// Replays one chunk of process output through the sink `spawn` recorded — the fake's
+    /// equivalent of the process printing to stdout.
+    fn spawn_count(&self, service_id: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .spawn_log
+            .iter()
+            .filter(|id| id.as_str() == service_id)
+            .count()
+    }
+    fn emit_output(&self, service_id: &str, data: &str) {
+        let sink = self
+            .state
+            .lock()
+            .unwrap()
+            .output_sinks
+            .get(service_id)
+            .cloned();
+        if let Some(sink) = sink {
+            sink(data);
+        }
     }
     /// Simulates a process dying on its own (not via a signal from us) — fires its exit code and
     /// removes it from the alive set, exactly like a real process disappearing underneath us.
@@ -241,12 +269,16 @@ impl ProcessAdapter for FakeProcessAdapter {
     async fn spawn(
         &self,
         input: SpawnInput,
-        _on_output: OnOutput,
+        on_output: OnOutput,
     ) -> Result<ManagedProcess, SupervisorError> {
         let mut state = self.state.lock().unwrap();
         if let Some(message) = state.spawn_should_fail.get(&input.service_id).cloned() {
             return Err(SupervisorError(message));
         }
+        state
+            .output_sinks
+            .insert(input.service_id.clone(), on_output);
+        state.spawn_log.push(input.service_id.clone());
         if is_container_command(&input.command) {
             let name = input.command.container_name.clone().unwrap();
             let record = state
@@ -877,6 +909,7 @@ fn argv_verified(id: &str, readiness: ReadinessSpec) -> ServiceDefinition {
         label: None,
         kind: Some(ServiceKind::Application),
         ownership: None,
+        restart: None,
         disabled: false,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
@@ -4138,4 +4171,220 @@ async fn detach_all_output_stops_every_log_follower() {
         h.process.is_alive(posix_pid(&h, "api")),
         "the service itself keeps running"
     );
+}
+
+// --- `readiness: log` ---
+
+#[tokio::test]
+async fn log_readiness_latches_ready_once_the_pattern_appears() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Log {
+            pattern: "listening on".to_string(),
+        },
+    )));
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::RunningUnready).await;
+
+    h.process.emit_output("api", "booting…\n");
+    tokio::task::yield_now().await;
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::RunningUnready
+    );
+
+    h.process.emit_output("api", "listening on :8080\n");
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+}
+
+/// The ready marker can be split across two writes — the matcher sees the joined stream.
+#[tokio::test]
+async fn log_readiness_matches_a_pattern_split_across_writes() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Log {
+            pattern: "ready to accept".to_string(),
+        },
+    )));
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::RunningUnready).await;
+
+    h.process.emit_output("api", "ready to ");
+    h.process.emit_output("api", "accept connections\n");
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+}
+
+/// A fresh spawn clears the previous process's latch — the new process must print the marker
+/// itself before it is ready.
+#[tokio::test]
+async fn a_respawn_must_emit_the_log_pattern_again() {
+    let h = build_harness(one_service_catalog(argv_verified(
+        "api",
+        ReadinessSpec::Log {
+            pattern: "ready".to_string(),
+        },
+    )));
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    h.process.emit_output("api", "ready\n");
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+
+    h.supervisor
+        .restart(&"api".to_string(), None)
+        .await
+        .unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::RunningUnready).await;
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::RunningUnready,
+        "a cleared latch must not satisfy the new process's readiness"
+    );
+    h.process.emit_output("api", "ready\n");
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+}
+
+// --- `restart:` policy ---
+
+fn with_restart(service: ServiceDefinition, on: &str, max: Option<u32>, delay_ms: Option<u64>) -> ServiceDefinition {
+    let mut service = service;
+    service.restart = Some(crate::catalog::ServiceRestartPolicy {
+        on: match on {
+            "always" => RestartTrigger::Always,
+            "on-failure" => RestartTrigger::OnFailure,
+            _ => RestartTrigger::Never,
+        },
+        max_restarts: max,
+        delay_ms,
+    });
+    service
+}
+
+#[tokio::test]
+async fn restart_on_failure_respawns_after_an_unexpected_nonzero_exit() {
+    let h = build_harness(one_service_catalog(with_restart(
+        argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
+        "on-failure",
+        None,
+        Some(5),
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+    assert_eq!(h.process.spawn_count("api"), 1);
+
+    h.process.kill_externally(posix_pid(&h, "api"), 1);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+    assert_eq!(
+        h.process.spawn_count("api"),
+        2,
+        "the crash must earn exactly one respawn"
+    );
+}
+
+/// `on-failure` only pays for a crash — an exit 0 while desired `running` is still unexpected but
+/// not a failure the policy covers.
+#[tokio::test]
+async fn restart_on_failure_does_not_respawn_a_clean_exit() {
+    let h = build_harness(one_service_catalog(with_restart(
+        argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
+        "on-failure",
+        None,
+        Some(5),
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+
+    h.process.kill_externally(posix_pid(&h, "api"), 0);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.process.spawn_count("api"), 1);
+}
+
+#[tokio::test]
+async fn restart_max_restarts_bounds_consecutive_respawns() {
+    let h = build_harness(one_service_catalog(with_restart(
+        argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
+        "on-failure",
+        Some(1),
+        Some(5),
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+
+    h.process.kill_externally(posix_pid(&h, "api"), 1);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+    assert_eq!(h.process.spawn_count("api"), 2);
+
+    // The service reached ready, so the budget reset — this second crash still earns a respawn.
+    h.process.kill_externally(posix_pid(&h, "api"), 1);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+    assert_eq!(h.process.spawn_count("api"), 3);
+}
+
+/// `maxRestarts` bounds crashes that never reach ready: the second consecutive crash stays down.
+#[tokio::test]
+async fn consecutive_crashes_exhaust_the_restart_budget() {
+    let h = build_harness(one_service_catalog(with_restart(
+        argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
+        "on-failure",
+        Some(1),
+        Some(5),
+    )));
+    // Never ready — tcp stays false so every spawn dies "unready" and attempts keep accumulating.
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::RunningUnready).await;
+
+    h.process.kill_externally(posix_pid(&h, "api"), 1);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    wait_until_actual(&h.host, "api", ActualServiceState::RunningUnready).await;
+    assert_eq!(h.process.spawn_count("api"), 2);
+
+    h.process.kill_externally(posix_pid(&h, "api"), 1);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.process.spawn_count("api"),
+        2,
+        "a third spawn must not happen past maxRestarts"
+    );
+    assert_eq!(
+        h.host.state_of("api").unwrap().actual_state,
+        ActualServiceState::Failed
+    );
+}
+
+/// A manual `restart` during the respawn delay makes the pending auto-respawn a no-op — the
+/// service must never get two live copies.
+#[tokio::test]
+async fn a_manual_restart_during_the_delay_prevents_a_double_spawn() {
+    let h = build_harness(one_service_catalog(with_restart(
+        argv_verified("api", ReadinessSpec::Tcp { port: 8080 }),
+        "on-failure",
+        None,
+        Some(300),
+    )));
+    h.probes.set_tcp_ready(8080, true);
+    h.supervisor.start(&"api".to_string(), None).await.unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+
+    h.process.kill_externally(posix_pid(&h, "api"), 1);
+    wait_until_actual(&h.host, "api", ActualServiceState::Failed).await;
+    h.supervisor
+        .restart(&"api".to_string(), None)
+        .await
+        .unwrap();
+    wait_until_actual(&h.host, "api", ActualServiceState::Ready).await;
+
+    // The 300ms auto-respawn window lapses with the service already back — it must not fire.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.process.spawn_count("api"),
+        2,
+        "the queued auto-respawn must see the service alive and skip"
+    );
+    assert!(h.process.is_alive(posix_pid(&h, "api")));
 }

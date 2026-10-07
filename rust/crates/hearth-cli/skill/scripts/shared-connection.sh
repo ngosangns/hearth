@@ -25,7 +25,7 @@ if [[ -z "$ROOT" ]]; then
     fi
     parent="$(dirname "$dir")"
     if [[ "$parent" == "$dir" ]]; then
-      echo "hearth skill: no HEARTH_ROOT and no hearth.yaml above $(pwd)" >&2
+      echo "hearth skill: no HEARTH_ROOT and no hearth.yaml/.yml/.json above $(pwd)" >&2
       exit 1
     fi
     dir="$parent"

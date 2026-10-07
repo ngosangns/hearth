@@ -23,7 +23,7 @@ for scripts: `$HEARTH_ROOT`, else walk up from cwd for `hearth.yaml` / `.yml` / 
 | Former MCP tool | Script | Mutate gate |
 | --- | --- | --- |
 | `local_services_status` | `scripts/status.sh [service]` | free |
-| `local_services_logs` | `scripts/logs.sh <service> [--tail N] [-f]` | free |
+| `local_services_logs` | `scripts/logs.sh <service> [--tail N] [--follow]` | free |
 | `local_services_trace` | `scripts/trace.sh <operationId>` | free |
 | `local_services_events` | `scripts/events.sh [--after N] [--epoch E]` | free |
 | `local_services_manage` | `scripts/manage.sh start\|stop\|restart <target> [--wait] [--kill-unowned]` | user asked |
@@ -45,7 +45,7 @@ Only call manage / restart-daemon / stop-daemon (or `hearth start|stop|restart|m
 
 ## Equivalent CLI
 
-- `hearth status [service]` / `hearth logs <service> [--tail N] [-f]`
+- `hearth status [service]` / `hearth logs <service> [--tail N] [--follow]`
 - `hearth urls [service]` — live URLs (prefer these over guessing ports)
 - `hearth start|stop|restart <service|group> [--wait]` — `start` also takes `--kill-unowned`
 - `hearth operation get|watch <id>`

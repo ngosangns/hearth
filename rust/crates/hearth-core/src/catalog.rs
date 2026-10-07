@@ -64,6 +64,36 @@ pub enum ReadinessSpec {
     /// The run command is the job. Exit 0 settles `succeeded` with desired `stopped`; any other
     /// exit is `failed`. There is no liveness probe after the process is gone.
     Exit,
+    /// Ready once `pattern` (a regular expression) appears in the service's own output — the
+    /// declarative stand-in for process-compose's `process_log_ready` and procman's
+    /// `output_matches`. The match latches: once seen, readiness stays satisfied even if the
+    /// pattern never appears again.
+    Log {
+        pattern: String,
+    },
+}
+
+/// What the supervisor does when a daemon-owned process exits while desired state is `running`:
+/// `onFailure` respawns after a nonzero exit, `always` after any exit, `never` (the default)
+/// leaves the service `failed` for an operator to see. `maxRestarts` bounds consecutive
+/// respawns — the counter resets once the service reaches `ready` — and `delayMs` is the pause
+/// before each respawn (default 1s).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRestartPolicy {
+    pub on: RestartTrigger,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_restarts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartTrigger {
+    Never,
+    OnFailure,
+    Always,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +390,10 @@ pub struct ServiceDefinition {
     /// start/stop/restart — direct operations are rejected and group targets expand past it.
     #[serde(default)]
     pub disabled: bool,
+    /// Respawn policy for an unexpected exit while desired state is `running`. Omitted means
+    /// `never`. Only daemon-owned services have a managed process to respawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<ServiceRestartPolicy>,
     pub profiles: ServiceProfiles,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ports: Option<Vec<ServicePort>>,
@@ -537,6 +571,7 @@ mod tests {
             label: None,
             kind: None,
             ownership: None,
+            restart: None,
             disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
@@ -568,6 +603,7 @@ mod tests {
             label: None,
             kind: None,
             ownership: None,
+            restart: None,
             disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
@@ -660,6 +696,7 @@ mod tests {
                 label: None,
                 kind: None,
                 ownership: None,
+                restart: None,
                 disabled: false,
                 profiles: ServiceProfiles {
                     run: ServiceRunProfile::Unresolved {

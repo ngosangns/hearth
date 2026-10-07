@@ -88,7 +88,28 @@ with the `RELEASE_TOKEN` repo secret when present (a PAT can push to a protected
 `GITHUB_TOKEN`.
 
 `PROTOCOL_VERSION` in `rust/crates/hearth-core/src/state.rs` is the protocol-compatibility signal — a
-bump there must be treated as breaking for every client.
+bump there must be treated as breaking for every client. It is **3** since `readiness: { kind: log }`
+and per-service `restart:` landed (new `ReadinessKind::Log` / `ReadinessSpec::Log` wire variants).
+
+### Catalog features added from the process-supervisor ecosystem
+
+- **`restart:`** — `{ on: never|on-failure|always, maxRestarts?: n, delayMs?: n|"2s" }` on a service.
+  The supervisor counts consecutive unexpected exits; the counter resets on `ready` (`transition`)
+  and on an explicit start/restart (which is why the auto-respawn path calls `start_locked`
+  directly, not `start()`). Respawn sleeps `delayMs` then re-enters the service queue and re-checks
+  `Failed && desired running` inside it, so a `stop` during the delay wins and a manual start that
+  already recovered the service can't spawn a second copy.
+- **`readiness: { kind: log, pattern }`** — a `LogMatcher` lazily registered on first output in
+  `append_output` (the funnel every output path shares: spawn sink, `attach_output` tails, docker
+  followers). It latches on first regex match against a rolling 64 KiB tail so patterns split
+  across writes still land. Cleared in `spawn_and_wait` and `detach_output` — a previous
+  incarnation's match must not satisfy a new process.
+- **humantime durations** — `readinessTimeoutMs`, `build.timeoutMs`, and `restart.delayMs` accept
+  `"30s"`-style strings via `read_duration_ms` as well as bare millisecond integers.
+- Third-party crates now doing what bespoke code did: `dotenvy` (`.env` parsing in `env.rs` — note
+  it *does* interpolate `${VAR}` against earlier entries and the process env), `semver`
+  (`update.rs`), `eventsource-stream` (TUI SSE — `SseFrameCap`/`capped_sse_bytes` preserves the
+  64 KiB frame bound the crate doesn't enforce), `ansi-to-tui` (`sgr_to_line`).
 
 ### The self-hosted runner's environment
 
@@ -408,6 +429,50 @@ from any dev box here, with the same username.
 - `WorkspaceStore::reload` must not quarantine `workspaces.json`; only `open` does.
 - A catalog mtime change reloads once while a daemon is up, and that reload must not `ensure`. The first observation only records the mtime. Stop and copy stay available during an in-flight start. Enter on a queued row cancels it. Reveal is `open -R`. Stop-all skips rows that are already stopped or succeeded.
 - The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. The binary calls `run_shell` only. `run_tui` (ANSI single-project) is **deprecated** and kept as reference; do not wire new entry points to it.
+- TUI input latency rules: the `terminal` branch of `event_loop` drains every already-queued
+  `Event` (`now_or_never`, ≤64) and paints **once** per batch — a wheel flick or held key must
+  never get a full `draw` per event. Input handlers signal a needed paint with
+  `input_pending_present`, not `draw()`. Selection changes set `log_request_due` so a burst issues
+  one `request_log` at batch end. Scrolling the workspace pane defers `open_selected` by
+  `WORKSPACE_OPEN_DELAY` (200 ms) so a pass over several workspaces doesn't tear down the session
+  and spawn a `discover` per row; `open_selected` clears `open_wait`. The pre-paint `rx` drain is
+  also bounded (≤64) — an SSE backlog must not stand between input and its paint. No network or
+  process spawns on the loop thread — `pbcopy`/`open` go through `spawn_blocking` + `Msg::Note`,
+  and a bulk action loads `SharedRegistry` once, not per target row.
+- The pty write runs on a **writer thread** (`ChannelWriter`/`WriterTap` in `shell.rs`): profiled
+  on Kiro/VS Code, a 5 KB diff takes 15–75 ms in `write()` (xterm.js drains the pty slowly), so
+  `draw` on the loop thread froze input. `BufWriter` flushes become channel packets a thread
+  drains at terminal pace; when the 16-packet channel fills, packets drop and `pty.dropped`
+  rises — every later diff is invalid until the queue drains and the app calls
+  `terminal.clear()` to force a full repaint (see `draw`'s `pty.dropped()` gate). Diffs are
+  stateful — never let a dropped packet be followed by another diff without the clear.
+- The terminal is `Viewport::Fixed` — `Terminal::draw` therefore never calls `autoresize` /
+  `backend.size()`: crossterm's `size()` opens `/dev/tty` per call and falls back to spawning
+  `tput` twice (~15 ms) with no controlling tty, which as a per-frame cost was the single biggest
+  measured draw overhead. Resizes arrive via `Event::Resize` → `terminal.resize` — do not add a
+  per-frame `terminal.size()` back. `FRAME_BUDGET` is 33 ms (~30 fps) for coalesced, data-driven
+  repaints; input draws bypass the scheduler and paint immediately. On Kiro/VS Code (xterm.js),
+  measured `draw` time is ~90% pty `write()` blocking on the diff bytes — `FrameScheduler::slowdown`
+  therefore pushes the coalesced baseline forward after any draw that exceeded the budget, and
+  `CountingStdout` reports per-draw bytes to the profiler (`draw_bytes`/`draw_max_bytes` in the
+  `SUM` line; `note_write_bytes` is the hook — the OSC8 link overlay writes through
+  `terminal.backend_mut()` so it stays on the same counted, buffered writer).
+- The log pane keeps `Desk.log_cache`: `sgr_to_line` + URL scan run **lazily per visible row**
+  (`cache.line(i)` memoizes), never for the whole retained log. `LogCache::sync` indexes line
+  byte-ranges (a memchr pass) and extends it in place on a pure append — the streaming case —
+  re-indexing only the last row, which a mid-line append continues. Do not go back to eager
+  `split('\n').map(parse)`; a 16 KiB log re-parsed per ~100 ms refresh was the frame spike.
+  `bounded_tail` trims by walking char boundaries back from the end — `limit` counts *chars*,
+  and the `len() <= limit` byte check is only the fast path, not the limit.
+- `Desk.sections`/`recipes`/`instances` are `Arc<Vec<…>>` so `list_visuals` validity is
+  `Arc::ptr_eq` — replace the `Arc` (or `Arc::make_mut`, which allocates a new one while the
+  cache holds a clone) rather than editing in place. `service_visuals`/`shared_visuals` are
+  cursor- and focus-independent: the `>` marker cell is patched by `paint_list` for the selected
+  row, which is what makes the cache safe across cursor moves and focus changes.
+- The writer
+  behind `CrosstermBackend` is a 64 KiB `BufWriter` (`ShellTerminal` in `shell.rs`) — a frame's
+  diff is one write, not hundreds of locked `Stdout` writes — and `init_terminal` reinstalls the
+  restore-on-panic hook that `ratatui::try_init` would have provided.
 - A bare `hearth` on a terminal **is** `tui` (stdin+stdout TTY check in `main.rs::run_cli`); piped
   it prints help, so `hearth` in scripts/`Command::output()` stays a usage printer.
 - Mouse reporting is button, drag, and wheel (`?1000`/`?1002`/`?1006`, `MOUSE_ON` in `shell.rs`).

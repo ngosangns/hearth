@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::{
-    is_container_command, CommandSpec, ReadinessSpec, ServiceCatalog, ServiceCommand,
-    ServiceDefinition, ServiceId, ServiceOwnership, ServiceRunProfile,
+    is_container_command, CommandSpec, ReadinessSpec, RestartTrigger, ServiceCatalog,
+    ServiceCommand, ServiceDefinition, ServiceId, ServiceOwnership, ServiceRunProfile,
 };
 use crate::state::{
     ActualServiceState, DesiredServiceState, ProcessIdentity, ReadinessKind, ServiceLifecycleState,
@@ -87,6 +87,7 @@ fn readiness_kind_of(readiness: &ReadinessSpec) -> ReadinessKind {
         ReadinessSpec::Tailnet => ReadinessKind::Tailnet,
         ReadinessSpec::Command { .. } => ReadinessKind::Command,
         ReadinessSpec::Exit => ReadinessKind::Exit,
+        ReadinessSpec::Log { .. } => ReadinessKind::Log,
     }
 }
 
@@ -231,8 +232,32 @@ pub struct ProcessSupervisor {
     /// Token of the continuous readiness loop, so a second arm for the same start (reconcile
     /// after the loop is already running) does not probe twice.
     probe_loops: Mutex<HashMap<ServiceId, u64>>,
+    /// Lazily-populated `readiness: log` matchers: `None` marks a service already checked and
+    /// found not to use log readiness (or an uncompilable pattern), so the hot output path does
+    /// not re-resolve the profile per chunk. Cleared on spawn/stop so a latch from the previous
+    /// process can't satisfy a new one's readiness.
+    log_matchers: Mutex<HashMap<ServiceId, Option<Arc<LogMatcher>>>>,
+    /// Consecutive unexpected exits per service, for `restart:` policy budgets. Reset when the
+    /// service reaches `ready` and cleared on an explicit start/restart — an auto-respawn must
+    /// not reset its own budget.
+    restart_attempts: Mutex<HashMap<ServiceId, u32>>,
     compose_start_tail: tokio::sync::Mutex<()>,
 }
+
+/// A `readiness: log` matcher: latches `matched` the first time the pattern appears anywhere in
+/// the service's output. `recent` keeps a rolling tail so a match split across two writes still
+/// lands.
+struct LogMatcher {
+    pattern: regex::Regex,
+    matched: AtomicBool,
+    recent: Mutex<String>,
+}
+
+/// How much recent output a `LogMatcher` retains for the split-write case.
+const LOG_MATCH_WINDOW: usize = 64 * 1024;
+
+/// Default pause before respawning a crashed service when `restart.delayMs` is unset.
+const RESTART_DELAY_MS: u64 = 1_000;
 
 impl ProcessSupervisor {
     pub fn new(host: Arc<dyn Host>, options: SupervisorOptions) -> Arc<Self> {
@@ -248,6 +273,8 @@ impl ProcessSupervisor {
             output_tails: Mutex::new(HashMap::new()),
             log_forwarders: Mutex::new(HashMap::new()),
             probe_loops: Mutex::new(HashMap::new()),
+            log_matchers: Mutex::new(HashMap::new()),
+            restart_attempts: Mutex::new(HashMap::new()),
             compose_start_tail: tokio::sync::Mutex::new(()),
         })
     }
@@ -273,6 +300,12 @@ impl ProcessSupervisor {
         operation_id: Option<String>,
         options: StartOptions,
     ) -> Result<(), SupervisorError> {
+        // An explicit start is a fresh `restart:` budget — unlike the auto-respawn path, which
+        // calls `start_locked` directly so it never resets its own counter.
+        self.restart_attempts
+            .lock()
+            .unwrap()
+            .remove(service_id);
         let sup = self.clone();
         let id = service_id.clone();
         self.queues
@@ -289,6 +322,10 @@ impl ProcessSupervisor {
     ) -> Result<(), SupervisorError> {
         self.cancel(service_id);
         self.abort_build(service_id);
+        self.restart_attempts
+            .lock()
+            .unwrap()
+            .remove(service_id);
         let sup = self.clone();
         let id = service_id.clone();
         let op = operation_id.clone();
@@ -2067,6 +2104,8 @@ impl ProcessSupervisor {
             return Ok(());
         }
         let fingerprint = normalize_command_fingerprint(&profile.command);
+        // A latch from a previous incarnation must not satisfy this process's log readiness.
+        self.log_matchers.lock().unwrap().remove(service_id);
         let sup = self.clone();
         let sid = service_id.clone();
         let on_output: OnOutput = Arc::new(move |data: &str| {
@@ -3064,6 +3103,28 @@ impl ProcessSupervisor {
                     }
                     return;
                 }
+                // `restart:` policy — count this crash, then decide whether it earns a respawn.
+                // The counter resets on `ready` (`transition`) and on an explicit start/restart,
+                // so `max_restarts` bounds *consecutive* crashes, not lifetime respawns.
+                let attempt = {
+                    let mut attempts = sup.restart_attempts.lock().unwrap();
+                    let n = attempts.entry(sid.clone()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                let policy = definition_for(&sup.host.catalog(), &sid)
+                    .and_then(|d| d.restart.clone());
+                let delay_ms = policy
+                    .as_ref()
+                    .and_then(|p| p.delay_ms)
+                    .unwrap_or(RESTART_DELAY_MS);
+                let will_respawn = state.desired_state == DesiredServiceState::Running
+                    && !(sup.options.is_closing)()
+                    && policy.is_some_and(|p| {
+                        (p.on == RestartTrigger::Always
+                            || (p.on == RestartTrigger::OnFailure && code != 0))
+                            && p.max_restarts.is_none_or(|max| attempt <= max)
+                    });
                 sup.transition_if_current(
                     &sid,
                     generation,
@@ -3073,7 +3134,11 @@ impl ProcessSupervisor {
                     Changes {
                         exit_code: Patch::Set(code),
                         exited_at: Patch::Set(sup.options.clock.now()),
-                        error: Patch::Set(format!("Process exited with code {code}")),
+                        error: Patch::Set(if will_respawn {
+                            format!("Process exited with code {code}; restarting (attempt {attempt})")
+                        } else {
+                            format!("Process exited with code {code}")
+                        }),
                         ..Default::default()
                     },
                 )
@@ -3084,6 +3149,33 @@ impl ProcessSupervisor {
                     .is_some_and(|a| a.identity.generation() == generation)
                 {
                     active.remove(&sid);
+                }
+                if will_respawn {
+                    // Respawn *outside* this queue closure (a `start` re-enters it) and re-check
+                    // inside the queue: a `stop` that lands during the delay must win, and a
+                    // manual start that already brought it back must not spawn a second copy.
+                    let sup2 = sup.clone();
+                    let sid2 = sid.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let sup3 = sup2.clone();
+                        let sid_key = sid2.clone();
+                        let sid3 = sid2.clone();
+                        sup2.queues
+                            .run(&sid_key, || async move {
+                                let restartable = sup3.state(&sid3).is_some_and(|s| {
+                                    s.actual_state == ActualServiceState::Failed
+                                        && s.desired_state == DesiredServiceState::Running
+                                });
+                                if !restartable || (sup3.options.is_closing)() {
+                                    return;
+                                }
+                                let _ = sup3
+                                    .start_locked(&sid3, None, StartOptions::default())
+                                    .await;
+                            })
+                            .await;
+                    });
                 }
             })
             .await;
@@ -3689,6 +3781,15 @@ impl ProcessSupervisor {
                 }
             }
             ReadinessSpec::Process | ReadinessSpec::Exit => false,
+            // The output matcher latches as soon as `append_output` sees the pattern; a probe is
+            // just a read of that flag.
+            ReadinessSpec::Log { .. } => self
+                .log_matchers
+                .lock()
+                .unwrap()
+                .get(service_id)
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|m| m.matched.load(Ordering::Relaxed)),
         }
     }
 
@@ -3727,6 +3828,9 @@ impl ProcessSupervisor {
         // Released before `stop()`: a raw-file tail drains synchronously on stop, and that file
         // I/O must not run (or panic) while every other service's tail map access waits on it.
         let tail = self.output_tails.lock().unwrap().remove(service_id);
+        // A detached output stream can no longer feed a log-readiness matcher; drop it so the
+        // next spawn/attach starts a fresh, unmatched one.
+        self.log_matchers.lock().unwrap().remove(service_id);
         if let Some(tail) = tail {
             tail.stop();
         }
@@ -3762,6 +3866,61 @@ impl ProcessSupervisor {
         };
         if forwarder.sender.try_send(data.to_string()).is_err() {
             forwarder.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        self.feed_log_matcher(service_id, data);
+    }
+
+    /// Registers (lazily, on first output) the `readiness: log` matcher for this service if it
+    /// has one, then feeds it this chunk. `None` in the map means "checked, not a log service"
+    /// so the profile lookup happens once per service per spawn/stop cycle, not per chunk.
+    fn feed_log_matcher(&self, service_id: &ServiceId, data: &str) {
+        let matcher = {
+            let mut matchers = self.log_matchers.lock().unwrap();
+            match matchers.get(service_id) {
+                Some(existing) => existing.clone(),
+                None => {
+                    let created = profile_for(&self.host.catalog(), service_id)
+                        .ok()
+                        .and_then(|profile| match &profile.readiness {
+                            ReadinessSpec::Log { pattern } => Some(pattern.clone()),
+                            _ => None,
+                        })
+                        .and_then(|pattern| match regex::Regex::new(&pattern) {
+                            Ok(regex) => Some(Arc::new(LogMatcher {
+                                pattern: regex,
+                                matched: AtomicBool::new(false),
+                                recent: Mutex::new(String::new()),
+                            })),
+                            Err(error) => {
+                                self.host.record_background_error(
+                                    service_id,
+                                    &format!("readiness.pattern does not compile: {error}"),
+                                );
+                                None
+                            }
+                        });
+                    matchers.insert(service_id.clone(), created.clone());
+                    created
+                }
+            }
+        };
+        let Some(matcher) = matcher else { return };
+        if matcher.matched.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut recent = matcher.recent.lock().unwrap();
+        recent.push_str(data);
+        if matcher.pattern.is_match(&recent) {
+            matcher.matched.store(true, Ordering::Relaxed);
+            recent.clear();
+        } else if recent.len() > LOG_MATCH_WINDOW {
+            let keep = recent.len() - LOG_MATCH_WINDOW;
+            let boundary = recent
+                .char_indices()
+                .find(|(i, _)| *i >= keep)
+                .map(|(i, _)| i)
+                .unwrap_or(recent.len());
+            recent.drain(..boundary);
         }
     }
 
@@ -3978,9 +4137,14 @@ impl ProcessSupervisor {
         };
         // `Host::set_service_state` publishes the one `service.lifecycle` event for this change;
         // publishing here too doubled every transition's SSE frames and event-buffer use.
+        let reaches_ready = next.readiness == ServiceReadiness::Ready;
         let error = next.error.clone();
         let updated_at = next.updated_at.clone();
         self.host.set_service_state(next).await;
+        if reaches_ready {
+            // A proven-healthy service earned back its full `restart:` budget.
+            self.restart_attempts.lock().unwrap().remove(service_id);
+        }
         if let Some(error) = &error {
             self.host
                 .append_log(service_id, &format!("{updated_at} {error}\n"))

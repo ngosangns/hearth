@@ -127,6 +127,12 @@ pub fn render_readiness(
             command: render_command_checked(command, vars, "readiness.command")?,
             cwd: cwd.clone(),
         },
+        ReadinessSpec::Log { pattern } => {
+            check_vars(pattern, vars, "readiness.pattern")?;
+            ReadinessSpec::Log {
+                pattern: render_str(pattern, vars),
+            }
+        }
         ReadinessSpec::Exit => ReadinessSpec::Exit,
     })
 }

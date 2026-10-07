@@ -58,18 +58,7 @@ struct UpdateEnv<'a> {
     platform_supported: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SemVer {
-    major: u64,
-    minor: u64,
-    patch: u64,
-}
-
-impl std::fmt::Display for SemVer {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
+type SemVer = semver::Version;
 
 #[derive(Clone, Debug)]
 struct Release {
@@ -352,26 +341,10 @@ fn parse_update_args(args: &[String]) -> Result<UpdateFlags, String> {
     Ok(flags)
 }
 
+/// Strict `X.Y.Z` only — release tags and versions never carry prerelease or build metadata.
 fn parse_semver(text: &str) -> Option<SemVer> {
-    if text.is_empty()
-        || !text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
-        return None;
-    }
-    let mut parts = text.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SemVer {
-        major,
-        minor,
-        patch,
-    })
+    let version = semver::Version::parse(text).ok()?;
+    (version.pre.is_empty() && version.build.is_empty()).then_some(version)
 }
 
 fn parse_release(document: &str) -> Result<Release, String> {

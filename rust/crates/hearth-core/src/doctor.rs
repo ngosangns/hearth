@@ -280,6 +280,7 @@ mod tests {
                 label: None,
                 kind: None,
                 ownership: None,
+                restart: None,
                 disabled: false,
                 profiles: ServiceProfiles {
                     run: ServiceRunProfile::Unresolved {

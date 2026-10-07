@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::ServiceId;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const STATE_VERSION: u32 = 1;
 
 pub const STALE_LOCK_MARKER_NAME: &str = "quarantine.json";
@@ -173,6 +173,8 @@ pub enum ReadinessKind {
     Command,
     /// `readiness: { kind: exit }` — the run command itself is the job.
     Exit,
+    /// `readiness: { kind: log }` — the service's own output carries the ready marker.
+    Log,
     /// Reserved: never produced. There is no custom readiness probe (a closure can't cross the
     /// YAML/JSON boundary — `command` is the stand-in); the variant stays only so a persisted or
     /// wire value that carries it still decodes. Removing it is a `PROTOCOL_VERSION` bump.
@@ -193,11 +195,12 @@ impl ReadinessKind {
             Self::Tailnet => "tailnet",
             Self::Command => "command",
             Self::Exit => "exit",
+            Self::Log => "log",
             Self::Custom => "custom",
         }
     }
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Process,
         Self::Tcp,
         Self::Http,
@@ -205,6 +208,7 @@ impl ReadinessKind {
         Self::Tailnet,
         Self::Command,
         Self::Exit,
+        Self::Log,
         Self::Custom,
     ];
 }

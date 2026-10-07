@@ -639,6 +639,7 @@ mod tests {
             label: None,
             kind: None,
             ownership: None,
+            restart: None,
             disabled: false,
             profiles: crate::catalog::ServiceProfiles {
                 run: crate::catalog::ServiceRunProfile::Unresolved {

@@ -120,7 +120,7 @@ pub fn load_catalog_from_file(
 // Declarative shape -> ServiceCatalog
 // -------------------------------------------------------------------------------------------
 
-const READINESS_KINDS: [&str; 7] = [
+const READINESS_KINDS: [&str; 8] = [
     "process",
     "tcp",
     "http",
@@ -128,6 +128,7 @@ const READINESS_KINDS: [&str; 7] = [
     "tailnet",
     "command",
     "exit",
+    "log",
 ];
 const SERVICE_KINDS: [&str; 2] = ["application", "infrastructure"];
 const OWNERSHIPS: [&str; 2] = ["daemon", "external"];
@@ -410,6 +411,23 @@ fn read_readiness(
         },
         "http" => read_http_readiness(obj, path, primary_port, errors),
         "exit" => Some(ReadinessSpec::Exit),
+        "log" => match obj.get("pattern") {
+            Some(Value::String(pattern)) if !pattern.is_empty() => {
+                match regex::Regex::new(pattern) {
+                    Ok(_) => Some(ReadinessSpec::Log {
+                        pattern: pattern.clone(),
+                    }),
+                    Err(error) => {
+                        errors.push(format!("{path}.pattern is not a valid regex: {error}"));
+                        None
+                    }
+                }
+            }
+            _ => {
+                errors.push(format!("{path}.pattern must be a non-empty string"));
+                None
+            }
+        },
         _ => {
             // kind === "command"
             let default_command = Value::Null;
@@ -642,7 +660,54 @@ const SERVICE_KEYS: &[&str] = &[
     "ports",
     "urls",
     "artifact",
+    "restart",
 ];
+
+const RESTART_KEYS: &[&str] = &["on", "maxRestarts", "delayMs"];
+const RESTART_TRIGGERS: [&str; 3] = ["never", "on-failure", "always"];
+
+/// `restart:` — `{ on: never|on-failure|always, maxRestarts?: n, delayMs?: n|"2s" }`.
+fn read_restart_policy(
+    value: &Value,
+    path: &str,
+    errors: &mut Vec<String>,
+) -> Option<crate::catalog::ServiceRestartPolicy> {
+    use crate::catalog::RestartTrigger;
+    let Some(obj) = value.as_object() else {
+        errors.push(format!("{path} must be an object"));
+        return None;
+    };
+    check_known_keys(obj, RESTART_KEYS, path, errors);
+    let on = match obj.get("on").and_then(Value::as_str) {
+        Some("never") => RestartTrigger::Never,
+        Some("always") => RestartTrigger::Always,
+        None | Some("on-failure") => RestartTrigger::OnFailure,
+        Some(other) => {
+            errors.push(format!(
+                "{path}.on must be one of {}, got {:?}",
+                RESTART_TRIGGERS.join(", "),
+                other
+            ));
+            return None;
+        }
+    };
+    let max_restarts = match obj.get("maxRestarts") {
+        None => None,
+        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => Some(n),
+            None => {
+                errors.push(format!("{path}.maxRestarts must be a non-negative integer"));
+                None
+            }
+        },
+    };
+    let delay_ms = read_duration_ms(obj.get("delayMs"), &format!("{path}.delayMs"), errors);
+    Some(crate::catalog::ServiceRestartPolicy {
+        on,
+        max_restarts,
+        delay_ms,
+    })
+}
 
 const ARTIFACT_KEYS: &[&str] = &["version", "url", "script", "scriptArgs", "sha256"];
 
@@ -846,6 +911,10 @@ fn render_service_artifact(
                         *cwd = render_str(cwd, &vars);
                     }
                 }
+                ReadinessSpec::Log { pattern } => {
+                    check_template(pattern, &vars, &format!("{path}.readiness.pattern"), errors);
+                    *pattern = render_str(pattern, &vars);
+                }
                 ReadinessSpec::Process
                 | ReadinessSpec::Tcp { .. }
                 | ReadinessSpec::Container
@@ -901,6 +970,28 @@ fn read_positive_u64(value: Option<&Value>, path: &str, errors: &mut Vec<String>
                 None
             }
         },
+    }
+}
+
+/// A duration in milliseconds: either a bare positive integer (ms, the original form) or a
+/// humantime string — `"30s"`, `"1m30s"`, `"500ms"` — so a catalog can read `readinessTimeoutMs:
+/// "2m"` instead of `120000`.
+fn read_duration_ms(value: Option<&Value>, path: &str, errors: &mut Vec<String>) -> Option<u64> {
+    match value {
+        None => None,
+        Some(v) if v.is_string() => match v
+            .as_str()
+            .and_then(|s| humantime::parse_duration(s).ok())
+        {
+            Some(d) if !d.is_zero() => Some(d.as_millis() as u64),
+            _ => {
+                errors.push(format!(
+                    "{path} must be a positive integer or a duration like \"30s\""
+                ));
+                None
+            }
+        },
+        _ => read_positive_u64(value, path, errors),
     }
 }
 
@@ -1158,7 +1249,7 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
             &mut errors,
         );
         let urls = read_urls(obj.get("urls"), &format!("{svc_path}.urls"), &mut errors);
-        let readiness_timeout_ms = read_positive_u64(
+        let readiness_timeout_ms = read_duration_ms(
             obj.get("readinessTimeoutMs"),
             &format!("{svc_path}.readinessTimeoutMs"),
             &mut errors,
@@ -1216,18 +1307,11 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
             if let Some(build_obj) = build_value.as_object() {
                 let build =
                     read_command_spec(build_value, &format!("{svc_path}.build"), &mut errors);
-                let timeout_ms = match build_obj.get("timeoutMs") {
-                    None => None,
-                    Some(v) => match v.as_i64() {
-                        Some(n) if n > 0 => Some(n as u64),
-                        _ => {
-                            errors.push(format!(
-                                "{svc_path}.build.timeoutMs must be a positive integer"
-                            ));
-                            None
-                        }
-                    },
-                };
+                let timeout_ms = read_duration_ms(
+                    build_obj.get("timeoutMs"),
+                    &format!("{svc_path}.build.timeoutMs"),
+                    &mut errors,
+                );
                 let serialization_key = match build_obj.get("serializationKey") {
                     None => None,
                     Some(Value::String(s)) => Some(s.clone()),
@@ -1268,12 +1352,16 @@ fn map_config_file(raw: &Value, root: &Path) -> Result<ServiceCatalog, Vec<Strin
                 false
             }
         };
+        let restart = obj
+            .get("restart")
+            .and_then(|v| read_restart_policy(v, &format!("{svc_path}.restart"), &mut errors));
         let mut definition = ServiceDefinition {
             id: id.clone(),
             label: obj.get("label").and_then(Value::as_str).map(str::to_string),
             kind,
             ownership,
             disabled,
+            restart,
             profiles: ServiceProfiles {
                 run: profile_run,
                 build: profile_build,
@@ -1683,6 +1771,106 @@ services:
     }
 
     #[test]
+    fn readiness_timeout_accepts_a_humantime_string() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: tcp, port: 8080 }\n    readinessTimeoutMs: \"1m30s\"\n",
+        );
+        let loaded = load_catalog(dir.path()).expect("should load");
+        match &loaded.catalog.services[0].profiles.run {
+            ServiceRunProfile::Verified {
+                readiness_timeout_ms,
+                ..
+            } => assert_eq!(*readiness_timeout_ms, Some(90_000)),
+            _ => panic!("expected verified"),
+        }
+    }
+
+    #[test]
+    fn a_bad_readiness_timeout_string_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: tcp, port: 8080 }\n    readinessTimeoutMs: banana\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(
+            err.errors
+                .iter()
+                .any(|e| e.contains("readinessTimeoutMs") && e.contains("duration")),
+            "{:?}",
+            err.errors
+        );
+    }
+
+    #[test]
+    fn maps_a_log_readiness_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: log, pattern: 'ready to accept' }\n",
+        );
+        let loaded = load_catalog(dir.path()).expect("should load");
+        match loaded.catalog.services[0].profiles.run.readiness() {
+            ReadinessSpec::Log { pattern } => assert_eq!(pattern, "ready to accept"),
+            other => panic!("expected log readiness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_invalid_log_pattern_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: log, pattern: '[unclosed' }\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(
+            err.errors
+                .iter()
+                .any(|e| e.contains("readiness.pattern")),
+            "{:?}",
+            err.errors
+        );
+    }
+
+    #[test]
+    fn maps_a_restart_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    restart: { on: always, maxRestarts: 5, delayMs: \"2s\" }\n",
+        );
+        let loaded = load_catalog(dir.path()).expect("should load");
+        let policy = loaded.catalog.services[0].restart.as_ref().unwrap();
+        assert_eq!(policy.on, crate::catalog::RestartTrigger::Always);
+        assert_eq!(policy.max_restarts, Some(5));
+        assert_eq!(policy.delay_ms, Some(2_000));
+    }
+
+    #[test]
+    fn a_bad_restart_trigger_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir,
+            "hearth.yaml",
+            "version: 1\nservices:\n  api:\n    run: { argv: [x] }\n    readiness: { kind: process }\n    restart: { on: sometimes }\n",
+        );
+        let err = load_catalog(dir.path()).unwrap_err();
+        assert!(
+            err.errors.iter().any(|e| e.contains("restart.on")),
+            "{:?}",
+            err.errors
+        );
+    }
+
+    #[test]
     fn http_and_tcp_shorthand_expand_to_a_concrete_probe() {
         let dir = tempfile::tempdir().unwrap();
         write(
@@ -1884,7 +2072,7 @@ services:
         assert_eq!(
             err.errors,
             vec![
-                "services.api has unknown key \"command\" (known: label, kind, ownership, disabled, env, container, cwd, run, stop, build, readiness, readinessTimeoutMs, preparationCommand, ports, urls, artifact)"
+                "services.api has unknown key \"command\" (known: label, kind, ownership, disabled, env, container, cwd, run, stop, build, readiness, readinessTimeoutMs, preparationCommand, ports, urls, artifact, restart)"
                     .to_string()
             ]
         );

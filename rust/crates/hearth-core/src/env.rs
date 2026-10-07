@@ -169,42 +169,14 @@ fn clear_login_shell_env_cache_for_tests() {
     login_shell_env_cache().lock().unwrap().clear();
 }
 
-/// Minimal `.env` parser: `KEY=VALUE` per line, optional `export ` prefix, `#`-comments, blank lines
-/// skipped, optional surrounding quotes stripped. No interpolation, no multi-line values —
-/// deliberately a subset of what `dotenv` supports.
+/// `.env` file → map, parsed by `dotenvy` (full dotenv semantics: `export ` prefixes, quoted and
+/// multi-line values, escapes, `${VAR}` interpolation against earlier entries and the process
+/// environment). An unreadable file resolves to `{}` — callers always fall back to the layers
+/// below.
 pub fn load_env_file(path: &Path) -> HashMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    let mut env = HashMap::new();
-    for raw_line in text.split('\n') {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let rest = line
-            .strip_prefix("export ")
-            .map(str::trim_start)
-            .unwrap_or(line);
-        let Some(eq) = rest.find('=') else { continue };
-        let key = &rest[..eq];
-        if key.is_empty()
-            || !(key.chars().next().unwrap().is_ascii_alphabetic() || key.starts_with('_'))
-            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            continue;
-        }
-        let value = rest[eq + 1..].trim();
-        let value = if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
-            || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
-        {
-            &value[1..value.len() - 1]
-        } else {
-            value
-        };
-        env.insert(key.to_string(), value.to_string());
-    }
-    env
+    dotenvy::from_path_iter(path)
+        .map(|iter| iter.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Default)]

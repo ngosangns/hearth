@@ -91,6 +91,7 @@ pub fn synthesize_service(
         label: Some(format!("{}@{} (shared)", instance.name, instance.version)),
         kind: Some(ServiceKind::Infrastructure),
         ownership: Some(ServiceOwnership::Daemon),
+        restart: None,
         disabled: false,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
@@ -183,6 +184,7 @@ pub fn project_service_entry(
         id,
         kind: Some(ServiceKind::Infrastructure),
         ownership: Some(ServiceOwnership::External),
+        restart: None,
         disabled: false,
         profiles: ServiceProfiles {
             run: ServiceRunProfile::Verified {
