@@ -754,8 +754,13 @@ impl Desk {
     }
 
     fn draw_split(&mut self, frame: &mut Frame, body: Rect, sidebar: u16) {
-        let [left, right] =
-            Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(0)]).areas(body);
+        let log_width = body.width.saturating_sub(sidebar) / 2;
+        let [left, middle, right] = Layout::horizontal([
+            Constraint::Length(sidebar),
+            Constraint::Min(0),
+            Constraint::Length(log_width),
+        ])
+        .areas(body);
         let (height, offset) = self.fit_workspace(block_inner_height(left), self.workspaces.len());
         self.paint_workspaces(frame, left, height, offset, false);
         let main = if self.shared_open {
@@ -763,7 +768,8 @@ impl Desk {
         } else {
             Pane::Services
         };
-        self.paint_main(frame, right, main);
+        self.paint_list(frame, middle, main);
+        self.paint_log(frame, right);
     }
 
     fn draw_narrow(&mut self, frame: &mut Frame, body: Rect) {
@@ -864,6 +870,11 @@ impl Desk {
 
     fn paint_main(&mut self, frame: &mut Frame, area: Rect, pane: Pane) {
         let (list_area, log_area) = split_main(area);
+        self.paint_list(frame, list_area, pane);
+        self.paint_log(frame, log_area);
+    }
+
+    fn paint_list(&mut self, frame: &mut Frame, list_area: Rect, pane: Pane) {
         let visuals = if pane == Pane::Shared {
             shared_visuals(self)
         } else {
@@ -943,7 +954,10 @@ impl Desk {
                 }
             }
         }
-        if log_area.height == 0 {
+    }
+
+    fn paint_log(&mut self, frame: &mut Frame, log_area: Rect) {
+        if log_area.height == 0 || log_area.width == 0 {
             return;
         }
         let log_title = format!("LOG — {}", self.log_title);
@@ -3021,7 +3035,7 @@ mod tests {
         desk.instances[0].actual_state = "preparing".into();
         desk.instances[0].install_error = Some("sha256 mismatch".into());
         assert_eq!(activation(&desk), Act::StartInstance("redis@8.2.10".into()));
-        let joined = buffer_text(&paint(&mut desk, 100, 20));
+        let joined = buffer_text(&paint(&mut desk, 200, 20));
         assert!(joined.contains("starting"), "{joined}");
         assert!(joined.contains("sha256 mismatch"), "{joined}");
         assert_eq!(key_command(&desk, key('X')), Some(Command::RemoveShared));
