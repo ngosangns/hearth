@@ -5,8 +5,33 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Bytes the terminal writer flushed since the last [`take_write_bytes`] — always tracked
+/// (one relaxed atomic add per write call) so `finish_draw` can pair ms spent with bytes sent.
+static WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_write_bytes(n: usize) {
+    WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+}
+
+pub fn take_write_bytes() -> u64 {
+    WRITE_BYTES.swap(0, Ordering::Relaxed)
+}
+
+/// Packets the writer channel had to drop because the terminal could not drain them — each
+/// drop is followed by a full repaint once the queue empties.
+static FRAME_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_frame_drop() {
+    FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn frame_drops() -> u64 {
+    FRAME_DROPS.load(Ordering::Relaxed)
+}
 
 struct Stats {
     window_start: Instant,
@@ -20,6 +45,8 @@ struct Stats {
     draws: u64,
     draw_us: u64,
     draw_max_us: u64,
+    draw_bytes: u64,
+    draw_max_bytes: u64,
     keys: u64,
     key_us: u64,
     key_max_us: u64,
@@ -61,6 +88,8 @@ fn profiler() -> Option<&'static Profiler> {
                     draws: 0,
                     draw_us: 0,
                     draw_max_us: 0,
+                    draw_bytes: 0,
+                    draw_max_bytes: 0,
                     keys: 0,
                     key_us: 0,
                     key_max_us: 0,
@@ -105,10 +134,13 @@ impl Profiler {
         let branch_us = format_map(&stats.branch_us);
         let branch_max = format_map(&stats.branch_max_us);
         let line = format!(
-            "SUM window_ms={elapsed_ms} sse={{{sse}}} http_n={{{http_n}}} http_us={{{http_us}}} http_max_us={{{http_max}}} branch_n={{{branch_n}}} branch_us={{{branch_us}}} branch_max_us={{{branch_max}}} draws={} draw_us={} draw_max_us={} keys={} key_us={} key_max_us={} queue_max={}",
+            "SUM window_ms={elapsed_ms} sse={{{sse}}} http_n={{{http_n}}} http_us={{{http_us}}} http_max_us={{{http_max}}} branch_n={{{branch_n}}} branch_us={{{branch_us}}} branch_max_us={{{branch_max}}} draws={} draw_us={} draw_max_us={} draw_bytes={} draw_max_bytes={} drops={} keys={} key_us={} key_max_us={} queue_max={}",
             stats.draws,
             stats.draw_us,
             stats.draw_max_us,
+            stats.draw_bytes,
+            stats.draw_max_bytes,
+            frame_drops(),
             stats.keys,
             stats.key_us,
             stats.key_max_us,
@@ -127,6 +159,8 @@ impl Profiler {
             draws: 0,
             draw_us: 0,
             draw_max_us: 0,
+            draw_bytes: 0,
+            draw_max_bytes: 0,
             keys: 0,
             key_us: 0,
             key_max_us: 0,
@@ -182,7 +216,7 @@ pub fn branch(name: &str, elapsed: Duration, queue_depth: usize) {
     profiler.maybe_roll(&mut stats);
 }
 
-pub fn draw(elapsed: Duration) {
+pub fn draw(elapsed: Duration, bytes: u64) {
     let Some(profiler) = profiler() else {
         return;
     };
@@ -191,6 +225,8 @@ pub fn draw(elapsed: Duration) {
     stats.draws += 1;
     stats.draw_us += us;
     stats.draw_max_us = stats.draw_max_us.max(us);
+    stats.draw_bytes += bytes;
+    stats.draw_max_bytes = stats.draw_max_bytes.max(bytes);
     profiler.maybe_roll(&mut stats);
 }
 

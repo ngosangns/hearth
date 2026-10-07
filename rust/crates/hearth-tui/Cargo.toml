@@ -17,6 +17,9 @@ unicode-width = "0.2"
 futures-util = "0.3"
 tokio-util = { workspace = true }
 ratatui = "0.30"
+eventsource-stream = "0.2"
+ansi-to-tui = "8"
 
 [dev-dependencies]
+bytes = "1"
 tempfile = { workspace = true }

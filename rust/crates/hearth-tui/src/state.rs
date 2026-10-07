@@ -72,13 +72,21 @@ pub const DEFAULT_LOG_TAIL_LIMIT: usize = 16 * 1024;
 
 /// Keeps only the last `limit` *characters* (Unicode scalar values) of `current` + `next`.
 pub fn bounded_tail(current: &str, next: &str, limit: usize) -> String {
-    let combined = format!("{current}{next}");
-    let char_count = combined.chars().count();
-    if char_count <= limit {
-        combined
-    } else {
-        combined.chars().skip(char_count - limit).collect()
+    let mut combined = String::with_capacity(current.len() + next.len());
+    combined.push_str(current);
+    combined.push_str(next);
+    // The limit counts characters; bytes ≥ chars, so a byte-fit is always a char-fit fast path
+    // that skips the scan entirely on small logs.
+    if combined.len() <= limit {
+        return combined;
     }
+    // Keep the last `limit` chars: walk char boundaries back from the end — one pass over the
+    // tail and an in-place drain, instead of count-all + skip + collect into a second buffer
+    // on every append.
+    if let Some((start, _)) = combined.char_indices().rev().nth(limit - 1) {
+        combined.drain(..start);
+    }
+    combined
 }
 
 #[derive(Debug, Clone, Default)]

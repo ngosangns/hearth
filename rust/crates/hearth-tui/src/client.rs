@@ -4,7 +4,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use eventsource_stream::{EventStream, EventStreamError};
+use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -232,97 +233,117 @@ impl ManagerTuiClient {
             .event_stream(*after, epoch.as_deref())
             .await
             .map_err(|e| e.message)?;
-        let mut stream = response.bytes_stream();
-        // Raw bytes, decoded per complete frame: a multi-byte character split across two TCP
-        // chunks must not turn into U+FFFD.
-        let mut buffer: Vec<u8> = Vec::new();
+        // `eventsource-stream` decodes complete frames (comment keep-alives dropped, multi-line
+        // `data:` joined, UTF-8 split across chunks intact); `capped_sse_bytes` keeps the
+        // `MAX_SSE_FRAME_BYTES` bound it buffers against.
+        let mut events = EventStream::new(capped_sse_bytes(response.bytes_stream()));
         loop {
-            let chunk = tokio::select! {
+            let event = tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
-                chunk = stream.next() => chunk,
+                event = events.next() => event,
             };
-            let bytes = match chunk {
+            let event = match event {
                 None => return Ok(()),
-                Some(Err(error)) => return Err(error.to_string()),
-                Some(Ok(bytes)) => bytes,
+                Some(Err(EventStreamError::Transport(message))) => return Err(message),
+                Some(Err(_)) => return Err("event stream frame is malformed".to_string()),
+                Some(Ok(event)) => event,
             };
-            append_sse_chunk(&mut buffer, &bytes)?;
-            while let Some(frame) = next_sse_frame(&mut buffer) {
-                if is_sse_comment(&frame) {
-                    continue;
+            if event.event == "replay" {
+                let replay: EventReplay = serde_json::from_str(&event.data)
+                    .map_err(|_| "event stream payload is malformed".to_string())?;
+                *epoch = Some(replay.epoch.clone());
+                if replay.reset {
+                    *after = Some(replay.latest_sequence);
                 }
-                let parsed = parse_sse(&frame)
-                    .ok_or_else(|| "event stream frame is malformed".to_string())?;
-                if parsed.event_type == "replay" {
-                    let replay: EventReplay = serde_json::from_value(parsed.data)
-                        .map_err(|_| "event stream payload is malformed".to_string())?;
-                    *epoch = Some(replay.epoch.clone());
-                    if replay.reset {
-                        *after = Some(replay.latest_sequence);
-                    }
-                    let _ = tx.send(WatchEvent::Replay(replay)).await;
-                } else {
-                    let event: ManagerEvent = serde_json::from_value(parsed.data)
-                        .map_err(|_| "event stream payload is malformed".to_string())?;
-                    *after = Some(event.sequence);
-                    let _ = tx.send(WatchEvent::ManagerEvent(event)).await;
-                }
+                let _ = tx.send(WatchEvent::Replay(replay)).await;
+            } else {
+                let event: ManagerEvent = serde_json::from_str(&event.data)
+                    .map_err(|_| "event stream payload is malformed".to_string())?;
+                *after = Some(event.sequence);
+                let _ = tx.send(WatchEvent::ManagerEvent(event)).await;
             }
         }
     }
 }
 
-/// Appends one network chunk to the pending-frame buffer, failing once a single frame would exceed
-/// `MAX_SSE_FRAME_BYTES`.
-pub fn append_sse_chunk(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
-    if buffer.len() + chunk.len() > MAX_SSE_FRAME_BYTES {
-        return Err("event stream frame exceeds limit".to_string());
+/// Counts bytes in the current (not yet terminated) SSE frame across chunks, so `capped_sse_bytes`
+/// can fail a stream whose pending frame outgrows the cap — `EventStream` buffers internally, so
+/// the limit has to live underneath it on the raw bytes.
+#[derive(Default)]
+struct SseFrameCap {
+    /// Bytes consumed since the last completed frame boundary.
+    pending: usize,
+    /// The last parsed unit was a complete line terminator.
+    last_term: bool,
+    /// The last byte was a CR whose CRLF may continue into the next byte.
+    pending_cr: bool,
+}
+
+impl SseFrameCap {
+    /// Returns `Err` once the pending frame exceeds `limit`. A frame boundary is two adjacent
+    /// line terminators, where each terminator is `\n`, `\r`, or `\r\n` — possibly split across
+    /// chunks.
+    fn feed(&mut self, chunk: &[u8], limit: usize) -> Result<(), String> {
+        // Index after the last boundary completed inside this chunk, if any.
+        let mut boundary: Option<usize> = None;
+        for (i, &byte) in chunk.iter().enumerate() {
+            match byte {
+                b'\r' => {
+                    if self.last_term {
+                        boundary = Some(i + 1);
+                    }
+                    self.last_term = true;
+                    self.pending_cr = true;
+                }
+                b'\n' => {
+                    if self.pending_cr {
+                        // Completes the CRLF; if that CR had just finished a boundary, the
+                        // boundary ends here instead.
+                        if boundary == Some(i) {
+                            boundary = Some(i + 1);
+                        }
+                        self.pending_cr = false;
+                    } else {
+                        if self.last_term {
+                            boundary = Some(i + 1);
+                        }
+                        self.last_term = true;
+                    }
+                }
+                _ => {
+                    self.last_term = false;
+                    self.pending_cr = false;
+                }
+            }
+        }
+        self.pending = match boundary {
+            Some(index) => chunk.len() - index,
+            None => self.pending + chunk.len(),
+        };
+        if self.pending > limit {
+            return Err("event stream frame exceeds limit".to_string());
+        }
+        Ok(())
     }
-    buffer.extend_from_slice(chunk);
-    Ok(())
 }
 
-/// Removes and decodes the next complete (blank-line-terminated) frame from `buffer`, if any.
-pub fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
-    let boundary = buffer.windows(2).position(|pair| pair == b"\n\n")?;
-    let frame = String::from_utf8_lossy(&buffer[..boundary]).into_owned();
-    buffer.drain(..boundary + 2);
-    Some(frame)
-}
-
-/// A frame of only comment (`:`) or blank lines — the server's keep-alive. Carries no event.
-pub fn is_sse_comment(frame: &str) -> bool {
-    frame
-        .lines()
-        .all(|line| line.is_empty() || line.starts_with(':'))
-}
-
-pub struct SseFrame {
-    pub event_type: String,
-    pub data: Value,
-}
-
-pub fn parse_sse(frame: &str) -> Option<SseFrame> {
-    if frame.len() > MAX_SSE_FRAME_BYTES {
-        return None;
-    }
-    let event_type = frame
-        .lines()
-        .find(|l| l.starts_with("event:"))
-        .map(|l| l["event:".len()..].trim().to_string())
-        .unwrap_or_else(|| "message".to_string());
-    let raw = frame
-        .lines()
-        .filter(|l| l.starts_with("data:"))
-        .map(|l| l["data:".len()..].trim())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if raw.is_empty() {
-        return None;
-    }
-    serde_json::from_str(&raw)
-        .ok()
-        .map(|data| SseFrame { event_type, data })
+/// Maps a response byte stream to one that fails with `event stream frame exceeds limit` as soon
+/// as a single frame's bytes pass `MAX_SSE_FRAME_BYTES` mid-buffer — the same bound the removed
+/// hand-rolled parser enforced on its own buffer.
+fn capped_sse_bytes<S, B, E>(inner: S) -> impl Stream<Item = Result<B, String>>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    inner
+        .map(|item| item.map_err(|e| e.to_string()))
+        .scan(SseFrameCap::default(), |cap, item| {
+            std::future::ready(Some(item.and_then(|bytes| {
+                cap.feed(bytes.as_ref(), MAX_SSE_FRAME_BYTES)
+                    .map(|_| bytes)
+            })))
+        })
 }
 
 /// A log read the shell applies on the UI thread. `Replace` is the full tail when the incremental
@@ -413,76 +434,107 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_a_replay_frame() {
-        let frame = "event: replay\ndata: {\"epoch\":\"e1\",\"reset\":false,\"latestSequence\":5}";
-        let parsed = parse_sse(frame).unwrap();
-        assert_eq!(parsed.event_type, "replay");
-        let replay: EventReplay = serde_json::from_value(parsed.data).unwrap();
+    /// Feeds byte chunks through `capped_sse_bytes` + `EventStream` — the same pipeline
+    /// `stream_events` runs — and returns the decoded events or the first transport error.
+    async fn events_of(chunks: &[&[u8]]) -> Result<Vec<eventsource_stream::Event>, String> {
+        let byte_stream = futures_util::stream::iter(
+            chunks
+                .iter()
+                .map(|c| Ok::<_, String>(bytes::Bytes::copy_from_slice(c))),
+        );
+        let mut events = Vec::new();
+        let mut stream = EventStream::new(capped_sse_bytes(byte_stream));
+        while let Some(item) = stream.next().await {
+            events.push(item.map_err(|e| match e {
+                EventStreamError::Transport(message) => message,
+                other => other.to_string(),
+            })?);
+        }
+        Ok(events)
+    }
+
+    #[tokio::test]
+    async fn parses_a_replay_frame() {
+        let events = events_of(&[
+            b"event: replay\ndata: {\"epoch\":\"e1\",\"reset\":false,\"latestSequence\":5}\n\n",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "replay");
+        let replay: EventReplay = serde_json::from_str(&events[0].data).unwrap();
         assert_eq!(replay.epoch, "e1");
         assert_eq!(replay.latest_sequence, 5);
     }
 
-    #[test]
-    fn parses_a_multi_line_data_field() {
-        let frame = "event: service.lifecycle\ndata: {\"sequence\":1,\ndata: \"type\":\"x\"}";
-        let parsed = parse_sse(frame).unwrap();
-        assert_eq!(parsed.event_type, "service.lifecycle");
-        assert_eq!(parsed.data, serde_json::json!({"sequence": 1, "type": "x"}));
+    #[tokio::test]
+    async fn parses_a_multi_line_data_field() {
+        let events = events_of(&[
+            b"event: service.lifecycle\ndata: {\"sequence\":1,\ndata: \"type\":\"x\"}\n\n",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(events[0].event, "service.lifecycle");
+        let data: serde_json::Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(data, serde_json::json!({"sequence": 1, "type": "x"}));
     }
 
-    #[test]
-    fn defaults_the_event_type_to_message_without_an_event_line() {
-        let frame = "data: {\"a\":1}";
-        let parsed = parse_sse(frame).unwrap();
-        assert_eq!(parsed.event_type, "message");
+    #[tokio::test]
+    async fn defaults_the_event_type_to_message_without_an_event_line() {
+        let events = events_of(&[b"data: {\"a\":1}\n\n"]).await.unwrap();
+        assert_eq!(events[0].event, "message");
     }
 
-    #[test]
-    fn rejects_a_frame_with_no_data_field() {
-        assert!(parse_sse("event: replay").is_none());
+    /// A frame with no `data:` field is not dispatched (SSE spec) — no event, no error.
+    #[tokio::test]
+    async fn a_frame_with_no_data_field_emits_nothing() {
+        let events = events_of(&[b"event: replay\n\n"]).await.unwrap();
+        assert!(events.is_empty());
     }
 
-    #[test]
-    fn rejects_an_oversized_chunk_append() {
+    #[tokio::test]
+    async fn an_oversized_frame_fails_the_stream() {
         let huge = vec![b'x'; MAX_SSE_FRAME_BYTES + 1];
-        assert!(append_sse_chunk(&mut Vec::new(), &huge).is_err());
+        assert!(events_of(&[&huge]).await.is_err());
     }
 
     /// axum's keep-alive is a bare `:` comment frame; it must be skipped, not treated as a
     /// malformed frame that tears the stream down.
-    #[test]
-    fn keep_alive_comment_frames_are_skipped() {
-        assert!(is_sse_comment(":"));
-        assert!(is_sse_comment(": ping"));
-        assert!(is_sse_comment(""));
-        assert!(!is_sse_comment("event: replay\ndata: {}"));
-        let mut buffer = Vec::new();
-        append_sse_chunk(
-            &mut buffer,
-            b":\n\nevent: replay\ndata: {\"epoch\":\"e\",\"reset\":false,\"latestSequence\":1}\n\n",
-        )
+    #[tokio::test]
+    async fn keep_alive_comment_frames_are_skipped() {
+        let events = events_of(&[
+            b":\n\n: ping\n\n",
+            b"event: replay\ndata: {\"epoch\":\"e\",\"reset\":false,\"latestSequence\":1}\n\n",
+        ])
+        .await
         .unwrap();
-        let frames: Vec<String> = std::iter::from_fn(|| next_sse_frame(&mut buffer))
-            .filter(|f| !is_sse_comment(f))
-            .collect();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(parse_sse(&frames[0]).unwrap().event_type, "replay");
-        assert!(buffer.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "replay");
     }
 
     /// A multi-byte character split across two network chunks decodes intact once the frame
     /// completes.
-    #[test]
-    fn a_character_split_across_chunks_decodes_intact() {
-        let frame = "data: {\"message\":\"héllo\"}\n\n".as_bytes();
+    #[tokio::test]
+    async fn a_character_split_across_chunks_decodes_intact() {
+        let frame = b"data: {\"message\":\"h\xc3\xa9llo\"}\n\n";
         let split = frame.iter().position(|b| *b == 0xC3).unwrap() + 1;
-        let mut buffer = Vec::new();
-        append_sse_chunk(&mut buffer, &frame[..split]).unwrap();
-        assert!(next_sse_frame(&mut buffer).is_none());
-        append_sse_chunk(&mut buffer, &frame[split..]).unwrap();
-        let parsed = parse_sse(&next_sse_frame(&mut buffer).unwrap()).unwrap();
-        assert_eq!(parsed.data["message"], "héllo");
+        let events = events_of(&[&frame[..split], &frame[split..]])
+            .await
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(data["message"], "héllo");
+    }
+
+    /// The frame cap survives a `\n\n` boundary split across chunk edges — the byte after the
+    /// boundary starts the next frame.
+    #[test]
+    fn frame_cap_tracks_a_boundary_split_across_chunks() {
+        let mut cap = SseFrameCap::default();
+        cap.feed(b"data: x\n", 7).unwrap_err();
+        let mut cap = SseFrameCap::default();
+        cap.feed(b"data: x\n", 16).unwrap();
+        cap.feed(b"\nnext: y", 16).unwrap();
+        assert_eq!(cap.pending, "next: y".len());
     }
 
     /// End-to-end through a real daemon: `action(..., kill_unowned: true)` is the TUI's version of
@@ -522,6 +574,7 @@ mod tests {
             label: None,
             kind: Some(ServiceKind::Application),
             ownership: None,
+            restart: None,
             disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {

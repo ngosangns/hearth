@@ -2,6 +2,7 @@
 //! [`Command`]s and draws a [`Frame`]. The command table is the key map and the footer.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hearth_core::catalog::{
@@ -287,6 +288,143 @@ impl Link {
     }
 }
 
+/// The log pane's parsed form. The frame only paints ~`height` rows, so `sgr_to_line` and the
+/// URL scan run lazily for those rows — a 16 KiB retained log is indexed (a memchr pass for
+/// line boundaries), not ANSI-parsed, per change. An appended tail extends the index instead of
+/// rebuilding it, which is the streaming case (`fetch_log` returns incremental slices).
+#[derive(Default)]
+struct LogCache {
+    /// The `log` text `ranges` index — content comparison is the staleness check.
+    source: String,
+    /// Byte range of each line inside `source`, without its '\n'. `source.split('\n')`
+    /// semantics: a trailing '\n' still yields a final empty row.
+    ranges: Vec<(usize, usize)>,
+    /// Rows painted so far; `None` entries parse on first use. Cleared (kept as `None`)
+    /// whenever the source isn't a pure append of the previous one.
+    rows: Vec<Option<ParsedLogLine>>,
+}
+
+struct ParsedLogLine {
+    line: Line<'static>,
+    /// (column, target) for each URL, measured in cells from the start of the painted line.
+    links: Vec<(u16, String)>,
+}
+
+impl ParsedLogLine {
+    fn parse(row: &str) -> Self {
+        let line = sgr_to_line(row);
+        Self {
+            links: line_links(&line),
+            line,
+        }
+    }
+}
+
+impl LogCache {
+    fn sync(&mut self, log: &str) {
+        // A never-indexed `""` still needs its one blank row, so "unchanged" also requires a
+        // populated index.
+        if self.source == log && !self.ranges.is_empty() {
+            return;
+        }
+        // `desk.log` grows by append while a service streams — keep every already-indexed
+        // (and already-parsed) row and only scan the new tail. The last row may have grown:
+        // a mid-line append continues it, so it is re-indexed from its start.
+        if log.starts_with(self.source.as_str()) {
+            let old_len = self.source.len();
+            if let Some((start, _)) = self.ranges.last().copied() {
+                self.ranges.pop();
+                self.rows.pop();
+                self.index_from(log, start);
+            } else {
+                self.index_from(log, old_len);
+            }
+        } else {
+            self.ranges.clear();
+            self.rows.clear();
+            self.index_from(log, 0);
+        }
+        self.source.clear();
+        self.source.push_str(log);
+        self.rows.resize_with(self.ranges.len(), || None);
+    }
+
+    /// Pushes a `(start, end)` range for every line at and after byte offset `from` — which is
+    /// always a line start (0, or just past a '\n', or a re-opened last line's start).
+    fn index_from(&mut self, log: &str, from: usize) {
+        let mut start = from;
+        for (i, byte) in log.bytes().enumerate().skip(from) {
+            if byte == b'\n' {
+                self.ranges.push((start, i));
+                start = i + 1;
+            }
+        }
+        self.ranges.push((start, log.len()));
+    }
+
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Parses row `index` on first access — `sgr_to_line` plus the URL scan — then caches it.
+    /// Only rows inside the visible window ever go through this.
+    fn line(&mut self, index: usize) -> &ParsedLogLine {
+        if self.rows[index].is_none() {
+            let (start, end) = self.ranges[index];
+            self.rows[index] = Some(if start == end && self.ranges.len() == 1 {
+                // An empty log paints a single blank row, matching the previous renderer.
+                ParsedLogLine {
+                    line: Line::from(" "),
+                    links: Vec::new(),
+                }
+            } else {
+                ParsedLogLine::parse(&self.source[start..end])
+            });
+        }
+        self.rows[index].as_ref().unwrap()
+    }
+}
+
+/// URLs in `text` as (byte index, trimmed target) pairs — the scan shared by the per-frame URL
+/// rows and the cached log lines.
+fn url_targets(text: &str) -> Vec<(usize, &str)> {
+    let mut starts: Vec<usize> = text
+        .match_indices("https://")
+        .map(|(index, _)| index)
+        .collect();
+    starts.extend(text.match_indices("http://").map(|(index, _)| index));
+    starts.sort_unstable();
+    starts
+        .into_iter()
+        .filter_map(|start| {
+            let end = text[start..]
+                .find(char::is_whitespace)
+                .map(|offset| start + offset)
+                .unwrap_or(text.len());
+            let target = text[start..end]
+                .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+            (!target.is_empty()).then_some((start, target))
+        })
+        .collect()
+}
+
+/// Geometry-free URL positions for a painted line: the column offset is fixed once `x` is added
+/// and the width clip happens when the row is actually drawn.
+fn line_links(line: &Line) -> Vec<(u16, String)> {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    url_targets(&text)
+        .into_iter()
+        .map(|(start, target)| {
+            let column = u16::try_from(visible_width(&text[..start])).unwrap_or(u16::MAX);
+            (column, target.to_string())
+        })
+        .collect()
+}
+
 /// The link run the pointer is selecting. Columns are screen columns; `end` is exclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSelection {
@@ -321,14 +459,17 @@ pub struct Desk {
     pub notice: String,
     pub workspaces: Vec<WorkspaceLine>,
     pub workspace_index: usize,
-    pub sections: Vec<Section>,
+    /// `Arc` so the painted row cache can test "did this list change" by pointer — `ptr_eq` is
+    /// airtight where a length/pointer pair is not, and every mutation path (`set_sections`,
+    /// `Arc::make_mut` on a shared list, a wholesale assign) ends up at a different allocation.
+    pub sections: Arc<Vec<Section>>,
     pub service_cursor: usize,
     pub urls: Vec<String>,
     pub log_title: String,
     pub log: String,
     pub summary: String,
-    pub recipes: Vec<RecipeLine>,
-    pub instances: Vec<InstanceLine>,
+    pub recipes: Arc<Vec<RecipeLine>>,
+    pub instances: Arc<Vec<InstanceLine>>,
     pub shared_cursor: usize,
     pub start_all: Vec<String>,
     pub attached: bool,
@@ -340,6 +481,24 @@ pub struct Desk {
     geometry: Geometry,
     pub links: Vec<Link>,
     pub link_selection: Option<LinkSelection>,
+    log_cache: Option<LogCache>,
+    /// `service_visuals`/`shared_visuals` output for the current lists. Rebuilt only when one of
+    /// its `Arc` inputs changes identity (or the selected-workspace flag flips), so a 60 fps
+    /// redraw over an SSE flood doesn't re-format every service row every frame.
+    list_visuals: Option<ListVisuals>,
+}
+
+/// The painted service/shared rows plus the `Arc` anchors they were built from.
+struct ListVisuals {
+    sections: Arc<Vec<Section>>,
+    recipes: Arc<Vec<RecipeLine>>,
+    instances: Arc<Vec<InstanceLine>>,
+    /// `service_visuals` paints a "daemon log" row iff a workspace is selected — index + len
+    /// decide that without sharing the workspace list itself.
+    workspace_index: usize,
+    workspaces_len: usize,
+    services: Vec<Painted>,
+    shared: Vec<Painted>,
 }
 
 impl Default for Desk {
@@ -353,14 +512,14 @@ impl Default for Desk {
             notice: String::new(),
             workspaces: Vec::new(),
             workspace_index: 0,
-            sections: Vec::new(),
+            sections: Arc::new(Vec::new()),
             service_cursor: 0,
             urls: Vec::new(),
             log_title: "log".to_string(),
             log: String::new(),
             summary: String::new(),
-            recipes: Vec::new(),
-            instances: Vec::new(),
+            recipes: Arc::new(Vec::new()),
+            instances: Arc::new(Vec::new()),
             shared_cursor: 0,
             start_all: Vec::new(),
             attached: false,
@@ -372,6 +531,8 @@ impl Default for Desk {
             geometry: Geometry::default(),
             links: Vec::new(),
             link_selection: None,
+            log_cache: None,
+            list_visuals: None,
         }
     }
 }
@@ -387,10 +548,10 @@ impl Desk {
 
     pub fn shared_ids(&self) -> Vec<RowId> {
         let mut rows = Vec::new();
-        for recipe in &self.recipes {
+        for recipe in self.recipes.iter() {
             rows.push(RowId::Recipe(recipe.name.clone()));
         }
-        for instance in &self.instances {
+        for instance in self.instances.iter() {
             rows.push(RowId::Instance(instance.id.clone()));
         }
         rows
@@ -414,7 +575,7 @@ impl Desk {
     /// Replaces the service tree and keeps the cursor on the same row when it still exists.
     pub fn set_sections(&mut self, sections: Vec<Section>, start_all: Vec<String>) {
         let keep = self.selected_service();
-        self.sections = sections;
+        self.sections = Arc::new(sections);
         self.start_all = start_all;
         let ids = self.service_ids();
         self.service_cursor = keep
@@ -479,7 +640,10 @@ impl Desk {
         let RowId::Recipe(name) = self.selected_shared().unwrap_or(RowId::Daemon) else {
             return false;
         };
-        let Some(recipe) = self.recipes.iter_mut().find(|recipe| recipe.name == name) else {
+        let Some(recipe) = Arc::make_mut(&mut self.recipes)
+            .iter_mut()
+            .find(|recipe| recipe.name == name)
+        else {
             return false;
         };
         let len = recipe.versions.len() as i64;
@@ -616,23 +780,25 @@ impl Desk {
         }
     }
 
-    pub fn hit(&self, column: usize, row: usize) -> Option<Hit> {
+    pub fn hit(&mut self, column: usize, row: usize) -> Option<Hit> {
         if self.help || self.composer.is_some() {
             return None;
         }
         if self.pending.is_some() && contains_cell(self.geometry.modal, column, row) {
             return None;
         }
-        let geo = &self.geometry;
+        let geo = self.geometry;
         if contains_cell(geo.workspace_items, column, row) {
             let index = geo.workspace_offset + row - geo.workspace_items.y as usize;
             return self.workspaces.get(index).map(|_| Hit::Workspace(index));
         }
         if contains_cell(geo.main_items, column, row) {
             let slot = geo.main_offset + row - geo.main_items.y as usize;
+            self.refresh_visuals();
+            let cached = self.list_visuals.as_ref().unwrap();
             let visuals = match geo.main {
-                Pane::Shared => shared_visuals(self),
-                Pane::Services => service_visuals(self),
+                Pane::Shared => &cached.shared,
+                Pane::Services => &cached.services,
                 Pane::Workspaces => return None,
             };
             let painted = visuals.get(slot)?;
@@ -874,11 +1040,39 @@ impl Desk {
         self.paint_log(frame, log_area);
     }
 
+    /// Rebuilds `list_visuals` when one of its inputs changed: the `Arc` identity of the
+    /// sections/recipes/instances lists, or the selected-workspace flag baked into the service
+    /// list's first row. Selection is *not* baked into the rows: every `*_line` mark column is
+    /// a `' '` and `paint_list` patches the focused row's marker cell to `>` — cursor moves
+    /// repaint two cells, not the list.
+    fn refresh_visuals(&mut self) {
+        let fresh = self.list_visuals.as_ref().is_some_and(|v| {
+            Arc::ptr_eq(&v.sections, &self.sections)
+                && Arc::ptr_eq(&v.recipes, &self.recipes)
+                && Arc::ptr_eq(&v.instances, &self.instances)
+                && v.workspace_index == self.workspace_index
+                && v.workspaces_len == self.workspaces.len()
+        });
+        if !fresh {
+            self.list_visuals = Some(ListVisuals {
+                sections: self.sections.clone(),
+                recipes: self.recipes.clone(),
+                instances: self.instances.clone(),
+                workspace_index: self.workspace_index,
+                workspaces_len: self.workspaces.len(),
+                services: service_visuals(self),
+                shared: shared_visuals(self),
+            });
+        }
+    }
+
     fn paint_list(&mut self, frame: &mut Frame, list_area: Rect, pane: Pane) {
+        self.refresh_visuals();
+        let cached = self.list_visuals.as_ref().unwrap();
         let visuals = if pane == Pane::Shared {
-            shared_visuals(self)
+            &cached.shared
         } else {
-            service_visuals(self)
+            &cached.services
         };
         let cursor = if pane == Pane::Shared {
             self.shared_cursor
@@ -908,7 +1102,7 @@ impl Desk {
         };
         let item_capacity = (inner.height as usize).saturating_sub(url_rows);
         let item_height = item_capacity.min(visuals.len());
-        let visual_cursor = visual_index_of_item(&visuals, cursor).unwrap_or(0);
+        let visual_cursor = visual_index_of_item(visuals, cursor).unwrap_or(0);
         let offset = {
             let slot = if pane == Pane::Shared {
                 &mut self.shared_offset
@@ -933,17 +1127,21 @@ impl Desk {
                 let selected = painted.is_some_and(|row| {
                     focused && row.kind == Visual::Item && row.selectable == cursor
                 });
-                let line = painted
-                    .map(|row| row.line.clone())
-                    .unwrap_or_else(|| Line::from(""));
-                paint_line(
-                    buf,
-                    inner.x,
-                    inner.y + slot as u16,
-                    inner.width,
-                    &line,
-                    selected,
-                );
+                let y = inner.y + slot as u16;
+                // `line` borrows straight from the cache — no per-frame `Line` clone. The `>`
+                // marker lives outside it: cached rows are cursor-independent, and the selected
+                // row's marker cell is patched right after `set_line`.
+                match painted {
+                    Some(row) => {
+                        paint_line(buf, inner.x, y, inner.width, &row.line, selected);
+                        if selected {
+                            if let Some(cell) = buf.cell_mut((inner.x, y)) {
+                                cell.set_symbol(">");
+                            }
+                        }
+                    }
+                    None => paint_line(buf, inner.x, y, inner.width, &Line::from(""), false),
+                }
             }
             if pane == Pane::Services {
                 for (index, url) in self.urls.iter().take(url_rows).enumerate() {
@@ -964,21 +1162,39 @@ impl Desk {
         let log_block = pane_block(&log_title, false);
         let log_inner = log_block.inner(log_area);
         frame.render_widget(log_block, log_area);
-        let rows = log_window(&self.log, log_inner.height as usize, &mut self.log_scroll);
+        let cache = self.log_cache.get_or_insert_with(LogCache::default);
+        cache.sync(&self.log);
         self.geometry.log_items = log_inner;
+        let height = log_inner.height as usize;
+        if height == 0 {
+            return;
+        }
+        let visible = log_window(cache.len(), height, &mut self.log_scroll);
+        let width = log_inner.width as usize;
         let buf = frame.buffer_mut();
-        for (index, row) in rows.iter().enumerate() {
-            let line = sgr_to_line(row);
+        for (index, row) in visible.enumerate() {
+            let parsed = cache.line(row);
             let y = log_inner.y + index as u16;
-            buf.set_line(log_inner.x, y, &line, log_inner.width);
-            collect_links(
-                &line,
-                log_inner.x,
-                y,
-                log_inner.width,
-                false,
-                &mut self.links,
-            );
+            buf.set_line(log_inner.x, y, &parsed.line, log_inner.width);
+            for (column, target) in &parsed.links {
+                let column = *column as usize;
+                if column >= width {
+                    continue;
+                }
+                let text = clip_width(target, width - column);
+                if text.is_empty() {
+                    continue;
+                }
+                self.links.push(Link {
+                    x: log_inner.x.saturating_add(column as u16),
+                    y,
+                    text,
+                    target: target.clone(),
+                    row_x: log_inner.x,
+                    row_width: log_inner.width,
+                    row_press: false,
+                });
+            }
         }
     }
 
@@ -1030,25 +1246,25 @@ struct Painted {
     selectable: usize,
 }
 
+/// Rows for the service pane. Lines are cursor- and focus-independent — the `>` marker and the
+/// selection chrome are applied by `paint_list` — so the result is cacheable across frames and
+/// cursor moves (`Desk::refresh_visuals` re-runs this only when the lists change).
 fn service_visuals(desk: &Desk) -> Vec<Painted> {
     let mut rows = Vec::new();
     let mut selectable = 0;
-    let focused = desk.focus == Pane::Services;
     if desk.selected_workspace().is_some() {
-        let selected = focused && desk.service_cursor == selectable;
         rows.push(Painted {
-            line: item_line(selected, "daemon log"),
+            line: item_line(false, "daemon log"),
             kind: Visual::Item,
             selectable,
         });
         selectable += 1;
     }
     let named = desk.sections.iter().any(|section| section.name.is_some());
-    for section in &desk.sections {
+    for section in desk.sections.iter() {
         if let Some(name) = &section.name {
-            let selected = focused && desk.service_cursor == selectable;
             rows.push(Painted {
-                line: item_line(selected, &name.to_uppercase()),
+                line: item_line(false, &name.to_uppercase()),
                 kind: Visual::Item,
                 selectable,
             });
@@ -1061,9 +1277,8 @@ fn service_visuals(desk: &Desk) -> Vec<Painted> {
             });
         }
         for service in &section.services {
-            let selected = focused && desk.service_cursor == selectable;
             rows.push(Painted {
-                line: service_line(service, selected),
+                line: service_line(service, false),
                 kind: Visual::Item,
                 selectable,
             });
@@ -1076,7 +1291,6 @@ fn service_visuals(desk: &Desk) -> Vec<Painted> {
 fn shared_visuals(desk: &Desk) -> Vec<Painted> {
     let mut rows = Vec::new();
     let mut selectable = 0;
-    let focused = desk.focus == Pane::Shared;
     if !desk.recipes.is_empty() {
         rows.push(Painted {
             line: Line::styled("RECIPES", theme::dim()),
@@ -1084,8 +1298,7 @@ fn shared_visuals(desk: &Desk) -> Vec<Painted> {
             selectable,
         });
     }
-    for recipe in &desk.recipes {
-        let selected = focused && desk.shared_cursor == selectable;
+    for recipe in desk.recipes.iter() {
         let installed = desk
             .instances
             .iter()
@@ -1096,7 +1309,7 @@ fn shared_visuals(desk: &Desk) -> Vec<Painted> {
             .map(String::as_str)
             .unwrap_or("");
         rows.push(Painted {
-            line: recipe_line(selected, &recipe.name, version, installed),
+            line: recipe_line(false, &recipe.name, version, installed),
             kind: Visual::Item,
             selectable,
         });
@@ -1109,8 +1322,7 @@ fn shared_visuals(desk: &Desk) -> Vec<Painted> {
             selectable,
         });
     }
-    for instance in &desk.instances {
-        let selected = focused && desk.shared_cursor == selectable;
+    for instance in desk.instances.iter() {
         let projects = match instance.attachments {
             0 => String::new(),
             1 => "  1 project".to_string(),
@@ -1123,7 +1335,7 @@ fn shared_visuals(desk: &Desk) -> Vec<Painted> {
             .map(|text| format!("  {text}"))
             .unwrap_or_default();
         rows.push(Painted {
-            line: instance_line(instance, selected, &projects, &failure),
+            line: instance_line(instance, false, &projects, &failure),
             kind: Visual::Item,
             selectable,
         });
@@ -1562,25 +1774,9 @@ fn collect_links(line: &Line, x: u16, y: u16, width: u16, row_press: bool, links
         .iter()
         .map(|span| span.content.as_ref())
         .collect();
-    let mut starts: Vec<usize> = text
-        .match_indices("https://")
-        .map(|(index, _)| index)
-        .collect();
-    starts.extend(text.match_indices("http://").map(|(index, _)| index));
-    starts.sort_unstable();
-    for start in starts {
+    for (start, target) in url_targets(&text) {
         let column = visible_width(&text[..start]);
         if column >= width as usize {
-            continue;
-        }
-        let tail = &text[start..];
-        let end = tail
-            .find(char::is_whitespace)
-            .map(|offset| start + offset)
-            .unwrap_or(text.len());
-        let target = text[start..end]
-            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
-        if target.is_empty() {
             continue;
         }
         let text = clip_width(target, width as usize - column);
@@ -2697,22 +2893,18 @@ fn visual_index_of_item(visuals: &[Painted], item: usize) -> Option<usize> {
         .position(|row| row.kind == Visual::Item && row.selectable == item)
 }
 
-/// The rows the log pane paints. `scroll` is lines up from the tail and is clamped to the buffer.
-/// Callers parse SGR only for this slice. The stored log is already capped at the tail fetch.
-fn log_window<'a>(log: &'a str, height: usize, scroll: &mut usize) -> Vec<&'a str> {
-    if height == 0 {
-        return Vec::new();
+/// The rows the log pane paints out of the parsed cache. `scroll` is lines up from the tail and
+/// is clamped to the buffer. Callers parse SGR once per log change, not once per frame.
+/// Indices of the rows the log pane paints: the newest `height` lines, offset upward by
+/// `scroll` (clamped to what exists). `scroll` == 0 is follow-tail.
+fn log_window(total: usize, height: usize, scroll: &mut usize) -> std::ops::Range<usize> {
+    if height == 0 || total == 0 {
+        return 0..0;
     }
-    if log.is_empty() {
-        *scroll = 0;
-        return vec![" "];
-    }
-    let total = log.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let max_scroll = total.saturating_sub(height);
     *scroll = (*scroll).min(max_scroll);
     let end = total - *scroll;
-    let start = end.saturating_sub(height);
-    log.split('\n').skip(start).take(end - start).collect()
+    end.saturating_sub(height)..end
 }
 
 const HELP: &[&str] = &[
@@ -2882,15 +3074,15 @@ mod tests {
         desk.attached = true;
         assert_eq!(activation(&desk), Act::FocusServices);
         desk.focus = Pane::Services;
-        desk.sections = group_sections(
+        desk.sections = Arc::new(group_sections(
             &[meta("api", false, false)],
             &[],
             &[live("api", "externally-owned")],
-        );
+        ));
         desk.service_cursor = 1;
         assert_eq!(activation(&desk), Act::Reclaim("api".into()));
-        desk.sections[0].services[0].disabled = true;
-        desk.sections[0].services[0].state = ActualServiceState::Stopped;
+        Arc::make_mut(&mut desk.sections)[0].services[0].disabled = true;
+        Arc::make_mut(&mut desk.sections)[0].services[0].state = ActualServiceState::Stopped;
         assert_eq!(activation(&desk), Act::Disabled);
     }
 
@@ -2901,11 +3093,11 @@ mod tests {
                 workspace("1", "viclass", true),
                 workspace("2", "other", false),
             ],
-            sections: group_sections(
+            sections: Arc::new(group_sections(
                 &[meta("postgres", false, false)],
                 &[],
                 &[live("postgres", "ready")],
-            ),
+            )),
             summary: summary_of(&group_sections(
                 &[meta("postgres", false, false)],
                 &[],
@@ -2980,7 +3172,7 @@ mod tests {
     fn reclaim_confirm_keeps_its_suffix_on_a_narrow_notice() {
         let mut desk = Desk {
             pending: Some(Pending::Reclaim("api".into())),
-            sections: vec![Section {
+            sections: Arc::new(vec![Section {
                 name: None,
                 services: vec![ServiceLine {
                     id: "api".into(),
@@ -2994,7 +3186,7 @@ mod tests {
                     shared_instance: None,
                     error: Some("x".repeat(80)),
                 }],
-            }],
+            }]),
             ..Desk::default()
         };
         let text = buffer_text(&paint(&mut desk, 40, 16));
@@ -3012,12 +3204,12 @@ mod tests {
             shared_open: true,
             ..Desk::default()
         };
-        desk.recipes.push(RecipeLine {
+        Arc::make_mut(&mut desk.recipes).push(RecipeLine {
             name: "redis".into(),
             versions: vec!["8.2.10".into(), "7.2".into()],
             version_index: 0,
         });
-        desk.instances.push(InstanceLine {
+        Arc::make_mut(&mut desk.instances).push(InstanceLine {
             id: "redis@8.2.10".into(),
             install_state: "installed".into(),
             actual_state: "ready".into(),
@@ -3030,10 +3222,10 @@ mod tests {
         assert_eq!(activation(&desk), Act::Install("redis@7.2".into()));
         desk.shared_cursor = 1;
         assert_eq!(activation(&desk), Act::StopInstance("redis@8.2.10".into()));
-        desk.instances[0].actual_state = "running-unready".into();
+        Arc::make_mut(&mut desk.instances)[0].actual_state = "running-unready".into();
         assert_eq!(activation(&desk), Act::StopInstance("redis@8.2.10".into()));
-        desk.instances[0].actual_state = "preparing".into();
-        desk.instances[0].install_error = Some("sha256 mismatch".into());
+        Arc::make_mut(&mut desk.instances)[0].actual_state = "preparing".into();
+        Arc::make_mut(&mut desk.instances)[0].install_error = Some("sha256 mismatch".into());
         assert_eq!(activation(&desk), Act::StartInstance("redis@8.2.10".into()));
         let joined = buffer_text(&paint(&mut desk, 200, 20));
         assert!(joined.contains("starting"), "{joined}");
@@ -3080,21 +3272,21 @@ mod tests {
             focus: Pane::Services,
             ..Desk::default()
         };
-        desk.sections = vec![Section {
+        desk.sections = Arc::new(vec![Section {
             name: Some("app".into()),
             services: vec![row("api", ActualServiceState::QueuedStart, false)],
-        }];
+        }]);
         desk.service_cursor = 1;
         assert_eq!(activation(&desk), Act::StopService("api".into()));
-        desk.sections[0].services[0].state = ActualServiceState::Stopping;
+        Arc::make_mut(&mut desk.sections)[0].services[0].state = ActualServiceState::Stopping;
         assert_eq!(activation(&desk), Act::Idle);
-        desk.sections[0].services[0].state = ActualServiceState::Ready;
+        Arc::make_mut(&mut desk.sections)[0].services[0].state = ActualServiceState::Ready;
         desk.service_cursor = 0;
         assert_eq!(activation(&desk), Act::RestartGroup("app".into()));
-        desk.sections[0].services[0].state = ActualServiceState::Stopped;
+        Arc::make_mut(&mut desk.sections)[0].services[0].state = ActualServiceState::Stopped;
         assert_eq!(activation(&desk), Act::StartGroup("app".into()));
-        desk.sections[0].services[0].finite = true;
-        desk.sections[0].services[0].state = ActualServiceState::Ready;
+        Arc::make_mut(&mut desk.sections)[0].services[0].finite = true;
+        Arc::make_mut(&mut desk.sections)[0].services[0].state = ActualServiceState::Ready;
         assert_eq!(activation(&desk), Act::StartGroup("app".into()));
     }
 
@@ -3220,6 +3412,7 @@ mod tests {
             label: Some("postgres@16.4 (shared)".into()),
             kind: Some(ServiceKind::Infrastructure),
             ownership: Some(ServiceOwnership::External),
+            restart: None,
             disabled: false,
             profiles: ServiceProfiles {
                 run: ServiceRunProfile::Verified {
@@ -3541,7 +3734,7 @@ mod tests {
             urls: vec!["app  http://127.0.0.1:3000/health".into()],
             ..Desk::default()
         };
-        desk.sections = group_sections(&[meta("api", false, false)], &[], &[live("api", "ready")]);
+        desk.sections = Arc::new(group_sections(&[meta("api", false, false)], &[], &[live("api", "ready")]));
         let _ = paint(&mut desk, 120, 24);
         let link = desk
             .links
@@ -3639,22 +3832,48 @@ mod tests {
             .map(|index| format!("row-{index}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let mut cache = LogCache::default();
+        cache.sync(&log);
         let mut scroll = 0;
-        let tail = log_window(&log, 8, &mut scroll);
+        let tail = log_window(cache.len(), 8, &mut scroll);
         assert_eq!(tail.len(), 8);
-        assert_eq!(tail[0], "row-992");
-        assert_eq!(tail[7], "row-999");
+        assert_eq!(line_text(&cache.line(tail.start).line), "row-992");
+        assert_eq!(line_text(&cache.line(tail.end - 1).line), "row-999");
         assert_eq!(scroll, 0);
         scroll = 10_000;
-        let head = log_window(&log, 8, &mut scroll);
+        let head = log_window(cache.len(), 8, &mut scroll);
         assert_eq!(head.len(), 8);
-        assert_eq!(head[0], "row-0");
-        assert_eq!(head[7], "row-7");
+        assert_eq!(line_text(&cache.line(head.start).line), "row-0");
+        assert_eq!(line_text(&cache.line(head.end - 1).line), "row-7");
         assert_eq!(scroll, 992);
-        assert!(log_window(&log, 0, &mut scroll).is_empty());
+        assert!(log_window(cache.len(), 0, &mut scroll).is_empty());
         let mut scroll = 4;
-        assert_eq!(log_window("", 3, &mut scroll), vec![" "]);
+        let mut empty = LogCache::default();
+        empty.sync("");
+        assert_eq!(log_window(empty.len(), 3, &mut scroll).len(), 1);
         assert_eq!(scroll, 0);
+    }
+
+    /// An appended tail is indexed incrementally — parsed rows stay valid and only the new text
+    /// is scanned.
+    #[test]
+    fn log_cache_indexes_an_appended_tail_without_reparsing_rows() {
+        let mut cache = LogCache::default();
+        cache.sync("first\nsecond");
+        let _ = cache.line(0); // parses row 0 into the memo
+        cache.sync("first\nsecond\nthird");
+        assert_eq!(cache.len(), 3);
+        assert!(cache.rows[0].is_some(), "row 0 stays parsed");
+        assert_eq!(line_text(&cache.line(0).line), "first");
+        assert_eq!(line_text(&cache.line(1).line), "second");
+        assert_eq!(line_text(&cache.line(2).line), "third");
+        // A mid-line append continues the last line, not a new row.
+        let mut cache = LogCache::default();
+        cache.sync("one\ntwo");
+        cache.sync("one\ntwo-three\nfour");
+        assert_eq!(cache.len(), 3);
+        assert_eq!(line_text(&cache.line(1).line), "two-three");
+        assert_eq!(line_text(&cache.line(2).line), "four");
     }
 
     #[test]
@@ -3692,11 +3911,11 @@ mod tests {
             workspaces: vec![workspace("1", "viclass", true)],
             ..Desk::default()
         };
-        desk.sections = group_sections(
+        desk.sections = Arc::new(group_sections(
             &[meta("postgres", false, false)],
             &[],
             &[live("postgres", "ready")],
-        );
+        ));
         let _ = paint(&mut desk, 120, 24);
         let workspace_at = desk.geometry.workspace_items;
         assert_eq!(
@@ -3718,7 +3937,7 @@ mod tests {
             notice: "Manager unavailable".to_string(),
             ..Desk::default()
         };
-        desk.sections = group_sections(&[meta("api", false, false)], &[], &[live("api", "ready")]);
+        desk.sections = Arc::new(group_sections(&[meta("api", false, false)], &[], &[live("api", "ready")]));
         let buffer = paint(&mut desk, 120, 24);
         let text = buffer_text(&buffer);
         let (row, _) = text
@@ -3748,3 +3967,4 @@ mod tests {
         assert_eq!(desk.hit(inner_x as usize, row), None);
     }
 }
+

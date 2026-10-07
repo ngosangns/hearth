@@ -5,7 +5,11 @@
 //! a watch event waits until the frame budget so a stream of log lines paints once per frame.
 use std::time::{Duration, Instant};
 
-pub const FRAME_BUDGET: Duration = Duration::from_millis(16);
+/// Coalesced data-driven repaints cap at ~30 fps. Input draws bypass the scheduler entirely
+/// (the terminal branch calls `draw` directly), so this only limits how fast an SSE/log flood
+/// repaints — the dominant pty-write volume on a busy session. 60 fps of log-pane diffs can
+/// exceed what a slower terminal drains, and a blocked `write()` stalls the whole loop.
+pub const FRAME_BUDGET: Duration = Duration::from_millis(33);
 /// At most one selected-log refetch per this interval while that service keeps logging.
 pub const LOG_COALESCE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -154,6 +158,15 @@ impl FrameScheduler {
         self.due = None;
         self.last = Some(now);
         true
+    }
+
+    /// A draw that blocked on a slow sink (pty write) pushes the coalesced budget baseline
+    /// forward: the next data-driven repaint waits roughly the blocked duration, capped, so
+    /// backlog shrinks at ~10 fps worst instead of queueing 30 fps of diffs the terminal
+    /// cannot drain. Input draws still paint immediately.
+    pub fn slowdown(&mut self, elapsed: Duration) {
+        let penalty = elapsed.min(Duration::from_millis(200));
+        self.last = Some(Instant::now() + penalty);
     }
 }
 

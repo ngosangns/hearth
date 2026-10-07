@@ -4,8 +4,9 @@
 //! enter, and that is the confirm.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +14,9 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     DisableMouseCapture, Event, EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
-use crossterm::execute;
-use futures_util::StreamExt;
+use crossterm::terminal::EnterAlternateScreen;
+use crossterm::{execute, queue};
+use futures_util::{FutureExt, StreamExt};
 use hearth_cli::{
     discover, ensure, request, request_with_timeout, restart_manager, stop_manager, Client,
     Discovery, LocalctlOptions,
@@ -36,7 +38,7 @@ use crate::desk::{
     unchecked_shared_notice, url_visible, Act, Command, Desk, Hit, ImpactFollow, InstanceLine,
     KnownRoot, Link, LinkSelection, Pane, Pending, RecipeLine, RowId, SharedTouch, WorkspaceLine,
 };
-use crate::schedule::{FetchCoalescer, FrameScheduler, LogAction, LogRefresh};
+use crate::schedule::{FetchCoalescer, FrameScheduler, LogAction, LogRefresh, FRAME_BUDGET};
 use crate::state::{Service, TuiFence, TuiState};
 
 pub type SpawnHook = Arc<dyn Fn(&Path) + Send + Sync>;
@@ -49,6 +51,9 @@ pub struct ShellOptions {
 }
 
 const EMPTY_CATALOG: &str = "No services yet. Add service blocks to hearth.yaml.";
+/// Scrolling through workspaces waits this long for the cursor to settle before the session is
+/// torn down and the landing workspace's daemon is discovered.
+const WORKSPACE_OPEN_DELAY: Duration = Duration::from_millis(200);
 const RELEASES_URL: &str = "https://github.com/ngosangns/hearth/releases";
 // Button, drag, and wheel. All-motion (`?1003`) stays off. Any reporting mode stops the terminal
 // from selecting text; Ghostty will not fall back while it is on, and Shift does nothing when
@@ -144,6 +149,145 @@ struct Session {
     urls: Vec<ResolvedServiceUrl>,
 }
 
+/// A `Write` that reports every written byte to the profiler — the number that decides whether
+/// a slow `draw` was render work or the pty write blocking on a terminal that drains slowly.
+struct CountingStdout<W: Write>(W);
+
+impl<W: Write> Write for CountingStdout<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.0.write(buf)?;
+        crate::profile::note_write_bytes(written);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// The pty write, moved off the event loop. Measured on Kiro/VS Code (xterm.js): a 5 KB frame
+/// takes 15–75 ms to `write()` — the pty buffer is a few KB and the reader drains slowly — so
+/// every `draw` on the loop thread froze input. `BufWriter` flushes land here as packets; a
+/// writer thread drains them at the terminal's own pace.
+///
+/// A full channel **drops** the packet and raises `dropped`: a ratatui diff is only valid
+/// against what reached the screen, so after a drop every later diff is also dropped (the flag
+/// short-circuits `write`) until the app sees the queue empty, calls `terminal.clear()`, and
+/// the next draw emits a full repaint. `depth` counts packets handed to the writer, not yet
+/// consumed — the add happens before `try_send` so the reader's subtract can never underflow.
+struct ChannelWriter {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    dropped: Arc<AtomicBool>,
+    depth: Arc<AtomicUsize>,
+}
+
+/// The app-side half of the writer channel.
+struct WriterTap {
+    dropped: Arc<AtomicBool>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl WriterTap {
+    /// `true` while a dropped packet still invalidates new diffs — cleared once the queue has
+    /// drained and the app has issued `terminal.clear()` for the repaint.
+    fn dropped(&self) -> bool {
+        self.dropped.load(Ordering::Acquire)
+    }
+    fn depth(&self) -> usize {
+        self.depth.load(Ordering::Acquire)
+    }
+    fn ack_drop(&self) {
+        self.dropped.store(false, Ordering::Release);
+    }
+}
+
+/// The writer queue is bounded in BYTES, not packets: once ~96 KiB is in flight the screen is
+/// already ≥1 s behind on a terminal draining at ~100 KB/s — past that point a packet is better
+/// dropped (then full-repainted on drain) than queued behind staleness.
+const WRITER_PACKETS: usize = 16;
+const WRITER_BYTES_CAP: usize = 96 * 1024;
+/// A selection move delays swapping the log pane's body until the cursor settles — one swap per
+/// burst instead of one full-pane diff per key repeat.
+const LOG_SWITCH_DELAY: Duration = Duration::from_millis(120);
+
+fn pty_writer() -> (ChannelWriter, WriterTap) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITER_PACKETS);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let depth = Arc::new(AtomicUsize::new(0));
+    let tap = WriterTap {
+        dropped: dropped.clone(),
+        depth: depth.clone(),
+    };
+    let writer_depth = depth.clone();
+    std::thread::spawn(move || {
+        let mut stdout = CountingStdout(std::io::stdout());
+        while let Ok(packet) = rx.recv() {
+            writer_depth.fetch_sub(packet.len(), Ordering::AcqRel);
+            let _ = stdout.write_all(&packet);
+            let _ = stdout.flush();
+        }
+    });
+    (ChannelWriter { tx, dropped, depth }, tap)
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.dropped.load(Ordering::Acquire) || self.depth.load(Ordering::Acquire) > WRITER_BYTES_CAP {
+            self.dropped.store(true, Ordering::Release);
+            crate::profile::note_frame_drop();
+            return Ok(buf.len());
+        }
+        // Reserve the slot before sending so the reader's `fetch_sub` can never see a packet
+        // the counter has not recorded yet.
+        self.depth.fetch_add(buf.len(), Ordering::AcqRel);
+        match self.tx.try_send(buf.to_vec()) {
+            Ok(()) => {}
+            Err(_) => {
+                self.depth.fetch_sub(buf.len(), Ordering::AcqRel);
+                self.dropped.store(true, Ordering::Release);
+                crate::profile::note_frame_drop();
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The terminal's writer is a 64 KiB buffer, then the writer channel above: a frame diff is
+/// hundreds of small `queue!` writes batched into one channel packet per `Terminal::draw`.
+type ShellTerminal =
+    ratatui::Terminal<ratatui::backend::CrosstermBackend<BufWriter<ChannelWriter>>>;
+
+/// Mirrors `ratatui::try_init` (panic hook, raw mode, alternate screen) but on the buffered
+/// channel backend above.
+fn init_terminal() -> std::io::Result<(ShellTerminal, WriterTap)> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, Show);
+        ratatui::restore();
+        previous(info);
+    }));
+    crossterm::terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    // `Viewport::Fixed` pins the area so `Terminal::draw` skips `autoresize` — `backend.size()`
+    // opens `/dev/tty` per call (and falls back to spawning `tput` twice when there is no
+    // controlling tty, ~15 ms), which is a per-frame cost the `Fullscreen` default pays.
+    // `Event::Resize` updates the fixed rect instead.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (writer, tap) = pty_writer();
+    let backend = ratatui::backend::CrosstermBackend::new(BufWriter::with_capacity(
+        64 * 1024, writer,
+    ));
+    let terminal = ratatui::Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, cols, rows)),
+        },
+    )?;
+    Ok((terminal, tap))
+}
+
 struct Restorer;
 
 impl Drop for Restorer {
@@ -162,8 +306,8 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
         }
     };
     let adopted = store.adopt_project(&options.initial_root);
-    let terminal = match ratatui::try_init() {
-        Ok(terminal) => terminal,
+    let (terminal, pty) = match init_terminal() {
+        Ok(init) => init,
         Err(error) => {
             ratatui::restore();
             eprintln!("hearth tui: {error}");
@@ -192,6 +336,7 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
         config_revision: None,
         tx,
         terminal,
+        pty,
         disposed: false,
         mouse_on: true,
         link_drag: None,
@@ -199,6 +344,9 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
         painted_size: None,
         input_at: None,
         input_pending_present: false,
+        log_request_due: false,
+        log_paint_wait: None,
+        open_wait: None,
         logs: LogRefresh::default(),
         log_wait: None,
         snap_fetch: FetchCoalescer::default(),
@@ -222,6 +370,8 @@ pub async fn run_shell(options: ShellOptions) -> i32 {
     app.open_selected();
     app.draw();
     let code = app.event_loop(rx, options.refresh_interval).await;
+    // Push anything still sitting in the buffered writer out before the terminal restores.
+    let _ = app.terminal.backend_mut().flush();
     if let Some(session) = app.session.take() {
         session.cancel.cancel();
     }
@@ -241,7 +391,10 @@ struct App {
     jobs: u32,
     config_revision: Option<u64>,
     tx: mpsc::Sender<Msg>,
-    terminal: ratatui::DefaultTerminal,
+    terminal: ShellTerminal,
+    /// The writer channel's app handle: a raised `dropped` flag means new diffs are invalid
+    /// until the queue drains and a full repaint goes out.
+    pty: WriterTap,
     disposed: bool,
     mouse_on: bool,
     link_drag: Option<LinkDrag>,
@@ -252,6 +405,17 @@ struct App {
     input_at: Option<(Instant, &'static str)>,
     /// Scroll and wheel paint once, after pending watch messages have been applied.
     input_pending_present: bool,
+    /// The selected service changed during an input batch; the log fetch is requested once when
+    /// the batch ends instead of once per coalesced key repeat or wheel tick.
+    log_request_due: bool,
+    /// A selection move defers swapping the log pane's body until the cursor settles: every
+    /// switch used to write `desk.log` with the new service's retained log, which made every
+    /// j/k repeat a full-pane diff on the wire. The list marker repaints at once; the body
+    /// swap and fetch happen `LOG_SWITCH_DELAY` after the last move.
+    log_paint_wait: Option<Instant>,
+    /// Scrolling the workspace pane defers tearing the session down until the cursor settles,
+    /// so a wheel pass over several workspaces does not spawn a discover per row.
+    open_wait: Option<Instant>,
     logs: LogRefresh,
     log_wait: Option<Instant>,
     snap_fetch: FetchCoalescer,
@@ -281,9 +445,32 @@ impl App {
                     if let Some(Ok(event)) = maybe {
                         self.input_pending_present = false;
                         self.on_terminal(event).await;
+                        // A wheel flick or a held key queues many events; giving each its own
+                        // full-frame draw is what made scrolling feel janky. Drain everything
+                        // already queued — every event still updates state — then paint once.
+                        let mut drained = 0usize;
+                        while drained < 64 {
+                            let Some(Some(Ok(more))) = events.next().now_or_never() else {
+                                break;
+                            };
+                            self.on_terminal(more).await;
+                            drained += 1;
+                        }
+                        if self.log_request_due {
+                            self.log_request_due = false;
+                            self.request_log(true);
+                        }
                         if self.input_pending_present {
-                            while let Ok(message) = rx.try_recv() {
+                            // Bounded drain: apply what is queued so the paint reflects fresh
+                            // state, but a backlog must never stand between input and its paint.
+                            // Remaining messages run on the next `rx.recv()` iteration.
+                            let mut msgs = 0;
+                            while msgs < 64 {
+                                let Ok(message) = rx.try_recv() else {
+                                    break;
+                                };
                                 self.on_msg(message).await;
+                                msgs += 1;
                             }
                             self.input_pending_present = false;
                             self.draw();
@@ -322,9 +509,14 @@ impl App {
 
     async fn on_terminal(&mut self, event: Event) {
         match event {
-            Event::Resize(_, _) => {
+            Event::Resize(cols, rows) => {
+                // The viewport is `Fixed`, so autoresize never runs — resize the buffers here.
+                let _ = self
+                    .terminal
+                    .resize(ratatui::layout::Rect::new(0, 0, cols, rows));
                 self.link_paint = None;
-                self.draw();
+                self.painted_size = None;
+                self.input_pending_present = true;
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -380,7 +572,7 @@ impl App {
                 let before = self.desk.selected_service();
                 self.desk.focus_next();
                 if self.desk.selected_service() != before {
-                    self.request_log(true);
+                    self.log_request_due = true;
                 }
                 self.input_pending_present = true;
             }
@@ -388,9 +580,9 @@ impl App {
                 let pane = self.desk.focus;
                 let before = self.desk.selected_service();
                 if self.desk.nudge(delta) && pane == Pane::Workspaces {
-                    self.open_selected();
+                    self.open_wait = Some(Instant::now() + WORKSPACE_OPEN_DELAY);
                 } else if self.desk.selected_service() != before {
-                    self.request_log(true);
+                    self.log_request_due = true;
                 }
                 self.input_pending_present = true;
             }
@@ -427,7 +619,7 @@ impl App {
             Command::RemoveShared => self.arm_shared_remove().await,
             Command::CycleVersion(delta) => {
                 if self.desk.cycle_version(delta) {
-                    self.draw();
+                    self.input_pending_present = true;
                 }
             }
             Command::Type(ch) => {
@@ -436,17 +628,17 @@ impl App {
                         text.push(ch);
                     }
                 }
-                self.draw();
+                self.input_pending_present = true;
             }
             Command::Backspace => {
                 if let Some(text) = &mut self.desk.composer {
                     text.pop();
                 }
-                self.draw();
+                self.input_pending_present = true;
             }
             Command::CancelComposer => {
                 self.desk.composer = None;
-                self.draw();
+                self.input_pending_present = true;
             }
             Command::SubmitComposer => self.submit_folder().await,
         }
@@ -619,6 +811,15 @@ impl App {
         let verb = action.as_wire_str();
         let mut touches = Vec::new();
         let mut unknown = Vec::new();
+        // One registry read for the whole bulk action — loading it per shared row multiplied a
+        // file read + canonicalize pass by the target count on the input path.
+        let registry = ids
+            .iter()
+            .any(|id| self.desk.service_line(id).is_some_and(|s| s.shared_instance.is_some()))
+            .then(shared_registry)
+            .flatten();
+        let mut current_root = None;
+        let mut known_roots = None;
         for id in ids {
             let Some(instance) = self
                 .desk
@@ -627,12 +828,14 @@ impl App {
             else {
                 continue;
             };
-            match attachment_roots(&instance) {
+            match attachment_roots(registry.as_ref(), &instance) {
                 Ok(roots) => {
                     let report = classify_attachments(
                         &roots,
-                        self.current_root().as_deref(),
-                        &self.known_roots(),
+                        current_root
+                            .get_or_insert_with(|| self.current_root())
+                            .as_deref(),
+                        known_roots.get_or_insert_with(|| self.known_roots()),
                     );
                     if !report.others.is_empty() {
                         touches.push(SharedTouch {
@@ -682,7 +885,7 @@ impl App {
             id: id.to_string(),
             action: action.to_string(),
         };
-        match attachment_roots(id) {
+        match attachment_roots(shared_registry().as_ref(), id) {
             Ok(roots) => {
                 let report = classify_attachments(
                     &roots,
@@ -705,7 +908,7 @@ impl App {
     }
 
     fn remove_pending(&self, id: &str) -> Pending {
-        match attachment_roots(id) {
+        match attachment_roots(shared_registry().as_ref(), id) {
             Ok(roots) => {
                 let report = classify_attachments(&roots, None, &self.known_roots());
                 Pending::RemoveShared {
@@ -772,7 +975,7 @@ impl App {
                 link: link.clone(),
             });
             self.desk.select_link(&link, column, column, false);
-            self.draw();
+            self.input_pending_present = true;
             return;
         }
         self.link_drag = None;
@@ -781,7 +984,7 @@ impl App {
         let hit = self.desk.hit(column as usize, row as usize);
         self.on_click(column as usize, row as usize).await;
         if hit.is_none() && had_link {
-            self.draw();
+            self.input_pending_present = true;
         }
     }
 
@@ -794,7 +997,7 @@ impl App {
         let link = drag.link.clone();
         self.desk
             .select_link(&link, anchor, column, anchor.abs_diff(column) >= 2);
-        self.draw();
+        self.input_pending_present = true;
     }
 
     fn on_link_up(&mut self) {
@@ -802,7 +1005,7 @@ impl App {
             return;
         }
         self.copy_link_selection();
-        self.draw();
+        self.input_pending_present = true;
     }
 
     fn copy_link_selection(&mut self) {
@@ -818,10 +1021,9 @@ impl App {
         } else {
             "copied selection"
         };
-        self.desk.notice = match copy_to_pasteboard(&text) {
-            Ok(()) => notice.to_string(),
-            Err(error) => error,
-        };
+        // pbcopy is a process spawn; wait for it off the event loop and only report failures.
+        self.desk.notice = notice.to_string();
+        self.copy_in_background(text);
     }
 
     fn on_wheel(&mut self, column: usize, row: usize, delta: i64) {
@@ -836,9 +1038,9 @@ impl App {
             .selected_workspace()
             .map(|workspace| workspace.id.clone());
         if before != after {
-            self.open_selected();
+            self.open_wait = Some(Instant::now() + WORKSPACE_OPEN_DELAY);
         } else if moved && service != self.desk.service_cursor {
-            self.request_log(true);
+            self.log_request_due = true;
         }
         self.input_pending_present = true;
     }
@@ -863,7 +1065,7 @@ impl App {
                 self.desk.focus = Pane::Services;
                 self.desk.service_cursor = cursor;
                 if changed {
-                    self.request_log(true);
+                    self.log_request_due = true;
                 }
             }
             Hit::Shared(cursor) => {
@@ -972,6 +1174,7 @@ impl App {
     }
 
     fn open_selected(&mut self) {
+        self.open_wait = None;
         self.drop_session();
         self.gen += 1;
         let gen = self.gen;
@@ -1387,7 +1590,12 @@ impl App {
         match self.desk.selected_service() {
             Some(RowId::Daemon) => self.request_daemon_log(immediate),
             Some(RowId::Group(name)) => {
-                self.stage_group_log(&name);
+                if immediate {
+                    self.desk.log_title = name.clone();
+                    self.defer_log_body();
+                } else {
+                    self.stage_group_log(&name);
+                }
                 self.logs.cancel();
                 self.log_wait = None;
             }
@@ -1399,16 +1607,47 @@ impl App {
         }
     }
 
+    /// Selection-driven log requests swap the pane body only after the cursor settles
+    /// (`LOG_SWITCH_DELAY`): on a held j/k or a wheel pass, the per-switch body write is a
+    /// full-pane diff per move — deferring collapses a burst into one swap.
+    fn defer_log_body(&mut self) {
+        self.log_paint_wait = Some(Instant::now() + LOG_SWITCH_DELAY);
+    }
+
+    /// The deferred body write for whatever row is selected now.
+    fn paint_selected_log(&mut self) {
+        match self.desk.selected_service() {
+            Some(RowId::Daemon) => {
+                self.desk.log = if self.session.is_none() {
+                    "Daemon log appears after the daemon is running.".to_string()
+                } else {
+                    "Loading…".to_string()
+                };
+            }
+            Some(RowId::Group(name)) => self.stage_group_log(&name),
+            Some(RowId::Service(id)) => {
+                self.desk.log_title = id.clone();
+                if let Some(session) = &self.session {
+                    let detail = session.state.detail();
+                    let cached = session.state.cached_log(&id);
+                    self.desk.log = format!("{detail}\n{cached}");
+                } else {
+                    self.desk.log = "Daemon is not running.".to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn request_daemon_log(&mut self, immediate: bool) {
         if immediate {
             self.desk.log_title = "daemon log".to_string();
+            self.defer_log_body();
             if self.session.is_none() {
-                self.desk.log = "Daemon log appears after the daemon is running.".to_string();
                 self.logs.cancel();
                 self.log_wait = None;
                 return;
             }
-            self.desk.log = "Loading…".to_string();
         } else if self.session.is_none() {
             return;
         }
@@ -1419,17 +1658,14 @@ impl App {
     fn request_service_log(&mut self, id: String, immediate: bool) {
         if immediate {
             self.desk.log_title = id.clone();
+            self.defer_log_body();
             if self.session.is_none() {
-                self.desk.log = "Daemon is not running.".to_string();
                 self.logs.cancel();
                 self.log_wait = None;
                 return;
             }
             if let Some(session) = &mut self.session {
                 session.state.selection.selected_name = id.clone();
-                let detail = session.state.detail();
-                let cached = session.state.cached_log(&id);
-                self.desk.log = format!("{detail}\n{cached}");
             }
         } else if self.session.is_none() {
             return;
@@ -2115,6 +2351,35 @@ impl App {
         });
     }
 
+    /// `pbcopy` off the event loop; the notice is already optimistic, so only a failure reports
+    /// back through the message channel.
+    fn copy_in_background(&self, text: String) {
+        let tx = self.tx.clone();
+        let gen = self.gen;
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = copy_to_pasteboard(&text) {
+                let _ = tx.blocking_send(Msg::Note { gen, text: error });
+            }
+        });
+    }
+
+    /// Runs `open` off the event loop — spawning and waiting on a child here would stall input.
+    fn run_command_note(&self, args: Vec<String>, ok: String, failed: String) {
+        let tx = self.tx.clone();
+        let gen = self.gen;
+        tokio::task::spawn_blocking(move || {
+            let text = match std::process::Command::new(&args[0])
+                .args(&args[1..])
+                .status()
+            {
+                Ok(status) if status.success() => ok,
+                Ok(status) => format!("{failed} ({status})"),
+                Err(error) => format!("{failed}: {error}"),
+            };
+            let _ = tx.blocking_send(Msg::Note { gen, text });
+        });
+    }
+
     fn copy_url(&mut self) {
         if self.desk.link_selection.is_some() {
             self.copy_link_selection();
@@ -2139,10 +2404,8 @@ impl App {
             self.draw();
             return;
         };
-        self.desk.notice = match copy_to_pasteboard(&text) {
-            Ok(()) => notice,
-            Err(error) => error,
-        };
+        self.desk.notice = notice;
+        self.copy_in_background(text);
         self.draw();
     }
 
@@ -2157,29 +2420,20 @@ impl App {
         let Some(path) = self.workspace_path(&id) else {
             return;
         };
-        self.desk.notice = match std::process::Command::new("open")
-            .arg("-R")
-            .arg(&path)
-            .status()
-        {
-            Ok(status) if status.success() => format!("revealed {}", path.display()),
-            Ok(status) => format!("reveal failed ({status}): {}", path.display()),
-            Err(error) => format!("reveal failed: {error}"),
-        };
-        self.draw();
+        let display = path.display().to_string();
+        self.run_command_note(
+            vec!["open".to_string(), "-R".to_string(), display.clone()],
+            format!("revealed {display}"),
+            format!("reveal failed: {display}"),
+        );
     }
 
     fn open_updates(&mut self) {
-        self.desk.notice = match std::process::Command::new("open")
-            .arg(RELEASES_URL)
-            .status()
-        {
-            Ok(status) if status.success() => {
-                "opened the releases page — hearth update installs the latest binary".to_string()
-            }
-            _ => format!("{RELEASES_URL} — hearth update installs the latest binary"),
-        };
-        self.draw();
+        self.run_command_note(
+            vec!["open".to_string(), RELEASES_URL.to_string()],
+            "opened the releases page — hearth update installs the latest binary".to_string(),
+            format!("{RELEASES_URL} — hearth update installs the latest binary"),
+        );
     }
 
     async fn submit_folder(&mut self) {
@@ -2240,20 +2494,22 @@ impl App {
             .iter()
             .map(|recipe| (recipe.name.clone(), recipe.version_index))
             .collect();
-        self.desk.recipes = snapshot
-            .recipes
-            .into_iter()
-            .map(|mut recipe| {
-                if let Some(index) = chosen.get(&recipe.name) {
-                    if *index < recipe.versions.len() {
-                        recipe.version_index = *index;
+        self.desk.recipes = std::sync::Arc::new(
+            snapshot
+                .recipes
+                .into_iter()
+                .map(|mut recipe| {
+                    if let Some(index) = chosen.get(&recipe.name) {
+                        if *index < recipe.versions.len() {
+                            recipe.version_index = *index;
+                        }
                     }
-                }
-                recipe
-            })
-            .collect();
+                    recipe
+                })
+                .collect(),
+        );
         let keep = self.desk.selected_shared();
-        self.desk.instances = snapshot.instances;
+        self.desk.instances = std::sync::Arc::new(snapshot.instances);
         let ids = self.desk.shared_ids();
         self.desk.shared_cursor = keep
             .and_then(|id| ids.iter().position(|row| row == &id))
@@ -2472,17 +2728,30 @@ impl App {
     }
 
     fn next_wake(&self) -> Option<tokio::time::Instant> {
-        let when = match (self.frames.due(), self.log_wait) {
-            (Some(frame), Some(log)) => Some(frame.min(log)),
-            (Some(frame), None) => Some(frame),
-            (None, Some(log)) => Some(log),
-            (None, None) => None,
-        }?;
-        Some(wake_at(when))
+        [
+            self.frames.due(),
+            self.log_wait,
+            self.open_wait,
+            self.log_paint_wait,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(wake_at)
     }
 
     fn on_wake(&mut self) {
         let now = Instant::now();
+        if self.log_paint_wait.is_some_and(|when| when <= now) {
+            self.log_paint_wait = None;
+            self.paint_selected_log();
+            self.draw();
+        }
+        if self.open_wait.is_some_and(|when| when <= now) {
+            self.open_wait = None;
+            self.open_selected();
+            self.draw();
+        }
         let action = self.logs.poll(now);
         self.note_log_action(action);
         if self.frames.poll(now) {
@@ -2497,12 +2766,17 @@ impl App {
     fn draw(&mut self) {
         self.frames.input(Instant::now());
         let started = Instant::now();
-        if let Ok(size) = self.terminal.size() {
-            let next = (size.width, size.height);
-            if self.painted_size != Some(next) {
-                self.link_paint = None;
-                self.painted_size = Some(next);
+        if self.pty.dropped() {
+            // A dropped packet invalidated every diff after it. Emit nothing while the writer
+            // still has queued packets — the channel drops them anyway — and repaint fully
+            // once the queue has drained.
+            if self.pty.depth() > 0 {
+                self.frames.mark(Instant::now());
+                self.finish_draw(started);
+                return;
             }
+            self.pty.ack_drop();
+            let _ = self.terminal.clear();
         }
         // `CompletedFrame` is the buffer that was just flushed. The current buffer was already
         // swapped and cleared, so link colours have to be read from the completed frame.
@@ -2510,46 +2784,57 @@ impl App {
             self.finish_draw(started);
             return;
         };
+        let area = completed.area;
+        let next = (area.width, area.height);
+        if self.painted_size != Some(next) {
+            self.link_paint = None;
+            self.painted_size = Some(next);
+        }
         if self.desk.help || self.desk.composer.is_some() || self.desk.pending.is_some() {
             self.link_paint = None;
             self.finish_draw(started);
             return;
         }
-        let signature = (self.desk.links.clone(), self.desk.link_selection.clone());
-        if self.link_paint.as_ref() == Some(&signature) {
+        // Compare before cloning: an unchanged link set skips both the clone and the rewrite.
+        if self.link_paint.as_ref().is_some_and(|(links, selection)| {
+            *links == self.desk.links && *selection == self.desk.link_selection
+        }) {
             self.finish_draw(started);
             return;
         }
-        self.link_paint = Some(signature);
+        self.link_paint = Some((self.desk.links.clone(), self.desk.link_selection.clone()));
         if self.desk.links.is_empty() {
             self.finish_draw(started);
             return;
         }
         let selection = self.desk.link_selection.clone();
-        let runs: Vec<(u16, u16, String)> = self
-            .desk
-            .links
-            .iter()
-            .map(|link| {
-                let fg = completed
-                    .buffer
-                    .cell((link.x, link.y))
-                    .map(|cell| cell.fg)
-                    .unwrap_or(ratatui::style::Color::DarkGray);
-                (link.x, link.y, link_overlay(link, selection.as_ref(), fg))
-            })
-            .collect();
-        let mut stdout = std::io::stdout();
-        for (x, y, text) in runs {
-            let _ = execute!(stdout, MoveTo(x, y));
-            let _ = write!(stdout, "{text}");
+        let mut out = Vec::new();
+        for link in &self.desk.links {
+            let fg = completed
+                .buffer
+                .cell((link.x, link.y))
+                .map(|cell| cell.fg)
+                .unwrap_or(ratatui::style::Color::DarkGray);
+            let _ = queue!(out, MoveTo(link.x, link.y));
+            out.extend_from_slice(link_overlay(link, selection.as_ref(), fg).as_bytes());
         }
-        let _ = stdout.flush();
+        // One write for every link (`execute!` would flush per link per frame) through the
+        // backend's buffered writer — one writer, counted toward this draw — rather than a
+        // second raw `stdout` write racing the BufWriter.
+        let _ = self.terminal.backend_mut().write_all(&out);
+        let _ = self.terminal.backend_mut().flush();
         self.finish_draw(started);
     }
 
     fn finish_draw(&mut self, started: Instant) {
-        crate::profile::draw(started.elapsed());
+        let elapsed = started.elapsed();
+        let bytes = crate::profile::take_write_bytes();
+        crate::profile::draw(elapsed, bytes);
+        if elapsed > FRAME_BUDGET {
+            // The draw blocked — almost always the pty `write` waiting on a slow terminal. Back
+            // off coalesced repaints so queued diffs shrink instead of the backlog growing.
+            self.frames.slowdown(elapsed);
+        }
         if let Some((at, kind)) = self.input_at.take() {
             crate::profile::input_latency(kind, at.elapsed());
         }
@@ -2698,11 +2983,15 @@ fn remove_is_forced(pending: &Pending) -> bool {
     }
 }
 
+fn shared_registry() -> Option<SharedRegistry> {
+    let io = hearth_core::file_io::create_file_io(false);
+    SharedRegistry::load(Arc::from(io), &shared_root()).ok()
+}
+
 /// Project roots attached to `id`, canonicalized. `Err` means the registry could not be read,
 /// which is not the same as an instance with no attachments.
-fn attachment_roots(id: &str) -> Result<Vec<String>, ()> {
-    let io = hearth_core::file_io::create_file_io(false);
-    let registry = SharedRegistry::load(Arc::from(io), &shared_root()).map_err(|_| ())?;
+fn attachment_roots(registry: Option<&SharedRegistry>, id: &str) -> Result<Vec<String>, ()> {
+    let registry = registry.ok_or(())?;
     let Some(instance) = registry.get(id) else {
         return Ok(Vec::new());
     };

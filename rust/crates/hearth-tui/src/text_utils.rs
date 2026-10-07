@@ -3,7 +3,6 @@
 //! delegate to a native (Rust) addon whose source isn't vendored into this checkout, so they are
 //! reimplemented here from their observed behavior (see the module docs on `truncate_to_width` for
 //! what was verified and what is a documented simplification).
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
@@ -230,146 +229,22 @@ pub fn truncate_to_width(text: &str, max_width: usize, pad: bool) -> String {
     out
 }
 
-/// Turn sanitized SGR into Ratatui spans. Cursor, erase, and other non-colour sequences are
-/// dropped by [`sanitize_terminal_text`] first, so a log line cannot move the cursor.
+/// Turn sanitized SGR into a Ratatui line. Cursor, erase, and other non-colour sequences are
+/// dropped by [`sanitize_terminal_text`] first, so a log line cannot move the cursor; the SGR
+/// parsing itself is `ansi-to-tui`'s.
 pub fn sgr_to_line(text: &str) -> Line<'static> {
-    let sanitized = sanitize_terminal_text(text);
-    let bytes = sanitized.as_bytes();
-    let mut spans = Vec::new();
-    let mut style = Style::default();
-    let mut buf = String::new();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b {
-            push_span(&mut spans, &mut buf, style);
-            let (consumed, is_sgr) = scan_escape(bytes, index);
-            if is_sgr {
-                let seq = &sanitized[index..index + consumed];
-                style = apply_sgr(style, &seq[2..seq.len() - 1]);
-            }
-            index += consumed;
-            continue;
-        }
-        let ch = sanitized[index..].chars().next().unwrap();
-        buf.push(ch);
-        index += ch.len_utf8();
-    }
-    push_span(&mut spans, &mut buf, style);
-    if spans.is_empty() {
-        spans.push(Span::raw(""));
-    }
-    Line::from(spans)
-}
-
-fn push_span(spans: &mut Vec<Span<'static>>, buf: &mut String, style: Style) {
-    if buf.is_empty() {
-        return;
-    }
-    spans.push(Span::styled(std::mem::take(buf), style));
-}
-
-fn apply_sgr(mut style: Style, params: &str) -> Style {
-    if params.is_empty() {
-        return Style::default();
-    }
-    let parts: Vec<&str> = params.split([';', ':']).collect();
-    let mut index = 0usize;
-    while index < parts.len() {
-        let Ok(code) = parts[index].parse::<i32>() else {
-            index += 1;
-            continue;
-        };
-        index += 1;
-        match code {
-            0 => style = Style::default(),
-            1 => style = style.add_modifier(Modifier::BOLD),
-            2 => style = style.add_modifier(Modifier::DIM),
-            3 => style = style.add_modifier(Modifier::ITALIC),
-            4 => style = style.add_modifier(Modifier::UNDERLINED),
-            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
-            23 => style = style.remove_modifier(Modifier::ITALIC),
-            24 => style = style.remove_modifier(Modifier::UNDERLINED),
-            39 => style.fg = None,
-            49 => style.bg = None,
-            30..=37 => style.fg = Some(ansi_color((code - 30) as u8, false)),
-            40..=47 => style.bg = Some(ansi_color((code - 40) as u8, false)),
-            90..=97 => style.fg = Some(ansi_color((code - 90) as u8, true)),
-            100..=107 => style.bg = Some(ansi_color((code - 100) as u8, true)),
-            38 | 48 => style = apply_extended(style, code == 38, &parts, &mut index),
-            _ => {}
-        }
-    }
-    style
-}
-
-fn apply_extended(mut style: Style, foreground: bool, parts: &[&str], index: &mut usize) -> Style {
-    if *index >= parts.len() {
-        return style;
-    }
-    let mode = parts[*index];
-    *index += 1;
-    let color = if mode == "5" {
-        let Some(value) = parts.get(*index).and_then(|part| part.parse::<u8>().ok()) else {
-            return style;
-        };
-        *index += 1;
-        Color::Indexed(value)
-    } else if mode == "2" {
-        if parts.get(*index).is_some_and(|part| part.is_empty()) {
-            *index += 1;
-        }
-        let Some(red) = parts.get(*index).and_then(|part| part.parse::<u8>().ok()) else {
-            return style;
-        };
-        let Some(green) = parts
-            .get(*index + 1)
-            .and_then(|part| part.parse::<u8>().ok())
-        else {
-            return style;
-        };
-        let Some(blue) = parts
-            .get(*index + 2)
-            .and_then(|part| part.parse::<u8>().ok())
-        else {
-            return style;
-        };
-        *index += 3;
-        Color::Rgb(red, green, blue)
-    } else {
-        return style;
-    };
-    if foreground {
-        style.fg = Some(color);
-    } else {
-        style.bg = Some(color);
-    }
-    style
-}
-
-fn ansi_color(index: u8, bright: bool) -> Color {
-    match (index, bright) {
-        (0, false) => Color::Black,
-        (1, false) => Color::Red,
-        (2, false) => Color::Green,
-        (3, false) => Color::Yellow,
-        (4, false) => Color::Blue,
-        (5, false) => Color::Magenta,
-        (6, false) => Color::Cyan,
-        (7, false) => Color::Gray,
-        (0, true) => Color::DarkGray,
-        (1, true) => Color::LightRed,
-        (2, true) => Color::LightGreen,
-        (3, true) => Color::LightYellow,
-        (4, true) => Color::LightBlue,
-        (5, true) => Color::LightMagenta,
-        (6, true) => Color::LightCyan,
-        _ => Color::White,
-    }
+    use ansi_to_tui::IntoText;
+    sanitize_terminal_text(text)
+        .into_text()
+        .ok()
+        .and_then(|text| text.lines.into_iter().next())
+        .unwrap_or_else(|| Line::from(vec![Span::raw("")]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::{Color, Modifier};
 
     #[test]
     fn drops_erase_display_and_cursor_home_sequences_that_would_move_the_paint_cursor() {

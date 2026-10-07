@@ -16,8 +16,8 @@ pub use shell::{run_shell, ShellOptions, SpawnHook};
 
 pub use actions::{keyboard_action, TuiAction};
 pub use client::{
-    append_sse_chunk, is_sse_comment, next_sse_frame, parse_sse, refresh_selected_log, EventReplay,
-    ManagerTuiClient, SseFrame, WatchEvent, LOG_TAIL_BYTES, MAX_SSE_FRAME_BYTES,
+    refresh_selected_log, EventReplay, ManagerTuiClient, WatchEvent, LOG_TAIL_BYTES,
+    MAX_SSE_FRAME_BYTES,
 };
 #[allow(deprecated)]
 pub use run::{run_tui, RunTuiOptions};
