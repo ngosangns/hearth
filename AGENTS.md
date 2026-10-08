@@ -125,6 +125,19 @@ from any dev box here, with the same username.
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
 
+### macOS app (`apps/macos`)
+
+NativePHP Desktop v2 window, an HTTP client of the project daemon. It does not replace `hearth tui`
+and it does not put a web server in the `hearth` binary. `php -S` drops class statics and `$GLOBALS`
+on every request, so `DaemonMemory` keeps the bearer token in a SysV segment keyed by pid. The
+sidecar file stores only the pid and the segment key. `BundledHearth` passes the PHP process
+environment into every child: under `php -S`, Symfony keeps only `getenv()` keys that also sit on
+`$_SERVER` and drops `HOME`, so `hearth` would read `/.hearth/shared`. `CommandResult::lastJson`
+decodes the whole stdout before a nested one-line object. `hearth update` refuses when `current_exe` is
+inside `*.app/Contents/` before it downloads anything. Updates replace the whole `.app`. Do not add
+PHP or Node to `task install` or the Rust test job. The DMG job is `.github/workflows/macos-app.yml`.
+It runs after Release and stays off `ci.yml`.
+
 ## Sharp edges
 
 **Process supervision**
@@ -493,9 +506,9 @@ from any dev box here, with the same username.
   succeeded row `(not running)`, but its `--json` `running` stays false.
 - The daemon's own log is the pinned `daemon log` row — pseudo-id `$daemon` (`$` can't collide with
   a real service id), fetched from `GET /v1/daemon/log` rather than `/v1/logs/:id`, so it survives
-  catalog reloads. `display_state` collapses `running`/`running-unready` → `running` and
-  `starting`/`preparing` → `starting`. `ready` and `running` both count in the ready/total
-  summaries. Finite services (`readiness: exit`) stay out of those totals unless `failed`.
+  catalog reloads. `display_state` maps `running-unready` to `degraded` and otherwise uses the wire
+  string. `ready`, `running`, and `running-unready` count in the ready/total summaries. Finite
+  services (`readiness: exit`) stay out of those totals unless `failed`.
 
 **Testing gotchas**
 

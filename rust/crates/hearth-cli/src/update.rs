@@ -187,6 +187,15 @@ async fn run_with(
             "the release asset is darwin-arm64 only",
         );
     }
+    // A notarized app cannot have one nested binary replaced. Refuse before any download.
+    if inside_app_bundle(env.current_exe) {
+        return fail(
+            io,
+            flags.json,
+            &report_base(env, None),
+            "This binary is inside a Hearth.app. Update the Hearth app. hearth update does not replace it.",
+        );
+    }
     if !install_owned(env.current_exe, &env.layout) {
         return fail(
             io,
@@ -823,6 +832,10 @@ fn report_base(env: &UpdateEnv<'_>, release: Option<&Release>) -> Report {
 fn succeed(io: &mut Io<'_>, json_mode: bool, report: &Report, human: &str) -> i32 {
     emit(io, json_mode, report, human, true);
     0
+}
+
+fn inside_app_bundle(path: &Path) -> bool {
+    path.to_string_lossy().contains(".app/Contents/")
 }
 
 fn fail(io: &mut Io<'_>, json_mode: bool, report: &Report, error: &str) -> i32 {
@@ -1591,6 +1604,33 @@ mod tests {
             link_target(&world),
             PathBuf::from("../share/hearth/bin/hearth-0.16.0")
         );
+    }
+
+    #[tokio::test]
+    async fn app_bundle_refuses_without_downloading() {
+        let world = world();
+        let bundled = world._tmp.path().join("Hearth.app/Contents/extras/hearth");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"app").unwrap();
+        let bytes = b"new";
+        let transport = Scripted::new(Ok(document("v0.17.0", bytes)), bytes.to_vec());
+        let argv = args(&[]);
+        let captured = exec(
+            &env(&world, &bundled, "0.16.0", &argv),
+            &transport,
+            &ok_smoke("0.17.0"),
+        )
+        .await;
+        assert_eq!(captured.code, 1);
+        assert!(
+            captured
+                .err
+                .iter()
+                .any(|line| line.contains("Hearth app") && line.contains("hearth update:")),
+            "{:?}",
+            captured.err
+        );
+        assert_eq!(transport.downloads(), 0);
     }
 
     #[tokio::test]

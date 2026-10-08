@@ -4,3 +4,4 @@
 rust/target/
 /dist/
 /.build/
+**/.build/

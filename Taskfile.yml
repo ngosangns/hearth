@@ -58,6 +58,32 @@ tasks:
         fi
         echo "installed $("$link" --version) at $link -> $dest"
 
+  app:build:
+    desc: Build the macOS Hearth.app bundle (AppKit + bundled release hearth) into apps/macos-appkit/.build
+    deps: [install]
+    cmds:
+      - sh apps/macos-appkit/scripts/bundle.sh
+
+  app:test:
+    desc: Run the legacy NativePHP app's PHP test suite (apps/macos)
+    dir: apps/macos
+    cmds:
+      - composer install --no-interaction
+      - php artisan test
+
+  app:install:
+    desc: Build Hearth.app and copy it into /Applications (quits a running copy first)
+    deps: [app:build]
+    cmds:
+      - osascript -e 'quit app "Hearth"' 2>/dev/null || true
+      - |
+        set -eu
+        app="apps/macos-appkit/.build/Hearth.app"
+        test -d "$app"
+        rm -rf "/Applications/Hearth.app"
+        cp -R "$app" /Applications/
+        echo "installed: $app -> /Applications/Hearth.app"
+
   catalog:package:
     desc: Build shared-service tarballs into dist/catalog (`task catalog:package -- redis`; default all)
     cmds:

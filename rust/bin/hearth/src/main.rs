@@ -219,6 +219,8 @@ usage: hearth [--root <path>] <command> [options]
 
 tui, shared, and update do not need a hearth.yaml in the current directory.
 hearth --root <project> tui adopts that project when it has a catalog.
+The macOS app is the workspace once it is installed.
+mcp install records this process path. A binary inside Hearth.app makes those configs point into the bundle.
 Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json."
     );
