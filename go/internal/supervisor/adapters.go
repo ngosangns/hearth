@@ -116,12 +116,19 @@ func captureCommandOutput(argv []string) (int32, string, string) {
 	if err := cmd.Start(); err != nil {
 		return -1, "", ""
 	}
+	// Dropped with the caller (a stop or sync racing its own deadline): the
+	// probe's group goes too. Disarmed once both pipes reached EOF and the
+	// leader is reaped.
+	guard := &groupGuard{pgid: int64(cmd.Process.Pid)}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 	timer := time.NewTimer(probeCommandTimeout)
 	defer timer.Stop()
 	select {
 	case werr := <-waitCh:
+		// Both pipes reached EOF and the leader is reaped: nothing of the
+		// group holds them.
+		guard.Disarm()
 		code := int32(-1)
 		if werr == nil {
 			code = 0
@@ -135,7 +142,7 @@ func captureCommandOutput(argv []string) (int32, string, string) {
 		// Either the leader is still running, or it was reaped and something
 		// it started still holds a pipe — either way the group is still
 		// populated. SIGKILL it; reap the leader if it is still ours.
-		sendSignalToGroup(int64(cmd.Process.Pid), SignalKill)
+		guard.Fire()
 		_ = cmd.Process.Kill()
 		<-waitCh
 		return -1, "", ""
@@ -313,20 +320,21 @@ func runningContainers(containerIDs []string) map[string]string {
 	return out
 }
 
-// containerWatch is one tracked container. Abandoned replaces Rust's
-// "receiver dropped" check.
+// containerWatch is one tracked container.
 type containerWatch struct {
-	record    DockerContainerRecord
-	exited    chan int32
-	abandoned *atomic.Bool
+	record DockerContainerRecord
+	exited chan int32
 }
 
 // ContainerWatcher reports when a started container stops being the instance
 // that was started (stopped, removed, or recreated under a new id). One poll
 // loop checks every tracked container with a single `docker inspect` every
 // containerPollInterval — a per-container 500 ms poll meant ~20 docker CLI
-// spawns a second for ten services — and exits once nothing is tracked. A
-// watch whose Abandoned flag was set is no longer tracked.
+// spawns a second for ten services — and exits once nothing is tracked.
+//
+// Rust also retires a watch whose oneshot receiver was dropped; Go has no
+// channel-abandonment signal, and the engine always drains Exited (or stops
+// the container), so a watch is retired when its container is gone.
 type ContainerWatcher struct {
 	mu      sync.Mutex
 	watches []*containerWatch
@@ -334,12 +342,11 @@ type ContainerWatcher struct {
 }
 
 // Watch registers record for tracking; exited receives 0 when the container
-// is gone. The returned flag is the caller's abandoned marker.
-func (w *ContainerWatcher) Watch(record DockerContainerRecord, exited chan int32) *atomic.Bool {
-	abandoned := &atomic.Bool{}
+// is gone.
+func (w *ContainerWatcher) Watch(record DockerContainerRecord, exited chan int32) {
 	startPolling := false
 	w.mu.Lock()
-	w.watches = append(w.watches, &containerWatch{record: record, exited: exited, abandoned: abandoned})
+	w.watches = append(w.watches, &containerWatch{record: record, exited: exited})
 	if !w.polling {
 		w.polling = true
 		startPolling = true
@@ -348,22 +355,16 @@ func (w *ContainerWatcher) Watch(record DockerContainerRecord, exited chan int32
 	if startPolling {
 		go w.poll()
 	}
-	return abandoned
 }
 
 func (w *ContainerWatcher) poll() {
 	for {
 		time.Sleep(containerPollInterval)
 		w.mu.Lock()
-		var kept []*containerWatch
 		var ids []string
 		for _, watch := range w.watches {
-			if !watch.abandoned.Load() {
-				kept = append(kept, watch)
-				ids = append(ids, watch.record.ContainerID)
-			}
+			ids = append(ids, watch.record.ContainerID)
 		}
-		w.watches = kept
 		if len(w.watches) == 0 {
 			w.polling = false
 			w.mu.Unlock()
@@ -384,7 +385,7 @@ func (w *ContainerWatcher) poll() {
 		for _, id := range ids {
 			asked[id] = true
 		}
-		kept = nil
+		var kept []*containerWatch
 		for _, watch := range w.watches {
 			id := watch.record.ContainerID
 			if asked[id] && running[id] != watch.record.ContainerStartedAt {
@@ -813,6 +814,10 @@ func drainRawLogOnce(path string, offset *atomic.Uint64, onOutput OnOutput) {
 // store on every re-attach. The returned tail's stop kills the `docker logs`
 // child; the task also ends on its own when the container stops, since
 // `docker logs --follow` exits with it.
+//
+// Rust also sets `kill_on_drop` so the follower dies with the daemon even if
+// nothing stops it. Go has no process-drop hook, so the engine's
+// DetachAllOutput (a leave-services shutdown) is what ends it there.
 func tailContainerLogs(containerName string, since *string, tail *uint64, env map[string]string, onOutput OnOutput) *OutputTail {
 	cancel := make(chan struct{})
 	done := &atomic.Bool{}
@@ -939,11 +944,11 @@ func (a *DefaultProcessAdapter) Spawn(input SpawnInput, onOutput OnOutput) (*Man
 			return nil, Errorf("Docker container %s is not running after start", containerName)
 		}
 		exited := make(chan int32, 1)
-		abandoned := a.Containers.Watch(*record, exited)
+		a.Containers.Watch(*record, exited)
 		return &ManagedProcess{
 			Record: ProcessRecord{Docker: record},
 			Exited: exited,
-		}, withAbandon(abandoned)
+		}, nil
 	}
 
 	if !processInspectionAvailable() {
@@ -1055,8 +1060,6 @@ func (a *DefaultProcessAdapter) Spawn(input SpawnInput, onOutput OnOutput) (*Man
 		Exited: exited,
 	}, nil
 }
-
-func withAbandon(*atomic.Bool) error { return nil }
 
 func (a *DefaultProcessAdapter) Inspect(identity *state.ProcessIdentity) Inspection {
 	if identity.ContainerID != nil {

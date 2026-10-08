@@ -21,6 +21,16 @@ const (
 )
 
 func (s *ProcessSupervisor) awaitExternalTask(serviceID string, profile *VerifiedProfile, generation, token uint64, operationID *string, exited <-chan int32) error {
+	// The readiness future's first poll runs one probe. Rust's `biased` select polls readiness
+	// first, so a probe that passes on the first poll wins; otherwise the readiness future is
+	// sleeping and a task that has already exited wins the select.
+	if s.valid(serviceID, generation, token) && !s.closing() && s.probe(&profile.Readiness, serviceID) {
+		kind := readinessKindOf(&profile.Readiness)
+		s.transitionIfCurrent(serviceID, generation, token, state.ActualReady, state.ReadinessReady, Changes{
+			ReadinessKind: setv(kind), ReadinessDetail: setv("readiness verified"), Error: clear[string](),
+		})
+		return nil
+	}
 	stop := make(chan struct{})
 	done := make(chan error, 1)
 	go func() { done <- s.awaitTaskProbe(serviceID, profile, generation, token, operationID, stop) }()
@@ -160,13 +170,15 @@ func (s *ProcessSupervisor) settleProcessLiveness(serviceID string, generation u
 	if !s.valid(serviceID, generation, token) || s.closing() {
 		return nil
 	}
-	if identity != nil && s.ownsIdentity(identity) != nil && !*s.ownsIdentity(identity) {
-		if !s.valid(serviceID, generation, token) {
-			return nil
+	if identity != nil {
+		if owned := s.ownsIdentity(identity); owned != nil && !*owned {
+			if !s.valid(serviceID, generation, token) {
+				return nil
+			}
+			message := "Process exited before liveness check"
+			s.fail(serviceID, generation, token, identity, message, operationID, nil, "")
+			return NewError(message)
 		}
-		message := "Process exited before liveness check"
-		s.fail(serviceID, generation, token, identity, message, operationID, nil, "")
-		return NewError(message)
 	}
 	var idPatch patch[state.ProcessIdentity]
 	if identity != nil {
@@ -226,13 +238,10 @@ func (s *ProcessSupervisor) spawnContinuousProbe(serviceID string, profile *Veri
 		return
 	}
 	s.probeLoops.Lock()
-	if s.loops[serviceID] == token && token != 0 {
-		// A second arm for the same start must not probe twice. Token 0 is unused;
-		// cancel() starts at 1. A missing entry is 0, which must not match a real token.
-		if _, ok := s.loops[serviceID]; ok {
-			s.probeLoops.Unlock()
-			return
-		}
+	if v, ok := s.loops[serviceID]; ok && v == token {
+		// A second arm for the same start must not probe twice.
+		s.probeLoops.Unlock()
+		return
 	}
 	s.loops[serviceID] = token
 	s.probeLoops.Unlock()
@@ -307,7 +316,7 @@ func (s *ProcessSupervisor) awaitExit(serviceID string, generation uint64, ident
 			if code, ok := s.observedExitCode(serviceID, generation); ok {
 				return s.finishExit(serviceID, generation, token, code)
 			}
-		} else if identity != nil && s.ownsIdentity(identity) != nil && !*s.ownsIdentity(identity) {
+		} else if identity != nil && ownsFalse(s.ownsIdentity(identity)) {
 			message := "Command exited while the daemon was down; exit code unknown"
 			stopped := state.DesiredStopped
 			s.transitionIfCurrent(serviceID, generation, token, state.ActualFailed, state.ReadinessFailed, Changes{
@@ -486,7 +495,9 @@ func (s *ProcessSupervisor) onExit(serviceID string, generation, token uint64, c
 		s.active.Unlock()
 		if will {
 			go func() {
-				s.sleep(int64(delay))
+				// The respawn delay is a real wall-clock pause (Rust's `tokio::time::sleep`),
+				// not the clock seam: a manual restart landing inside the window must win.
+				time.Sleep(time.Duration(delay) * time.Millisecond)
 				s.queues.Run(serviceID, func() {
 					st := s.state(serviceID)
 					if st == nil || st.ActualState != state.ActualFailed || st.DesiredState != state.DesiredRunning || s.closing() {
@@ -1068,7 +1079,7 @@ func (s *ProcessSupervisor) identityMatchesState(st *state.ServiceLifecycleState
 
 func (s *ProcessSupervisor) owns(st *state.ServiceLifecycleState) *bool {
 	if !s.identityMatchesState(st) {
-		return boolPtr(false)
+		return new(false)
 	}
 	return s.ownsIdentity(st.Identity)
 }
@@ -1092,33 +1103,33 @@ func (s *ProcessSupervisor) observedMatches(identity *state.ProcessIdentity) *bo
 	insp := s.options.Process.Inspect(identity)
 	switch insp.Kind {
 	case InspectionGone:
-		return boolPtr(false)
+		return new(false)
 	case InspectionUnknown:
 		return nil
 	}
 	if insp.Observed == nil || !insp.Observed.Alive {
-		return boolPtr(false)
+		return new(false)
 	}
 	if insp.Observed.Record.CommandFingerprint() != identity.CommandFingerprint && !s.sameExecutable(insp.Observed.Record, identity) {
-		return boolPtr(false)
+		return new(false)
 	}
 	if identity.IsDocker() {
 		rec := insp.Observed.Record.Docker
 		if rec == nil || identity.ContainerName == nil || identity.ContainerID == nil || identity.ContainerStartedAt == nil {
-			return boolPtr(false)
+			return new(false)
 		}
-		return boolPtr(rec.ContainerName == *identity.ContainerName && rec.ContainerID == *identity.ContainerID && rec.ContainerStartedAt == *identity.ContainerStartedAt)
+		return new(rec.ContainerName == *identity.ContainerName && rec.ContainerID == *identity.ContainerID && rec.ContainerStartedAt == *identity.ContainerStartedAt)
 	}
 	rec := insp.Observed.Record.Posix
 	if rec == nil {
-		return boolPtr(false)
+		return new(false)
 	}
-	return boolPtr(rec.Pid == identity.PidValue() && rec.Pgid == identity.PgidValue() && rec.StartIdentity == identity.StartIdentityValue())
+	return new(rec.Pid == identity.PidValue() && rec.Pgid == identity.PgidValue() && rec.StartIdentity == identity.StartIdentityValue())
 }
 
 func (s *ProcessSupervisor) ownsIdentity(identity *state.ProcessIdentity) *bool {
 	if identity == nil || identity.ManagerInstanceID != s.host.InstanceID() {
-		return boolPtr(false)
+		return new(false)
 	}
 	return s.observedMatches(identity)
 }
@@ -1161,7 +1172,7 @@ func (s *ProcessSupervisor) transition(serviceID string, generation uint64, actu
 		desired = *changes.Desired
 	}
 	created := now
-	if previous != nil && previous.CreatedAt != "" {
+	if previous != nil {
 		created = previous.CreatedAt
 	}
 	var prevID *state.ProcessIdentity
@@ -1376,6 +1387,10 @@ func asSupervisor(err error) error {
 	}
 	return NewError(err.Error())
 }
+
+// ownsFalse reports a definitive "not ours" from an ownership probe. A nil
+// (unverifiable) answer is never "not ours".
+func ownsFalse(v *bool) bool { return v != nil && !*v }
 
 func containsStr(list []string, want string) bool {
 	for _, v := range list {

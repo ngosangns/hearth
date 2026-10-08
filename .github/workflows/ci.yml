@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  rust-test:
+  go-test:
     # The self-hosted runner shares a user account with other repos' runners: never run code from
     # a fork's pull request on it. Same-repo PRs and pushes run as usual.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 90
     defaults:
       run:
-        working-directory: rust
+        working-directory: go
     steps:
       - uses: actions/checkout@v7
         with:
@@ -34,21 +34,16 @@ jobs:
       # The runner service has no login-shell PATH; see the action for why.
       - uses: ./.github/actions/toolchain-path
         with:
-          tools: cargo
-      - run: cargo --version && rustc --version
-      - run: cargo test --workspace
-      # The runner's toolchain is managed by rustup, whose stable toolchain does not include clippy
-      # unless the component is added. Dev machines here use Homebrew's rust, which bundles it.
-      - name: Ensure clippy is available
+          tools: go
+      - run: go version
+      - run: go build ./...
+      - run: go test ./...
+      - run: go vet ./...
+      - name: gofmt check
         run: |
           set -euo pipefail
-          if cargo clippy --version >/dev/null 2>&1; then
-            echo "clippy already available: $(cargo clippy --version)"
-            exit 0
-          fi
-          if ! command -v rustup >/dev/null 2>&1; then
-            echo "clippy is missing and rustup is not available to install it" >&2
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
             exit 1
           fi
-          rustup component add clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings

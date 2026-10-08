@@ -19,7 +19,7 @@ type CommandSpec struct {
 	Exec  *bool    `json:"exec,omitempty"`
 }
 
-func (c *CommandSpec) IsArgv() bool { return c != nil && c.Argv != nil }
+func (c *CommandSpec) IsArgv() bool  { return c != nil && c.Argv != nil }
 func (c *CommandSpec) IsShell() bool { return c != nil && c.Shell != "" }
 
 // MarshalJSON emits the untagged shape: `{"argv":[...]}` or
@@ -71,11 +71,11 @@ func (c *CommandSpec) UnmarshalJSON(data []byte) error {
 }
 
 type ServiceCommand struct {
-	Command           CommandSpec         `json:"command"`
-	Cwd               string              `json:"cwd"`
-	Environment       map[string]string   `json:"environment,omitempty"`
-	ContainerName     *string             `json:"containerName,omitempty"`
-	DockerStopCommand *CommandSpec        `json:"dockerStopCommand,omitempty"`
+	Command           CommandSpec       `json:"command"`
+	Cwd               string            `json:"cwd"`
+	Environment       map[string]string `json:"environment,omitempty"`
+	ContainerName     *string           `json:"containerName,omitempty"`
+	DockerStopCommand *CommandSpec      `json:"dockerStopCommand,omitempty"`
 }
 
 // ReadinessSpec is `{"kind":"..."}`-tagged. Exactly one kind's fields are set.
@@ -132,12 +132,12 @@ type PreparationCommand struct {
 
 // ServiceRunProfile is `{"commandStatus":"verified"|"unresolved"}`-tagged.
 type ServiceRunProfile struct {
-	CommandStatus       string              `json:"commandStatus"`
-	Command             *ServiceCommand     `json:"command,omitempty"`
-	Readiness           ReadinessSpec       `json:"readiness"`
-	ReadinessTimeoutMs  *uint64             `json:"readinessTimeoutMs,omitempty"`
-	Preparation         []string            `json:"preparation,omitempty"`
-	PreparationCommand  *PreparationCommand `json:"preparationCommand,omitempty"`
+	CommandStatus      string              `json:"commandStatus"`
+	Command            *ServiceCommand     `json:"command,omitempty"`
+	Readiness          ReadinessSpec       `json:"readiness"`
+	ReadinessTimeoutMs *uint64             `json:"readinessTimeoutMs,omitempty"`
+	Preparation        []string            `json:"preparation,omitempty"`
+	PreparationCommand *PreparationCommand `json:"preparationCommand,omitempty"`
 }
 
 func (p *ServiceRunProfile) IsVerified() bool { return p.CommandStatus == "verified" }
@@ -326,16 +326,16 @@ type ServiceProfiles struct {
 }
 
 type ServiceDefinition struct {
-	ID        string            `json:"id"`
-	Label     *string           `json:"label,omitempty"`
-	Kind      *ServiceKind      `json:"kind,omitempty"`
-	Ownership *ServiceOwnership `json:"ownership,omitempty"`
-	Disabled  bool              `json:"disabled"`
+	ID        string                `json:"id"`
+	Label     *string               `json:"label,omitempty"`
+	Kind      *ServiceKind          `json:"kind,omitempty"`
+	Ownership *ServiceOwnership     `json:"ownership,omitempty"`
+	Disabled  bool                  `json:"disabled"`
 	Restart   *ServiceRestartPolicy `json:"restart,omitempty"`
-	Profiles  ServiceProfiles   `json:"profiles"`
-	Ports     []ServicePort     `json:"ports,omitempty"`
-	URLs      []ServiceURL      `json:"urls,omitempty"`
-	Artifact  *ServiceArtifact  `json:"artifact,omitempty"`
+	Profiles  ServiceProfiles       `json:"profiles"`
+	Ports     []ServicePort         `json:"ports,omitempty"`
+	URLs      []ServiceURL          `json:"urls,omitempty"`
+	Artifact  *ServiceArtifact      `json:"artifact,omitempty"`
 }
 
 type CatalogGroup struct {
@@ -350,13 +350,13 @@ const (
 )
 
 type ServiceCatalog struct {
-	Services           []ServiceDefinition     `json:"services"`
-	Groups             map[string][]string     `json:"groups"`
-	GroupTree          []CatalogGroup          `json:"groupTree,omitempty"`
-	ComposeFile        *string                 `json:"composeFile,omitempty"`
-	RuntimeDirectory   *string                 `json:"runtimeDirectory,omitempty"`
-	StartFailurePolicy StartFailurePolicy      `json:"startFailurePolicy"`
-	PrivateFileGuard   *bool                   `json:"privateFileGuard,omitempty"`
+	Services           []ServiceDefinition `json:"services"`
+	Groups             map[string][]string `json:"groups"`
+	GroupTree          []CatalogGroup      `json:"groupTree,omitempty"`
+	ComposeFile        *string             `json:"composeFile,omitempty"`
+	RuntimeDirectory   *string             `json:"runtimeDirectory,omitempty"`
+	StartFailurePolicy StartFailurePolicy  `json:"startFailurePolicy"`
+	PrivateFileGuard   *bool               `json:"privateFileGuard,omitempty"`
 }
 
 type CatalogValidation struct {

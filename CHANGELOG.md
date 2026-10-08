@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- New SwiftUI macOS app in `apps/macos-swiftui`, laid out like synca's: a unit-tested `HearthKit` and a three-column window (workspaces, services grouped by `groupTree`, log). Trust, daemon stop/restart, forget, group and shared stop/restart that affect other workspaces, shared remove, and port reclaim ask through a confirmation dialog. `task app:build` bundles it with the installed `hearth`; `task app:test` runs its tests. `task app:install` quits a running copy and rsyncs the bundle into `/Applications`. `task go:test` covers the Go port.
-- Removed the NativePHP app (`apps/macos`), its DMG workflow, and the deprecated ANSI `run_tui` path. `hearth tui` is the Ratatui shell. The macOS window is the SwiftUI app.
+- **The backend is now Go.** `rust/` is gone; the product is the Go binary at `go/cmd/hearth` (module `github.com/ngosangns/hearth/go`). The daemon, supervisor, manager HTTP+SSE surface, shared-services (`smp`) manager, CLI, MCP server, and self-updater are all ported to `go/internal/*`. `task test` / `task clippy` / `task install` and CI now run Go (`go test ./...`, `go vet ./...`, `gofmt`). The version string moved from `rust/bin/hearth/Cargo.toml` to the repo-root `VERSION` file, stamped with `-ldflags "-X main.version=..."`.
+- **The TUI is removed.** `hearth-tui` was not ported: there is no `hearth tui` command, and a bare `hearth` always prints help. The SwiftUI macOS app is the workspace UI.
+- New SwiftUI macOS app in `apps/macos-swiftui`, laid out like synca's: a unit-tested `HearthKit` and a three-column window (workspaces, services grouped by `groupTree`, log). Trust, daemon stop/restart, forget, group and shared stop/restart that affect other workspaces, shared remove, and port reclaim ask through a confirmation dialog. `task app:build` bundles it with the installed `hearth`; `task app:test` runs its tests. `task app:install` quits a running copy and rsyncs the bundle into `/Applications`.
+- Removed the NativePHP app (`apps/macos`) and its DMG workflow.
 
 ## 0.22.0
 

@@ -52,7 +52,7 @@ func LogCursorGeneration(lifecycle, rotation uint64) uint64 {
 }
 
 type logStreamState struct {
-	Version     uint32           `json:"version"`
+	Version     uint32            `json:"version"`
 	Generations map[string]uint64 `json:"generations"`
 }
 
@@ -72,11 +72,11 @@ type CursorLogStore struct {
 	rotationCount   int
 	streamStatePath string
 
-	genMu              sync.Mutex
+	genMu               sync.Mutex
 	rotationGenerations map[string]uint64
-	appendQueues       *syncx.KeyedLock[string]
-	metadataSerial     sync.Mutex
-	loadOnce           sync.Once
+	appendQueues        *syncx.KeyedLock[string]
+	metadataSerial      sync.Mutex
+	loadOnce            sync.Once
 }
 
 func NewCursorLogStore(io fileio.FileIO, directory string, latestTailBytes, maxBytes uint64, rotationCount int) *CursorLogStore {
@@ -198,7 +198,7 @@ func (s *CursorLogStore) ensureLoaded() { s.loadOnce.Do(s.load) }
 func (s *CursorLogStore) load() {
 	if raw, err := s.io.ReadFile(s.streamStatePath); err == nil && raw != nil {
 		var value struct {
-			Version     uint32           `json:"version"`
+			Version     uint32            `json:"version"`
 			Generations map[string]uint64 `json:"generations"`
 		}
 		if err := json.Unmarshal([]byte(*raw), &value); err != nil {

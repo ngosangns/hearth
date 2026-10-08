@@ -4,6 +4,7 @@
 package shared
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,15 @@ import (
 
 const fetchTimeout = 20 * time.Second
 const cacheFileName = "catalog.json"
+
+// embeddedCatalog is the repo-root `catalog.json` baked into the binary — the
+// same document the pinned URL serves (write-catalog.py writes both). Last
+// resort when the registry is unreachable and nothing is cached yet: the URL
+// 404s for a private repo (raw.githubusercontent.com needs auth), so without
+// this the catalog endpoint can never answer on a first run.
+//
+//go:embed catalog.json
+var embeddedCatalog string
 
 // SharedArtifact is where the darwin-arm64 tarball comes from. Exactly one of
 // URL or Script.
@@ -167,8 +177,8 @@ type SharedServiceFamily struct {
 }
 
 type SharedCatalogDocument struct {
-	Version  uint32                          `json:"version"`
-	Services map[string]SharedServiceFamily  `json:"services"`
+	Version  uint32                         `json:"version"`
+	Services map[string]SharedServiceFamily `json:"services"`
 }
 
 func (d *SharedCatalogDocument) Recipe(name, version string) *SharedRecipe {
@@ -239,40 +249,80 @@ func mergeMissingRecipes(doc, other *SharedCatalogDocument) {
 	}
 }
 
+// loadCached is the disk cache, topped up with any recipe the embedded
+// catalog has that the cache lacks. A cache written once (env / `catalog-url`
+// / `file://` use) would otherwise hide every recipe added in a newer `hearth`
+// build forever, because the private-repo fetch always fails. A recipe present
+// in both keeps the cached (actually fetched) version.
+func (rc *RemoteCatalog) loadCached() *SharedCatalogDocument {
+	data, err := os.ReadFile(rc.cachePath())
+	if err != nil {
+		return nil
+	}
+	doc, err := parseDocument(string(data))
+	if err != nil {
+		return nil
+	}
+	if embedded, err := parseDocument(embeddedCatalog); err == nil {
+		mergeMissingRecipes(doc, embedded)
+	}
+	return doc
+}
+
 // Document returns the catalog: fetched (cached on success) or cache/embedded
-// fallback.
+// fallback. `file://` URLs exist for tests/local development of the whole
+// attach path without publishing a real registry — the cache write-through
+// still applies.
 func (rc *RemoteCatalog) Document() (*SharedCatalogDocument, error) {
 	url := SharedCatalogURL
 	if rc.catalogURL != nil && *rc.catalogURL != "" {
 		url = *rc.catalogURL
 	}
 	var fetchedErr error
-	client := &http.Client{Timeout: fetchTimeout}
-	if resp, err := client.Get(url); err == nil {
-		if resp.StatusCode == http.StatusOK {
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err == nil {
-				if doc, perr := parseDocument(string(body)); perr == nil {
-					_ = os.WriteFile(rc.cachePath(), body, 0o644)
-					return doc, nil
-				} else {
-					fetchedErr = perr
-				}
-			} else {
-				fetchedErr = err
+	var fetched *SharedCatalogDocument
+	if rest, ok := strings.CutPrefix(url, "file://"); ok {
+		var text []byte
+		text, fetchedErr = os.ReadFile(rest)
+		if fetchedErr == nil {
+			fetched, fetchedErr = parseDocument(string(text))
+			if fetchedErr == nil {
+				_ = os.WriteFile(rc.cachePath(), text, 0o644)
 			}
-		} else {
-			resp.Body.Close()
-			fetchedErr = fmt.Errorf("status %d", resp.StatusCode)
 		}
 	} else {
-		fetchedErr = err
-	}
-	if data, err := os.ReadFile(rc.cachePath()); err == nil {
-		if doc, perr := parseDocument(string(data)); perr == nil {
-			return doc, nil
+		client := &http.Client{Timeout: fetchTimeout}
+		if resp, err := client.Get(url); err == nil {
+			if resp.StatusCode == http.StatusOK {
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					if doc, perr := parseDocument(string(body)); perr == nil {
+						_ = os.WriteFile(rc.cachePath(), body, 0o644)
+						fetched = doc
+					} else {
+						fetchedErr = perr
+					}
+				} else {
+					fetchedErr = err
+				}
+			} else {
+				resp.Body.Close()
+				fetchedErr = fmt.Errorf("status %d", resp.StatusCode)
+			}
+		} else {
+			fetchedErr = err
 		}
+	}
+	if fetched != nil {
+		return fetched, nil
+	}
+	if doc := rc.loadCached(); doc != nil {
+		return doc, nil
+	}
+	// No cached document: a private repo makes the pinned raw URL answer 404
+	// forever, so the binary's own copy of catalog.json is what answers.
+	if doc, err := parseDocument(embeddedCatalog); err == nil {
+		return doc, nil
 	}
 	return nil, Errorf("could not load the shared catalog: %v", fetchedErr)
 }

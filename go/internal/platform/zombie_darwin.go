@@ -10,10 +10,10 @@ import (
 // libc's proc_pidinfo() is a thin wrapper over the proc_info(2) syscall with
 // callnum PROC_INFO_CALL_PIDINFO — stable Darwin ABI.
 const (
-	sysProcInfo          = 0x150 // SYS_PROC_INFO
-	procInfoCallPidinfo  = 0x2   // PROC_INFO_CALL_PIDINFO
-	procPidTBsdInfo      = 3     // PROC_PIDTBSDINFO
-	procBsdInfoSize      = 648   // sizeof(struct proc_bsdinfo)
+	sysProcInfo         = 0x150 // SYS_PROC_INFO
+	procInfoCallPidinfo = 0x2   // PROC_INFO_CALL_PIDINFO
+	procPidTBsdInfo     = 3     // PROC_PIDTBSDINFO
+	procBsdInfoSize     = 648   // sizeof(struct proc_bsdinfo)
 )
 
 // platformZombieStatus mirrors the Rust libc::proc_pidinfo probe: fills the

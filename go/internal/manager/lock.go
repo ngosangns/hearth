@@ -36,10 +36,10 @@ import (
 )
 
 const (
-	managerStartupGraceMs               = 5000
-	liveManagerHealthcheckAttempts      = 2
-	liveManagerHealthcheckRetryDelayMs  = 150
-	liveManagerHealthcheckTimeoutMs     = 1500
+	managerStartupGraceMs              = 5000
+	liveManagerHealthcheckAttempts     = 2
+	liveManagerHealthcheckRetryDelayMs = 150
+	liveManagerHealthcheckTimeoutMs    = 1500
 )
 
 func nowMillis() int64 { return time.Now().UnixMilli() }

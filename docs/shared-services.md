@@ -259,7 +259,7 @@ catalog needed.
 
 `detach <name@ver> --stop-if-unused` also stops the instance when this was its last attachment.
 `ensure --json` (the `manager ensure --json` contract for smp — prints the `ManagerConnection`
-for `~/.hearth/shared`, used by `hearth tui`) · `list [--json]` (remote registry, no daemon
+for `~/.hearth/shared`) · `list [--json]` (remote registry, no daemon
 needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attach|detach|probe
 <name@ver>` · `install <name@ver>` · `remove <name@ver>`.
 
@@ -268,15 +268,6 @@ needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attac
 Skill scripts / CLI cover `shared list`, `shared status`, and `scripts/shared-connection.sh` (MCP tools of the same names remain in-binary but are retired for agents) (queried against smp
 directly via its lock-dir token). The skill doc (`hearth skill install`) documents the flow:
 read `shared:` in `hearth.yaml` → attach happens on `start` → query connection info via MCP.
-
-## TUI
-
-`hearth tui` has a shared-services view. It reads recipes from the remote catalog and instances
-from a live smp daemon or the local registry, and it does not spawn smp just to draw the list.
-Install follows the version selected on that row and uses an unbounded request timeout. Start,
-stop, and restart act on one instance. Remove takes a second keypress; when projects are still
-attached, confirming sends `force: true` and deletes their data. Attach and detach stay
-project-side: a `shared:` entry plus start or stop.
 
 ## Edge cases
 

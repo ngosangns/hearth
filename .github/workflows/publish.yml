@@ -1,6 +1,6 @@
 name: Publish
 
-# Manual release path: bumps rust/bin/hearth/Cargo.toml (+ Cargo.lock) to `version`, pushes the
+# Manual release path: bumps the repo-root VERSION file to `version`, pushes the
 # bump commit to main, gates it on the full CI suite, then tags `v<version>` and publishes the
 # release asset. Run it from Actions → Publish → Run workflow, or:
 #   gh workflow run publish.yml -f version=0.19.0
@@ -33,9 +33,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
-      - uses: ./.github/actions/toolchain-path
-        with:
-          tools: cargo
       - id: bump
         env:
           VERSION: ${{ inputs.version }}
@@ -58,22 +55,19 @@ jobs:
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          manifest="rust/bin/hearth/Cargo.toml"
-          current="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' "$manifest")"
+          # The canonical version is the repo-root VERSION file — what `go build -X
+          # main.version=` stamps and `hearth update` compares against the tag.
+          manifest="VERSION"
+          current="$(tr -d '[:space:]' < "$manifest")"
           latest="$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -1)"
           if [ "$VERSION" = "$current" ] || [ "$latest" != "$VERSION" ]; then
             echo "refusing to release $VERSION over current $current" >&2
             exit 1
           fi
-          # First `version = ` line only, same anchor `task install` uses.
-          awk -v v="$VERSION" \
-            '!done && $1=="version" && $2=="=" { sub(/"[^"]*"/, "\"" v "\""); done=1 } { print }' \
-            "$manifest" > "$manifest.next" && mv "$manifest.next" "$manifest"
-          # Refresh the matching hearth entry in Cargo.lock without compiling.
-          (cd rust && cargo metadata --format-version 1 --quiet > /dev/null)
+          printf '%s\n' "$VERSION" > "$manifest"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$manifest" rust/Cargo.lock
+          git add "$manifest"
           git commit -m "release $tag"
           git push origin HEAD:main
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -95,10 +89,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.cut.outputs.sha }}
-      # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as cargo's.
+      # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as go's.
       - uses: ./.github/actions/toolchain-path
         with:
-          tools: cargo gh
+          tools: go gh
       - name: Push the release tag
         run: |
           set -euo pipefail

@@ -43,8 +43,8 @@ func civilFromDays(z int64) (int64, int64, int64) {
 	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
 	y := yoe + era*400
 	doy := doe - (365*yoe + yoe/4 - yoe/100) // [0, 365]
-	mp := (5*doy + 2) / 153                // [0, 11]
-	d := doy - (153*mp+2)/5 + 1            // [1, 31]
+	mp := (5*doy + 2) / 153                  // [0, 11]
+	d := doy - (153*mp+2)/5 + 1              // [1, 31]
 	var m int64
 	if mp < 10 {
 		m = mp + 3 // [3, 12]

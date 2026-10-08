@@ -5,37 +5,43 @@ vars:
 
 tasks:
   test:
-    desc: Run the Rust workspace test suite (needs docker running, tailscale, nc, ps, sh)
-    dir: rust
+    desc: Run the Go test suite (needs docker running, tailscale, nc, ps, sh)
+    dir: go
     cmds:
-      - cargo test --workspace
+      - go test ./...
 
   clippy:
-    desc: Lint the Rust workspace exactly as CI does (warnings are errors)
-    dir: rust
+    desc: Lint the Go module exactly as CI does (vet + gofmt)
+    dir: go
     cmds:
-      - cargo clippy --workspace --all-targets -- -D warnings
+      - go vet ./...
+      - test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
   install:
     desc: Build release hearth, sign the versioned binary, and symlink ~/.local/bin/hearth to it
-    dir: rust
+    dir: go
     cmds:
-      - cargo build --release -p hearth
+      - |
+        set -eu
+        version="$(cat ../VERSION)"
+        test -n "$version"
+        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$version" -o hearth-build ./cmd/hearth
       # Sign a new inode, then point the symlink at it. codesign --force on a mapped
       # binary SIGKILLs that process, and cp onto the symlink would collapse this layout.
       - |
         set -eu
-        version="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' bin/hearth/Cargo.toml)"
+        version="$(cat ../VERSION)"
         test -n "$version"
         dest_dir="{{env "HOME"}}/.local/share/hearth/bin"
         link="{{.HEARTH_BIN}}"
         dest="$dest_dir/hearth-$version"
         staged="$dest_dir/.hearth-$version.staging.$$"
         mkdir -p "$dest_dir" "$(dirname "$link")"
-        cp target/release/hearth "$staged"
+        cp hearth-build "$staged"
         codesign --sign - --force "$staged"
         chmod 755 "$staged"
         mv -f "$staged" "$dest"
+        rm -f hearth-build
         aside=""
         if [ -e "$link" ] && [ ! -L "$link" ]; then
           aside="$dest_dir/hearth-previous-$$"
@@ -90,21 +96,22 @@ tasks:
         echo "installed: $app -> /Applications/Hearth.app"
 
   go:build:
-    desc: Build the Go supervisor port (no installable binary yet; library packages only)
+    desc: Build the Go module and the hearth binary into go/hearth
     dir: go
     cmds:
-      - go build ./...
+      - go build -trimpath -ldflags "-s -w -X main.version=$(cat ../VERSION)" -o hearth ./cmd/hearth
 
   go:test:
-    desc: Run the Go port tests, same role as synca's `make -C go test`
+    desc: Run the Go test suite (same as `task test`)
     dir: go
     cmds:
       - go test ./...
 
   go:clean:
-    desc: Remove Go build cache for this module
+    desc: Remove the built binary and Go build cache for this module
     dir: go
     cmds:
+      - rm -f hearth
       - go clean ./...
 
   catalog:package:
@@ -123,7 +130,7 @@ tasks:
       - scripts/catalog/smoke.sh
 
   ci:
-    desc: Everything CI runs (Rust test + clippy)
+    desc: Everything CI runs (Go test + vet/gofmt)
     cmds:
       - task: test
       - task: clippy

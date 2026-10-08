@@ -38,8 +38,8 @@ func (RequestIDConflict) Error() string { return "requestId is already used by a
 
 // OperationHandle is the shared mutable operation record.
 type OperationHandle struct {
-	mu  sync.Mutex
-	Op  state.Operation
+	mu sync.Mutex
+	Op state.Operation
 }
 
 func (h *OperationHandle) Snapshot() state.Operation {

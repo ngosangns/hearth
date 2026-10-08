@@ -169,7 +169,7 @@ func fileName(token string) string {
 }
 
 // Interpreters and the hearth binary run many different commands. Matching
-// them by argv0 would reap a daemon, a TUI, or another script in the same
+// them by argv0 would reap a daemon, the app, or another script in the same
 // directory.
 func dedicatedServerBinary(exe string) bool {
 	name := fileName(exe)

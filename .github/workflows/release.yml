@@ -33,10 +33,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-      # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as cargo's.
+      # `gh` lives in Homebrew's bin dir, which the runner service's PATH lacks as well as go's.
       - uses: ./.github/actions/toolchain-path
         with:
-          tools: cargo gh
+          tools: go gh
       - uses: ./.github/actions/release-asset
         with:
           tag: ${{ env.RELEASE_TAG }}

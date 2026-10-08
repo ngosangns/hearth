@@ -1,6 +1,6 @@
 import Foundation
 
-/// One row of `workspaces.json`, shared with `hearth tui`: `{ id, path, trusted, addedAt }`.
+/// One row of `workspaces.json`, the app's workspace list: `{ id, path, trusted, addedAt }`.
 public struct WorkspaceRecord: Sendable, Equatable, Identifiable, Codable {
     public let id: String
     public let path: String

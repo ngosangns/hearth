@@ -1,4 +1,4 @@
-// Package state holds the wire/persistence types shared by the daemon, CLI, TUI
+// Package state holds the wire/persistence types shared by the daemon, CLI,
 // and macOS app. Field names and enum encodings must match the Rust daemon's
 // serde output exactly (camelCase keys, kebab-case multi-word states).
 package state
@@ -197,20 +197,20 @@ func (p *ProcessIdentity) StartIdentityValue() string {
 }
 
 type ServiceLifecycleState struct {
-	ServiceID           string              `json:"serviceId"`
-	DesiredState        DesiredServiceState `json:"desiredState"`
-	ActualState         ActualServiceState  `json:"actualState"`
-	Readiness           ServiceReadiness    `json:"readiness"`
-	Generation          uint64              `json:"generation"`
-	Identity            *ProcessIdentity    `json:"identity,omitempty"`
-	ReadinessKind       *ReadinessKind      `json:"readinessKind,omitempty"`
-	ReadinessDetail     *string             `json:"readinessDetail,omitempty"`
-	CreatedAt           string              `json:"createdAt"`
-	UpdatedAt           string              `json:"updatedAt"`
-	ExitedAt            *string             `json:"exitedAt,omitempty"`
-	ExitCode            *int32              `json:"exitCode,omitempty"`
-	Error               *string             `json:"error,omitempty"`
-	CurrentOperationID  *string             `json:"currentOperationId,omitempty"`
+	ServiceID          string              `json:"serviceId"`
+	DesiredState       DesiredServiceState `json:"desiredState"`
+	ActualState        ActualServiceState  `json:"actualState"`
+	Readiness          ServiceReadiness    `json:"readiness"`
+	Generation         uint64              `json:"generation"`
+	Identity           *ProcessIdentity    `json:"identity,omitempty"`
+	ReadinessKind      *ReadinessKind      `json:"readinessKind,omitempty"`
+	ReadinessDetail    *string             `json:"readinessDetail,omitempty"`
+	CreatedAt          string              `json:"createdAt"`
+	UpdatedAt          string              `json:"updatedAt"`
+	ExitedAt           *string             `json:"exitedAt,omitempty"`
+	ExitCode           *int32              `json:"exitCode,omitempty"`
+	Error              *string             `json:"error,omitempty"`
+	CurrentOperationID *string             `json:"currentOperationId,omitempty"`
 }
 
 type OperationTraceEntry struct {
@@ -273,7 +273,7 @@ type ManagerInfo struct {
 }
 
 type PersistedManagerState struct {
-	Version  uint32                             `json:"version"`
+	Version  uint32                            `json:"version"`
 	Services map[string]*ServiceLifecycleState `json:"services"`
 }
 

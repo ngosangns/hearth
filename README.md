@@ -2,32 +2,18 @@
 
 # hearth
 
-Local dev services manager: one long-lived daemon per project folder, plus a CLI, TUI, and MCP
-server. All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every managed
-process; nothing else starts or stops one directly.
+Local dev services manager: one long-lived daemon per project folder, plus a CLI and MCP server.
+All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every managed process;
+nothing else starts or stops one directly.
 
-The product is the compiled `hearth` binary (`rust/bin/hearth`). `hearth tui` is the workspace
-UI. It runs from any directory.
+The product is the compiled `hearth` binary (`go/cmd/hearth`). It runs from any directory.
 
 ```
  your CLI  ─┐
- your TUI   ├──HTTP + SSE (loopback)──►  daemon (hearth)
- your MCP  ─┘                                  │
+ your MCP  ─┼──HTTP + SSE (loopback)──►  daemon (hearth)
+ macOS app ─┘                                  │
                                         ProcessSupervisor (spawns/probes/tails)
 ```
-
-```
-hearth tui
-```
-
-The TUI lists workspaces, starts and stops services, tails logs, and manages shared services.
-A new folder stays untrusted until a second Enter, and an untrusted folder does not spawn a
-daemon. A daemon you stop stays stopped until you press Enter on that workspace again.
-**Kill & Start**, and removing a shared instance that still has project attachments, both take
-a second keypress. Check for updates opens this repo's GitHub Releases page.
-`hearth update` installs the latest binary. Add a folder by
-its absolute path. The workspace list stays in
-`~/Library/Application Support/HearthApp/workspaces.json`.
 
 A project supplies a `hearth.yaml` (`.yml` / `.json` also work) naming its services, how to
 start them, and how to tell when they are ready. TypeScript catalogs are not accepted.
@@ -58,8 +44,8 @@ services:
 
 `groups:` members may also name other groups — `all: [infra, app]` expands depth-first in
 declaration order (deduplicated, cycles rejected at load). A member naming both a service and a
-group resolves as the service. The TUI groups its service list by direct membership and
-offers per-group start and stop.
+group resolves as the service. Clients group the service list by direct membership and offer
+per-group start and stop.
 
 `disabled: true` on a service keeps it in the catalog but out of every lifecycle action: direct
 start/stop/restart is rejected (`service_disabled`) and group targets expand past it. It does not
@@ -162,8 +148,6 @@ task install          # versioned binary + symlink at ~/.local/bin/hearth
 hearth update --check
 hearth update
 hearth --root /path/to/project status
-hearth tui           # workspaces and shared services; works from any directory
-hearth --root /path/to/project tui   # also adopts that project when it has a catalog
 hearth --root /path/to/project mcp
 ```
 
@@ -178,9 +162,9 @@ unit), and `shared:` entries, which detach.
 ## Build and test
 
 ```bash
-cd rust
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cd go
+go test ./...
+go vet ./...
 ```
 
 The suite needs a running `docker` daemon, `tailscale`, plus `nc`, `ps`, and `sh`.
@@ -190,7 +174,8 @@ Shared services are specified in [docs/shared-services.md](docs/shared-services.
 
 ## Release
 
-The version string is `rust/bin/hearth/Cargo.toml`. Pushing a `v*.*.*` tag runs CI
+The version string is the repo-root `VERSION` file (stamped into the binary with
+`-ldflags "-X main.version=..."`). Pushing a `v*.*.*` tag runs CI
 (`.github/workflows/ci.yml`). A successful tag run starts `.github/workflows/release.yml`, which
-runs `cargo build --release -p hearth`, ad-hoc signs the binary, and uploads `hearth-<tag>` to the
+runs `go build ./cmd/hearth`, ad-hoc signs the binary, and uploads `hearth-<tag>` to the
 GitHub Release. A red CI run does not publish. `hearth update` installs that asset.

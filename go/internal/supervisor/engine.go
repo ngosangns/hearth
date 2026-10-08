@@ -401,8 +401,6 @@ func (s *ProcessSupervisor) Status(serviceID string) error {
 	})
 }
 
-func boolPtr(v bool) *bool { return &v }
-
 // Reconcile re-reads persisted rows, including externally-owned ones. Unknown
 // from a probe leaves the row unchanged.
 func (s *ProcessSupervisor) Reconcile() {

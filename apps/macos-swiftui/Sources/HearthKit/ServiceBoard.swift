@@ -1,7 +1,7 @@
 import Foundation
 
 /// Pure service-board rules: grouping, state wording, bulk targets, URL visibility, shared
-/// impact notices. Ported from the `hearth tui` desk so the window and the TUI agree.
+/// impact notices. Ported from the old `hearth tui` desk so the window matches it.
 public enum ServiceBoard {
 
     public struct Line: Sendable, Equatable, Identifiable {

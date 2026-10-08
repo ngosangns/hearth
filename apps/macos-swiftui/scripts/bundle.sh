@@ -10,8 +10,8 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-VERSION="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' ../../rust/bin/hearth/Cargo.toml)"
-test -n "$VERSION" || { echo "cannot read the hearth version from rust/bin/hearth/Cargo.toml" >&2; exit 1; }
+VERSION="$(tr -d '[:space:]' < ../../VERSION)"
+test -n "$VERSION" || { echo "cannot read the hearth version from VERSION" >&2; exit 1; }
 
 HEARTH_BIN="${HEARTH_BIN:-$HOME/.local/bin/hearth}"
 if [ -L "$HEARTH_BIN" ]; then

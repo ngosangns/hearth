@@ -16,9 +16,9 @@ if [[ "$(grep -v '^#' MANIFEST)" != "$expected" ]]; then
 fi
 
 REPO="$(cd ../.. && pwd)"
-HEARTH="${HEARTH:-$REPO/rust/target/debug/hearth}"
+HEARTH="${HEARTH:-$REPO/go/hearth}"
 if [[ ! -x "$HEARTH" ]]; then
-  (cd "$REPO/rust" && cargo build -p hearth)
+  (cd "$REPO/go" && go build -trimpath -ldflags "-s -w -X main.version=$(cat ../VERSION)" -o hearth ./cmd/hearth)
 fi
 
 HOME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hearth-catalog-smoke.XXXXXX")"

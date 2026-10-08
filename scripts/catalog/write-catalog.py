@@ -175,6 +175,12 @@ out = ROOT / "catalog.json"
 out.write_text(json.dumps(document, indent=2) + "\n")
 print(f"wrote {out}")
 
+# The Go binary embeds this document (`//go:embed` cannot reach outside its package), so the
+# same bytes must land in go/internal/shared/catalog.json for the no-network fallback.
+embedded = ROOT / "go" / "internal" / "shared" / "catalog.json"
+embedded.write_text(json.dumps(document, indent=2) + "\n")
+print(f"wrote {embedded}")
+
 CATALOG_DIR = ROOT / "scripts" / "catalog"
 payload = sorted(
     p.relative_to(CATALOG_DIR).as_posix()

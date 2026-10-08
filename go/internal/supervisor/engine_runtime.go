@@ -31,12 +31,14 @@ func (s *ProcessSupervisor) startLocked(serviceID string, operationID *string, o
 	if hasActive {
 		s.finalize(serviceID, true)
 	}
-	if current != nil && current.Identity != nil && isActiveState(current.ActualState) && s.owns(current) != nil && *s.owns(current) {
-		return nil
+	if current != nil && current.Identity != nil && isActiveState(current.ActualState) {
+		if owned := s.owns(current); owned != nil && *owned {
+			return nil
+		}
 	}
 	var retained *state.ProcessIdentity
 	if current != nil && s.identityMatchesState(current) && current.Identity != nil && !current.Identity.IsDocker() {
-		if s.observedMatches(current.Identity) != nil && *s.observedMatches(current.Identity) {
+		if owned := s.observedMatches(current.Identity); owned != nil && *owned {
 			retained = cloneIdentity(current.Identity)
 		}
 	}

@@ -17,18 +17,22 @@ runs:
   steps:
     - name: Build hearth
       shell: bash
-      working-directory: rust
+      working-directory: go
       env:
         RELEASE_TAG: ${{ inputs.tag }}
       run: |
         set -euo pipefail
-        cargo build --release -p hearth
-        # Ad-hoc sign after the copy-equivalent link, or macOS kills the binary on launch.
-        codesign --sign - --force target/release/hearth
-        cp target/release/hearth "hearth-${RELEASE_TAG}"
+        # The asset is stamped with the tag's version (without the v) — the same string the
+        # VERSION file carries on the tagged commit and what `hearth update` compares.
+        version="${RELEASE_TAG#v}"
+        CGO_ENABLED=0 go build -trimpath \
+          -ldflags "-s -w -X main.version=$version" \
+          -o "hearth-${RELEASE_TAG}" ./cmd/hearth
+        # Ad-hoc sign after the link, or macOS kills the binary on launch.
+        codesign --sign - --force "hearth-${RELEASE_TAG}"
     - name: Publish GitHub Release
       shell: bash
-      working-directory: rust
+      working-directory: go
       env:
         RELEASE_TAG: ${{ inputs.tag }}
         GH_TOKEN: ${{ inputs.token }}

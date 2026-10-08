@@ -17,8 +17,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # Each $GITHUB_PATH line is prepended, so the last one wins: rustup's ~/.cargo/bin is
-        # written last to take precedence over a Homebrew rust on the same machine.
+        # Each $GITHUB_PATH line is prepended, so the last one wins. Homebrew's bin dir carries
+        # `go` and `gh`; ~/.cargo/bin is kept last for any leftover rustup tooling.
         printf '%s\n' /usr/local/bin /opt/homebrew/bin "$HOME/.cargo/bin" >> "$GITHUB_PATH"
     # A separate step: $GITHUB_PATH only takes effect for the steps after the one that wrote it.
     - name: Check required tools

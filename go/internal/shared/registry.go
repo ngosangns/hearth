@@ -40,12 +40,12 @@ type SharedAttachment struct {
 // snapshot taken at registration — installs never consult the remote registry
 // again for this instance.
 type SharedInstance struct {
-	Name        string  `json:"name"`
-	Version     string  `json:"version"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
 	// Resolved listen port — derived deterministically, collision-shifted at
 	// registration. Extra listeners live in ExtraPorts, contiguous after this.
-	Port       uint16   `json:"port"`
-	ExtraPorts []uint16 `json:"extraPorts,omitempty"`
+	Port         uint16       `json:"port"`
+	ExtraPorts   []uint16     `json:"extraPorts,omitempty"`
 	InstallState InstallState `json:"installState"`
 	InstallError *string      `json:"installError,omitempty"`
 	Recipe       SharedRecipe `json:"recipe"`
