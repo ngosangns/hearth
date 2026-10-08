@@ -22,7 +22,7 @@ struct LogView: View {
             }
             if model.selectedService == nil {
                 StateView(systemImage: Icon.log, title: "Select a service",
-                          message: "Choose a service or press its Log button to read its output.")
+                          message: "Choose a service to read its output.")
             } else if model.log.text.isEmpty {
                 StateView(systemImage: Icon.log, title: "No output yet")
             } else {

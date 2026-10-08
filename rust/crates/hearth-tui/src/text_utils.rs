@@ -1,8 +1,6 @@
-//! Port of `src/tui/text.utils.ts` plus the `visibleWidth`/`truncateToWidth` primitives from
-//! `@oh-my-pi/pi-tui` that `src/tui/screen.ts` builds on. pi-tui's own versions of the latter two
-//! delegate to a native (Rust) addon whose source isn't vendored into this checkout, so they are
-//! reimplemented here from their observed behavior (see the module docs on `truncate_to_width` for
-//! what was verified and what is a documented simplification).
+//! Width and sanitizing for log lines painted by the Ratatui shell.
+//! `visible_width` and the 3-space tab expansion were checked against pi-tui's observed
+//! output; colour SGR is kept, cursor and erase sequences are dropped.
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
@@ -16,8 +14,6 @@ const TAB_WIDTH: usize = 3;
 pub fn replace_tabs(text: &str) -> String {
     text.replace('\t', &" ".repeat(TAB_WIDTH))
 }
-
-const SGR_RESET: &str = "\x1b[0m";
 
 /// Make untrusted text safe to place inside a single viewport row.
 ///
@@ -154,81 +150,6 @@ pub fn visible_width(s: &str) -> usize {
     width
 }
 
-fn is_reset_sgr(seq: &str) -> bool {
-    let params = &seq[2..seq.len() - 1];
-    params.is_empty() || params == "0"
-}
-
-/// Truncates `text` to at most `max_width` visible columns (never splitting a wide character in
-/// half), optionally padding with spaces up to exactly `max_width`. No ellipsis is ever appended
-/// (every call site in this codebase passes pi-tui's `Ellipsis.Omit`, so that parameter is dropped
-/// here rather than ported).
-///
-/// **Documented simplification**: pi-tui's real `truncateToWidth` delegates to a native addon whose
-/// source isn't vendored in this checkout, so its exact behaviour was reverse-engineered by probing
-/// the compiled function directly (`bun -e 'import { truncateToWidth } from "@oh-my-pi/pi-tui"; ...'`)
-/// rather than read from source. The rule this reproduces, confirmed against roughly a dozen probed
-/// inputs: an open (non-reset) SGR sequence encountered exactly at the width cap is only kept if a
-/// colour is already open at that point (closing it), and a synthetic trailing `\x1b[0m` is appended
-/// when truncation actually dropped content, at least one SGR sequence survived into the kept
-/// output, and that output doesn't already end with one. This matches every probed case, but the
-/// native engine may special-case inputs not covered by that probing (e.g. nested/nonstandard SGR
-/// forms) — none of the ported TUI tests exercise the ambiguous cases, so this gap is unlikely to
-/// matter in practice for real service log output.
-pub fn truncate_to_width(text: &str, max_width: usize, pad: bool) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::new();
-    let mut width = 0usize;
-    let mut i = 0usize;
-    let mut truncated = false;
-    let mut saw_sgr = false;
-    let mut color_open = false;
-    let mut at_cap = false;
-
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            let (consumed, is_sgr) = scan_escape(bytes, i);
-            let seq = &text[i..i + consumed];
-            if is_sgr {
-                if at_cap && !color_open {
-                    // Drop: an unclosed colour-open (or a redundant reset) right at the cap, with
-                    // nothing open to close, contributes nothing the caller would see.
-                } else {
-                    out.push_str(seq);
-                    saw_sgr = true;
-                    color_open = !is_reset_sgr(seq);
-                }
-            } else {
-                out.push_str(seq);
-            }
-            i += consumed;
-            continue;
-        }
-        let ch = text[i..].chars().next().unwrap();
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + w > max_width {
-            truncated = true;
-            break;
-        }
-        out.push(ch);
-        width += w;
-        i += ch.len_utf8();
-        if width == max_width {
-            at_cap = true;
-        }
-    }
-    if i < bytes.len() && !truncated {
-        truncated = true;
-    }
-    if truncated && saw_sgr && !out.ends_with(SGR_RESET) {
-        out.push_str(SGR_RESET);
-    }
-    if pad && width < max_width {
-        out.push_str(&" ".repeat(max_width - width));
-    }
-    out
-}
-
 /// Turn sanitized SGR into a Ratatui line. Cursor, erase, and other non-colour sequences are
 /// dropped by [`sanitize_terminal_text`] first, so a log line cannot move the cursor; the SGR
 /// parsing itself is `ansi-to-tui`'s.
@@ -313,14 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_width_pads_and_cuts_without_splitting_wide_characters() {
-        assert_eq!(truncate_to_width("hello world", 5, true), "hello");
-        assert_eq!(truncate_to_width("hi", 5, true), "hi   ");
-        assert_eq!(truncate_to_width("你好世界", 4, true), "你好");
-        assert_eq!(truncate_to_width("你好世界", 3, true), "你 ");
-    }
-
-    #[test]
     fn sgr_colours_become_spans_and_cursor_controls_stay_dropped() {
         let failed = sgr_to_line("\x1b[1;31mfail\x1b[0m");
         assert_eq!(failed.spans[0].content.as_ref(), "fail");
@@ -336,20 +249,4 @@ mod tests {
         assert_eq!(indexed.spans[0].style.fg, Some(Color::Indexed(196)));
     }
 
-    #[test]
-    fn truncate_to_width_manages_open_colour_across_a_cut() {
-        assert_eq!(
-            truncate_to_width("\x1b[31mhello world", 7, true),
-            "\x1b[31mhello w\x1b[0m"
-        );
-        assert_eq!(
-            truncate_to_width("\x1b[31mhello\x1b[0m world", 7, true),
-            "\x1b[31mhello\x1b[0m w\x1b[0m"
-        );
-        assert_eq!(
-            truncate_to_width("\x1b[31mhi\x1b[0mxx", 2, true),
-            "\x1b[31mhi\x1b[0m"
-        );
-        assert_eq!(truncate_to_width("hi\x1b[0m more", 2, true), "hi");
-    }
 }

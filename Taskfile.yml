@@ -64,21 +64,20 @@ tasks:
     cmds:
       - sh apps/macos-swiftui/scripts/bundle.sh
 
-  app:swift-test:
-    desc: Run the SwiftUI app's HearthKit unit tests (apps/macos-swiftui)
+  app:test:
+    desc: Run the SwiftUI app tests (apps/macos-swiftui), same role as synca's `make test`
     dir: apps/macos-swiftui
     cmds:
       - swift test
 
-  app:test:
-    desc: Run the legacy NativePHP app's PHP test suite (apps/macos)
-    dir: apps/macos
+  app:clean:
+    desc: Remove the SwiftPM build and any Hearth.app next to the package
+    dir: apps/macos-swiftui
     cmds:
-      - composer install --no-interaction
-      - php artisan test
+      - rm -rf .build Hearth.app
 
   app:install:
-    desc: Build Hearth.app and copy it into /Applications (quits a running copy first)
+    desc: Build Hearth.app and rsync it into /Applications (quits a running copy first)
     deps: [app:build]
     cmds:
       - osascript -e 'quit app "Hearth"' 2>/dev/null || true
@@ -86,9 +85,27 @@ tasks:
         set -eu
         app="apps/macos-swiftui/.build/Hearth.app"
         test -d "$app"
-        rm -rf "/Applications/Hearth.app"
-        cp -R "$app" /Applications/
+        mkdir -p /Applications/Hearth.app
+        rsync -a --delete "$app"/ /Applications/Hearth.app/
         echo "installed: $app -> /Applications/Hearth.app"
+
+  go:build:
+    desc: Build the Go supervisor port (no installable binary yet; library packages only)
+    dir: go
+    cmds:
+      - go build ./...
+
+  go:test:
+    desc: Run the Go port tests, same role as synca's `make -C go test`
+    dir: go
+    cmds:
+      - go test ./...
+
+  go:clean:
+    desc: Remove Go build cache for this module
+    dir: go
+    cmds:
+      - go clean ./...
 
   catalog:package:
     desc: Build shared-service tarballs into dist/catalog (`task catalog:package -- redis`; default all)

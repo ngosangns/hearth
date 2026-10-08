@@ -51,7 +51,7 @@ struct GroupHeader: View {
                     .help("Stop every running service in \(name)")
             }
             .buttonStyle(.bordered)
-            .controlSize(.small)
+            .controlSize(.regular)
         }
     }
 }
@@ -121,7 +121,7 @@ struct ServiceCard: View {
     }
 }
 
-/// Start/Stop, Restart, Log, and Reclaim for one service. Labels stay visible; the bar wraps.
+/// Start/Stop, Restart, and Reclaim for one service. Labels stay visible; the bar wraps.
 struct ServiceActionBar: View {
     @Environment(AppModel.self) private var model
     let line: ServiceBoard.Line
@@ -148,8 +148,6 @@ struct ServiceActionBar: View {
                     .help("Kill the process holding the port, then start")
                 }
             }
-            Button { model.selectService(line.id); model.logOpen = true } label: { Label("Log", systemImage: Icon.log) }
-                .help("Show the log for \(line.label)")
         }
     }
 }

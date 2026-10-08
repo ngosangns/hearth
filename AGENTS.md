@@ -125,29 +125,18 @@ from any dev box here, with the same username.
   machines here use Homebrew's rust, which bundles it. `ci.yml` adds the component explicitly
   (idempotent).
 
-### macOS app (`apps/macos`)
-
-NativePHP Desktop v2 window, an HTTP client of the project daemon. It does not replace `hearth tui`
-and it does not put a web server in the `hearth` binary. `php -S` drops class statics and `$GLOBALS`
-on every request, so `DaemonMemory` keeps the bearer token in a SysV segment keyed by pid. The
-sidecar file stores only the pid and the segment key. `BundledHearth` passes the PHP process
-environment into every child: under `php -S`, Symfony keeps only `getenv()` keys that also sit on
-`$_SERVER` and drops `HOME`, so `hearth` would read `/.hearth/shared`. `CommandResult::lastJson`
-decodes the whole stdout before a nested one-line object. `hearth update` refuses when `current_exe` is
-inside `*.app/Contents/` before it downloads anything. Updates replace the whole `.app`. Do not add
-PHP or Node to `task install` or the Rust test job. The DMG job is `.github/workflows/macos-app.yml`.
-It runs after Release and stays off `ci.yml`.
-
 ### SwiftUI app (`apps/macos-swiftui`)
 
 Structured like `../synca/macos`: `HearthKit` (CLI runner, bearer client, wire models, `WorkspaceStore`,
 `ServiceBoard`, `LogBuffer`; unit-tested, no UI imports) and `hearth-app` (`Model`, `Design`, `Features`).
-`task app:build` bundles it with the installed `hearth` in `Contents/extras/`; `task app:swift-test` runs the tests.
+`task app:build` bundles it with the installed `hearth` in `Contents/extras/`; `task app:test` runs its tests.
+`task app:install` quits a running copy, then `rsync -a --delete`s the bundle into `/Applications`, the same
+install `../synca/macos` uses. `task go:test` / `task go:build` cover the Go port (`go/` has no `cmd` yet).
 It is a pure HTTP client of the project daemon (tokens live in memory only) and spawns `hearth` with an argv
 array. It shares `workspaces.json` with `hearth tui`; `HEARTH_WORKSPACE_FILE` overrides it for a scratch session.
 Confirmations use `confirmationDialog`; `killUnowned` is sent only from the "Kill and Start" confirmation.
 Launch the built bundle with `open -n`; running the inner binary directly never gets a window.
-`apps/macos` (NativePHP) and `macos-app.yml` are the older DMG path and are not built from this tree.
+`hearth update` refuses when `current_exe` is inside `*.app/Contents/` before it downloads anything. Updates replace the whole `.app`.
 
 ## Sharp edges
 
@@ -452,7 +441,7 @@ Launch the built bundle with `open -n`; running the inner binary directly never 
   local registry. It does not spawn smp just to draw. Install uses an unbounded request timeout.
 - `WorkspaceStore::reload` must not quarantine `workspaces.json`; only `open` does.
 - A catalog mtime change reloads once while a daemon is up, and that reload must not `ensure`. The first observation only records the mtime. Stop and copy stay available during an in-flight start. Enter on a queued row cancels it. Reveal is `open -R`. Stop-all skips rows that are already stopped or succeeded.
-- The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. The binary calls `run_shell` only. `run_tui` (ANSI single-project) is **deprecated** and kept as reference; do not wire new entry points to it.
+- The workspace shell paints with Ratatui 0.30 (`terminal.draw` in `shell.rs`). Keys stay on the command table in `desk.rs`, and the HTTP+SSE client is unchanged. The binary calls `run_shell` only.
 - TUI input latency rules: the `terminal` branch of `event_loop` drains every already-queued
   `Event` (`now_or_never`, ≤64) and paints **once** per batch — a wheel flick or held key must
   never get a full `draw` per event. Input handlers signal a needed paint with
@@ -549,10 +538,8 @@ Launch the built bundle with `open -n`; running the inner binary directly never 
 
 - **No `Custom` readiness variant.** A closure can't cross the YAML/JSON boundary.
 - **SSE backpressure is frame-count only** (64 frames).
-- **Ratatui 0.30 paints the workspace shell; `run_tui` still uses crossterm strings.** `run.rs` has no automated coverage (it
-  owns a real terminal). Log text is sanitized, then SGR is parsed into spans for the shell log pane.
-- **`truncateToWidth`/`visibleWidth`/`DEFAULT_TAB_WIDTH` were reverse-engineered** against pi-tui's
-  native addon. The tab width is a fixed 3-space replacement. See `truncate_to_width`'s doc comment.
+- **Ratatui 0.30 paints the workspace shell.** Log text is sanitized, then SGR is parsed into spans for the shell log pane.
+- **`visibleWidth`/`DEFAULT_TAB_WIDTH` were reverse-engineered** against pi-tui's native addon. The tab width is a fixed 3-space replacement.
 - **`hearth-mcp` hand-implements `ServerHandler`** rather than using `rmcp`'s `#[tool]` macros: names
   carry a runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
 - **`hearth mcp` and `hearth tui` are intercepted in the binary**, not in `hearth-cli`, to avoid a crate cycle.

@@ -1,5 +1,5 @@
 name: Release
-# macos-app.yml reads this title back out of the workflow_run event. Keep it the tag alone.
+# run-name is the tag. Release reads it back as RELEASE_TAG from the workflow_run event.
 run-name: ${{ github.event.workflow_run.head_branch }}
 
 # Tag pushes (`v*.*.*`) are the release signal — `git tag v0.10.0 && git push --tags`. The tag push

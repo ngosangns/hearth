@@ -30,7 +30,7 @@ pub struct EventReplay {
 }
 
 /// Emitted by `watch()`'s reconnect loop, in strict order, over an `mpsc` channel. The *owner* of a
-/// `TuiState` (the single-threaded `run_tui` event loop) turns `BeginConnection` into a real
+/// `TuiState` (the single-threaded `run_shell` event loop) turns `BeginConnection` into a real
 /// `TuiFence` by calling `state.begin_connection()`, then applies that same fence to every message
 /// that follows until the next `BeginConnection` — this is what lets a stale reconnect attempt's
 /// leftover messages never overwrite state a newer connection attempt has already superseded,
@@ -371,37 +371,6 @@ pub async fn fetch_log(
         .await
         .map_err(|error| error.message)?;
     Ok(FetchedLog::Replace(latest))
-}
-
-/// Re-fetches the selected service's log tail at its current cursor, falling back to a
-/// from-scratch fetch (and a `replace_log` rather than an incremental append) when the incremental
-/// fetch came back truncated at exactly the tail-byte cap.
-pub async fn refresh_selected_log(
-    client: &ManagerTuiClient,
-    state: &mut crate::state::TuiState,
-    fence: crate::state::TuiFence,
-) -> Result<bool, String> {
-    let service = state.selection.selected_name.clone();
-    if service.is_empty() {
-        return Ok(false);
-    }
-    let cursor = state.log_cursor(&service);
-    let delta = client
-        .log(&service, cursor.cursor, cursor.generation)
-        .await
-        .map_err(|e| e.message)?;
-    let data_len = delta.data.len();
-    if !state.apply_log(fence, &service, &delta) {
-        return Ok(false);
-    }
-    if cursor.cursor.is_none() || data_len < LOG_TAIL_BYTES as usize {
-        return Ok(true);
-    }
-    let latest = client
-        .log(&service, None, None)
-        .await
-        .map_err(|e| e.message)?;
-    Ok(state.replace_log(fence, &service, &latest))
 }
 
 #[cfg(test)]

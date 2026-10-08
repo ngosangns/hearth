@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- New SwiftUI macOS app in `apps/macos-swiftui`, laid out like synca's: a unit-tested `HearthKit` and a three-column window (workspaces, services grouped by `groupTree`, log). Trust, daemon stop/restart, forget, group and shared stop/restart that affect other workspaces, shared remove, and port reclaim ask through a confirmation dialog. `task app:build` bundles it with the installed `hearth`; `task app:swift-test` runs its tests.
+- New SwiftUI macOS app in `apps/macos-swiftui`, laid out like synca's: a unit-tested `HearthKit` and a three-column window (workspaces, services grouped by `groupTree`, log). Trust, daemon stop/restart, forget, group and shared stop/restart that affect other workspaces, shared remove, and port reclaim ask through a confirmation dialog. `task app:build` bundles it with the installed `hearth`; `task app:test` runs its tests. `task app:install` quits a running copy and rsyncs the bundle into `/Applications`. `task go:test` covers the Go port.
+- Removed the NativePHP app (`apps/macos`), its DMG workflow, and the deprecated ANSI `run_tui` path. `hearth tui` is the Ratatui shell. The macOS window is the SwiftUI app.
 
 ## 0.22.0
 
