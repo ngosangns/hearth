@@ -104,8 +104,15 @@ struct ServiceCard: View {
                             HStack(spacing: Theme.Space.sm) {
                                 Button { open(url.url) } label: { Label(url.label, systemImage: Icon.link) }
                                     .buttonStyle(.borderless).help("Open \(url.url)")
-                                Text(url.url).font(.caption.monospaced()).foregroundStyle(.secondary)
-                                    .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                                if let destination = destination(url.url) {
+                                    Link(url.url, destination: destination)
+                                        .font(.caption.monospaced())
+                                        .lineLimit(1).truncationMode(.middle)
+                                        .help(url.url)
+                                } else {
+                                    Text(url.url).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                                }
                             }
                         }
                     }
@@ -120,8 +127,13 @@ struct ServiceCard: View {
     }
 
     private func open(_ string: String) {
-        guard let url = URL(string: string), ["http", "https"].contains(url.scheme) else { return }
+        guard let url = destination(string) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private func destination(_ string: String) -> URL? {
+        guard let url = URL(string: string), ["http", "https"].contains(url.scheme) else { return nil }
+        return url
     }
 }
 
