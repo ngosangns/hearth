@@ -133,9 +133,11 @@ impl CursorLogStore {
         let _guard = self.append_queues.lock(service_id).await;
         self.ensure_loaded().await;
         let path = self.path_for(service_id);
-        let safe_limit = limit
-            .unwrap_or(self.latest_tail_bytes)
-            .clamp(1, self.latest_tail_bytes);
+        // No `limit` keeps the short tail. An explicit limit pages earlier bytes and is honored
+        // up to the file cap — the file itself never grows past `max_bytes`. Clamping a page
+        // request back to the default tail makes a backward read return the same window forever.
+        let cap = self.max_bytes.max(self.latest_tail_bytes);
+        let safe_limit = limit.unwrap_or(self.latest_tail_bytes).clamp(1, cap);
         // Clients echo `generation` back. Fold the rotation counter into that same number so a
         // rotation resets a follower the same way a process restart does. A bare lifecycle number
         // from an older client mismatches once, then the client echoes the composite.
@@ -454,6 +456,32 @@ mod tests {
         assert!(!slice.reset);
         assert_eq!(slice.cursor, 0);
         assert_eq!(slice.next_cursor, 11);
+    }
+
+    #[tokio::test]
+    async fn requested_limit_reads_past_the_default_tail() {
+        let (store, _dir) = store(16, 64, 2);
+        store
+            .append(&"api".to_string(), &"abcdefghij".repeat(4))
+            .await
+            .unwrap();
+        let small = store.read(&"api".to_string(), None, None, 0, None).await;
+        assert_eq!(small.data.len(), 16);
+        assert!(small.truncated);
+        let wider = store
+            .read(&"api".to_string(), None, Some(32), 0, None)
+            .await;
+        assert_eq!(wider.data.len(), 32);
+        assert!(wider.truncated);
+        assert!(wider.cursor < small.cursor);
+        assert_eq!(wider.next_cursor, small.next_cursor);
+        assert_eq!(&wider.data[wider.data.len() - 16..], small.data);
+        let all = store
+            .read(&"api".to_string(), None, Some(10_000), 0, None)
+            .await;
+        assert_eq!(all.data.len(), 40);
+        assert!(!all.truncated);
+        assert_eq!(all.cursor, 0);
     }
 
     #[tokio::test]

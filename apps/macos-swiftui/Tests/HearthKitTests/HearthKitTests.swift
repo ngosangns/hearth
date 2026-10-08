@@ -266,21 +266,42 @@ private func service(_ id: String, readiness: String = "http", label: String? = 
         #expect(log.cursor == nil && log.generation == nil)
     }
 
-    @Test func earlierGrowsTheWindowOnlyWhenMoreExists() {
+    @Test func widerWindowPrependsEarlierBytesAndKeepsTheTail() throws {
+        let json = #"{"data":"TAIL","cursor":4,"nextCursor":8,"generation":5,"reset":false,"truncated":true}"#.data(using: .utf8)!
         var log = LogBuffer()
-        let first = log.expand()
-        #expect(!first)
-        log.apply(LogSlice(data: String(repeating: "x", count: LogBuffer.defaultLimit), nextCursor: 1, generation: 0, reset: true))
-        #expect(log.hasMore)
-        let second = log.expand()
-        #expect(second)
-        #expect(log.limit == LogBuffer.defaultLimit * 4 && log.text.isEmpty && log.cursor == nil)
+        #expect(log.nextWindowLimit() == nil)
+        log.apply(try JSONDecoder().decode(LogSlice.self, from: json))
+        #expect(log.text == "TAIL" && log.hasMore && log.cursor == 8 && log.prepended == 0)
+        #expect(log.nextWindowLimit() == 4 + LogBuffer.defaultLimit)
+
+        log.install(LogSlice(data: "éTAIL", cursor: 2, nextCursor: 8, generation: 5, truncated: true))
+        #expect(log.text == "éTAIL")
+        #expect(log.prepended == "é".utf16.count)
+        #expect(log.hasMore && log.cursor == 8)
+
+        log.apply(LogSlice(data: "!", nextCursor: 9, generation: 5, reset: false))
+        #expect(log.text == "éTAIL!" && log.prepended == 0 && log.cursor == 9 && log.hasMore)
+
+        log.install(LogSlice(data: "éTAIL!", cursor: 2, nextCursor: 9, generation: 5, truncated: true))
+        #expect(log.text == "éTAIL!" && log.prepended == 0 && !log.hasMore)
+
+        log.install(LogSlice(data: "NEW", cursor: 0, nextCursor: 3, generation: 9, reset: true, truncated: false))
+        #expect(log.text == "NEW" && log.prepended == 0 && !log.hasMore && log.cursor == 3)
     }
 
     @Test func escapeSequencesAreStrippedForDisplay() {
         let raw = "\u{1B}[31mred\u{1B}[0m plain \u{1B}]0;title\u{07}ok"
         #expect(LogBuffer.stripEscapes(raw) == "red plain ok")
         #expect(LogBuffer.stripEscapes("no escapes") == "no escapes")
+    }
+
+    @Test func colorRunsKeepSgrAndDropCursorMoves() {
+        let runs = LogBuffer.colorRuns("\u{1B}[31mred\u{1B}[0m plain \u{1B}]0;title\u{07}\u{1B}[1;32mbold\u{1B}[2J")
+        #expect(runs.map(\.text) == ["red", " plain ", "bold"])
+        #expect(runs[0].fg == 1 && !runs[0].bold)
+        #expect(runs[1].fg == nil)
+        #expect(runs[2].fg == 2 && runs[2].bold)
+        #expect(LogBuffer.colorRuns("plain").map(\.text) == ["plain"])
     }
 
     @Test func identicalTextDoesNotBumpTheRevision() {

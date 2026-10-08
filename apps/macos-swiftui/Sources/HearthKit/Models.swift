@@ -184,15 +184,20 @@ public struct UrlRow: Decodable, Sendable, Equatable {
 
 public struct LogSlice: Decodable, Sendable, Equatable {
     public let data: String
+    public let cursor: Int?
     public let nextCursor: Int?
     public let generation: Int?
     public let reset: Bool?
+    /// The window starts after byte 0, so an earlier page exists in this file.
+    public let truncated: Bool?
 
-    public init(data: String, nextCursor: Int? = nil, generation: Int? = nil, reset: Bool? = nil) {
+    public init(data: String, cursor: Int? = nil, nextCursor: Int? = nil, generation: Int? = nil, reset: Bool? = nil, truncated: Bool? = nil) {
         self.data = data
+        self.cursor = cursor
         self.nextCursor = nextCursor
         self.generation = generation
         self.reset = reset
+        self.truncated = truncated
     }
 }
 

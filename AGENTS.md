@@ -283,6 +283,9 @@ Launch the built bundle with `open -n`; running the inner binary directly never 
   only refreshes the log cursor. Do not reconstruct full lifecycle state from event payloads alone.
 - The log `generation` clients echo is `lifecycle * 1_000_000 + rotation`, not the lifecycle alone.
   A rotation resets a follower the same way a restart does. Generation 0 is valid (no state row).
+- `GET /v1/logs/:id` with no `limit` stays the 16 KiB tail. An explicit `limit` is honored up to
+  the current file cap (`max_bytes`, 256 KiB) so a pane can page earlier bytes. Do not clamp that
+  request back to the default tail — the next page then returns the same window forever.
 
 **Catalog**
 

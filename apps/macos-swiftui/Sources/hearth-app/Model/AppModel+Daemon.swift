@@ -110,29 +110,54 @@ extension AppModel {
     // MARK: Log
 
     func loadLog() async {
-        guard !logLoading, let service = selectedService,
-              let row = selectedRecord, let session = sessions[row.path] else { return }
+        await fetchLog(earlier: false)
+    }
+
+    /// One page before the bytes already on screen. The tail stays put; the pane shifts its scroll
+    /// anchor by `log.prepended`. A second call while a fetch is in flight is a no-op.
+    func loadEarlier() {
+        guard !logLoading, log.hasMore, log.nextWindowLimit() != nil else { return }
         logLoading = true
+        Task { await fetchLog(earlier: true, held: true) }
+    }
+
+    private func fetchLog(earlier: Bool, held: Bool = false) async {
+        guard let service = selectedService, let row = selectedRecord, let session = sessions[row.path] else {
+            if held { logLoading = false }
+            return
+        }
+        let limit: Int
+        let cursor: Int?
+        if earlier {
+            guard let next = log.nextWindowLimit() else {
+                if held { logLoading = false }
+                return
+            }
+            limit = next
+            cursor = nil
+        } else {
+            guard !logLoading else { return }
+            limit = log.limit
+            cursor = log.cursor
+            logLoading = true
+        }
         let epoch = logEpoch
+        let generation = log.generation
         defer { if epoch == logEpoch { logLoading = false } }
         let client = ManagerClient(session: session)
-        let (cursor, generation, limit) = (log.cursor, log.generation, log.limit)
         do {
             let slice = try await client.serviceLog(service, cursor: cursor, generation: generation, limit: limit)
             guard epoch == logEpoch else { return }
-            log.apply(slice)
+            if earlier || cursor == nil {
+                log.install(slice)
+            } else {
+                log.apply(slice)
+            }
         } catch ManagerError.sessionEnded {
             endSession(root: row.path)
         } catch {
             // Keep the text already shown.
         }
-    }
-
-    func expandLog() {
-        guard log.expand() else { return }
-        logEpoch += 1
-        logLoading = false
-        Task { await loadLog() }
     }
 
     func toggleLog() {
