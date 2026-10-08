@@ -59,10 +59,16 @@ tasks:
         echo "installed $("$link" --version) at $link -> $dest"
 
   app:build:
-    desc: Build the macOS Hearth.app bundle (AppKit + bundled release hearth) into apps/macos-appkit/.build
+    desc: Build the macOS Hearth.app bundle (SwiftUI + bundled release hearth) into apps/macos-swiftui/.build
     deps: [install]
     cmds:
-      - sh apps/macos-appkit/scripts/bundle.sh
+      - sh apps/macos-swiftui/scripts/bundle.sh
+
+  app:swift-test:
+    desc: Run the SwiftUI app's HearthKit unit tests (apps/macos-swiftui)
+    dir: apps/macos-swiftui
+    cmds:
+      - swift test
 
   app:test:
     desc: Run the legacy NativePHP app's PHP test suite (apps/macos)
@@ -78,7 +84,7 @@ tasks:
       - osascript -e 'quit app "Hearth"' 2>/dev/null || true
       - |
         set -eu
-        app="apps/macos-appkit/.build/Hearth.app"
+        app="apps/macos-swiftui/.build/Hearth.app"
         test -d "$app"
         rm -rf "/Applications/Hearth.app"
         cp -R "$app" /Applications/

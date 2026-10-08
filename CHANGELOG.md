@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- New SwiftUI macOS app in `apps/macos-swiftui`, laid out like synca's: a unit-tested `HearthKit` and a three-column window (workspaces, services grouped by `groupTree`, log). Trust, daemon stop/restart, forget, group and shared stop/restart that affect other workspaces, shared remove, and port reclaim ask through a confirmation dialog. `task app:build` bundles it with the installed `hearth`; `task app:swift-test` runs its tests.
+
 ## 0.22.0
 
 - Stopping a service also kills a child that a double fork reparented to launchd while it stayed in the service's process group (`(cmd &)`), including one that ignores SIGTERM. It used to survive: the stop saw the leader die, treated the tree as gone, and never sent SIGKILL.

@@ -138,6 +138,17 @@ inside `*.app/Contents/` before it downloads anything. Updates replace the whole
 PHP or Node to `task install` or the Rust test job. The DMG job is `.github/workflows/macos-app.yml`.
 It runs after Release and stays off `ci.yml`.
 
+### SwiftUI app (`apps/macos-swiftui`)
+
+Structured like `../synca/macos`: `HearthKit` (CLI runner, bearer client, wire models, `WorkspaceStore`,
+`ServiceBoard`, `LogBuffer`; unit-tested, no UI imports) and `hearth-app` (`Model`, `Design`, `Features`).
+`task app:build` bundles it with the installed `hearth` in `Contents/extras/`; `task app:swift-test` runs the tests.
+It is a pure HTTP client of the project daemon (tokens live in memory only) and spawns `hearth` with an argv
+array. It shares `workspaces.json` with `hearth tui`; `HEARTH_WORKSPACE_FILE` overrides it for a scratch session.
+Confirmations use `confirmationDialog`; `killUnowned` is sent only from the "Kill and Start" confirmation.
+Launch the built bundle with `open -n`; running the inner binary directly never gets a window.
+`apps/macos` (NativePHP) and `macos-app.yml` are the older DMG path and are not built from this tree.
+
 ## Sharp edges
 
 **Process supervision**
