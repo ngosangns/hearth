@@ -1,6 +1,6 @@
 [package]
 name = "hearth"
-version = "0.24.0"
+version = "0.24.1"
 edition.workspace = true
 publish.workspace = true
 
