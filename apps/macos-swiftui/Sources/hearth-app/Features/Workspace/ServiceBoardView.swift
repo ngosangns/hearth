@@ -69,22 +69,26 @@ struct ServiceCard: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
                     FlowLayout {
-                        Text(line.label).font(.headline).textSelection(.enabled)
+                        Text(line.label)
+                            .font(.headline)
+                            .foregroundStyle(line.disabled ? .secondary : .primary)
+                            .textSelection(.enabled)
                         if line.shared { Tag(text: "shared", tint: .purple) }
-                        if line.infra { Tag(text: "infra") }
                         if line.finite { Tag(text: "job") }
                         if line.disabled { Tag(text: "disabled") }
                     }
-                    if let instance = line.sharedInstance {
-                        Button { showInfo = true } label: { Label("Shared service info", systemImage: Icon.infoOutline).labelStyle(.iconOnly) }
+                    if line.shared || line.infra {
+                        Button { showInfo = true } label: { Label("Service info", systemImage: Icon.infoOutline).labelStyle(.iconOnly) }
                             .buttonStyle(.borderless)
-                            .help("Who uses \(instance)")
+                            .help(line.shared ? "Who uses \(line.sharedInstance ?? line.label)" : "Infrastructure service")
                             .popover(isPresented: $showInfo, arrowEdge: .bottom) {
-                                SharedInfoPopover(instance: instance, serviceLabel: line.label)
+                                ServiceInfoPopover(line: line)
                             }
                     }
                     Spacer(minLength: 0)
-                    StatePill(state: line.state)
+                    if !line.disabled {
+                        StatePill(state: line.state)
+                    }
                 }
                 if !line.ports.isEmpty {
                     Text("Ports  \(line.ports)").font(.caption.monospaced()).foregroundStyle(.secondary)
@@ -152,49 +156,58 @@ struct ServiceActionBar: View {
     }
 }
 
-/// Popover for the info button on a shared service: who uses the instance.
-struct SharedInfoPopover: View {
+/// Popover for the info button: infrastructure note, and who uses a shared instance.
+struct ServiceInfoPopover: View {
     @Environment(AppModel.self) private var model
-    let instance: String
-    let serviceLabel: String
+    let line: ServiceBoard.Line
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            HStack(spacing: Theme.Space.sm) {
-                Image(systemName: Icon.shared).foregroundStyle(.secondary)
-                Text(instance).font(.headline)
+            if line.infra {
+                Label("Infrastructure", systemImage: Icon.infoOutline)
+                    .font(.headline)
+                Text("\(line.label) is an infrastructure service.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            let here = model.sections.flatMap(\.services).filter { $0.sharedInstance == instance }
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                SectionHeading(title: "Services in this workspace", count: here.count)
-                ForEach(here) { service in
-                    HStack(spacing: Theme.Space.sm) {
-                        Text(service.label)
-                        Spacer(minLength: Theme.Space.md)
-                        StatePill(state: service.state)
-                    }
+            if let instance = line.sharedInstance {
+                HStack(spacing: Theme.Space.sm) {
+                    Image(systemName: Icon.shared).foregroundStyle(.secondary)
+                    Text(instance).font(.headline)
                 }
-            }
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                let roots = model.sharedInfo[instance]?.attachmentRoots
-                SectionHeading(title: "Attached workspaces", count: roots?.count)
-                if let roots {
-                    if roots.isEmpty { Text("None.").font(.callout).foregroundStyle(.secondary) }
-                    ForEach(roots, id: \.self) { root in
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(WorkspaceStore.folderName(root))
-                            Text(WorkspaceStore.displayPath(root)).font(.caption).foregroundStyle(.secondary)
+                let here = model.sections.flatMap(\.services).filter { $0.sharedInstance == instance }
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    SectionHeading(title: "Services in this workspace", count: here.count)
+                    ForEach(here) { service in
+                        HStack(spacing: Theme.Space.sm) {
+                            Text(service.label)
+                            Spacer(minLength: Theme.Space.md)
+                            if !service.disabled { StatePill(state: service.state) }
                         }
                     }
-                } else if model.sharedInfoFailed {
-                    Text("Could not read the shared registry.").font(.callout).foregroundStyle(.secondary)
-                } else {
-                    ProgressView().controlSize(.small)
+                }
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    let roots = model.sharedInfo[instance]?.attachmentRoots
+                    SectionHeading(title: "Attached workspaces", count: roots?.count)
+                    if let roots {
+                        if roots.isEmpty { Text("None.").font(.callout).foregroundStyle(.secondary) }
+                        ForEach(roots, id: \.self) { root in
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(WorkspaceStore.folderName(root))
+                                Text(WorkspaceStore.displayPath(root)).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    } else if model.sharedInfoFailed {
+                        Text("Could not read the shared registry.").font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
                 }
             }
         }
         .padding(Theme.Space.lg)
         .frame(minWidth: 260, maxWidth: 380, alignment: .leading)
-        .task { await model.loadSharedInfo() }
+        .task { if line.shared { await model.loadSharedInfo() } }
     }
 }
