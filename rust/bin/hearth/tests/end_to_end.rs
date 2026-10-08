@@ -47,13 +47,21 @@ fn run_lsd(root: &Path, args: &[&str]) -> (i32, String, String) {
 fn ad_hoc_signed_binary_runs_without_being_killed() {
     // Phase 0 answered GO for a trivial hello-world binary; this reconfirms it for the actual
     // multi-thousand-line `hearth` binary, ad-hoc signed exactly the way a real packaging step would.
+    // Sign a copy. `codesign --force` on the shared `CARGO_BIN_EXE` inode SIGKILLs every other test
+    // that already spawned that daemon.
+    let dir = tempfile::tempdir().unwrap();
+    let signed = dir.path().join("hearth");
+    std::fs::copy(lsd_bin(), &signed).unwrap();
     let status = Command::new("codesign")
-        .args(["--force", "--sign", "-", lsd_bin()])
+        .arg("--force")
+        .arg("--sign")
+        .arg("-")
+        .arg(&signed)
         .status();
     if let Ok(status) = status {
         assert!(status.success(), "ad-hoc codesign should succeed");
     }
-    let output = Command::new(lsd_bin())
+    let output = Command::new(&signed)
         .arg("--help-does-not-exist-but-should-still-run")
         .output()
         .expect("the ad-hoc-signed binary must still execute, not be killed on launch");
