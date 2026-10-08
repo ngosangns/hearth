@@ -8,16 +8,7 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             if model.cliMissing { CLIMissingBanner() }
-            HSplitView {
-                SidebarView()
-                    .frame(minWidth: 240, idealWidth: 280, maxWidth: 380)
-                DetailView()
-                    .frame(minWidth: 420, maxWidth: .infinity)
-                if model.showsLog {
-                    LogView()
-                        .frame(minWidth: 280, idealWidth: 420, maxWidth: .infinity)
-                }
-            }
+            ColumnLayout()
             StatusBar()
         }
         .overlay(alignment: .bottom) {
@@ -82,5 +73,71 @@ struct StatusBar: View {
         .overlay(alignment: .top) { Divider() }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(model.operations.last.map { "Working: \($0.title)" } ?? "Ready")
+    }
+}
+
+/// Sidebar and detail columns keep their own width (content width by default, draggable); the log
+/// column takes everything that is left. With the log hidden the detail column fills the window.
+/// `HSplitView` was dropped because it shares extra width between all panes and ignores `maxWidth`.
+private struct ColumnLayout: View {
+    @Environment(AppModel.self) private var model
+    @AppStorage("hearth.sidebarWidth") private var sidebarWidth = Double(Column.sidebar.ideal)
+    @AppStorage("hearth.detailWidth") private var detailWidth = Double(Column.detail.ideal)
+
+    var body: some View {
+        GeometryReader { geo in
+            let logShown = model.showsLog
+            let sidebar = Column.sidebar.clamp(sidebarWidth)
+            // Never let the fixed columns squeeze the log below its minimum.
+            let detailRoom = geo.size.width - sidebar - (logShown ? Column.logMin : 0)
+            let detail = max(Column.detail.min, min(Column.detail.clamp(detailWidth), detailRoom))
+            HStack(spacing: 0) {
+                SidebarView().frame(width: sidebar)
+                ColumnDivider(width: $sidebarWidth, range: Column.sidebar)
+                if logShown {
+                    DetailView().frame(width: detail)
+                    ColumnDivider(width: $detailWidth, range: Column.detail)
+                    LogView().frame(maxWidth: .infinity)
+                } else {
+                    DetailView().frame(maxWidth: .infinity)
+                }
+            }
+        }
+    }
+}
+
+private enum Column {
+    struct Range { let min: CGFloat, ideal: CGFloat, max: CGFloat
+        func clamp(_ w: CGFloat) -> CGFloat { Swift.min(max, Swift.max(min, w)) }
+    }
+    static let sidebar = Range(min: 220, ideal: 280, max: 400)
+    static let detail = Range(min: 420, ideal: 560, max: 900)
+    static let logMin: CGFloat = 280
+}
+
+/// One-point divider with a wider drag target that resizes the column on its left.
+private struct ColumnDivider: View {
+    @Binding var width: Double
+    fileprivate let range: Column.Range
+    @State private var startWidth: Double?
+
+    var body: some View {
+        Divider()
+            .overlay {
+                Color.clear.frame(width: 9).contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let start = startWidth ?? width
+                                startWidth = start
+                                width = range.clamp(start + drag.translation.width)
+                            }
+                            .onEnded { _ in startWidth = nil }
+                    )
+            }
+            .accessibilityHidden(true)
     }
 }
