@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0
 
 - **The backend is now Go.** `rust/` is gone; the product is the Go binary at `go/cmd/hearth` (module `github.com/ngosangns/hearth/go`). The daemon, supervisor, manager HTTP+SSE surface, shared-services (`smp`) manager, CLI, MCP server, and self-updater are all ported to `go/internal/*`. `task test` / `task clippy` / `task install` and CI now run Go (`go test ./...`, `go vet ./...`, `gofmt`). The version string moved from `rust/bin/hearth/Cargo.toml` to the repo-root `VERSION` file, stamped with `-ldflags "-X main.version=..."`.
 - **The TUI is removed.** `hearth-tui` was not ported: there is no `hearth tui` command, and a bare `hearth` always prints help. The SwiftUI macOS app is the workspace UI.
