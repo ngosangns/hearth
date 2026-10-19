@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.26.0
 
 - Shared services start again. The Go port joined each command's `cwd` onto the daemon root with `filepath.Join`, which nests an absolute path instead of using it (Rust's `Path::join` replaced it). Every shared instance runs with its absolute data dir as `cwd`, so the child's chdir failed and the start reported `fork/exec <binary>: no such file or directory` for mongodb, redis, kafka, minio and nginx, even though the binary was there. Spawn, docker commands, readiness/`command` probes and builds now keep an absolute `cwd` as is.
+- A service marked `disabled: true` is stopped by the daemon, not only refused to clients. The check runs after the daemon is listening, on catalog reload, and every two seconds. It stops the tracked process tree, a port holder that is this service, the same command, the program a `shell` + `exec` replaced into in the directory the shell `cd`s to, and a command line that still contains that service's install directory. One process-table read covers every disabled service. A different program on the port is left alone. `SyncExternalServices` does not adopt a disabled row.
+- The daemon publishes its port before that check. Stopping disabled processes during bootstrap used to hold the lock with no port, and a second `hearth manager` start then reported that the manager exited before it started listening.
+- The macOS window takes its chrome, tokens, and confirmation from `ns-shell`, the package shared with synca and promptscope. How the window, the kit, and the Go binary sit on each other is `ARCHITECTURE.md`.
 
 ## 0.25.0
 
