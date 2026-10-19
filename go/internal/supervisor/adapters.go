@@ -929,12 +929,25 @@ func NewDefaultProcessAdapter(root, runtimeDir string, baseEnv map[string]string
 	}
 }
 
+// resolveCwd anchors a relative command cwd at root and keeps an absolute one
+// as is. filepath.Join would nest an absolute cwd under root (the Rust
+// Path::join it replaced did not), which broke every shared service: their cwd
+// is the absolute instance data dir, so the child's chdir hit a nonexistent
+// <root><root>/instances/... and exec reported "fork/exec <binary>: no such
+// file or directory".
+func resolveCwd(root, cwd string) string {
+	if filepath.IsAbs(cwd) {
+		return filepath.Clean(cwd)
+	}
+	return filepath.Join(root, cwd)
+}
+
 func (a *DefaultProcessAdapter) Spawn(input SpawnInput, onOutput OnOutput) (*ManagedProcess, error) {
 	env := mergedEnvironment(a.BaseEnvironment, input.Command.Environment)
 
 	if catalog.IsContainerCommand(&input.Command) {
 		argv, _ := CommandArgv(&input.Command.Command)
-		cwd := filepath.Join(a.Root, input.Command.Cwd)
+		cwd := resolveCwd(a.Root, input.Command.Cwd)
 		if code := runCommand(nil, argv, cwd, env, onOutput); code != 0 {
 			return nil, Errorf("Docker service command exited with %d", code)
 		}
@@ -976,7 +989,7 @@ func (a *DefaultProcessAdapter) Spawn(input SpawnInput, onOutput OnOutput) (*Man
 	}
 	defer stdoutFile.Close()
 
-	cwd := filepath.Join(a.Root, input.Command.Cwd)
+	cwd := resolveCwd(a.Root, input.Command.Cwd)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = cwd
 	cmd.Env = envList(env)
@@ -1146,7 +1159,7 @@ func (a *DefaultProcessAdapter) StopContainer(command *catalog.ServiceCommand, o
 	// Compose is cwd- and env-sensitive (`COMPOSE_FILE`,
 	// `COMPOSE_PROJECT_NAME`). Stop has to use the same directory and merged
 	// environment the start used, or it targets a different project.
-	cwd := filepath.Join(a.Root, command.Cwd)
+	cwd := resolveCwd(a.Root, command.Cwd)
 	env := mergedEnvironment(a.BaseEnvironment, command.Environment)
 	if code := runCommand(nil, argv, cwd, env, onOutput); code != 0 {
 		return true, Errorf("Docker service stop exited with %d", code)
@@ -1202,7 +1215,7 @@ func (a *DefaultProbeAdapter) Command(ctx CommandContext, command *catalog.Comma
 	argv, _ := CommandArgv(command)
 	dir := a.Root
 	if cwd != nil {
-		dir = filepath.Join(a.Root, *cwd)
+		dir = resolveCwd(a.Root, *cwd)
 	}
 	ok := runCommand(ctx, argv, dir, a.BaseEnvironment, nil) == 0
 	return &ok
@@ -1226,7 +1239,7 @@ func (b *DefaultRunBuild) Run(command *catalog.ServiceCommand, onOutput OnOutput
 	}
 	argv, _ := CommandArgv(&command.Command)
 	env := mergedEnvironment(b.BaseEnvironment, command.Environment)
-	cwd := filepath.Join(b.Root, command.Cwd)
+	cwd := resolveCwd(b.Root, command.Cwd)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = cwd
 	cmd.Env = envList(env)

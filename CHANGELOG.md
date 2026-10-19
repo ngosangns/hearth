@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Shared services start again. The Go port joined each command's `cwd` onto the daemon root with `filepath.Join`, which nests an absolute path instead of using it (Rust's `Path::join` replaced it). Every shared instance runs with its absolute data dir as `cwd`, so the child's chdir failed and the start reported `fork/exec <binary>: no such file or directory` for mongodb, redis, kafka, minio and nginx, even though the binary was there. Spawn, docker commands, readiness/`command` probes and builds now keep an absolute `cwd` as is.
+
 ## 0.25.0
 
 - **The backend is now Go.** `rust/` is gone; the product is the Go binary at `go/cmd/hearth` (module `github.com/ngosangns/hearth/go`). The daemon, supervisor, manager HTTP+SSE surface, shared-services (`smp`) manager, CLI, MCP server, and self-updater are all ported to `go/internal/*`. `task test` / `task clippy` / `task install` and CI now run Go (`go test ./...`, `go vet ./...`, `gofmt`). The version string moved from `rust/bin/hearth/Cargo.toml` to the repo-root `VERSION` file, stamped with `-ldflags "-X main.version=..."`.
