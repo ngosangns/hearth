@@ -402,10 +402,16 @@ func (s *ProcessSupervisor) Status(serviceID string) error {
 }
 
 // Reconcile re-reads persisted rows, including externally-owned ones. Unknown
-// from a probe leaves the row unchanged.
+// from a probe leaves the row unchanged. Disabled services are stopped first
+// and then left out of adoption, so a live process is not marked running again.
 func (s *ProcessSupervisor) Reconcile() {
+	s.StopDisabledServices()
+	disabled := disabledIDs(s.host.Catalog())
 	for _, snap := range s.host.ServiceStates() {
 		snap := snap
+		if disabled[snap.ServiceID] {
+			continue
+		}
 		if snap.ActualState == state.ActualExternallyOwned {
 			s.queues.Run(snap.ServiceID, func() {
 				st := s.state(snap.ServiceID)
@@ -540,6 +546,9 @@ func (s *ProcessSupervisor) reconcileExternallyOwned(st *state.ServiceLifecycleS
 func (s *ProcessSupervisor) SyncExternalServices() {
 	var services []catalog.ServiceDefinition
 	for _, def := range s.host.Catalog().Services {
+		if def.Disabled {
+			continue
+		}
 		if def.Ownership != nil && *def.Ownership == catalog.OwnershipExternal {
 			services = append(services, def)
 		}

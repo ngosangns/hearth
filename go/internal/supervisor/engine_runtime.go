@@ -12,6 +12,9 @@ func (s *ProcessSupervisor) startLocked(serviceID string, operationID *string, o
 	if s.closing() {
 		return nil
 	}
+	if serviceDisabled(s.host.Catalog(), serviceID) {
+		return Errorf("service %s is disabled", serviceID)
+	}
 	profile, err := profileFor(s.host.Catalog(), serviceID)
 	if err != nil {
 		return err
@@ -233,6 +236,161 @@ func (s *ProcessSupervisor) reclaimPort(port uint16) error {
 	return Errorf("Port %d is still held by %s after SIGKILL", port, s.describePortHolders(port))
 }
 
+// StopDisabledServices is the daemon lifecycle check for `disabled: true`.
+// The tracked process tree is stopped, a port holder that is this service is
+// stopped, and any other host process of that service is stopped too: the
+// same command, the program a `shell` + `exec` replaced into, or a command
+// line that still contains that service's install directory. The exec'd
+// program is matched in the directory the shell `cd`s into. An unreadable
+// process list is skipped. A different program on the port is left for an
+// explicit kill-unowned start.
+func (s *ProcessSupervisor) StopDisabledServices() {
+	if s.closing() {
+		return
+	}
+	cat := s.host.Catalog()
+	if cat == nil {
+		return
+	}
+	var jobs []disabledJob
+	for i := range cat.Services {
+		if !cat.Services[i].Disabled || s.closing() {
+			continue
+		}
+		id := cat.Services[i].ID
+		if err := s.Stop(id, nil); err != nil {
+			s.host.RecordBackgroundError("supervisor.disabled", id+": "+err.Error())
+		}
+		if s.closing() {
+			return
+		}
+		jobs = append(jobs, disabledJob{id: id, queries: s.disabledQueries(id)})
+	}
+	matches, ok := s.disabledProcessMatches(jobs)
+	if !ok {
+		return
+	}
+	for _, job := range jobs {
+		if s.closing() {
+			return
+		}
+		job := job
+		rows := matches[job.id]
+		if err := s.withQueue(job.id, func() error {
+			if s.noteServiceHolder(job.id) {
+				if err := s.stopLocked(job.id, nil); err != nil {
+					return err
+				}
+			}
+			if len(rows) == 0 {
+				return nil
+			}
+			return s.signalMatchedProcesses(job.id, rows)
+		}); err != nil {
+			s.host.RecordBackgroundError("supervisor.disabled", job.id+": "+err.Error())
+		}
+	}
+}
+
+type disabledJob struct {
+	id      string
+	queries []serviceProcessQuery
+}
+
+// disabledQueries is how a disabled service is found on the host. The catalog
+// cwd covers the wrapper. A shell that `cd`s before `exec` also searches that
+// directory for the exec'd program and for the install-dir marker.
+func (s *ProcessSupervisor) disabledQueries(serviceID string) []serviceProcessQuery {
+	fingerprints := s.duplicateFingerprints(serviceID)
+	executables := s.duplicateExecutables(serviceID)
+	cwd := s.serviceCwd(serviceID)
+	profile, err := profileFor(s.host.Catalog(), serviceID)
+	if err != nil {
+		return []serviceProcessQuery{{
+			id: serviceID, fingerprints: fingerprints, executables: executables, cwd: cwd,
+		}}
+	}
+	lived := processCwd(&profile.Command)
+	marker, _ := installDirMarker(&profile.Command)
+	execFingerprints := execTargetFingerprints(&profile.Command)
+	if lived == cwd || pathsEqual(lived, cwd) {
+		for _, fp := range execFingerprints {
+			if !containsStr(fingerprints, fp) {
+				fingerprints = append(fingerprints, fp)
+			}
+		}
+		return []serviceProcessQuery{{
+			id: serviceID, fingerprints: fingerprints, executables: executables, cwd: cwd, marker: marker,
+		}}
+	}
+	livedFingerprints := append([]string{}, execFingerprints...)
+	for _, fp := range fingerprints {
+		if !containsStr(livedFingerprints, fp) {
+			livedFingerprints = append(livedFingerprints, fp)
+		}
+	}
+	return []serviceProcessQuery{
+		{id: serviceID, fingerprints: fingerprints, executables: executables, cwd: cwd},
+		{id: serviceID, fingerprints: livedFingerprints, cwd: lived, marker: marker},
+	}
+}
+
+// disabledProcessMatches reads every disabled service's host processes in one
+// pass when the real process adapter is in use. ok is false when that table
+// could not be read; the caller skips the reap rather than guessing.
+func (s *ProcessSupervisor) disabledProcessMatches(jobs []disabledJob) (map[string][]CommandMatch, bool) {
+	out := map[string][]CommandMatch{}
+	if len(jobs) == 0 || s.options.Process == nil {
+		return out, true
+	}
+	if adapter, isDefault := s.options.Process.(*DefaultProcessAdapter); isDefault {
+		queries := make([]serviceProcessQuery, 0, len(jobs))
+		for _, job := range jobs {
+			queries = append(queries, job.queries...)
+		}
+		return matchServiceProcesses(adapter.Root, queries)
+	}
+	for _, job := range jobs {
+		var rows []CommandMatch
+		seen := map[int64]struct{}{}
+		for _, query := range job.queries {
+			if len(query.fingerprints) == 0 && len(query.executables) == 0 {
+				continue
+			}
+			matches := s.options.Process.CommandMatches(query.fingerprints, query.executables, query.cwd)
+			if matches == nil {
+				return nil, false
+			}
+			for _, row := range *matches {
+				if _, ok := seen[row.Pid]; ok {
+					continue
+				}
+				seen[row.Pid] = struct{}{}
+				rows = append(rows, row)
+			}
+		}
+		out[job.id] = rows
+	}
+	return out, true
+}
+
+func disabledIDs(cat *catalog.ServiceCatalog) map[string]bool {
+	out := map[string]bool{}
+	if cat == nil {
+		return out
+	}
+	for i := range cat.Services {
+		if cat.Services[i].Disabled {
+			out[cat.Services[i].ID] = true
+		}
+	}
+	return out
+}
+
+func serviceDisabled(cat *catalog.ServiceCatalog, serviceID string) bool {
+	return disabledIDs(cat)[serviceID]
+}
+
 func (s *ProcessSupervisor) duplicateFingerprints(serviceID string) []string {
 	profile, err := profileFor(s.host.Catalog(), serviceID)
 	if err != nil {
@@ -342,9 +500,13 @@ func (s *ProcessSupervisor) reapDuplicateServiceProcesses(serviceID string, fing
 	if matches == nil {
 		return Errorf("%s: could not list processes; refusing to start beside an unchecked duplicate", serviceID)
 	}
+	return s.signalMatchedProcesses(serviceID, *matches)
+}
+
+func (s *ProcessSupervisor) signalMatchedProcesses(serviceID string, matches []CommandMatch) error {
 	seen := map[int64]struct{}{}
 	var entries []ProcessTreeEntry
-	for _, matched := range *matches {
+	for _, matched := range matches {
 		if matched.Pid <= 1 {
 			continue
 		}

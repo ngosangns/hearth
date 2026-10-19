@@ -129,6 +129,8 @@ from any dev box here, with the same username.
 
 ### SwiftUI app (`apps/macos-swiftui`)
 
+How the window, the kit, and the Go binary sit on each other is `ARCHITECTURE.md`
+(Zed's composition root / workspace shell / headless core, without GPUI or Rust).
 Structured like `../synca/macos`: `HearthKit` (CLI runner, bearer client, wire models, `WorkspaceStore`,
 `ServiceBoard`, `LogBuffer`; unit-tested, no UI imports) and `hearth-app` (`Model`, `Design`, `Features`).
 `task app:build` bundles it with the installed `hearth` in `Contents/extras/`; `task app:test` runs its tests.
@@ -337,7 +339,13 @@ Launch the built bundle with `open -n`; running the inner binary directly never 
   service. Cycles are a load error, not truncation.
 - `disabled: true` rejects direct start/stop/restart (`service_disabled`, `status` still works) and
   is stripped from flattened `groups` — group ops skip it silently; `group_tree` still lists it for
-  display. It does not stop an already-running service — the row just stops being actionable.
+  display. The daemon lifecycle check (`StopDisabledServices`, from the post-listen reconcile,
+  catalog reload, and the 2s tick) stops its processes: the tracked tree, a port holder that is this
+  service, and other host processes of that service — the same command, the program a `shell` +
+  `exec` replaced into (in the directory the shell `cd`s to), and a command line that still
+  contains the install directory. One process-table read covers every disabled service. A
+  different program on the port stays for an explicit `killUnowned` start. `SyncExternalServices`
+  does not adopt a disabled row.
 - A missing/invalid `readiness` must fail the load, not skip the service.
 - Readiness shorthand expands at project load, and for a shared recipe at synthesize: `kind: http`
   with no `url` is `GET http://127.0.0.1:<primary>/health` (2xx); `path` replaces `/health`;

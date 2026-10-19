@@ -32,6 +32,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -397,6 +398,10 @@ func (m *HearthManager) ReloadCatalog(next catalog.ServiceCatalog) (*ReloadOutco
 	m.catalogMu.Lock()
 	m.catalog = &next
 	m.catalogMu.Unlock()
+	// A service that became disabled, or was already disabled and still has a
+	// process, is stopped with the new catalog in place. A failure is retried
+	// on the lifecycle tick; it does not roll the catalog back.
+	m.supervisor.StopDisabledServices()
 	m.events.Publish("manager.catalog-reloaded", map[string]any{
 		"removed": removedIDs,
 		"changed": changed,
@@ -681,7 +686,6 @@ func Bootstrap(options HearthManagerOptions) (*HearthManager, error) {
 		manager.stateMu.Lock()
 		manager.state = loaded
 		manager.stateMu.Unlock()
-		manager.supervisor.Reconcile()
 
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -720,15 +724,30 @@ func Bootstrap(options HearthManagerOptions) (*HearthManager, error) {
 		}
 		manager.events.Publish("manager.started", map[string]any{"instanceId": manager.instanceID})
 
-		// The adoption loop runs unconditionally: a catalog with no
-		// `ownership: external` service makes each tick a no-op, and the first
-		// such service may only arrive later by reload.
-		manager.supervisor.SyncExternalServices()
+		// Reconcile stops disabled services and adopts the rest. It runs after
+		// the port is published: doing it before listen held the lock with no
+		// port for as long as those processes took to die, and a client then
+		// reported that the daemon exited before it started listening.
 		stop := make(chan struct{})
 		manager.externalSyncMu.Lock()
 		manager.externalSyncStop = stop
 		manager.externalSyncMu.Unlock()
 		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					manager.RecordBackgroundError("supervisor.lifecycle", fmt.Sprintf("%v\n%s", recovered, debug.Stack()))
+				}
+			}()
+			guard := func(fn func()) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						manager.RecordBackgroundError("supervisor.lifecycle", fmt.Sprintf("%v\n%s", recovered, debug.Stack()))
+					}
+				}()
+				fn()
+			}
+			guard(manager.supervisor.Reconcile)
+			guard(manager.supervisor.SyncExternalServices)
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -736,7 +755,10 @@ func Bootstrap(options HearthManagerOptions) (*HearthManager, error) {
 				case <-stop:
 					return
 				case <-ticker.C:
-					manager.supervisor.SyncExternalServices()
+					guard(func() {
+						manager.supervisor.StopDisabledServices()
+						manager.supervisor.SyncExternalServices()
+					})
 				}
 			}
 		}()

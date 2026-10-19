@@ -463,6 +463,17 @@ func listLiveProcesses() ([]LiveProcess, error) {
 	return ParsePsCommandRows(stdout), nil
 }
 
+type serviceProcessQuery struct {
+	id           string
+	fingerprints []string
+	executables  []string
+	cwd          string
+	// marker is a command-line substring, used when the exec'd program's
+	// arguments no longer hash to the catalog text but still contain its
+	// install directory. Empty means unused.
+	marker string
+}
+
 // MatchingServiceProcesses lists live host processes in `projectRoot/cwd`
 // that are this service: the observed command hashes to one of `fingerprints`,
 // or its absolute executable is one of `executables` (a title rewrite keeps
@@ -473,57 +484,105 @@ func MatchingServiceProcesses(projectRoot string, fingerprints, executables []st
 	if len(fingerprints) == 0 && len(executables) == 0 {
 		return &[]CommandMatch{}
 	}
-	code, stdout, err := runPs([]string{"ps", "-axww", "-o", "pid=,lstart=,command="})
-	if err != nil || code != 0 {
+	matched, ok := matchServiceProcesses(projectRoot, []serviceProcessQuery{{
+		fingerprints: fingerprints,
+		executables:  executables,
+		cwd:          cwd,
+	}})
+	if !ok {
 		return nil
 	}
+	rows := matched[""]
+	return &rows
+}
+
+func queryMatchesCommand(command string, query serviceProcessQuery) bool {
+	if CommandFingerprintMatches(command, query.fingerprints) || ExecutableMatches(command, query.executables) {
+		return true
+	}
+	return query.marker != "" && strings.Contains(command, query.marker)
+}
+
+// matchServiceProcesses reads the process table once and assigns each live
+// process to the queries it belongs to. ok is false when the table or a cwd
+// could not be read. An empty result is a confirmed miss. Two queries may
+// share an id; both of their hits are kept.
+func matchServiceProcesses(projectRoot string, queries []serviceProcessQuery) (map[string][]CommandMatch, bool) {
+	out := map[string][]CommandMatch{}
+	active := make([]serviceProcessQuery, 0, len(queries))
+	for _, query := range queries {
+		out[query.id] = nil
+		if len(query.fingerprints) == 0 && len(query.executables) == 0 && query.marker == "" {
+			continue
+		}
+		active = append(active, query)
+	}
+	if len(active) == 0 {
+		return out, true
+	}
+	code, stdout, err := runPs([]string{"ps", "-axww", "-o", "pid=,lstart=,command="})
+	if err != nil || code != 0 {
+		return nil, false
+	}
 	selfPid := int64(os.Getpid())
-	var candidates []LiveProcess
-	for _, p := range ParsePsCommandRows(stdout) {
-		if p.Pid > 1 && p.Pid != selfPid &&
-			(CommandFingerprintMatches(p.Command, fingerprints) || ExecutableMatches(p.Command, executables)) {
-			candidates = append(candidates, p)
+	type hit struct {
+		process LiveProcess
+		queries []string
+	}
+	var hits []hit
+	for _, process := range ParsePsCommandRows(stdout) {
+		if process.Pid <= 1 || process.Pid == selfPid {
+			continue
+		}
+		var ids []string
+		for _, query := range active {
+			if queryMatchesCommand(process.Command, query) {
+				ids = append(ids, query.id)
+			}
+		}
+		if len(ids) > 0 {
+			hits = append(hits, hit{process: process, queries: ids})
 		}
 	}
-	if len(candidates) == 0 {
-		return &[]CommandMatch{}
+	if len(hits) == 0 {
+		return out, true
 	}
-	var spec []string
-	for _, c := range candidates {
-		spec = append(spec, strconv.FormatInt(c.Pid, 10))
+	spec := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		spec = append(spec, strconv.FormatInt(hit.process.Pid, 10))
 	}
 	lsofCode, lsofOut, err := runPs([]string{"lsof", "-nP", "-d", "cwd", "-a", "-p", strings.Join(spec, ","), "-Fn"})
 	if err != nil || lsofCode == -1 {
-		return nil
+		return nil, false
 	}
 	cwds := ParseLsofCwdMap(lsofOut)
-	expected := filepath.Join(projectRoot, cwd)
-	var matches []CommandMatch
-	for _, candidate := range candidates {
-		actual, ok := cwds[candidate.Pid]
-		switch {
-		case ok && pathsEqual(actual, expected):
-			matches = append(matches, CommandMatch{Pid: candidate.Pid, StartIdentity: candidate.StartIdentity})
-		case ok:
-			// Different cwd — not this service.
-		default:
-			// Gone between the two probes is not a duplicate. Still alive
-			// with no cwd is unknown — killing it would be a guess, and
-			// ignoring it could leave a second copy.
-			code, stdout, err := runPs([]string{"ps", "-ww", "-o", "pid=,lstart=,command=", "-p", strconv.FormatInt(candidate.Pid, 10)})
+	expected := map[string]string{}
+	for _, query := range active {
+		expected[query.id] = filepath.Join(projectRoot, query.cwd)
+	}
+	for _, hit := range hits {
+		actual, known := cwds[hit.process.Pid]
+		if !known {
+			code, stdout, err := runPs([]string{"ps", "-ww", "-o", "pid=,lstart=,command=", "-p", strconv.FormatInt(hit.process.Pid, 10)})
 			if err != nil {
-				return nil
+				return nil, false
 			}
 			if code == 0 {
 				for _, row := range ParsePsCommandRows(stdout) {
-					if row.Pid == candidate.Pid && row.StartIdentity == candidate.StartIdentity {
-						return nil
+					if row.Pid == hit.process.Pid && row.StartIdentity == hit.process.StartIdentity {
+						return nil, false
 					}
 				}
 			}
+			continue
+		}
+		for _, id := range hit.queries {
+			if pathsEqual(actual, expected[id]) {
+				out[id] = append(out[id], CommandMatch{Pid: hit.process.Pid, StartIdentity: hit.process.StartIdentity})
+			}
 		}
 	}
-	return &matches
+	return out, true
 }
 
 func sendSignal(pid int64, signal ProcessSignal) {

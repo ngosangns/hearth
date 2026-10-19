@@ -47,9 +47,14 @@ declaration order (deduplicated, cycles rejected at load). A member naming both 
 group resolves as the service. Clients group the service list by direct membership and offer
 per-group start and stop.
 
-`disabled: true` on a service keeps it in the catalog but out of every lifecycle action: direct
-start/stop/restart is rejected (`service_disabled`) and group targets expand past it. It does not
-stop a service already running — stop it before disabling, or leave it be.
+`disabled: true` on a service keeps it in the catalog but out of every client lifecycle action:
+direct start/stop/restart is rejected (`service_disabled`) and group targets expand past it. The
+daemon's own lifecycle check stops that service's processes: the tracked tree, a port holder that
+is this service, and any other host process of that service. That includes the same command, the
+program a `shell` + `exec` replaced into (matched in the directory the shell `cd`s to), and a
+command line that still contains that service's install directory. The check runs after the
+daemon is listening, on catalog reload, and on the two-second tick. A different program on the
+port is not signalled.
 
 A command that runs and then exits — a one-shot build, not a server — uses
 `readiness: { kind: exit }`. The row stays `running` until the process exits. It does not
@@ -169,7 +174,7 @@ go vet ./...
 
 The suite needs a running `docker` daemon, `tailscale`, plus `nc`, `ps`, and `sh`.
 
-See [AGENTS.md](AGENTS.md) for architecture, sharp edges, and how `task install` refreshes the binary.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how the daemon, the CLI, and the window sit on each other, and [AGENTS.md](AGENTS.md) for sharp edges and how `task install` refreshes the binary.
 Shared services are specified in [docs/shared-services.md](docs/shared-services.md).
 
 ## Release
