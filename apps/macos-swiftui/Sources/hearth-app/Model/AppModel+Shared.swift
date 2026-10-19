@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 /// The Shared pane: recipes from the remote catalog and instances from a live smp, or from the
 /// local registry when smp is down. Drawing the pane never starts smp.

@@ -1,6 +1,7 @@
 import SwiftUI
 import Observation
 import HearthKit
+import NSShell
 
 /// Single source of truth for UI state. Views read; user intents call the methods in this type and
 /// its extensions. Every `hearth` call goes through `begin`/`end`, which drives the status bar.

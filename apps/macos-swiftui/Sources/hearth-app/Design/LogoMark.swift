@@ -1,4 +1,5 @@
 import SwiftUI
+import NSShell
 
 /// Hearth logo: a white flame on synca's brand-gradient squircle. `scripts/make-icon.swift`
 /// renders the same artwork into `AppIcon.icns`; keep the two in step.

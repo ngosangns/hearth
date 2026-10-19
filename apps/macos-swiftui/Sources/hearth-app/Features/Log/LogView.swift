@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import HearthKit
+import NSShell
 
 /// Third column: the selected service's log (or the daemon log). Follows the tail until the
 /// user scrolls up; a Latest button jumps back.

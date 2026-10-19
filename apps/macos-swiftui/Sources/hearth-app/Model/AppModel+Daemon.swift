@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 /// Workspace and daemon lifecycle: discover, trust, start, stop, restart, forget, and the board
 /// refresh that follows each of them.

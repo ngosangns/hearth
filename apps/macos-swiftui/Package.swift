@@ -4,14 +4,18 @@ import PackageDescription
 let package = Package(
     name: "hearth-app",
     platforms: [.macOS(.v14)],
+    dependencies: [
+        .package(path: "../../../ns-shell"),
+    ],
     targets: [
-        // Pure logic: hearth CLI runner, daemon HTTP client, wire models, workspace
-        // list, service board rules, log buffer. No UI imports, so it is unit-testable.
+        // Headless client of the hearth daemon. No UI imports.
+        // Zed: crates/client. The daemon (go/) is crates/project.
         .target(name: "HearthKit", path: "Sources/HearthKit"),
-        // SwiftUI app: state (Model), design system (Design), feature views.
+        // Composition root. App binds HearthCommand. WindowShell is the
+        // workspace chrome. Design is the component crate. See ARCHITECTURE.md.
         .executableTarget(
             name: "hearth-app",
-            dependencies: ["HearthKit"],
+            dependencies: ["HearthKit", .product(name: "NSShell", package: "ns-shell")],
             path: "Sources/hearth-app"
         ),
         .testTarget(

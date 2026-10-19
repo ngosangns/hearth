@@ -1,5 +1,6 @@
 import Foundation
 import HearthKit
+import NSShell
 
 enum Pane: String, CaseIterable, Identifiable {
     case workspaces = "Workspaces"
@@ -39,22 +40,6 @@ struct WorkspaceItem: Identifiable, Equatable {
 struct Operation: Identifiable {
     let id = UUID()
     var title: String
-}
-
-struct Toast: Identifiable, Equatable {
-    enum Style { case success, error, info }
-    let id = UUID()
-    let message: String
-    let style: Style
-}
-
-struct Confirmation: Identifiable {
-    let id = UUID()
-    let title: String
-    let message: String
-    let confirmTitle: String
-    let destructive: Bool
-    let action: @MainActor () -> Void
 }
 
 /// What the Shared pane has selected: an installed instance or a catalog recipe.

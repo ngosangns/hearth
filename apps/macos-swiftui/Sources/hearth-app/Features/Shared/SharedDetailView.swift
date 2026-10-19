@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 /// Second column of the Shared pane, laid out like a workspace: hero card, then sections.
 struct SharedDetailView: View {

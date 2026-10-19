@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 /// Services grouped by direct `groupTree` membership. Each service is a card that carries its own
 /// URLs and actions, so nothing here depends on a separate selection list (and a selection change

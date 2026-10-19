@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 struct SidebarView: View {
     @Environment(AppModel.self) private var model

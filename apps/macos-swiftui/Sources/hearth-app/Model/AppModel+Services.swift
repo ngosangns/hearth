@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 /// Service, group and bulk actions against the attached daemon.
 extension AppModel {

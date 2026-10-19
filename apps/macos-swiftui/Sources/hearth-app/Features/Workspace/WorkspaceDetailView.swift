@@ -1,5 +1,6 @@
 import SwiftUI
 import HearthKit
+import NSShell
 
 /// Second column for a workspace: hero card with daemon actions, then services by group.
 struct WorkspaceDetailView: View {

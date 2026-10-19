@@ -1,3 +1,4 @@
+import NSShell
 /// Central SF Symbols registry, the same names synca uses plus the Hearth-specific ones. Views
 /// never hard-code a symbol name; add a case here so icons stay consistent.
 enum Icon {
