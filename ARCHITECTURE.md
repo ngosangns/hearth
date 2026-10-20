@@ -1,27 +1,6 @@
 # How this app is built
 
-Hearth follows the same construction as [Zed](https://github.com/zed-industries/zed): a composition root wires a window shell to a headless core, and every other binary is a client of that core. The languages differ on purpose. Zed rejected a web view because a text editor cannot spend its frame budget on one. Hearth is a process supervisor, not an editor. Its core stays the Go binary. Its window stays SwiftUI. GPUI is not a dependency: it is GPL-3.0 and it exists to draw an editor at 120 fps.
-
-The names below are Zed's crate names, so a reader can move between the two trees.
-
-## Dependency direction
-
-Arrows point at what a layer is allowed to import. Nothing below the line imports SwiftUI.
-
-```
-hearth-app          crates/zed          composition root: menus, actions, which panel is open
-   │  WindowShell   crates/workspace    banner, docks, center pane, status bar, toast, modal
-   │  Design        crates/ui + theme   tokens and components, no service rules
-   ▼
-HearthKit          crates/client        HTTP + SSE, workspace list, service-board rules
-   │
-   ▼
-hearth (Go)        crates/project       the only process that starts or stops a service
-```
-
-`hearth-app` may import `HearthKit` and `NSShell`. `HearthKit` imports neither SwiftUI nor `hearth-app`. The Go module does not import the app. Feature views do not call `supervisor` or spawn processes; they call `AppModel`, and `AppModel` calls `HearthKit`.
-
-`NSShell` is the private package [ns-shell](https://github.com/ngosangns/ns-shell), checked out beside this repo. It holds the tokens, components, toast, confirmation, and window layers shared with synca and promptscope. This repo keeps hearth's commands, service board, and daemon client.
+Hearth is a process supervisor. The product in this repo is the Go binary at `go/cmd/hearth`. The macOS window is `hearth-gpui` in the sibling repo `ns-gpui`. It calls this CLI. This repo has no UI.
 
 ## What each Go package is
 
@@ -39,31 +18,13 @@ hearth (Go)        crates/project       the only process that starts or stops a 
 | `internal/updater` | `crates/auto_update` | GitHub release into the versioned bin dir. |
 | `internal/shared` | a second `project` root | The machine-global `smp` daemon at `~/.hearth/shared`. |
 
-One binary hosts the daemon, the CLI, and MCP, the way one Zed binary hosts the window and a separate `cli` binary only finds that window and speaks IPC. Hearth inverts the thin side: the long-lived process is the daemon, and the window is the client. A supervisor cannot live inside a window that the user can quit.
-
-## Window
-
-Zed's `Workspace` is the root of one window. Hearth already uses "workspace" for a project folder, so the window type is `WindowShell` and the folder stays a workspace.
-
-| Zed | This window |
-| --- | --- |
-| Left dock, `ProjectPanel` | `SidebarView` — workspace list and shared-services list |
-| Center `Pane` of items | `DetailView` — the open workspace or the shared board |
-| Right / bottom dock | `LogView`, shown only while `logOpen` |
-| `StatusBar` | version, in-flight operation, ready or working |
-| Banner | `CLIMissingBanner` when `hearth` is not on `PATH` |
-| `toast_layer` | `Toast` over the shell |
-| `modal_layer` | `confirmationDialog`. Destructive work does not run without it. |
-
-`App` (`HearthApp`) is the composition root. It owns `AppModel` the way GPUI's `App` owns every entity: one owner, views only read it. Work that talks to the daemon runs in a `Task`, which is the foreground executor; the daemon's own goroutines are the background executor. The window never starts a service itself.
-
-Commands are `HearthCommand` values. Menus only bind them. Adding a command means one case, one title, one shortcut, one `run`.
+One binary hosts the daemon, the CLI, and MCP. The long-lived process is the daemon. A supervisor cannot live inside a window that the user can quit.
 
 ## Scope
 
-In scope: one daemon per project root, one `smp` daemon per machine, a CLI and an MCP server on the same protocol, and one macOS window that is a client.
+In scope: one daemon per project root, one `smp` daemon per machine, and a CLI and an MCP server on the same protocol.
 
-Out of scope, including things Zed has that this product does not need: a GPU UI framework, a command palette, an extension host inside the window, collaboration, a language server, multi-window workspace restore, and a second implementation of start/stop in Swift. The Rust workspace was removed on purpose; do not bring it back to resemble Zed's toolchain.
+Out of scope: a UI in this repo, a command palette, an extension host, collaboration, a language server, and a second implementation of start/stop. The window is `hearth-gpui` in `ns-gpui`. Do not add a UI target or a Rust module here.
 
 ## GitHub
 

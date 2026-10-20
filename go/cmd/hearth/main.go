@@ -210,7 +210,7 @@ usage: hearth [--root <path>] <command> [options]
   skill install --dest <skill-dir>      install SKILL.md + scripts (MCP retired for agents)
 
 shared and update do not need a hearth.yaml in the current directory.
-The macOS app is the workspace once it is installed.
+The workspace window is hearth-gpui, not this binary.
 mcp install records this process path. A binary inside Hearth.app makes those configs point into the bundle.
 Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json.`)

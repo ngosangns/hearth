@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.0
+
+- The SwiftUI app is gone from this repo. The window is `hearth-gpui` in `ns-gpui`. `task app:build`, `task app:test`, and `task app:install` are removed. `hearth update` is unchanged.
+
 ## 0.26.0
 
 - Shared services start again. The Go port joined each command's `cwd` onto the daemon root with `filepath.Join`, which nests an absolute path instead of using it (Rust's `Path::join` replaced it). Every shared instance runs with its absolute data dir as `cwd`, so the child's chdir failed and the start reported `fork/exec <binary>: no such file or directory` for mongodb, redis, kafka, minio and nginx, even though the binary was there. Spawn, docker commands, readiness/`command` probes and builds now keep an absolute `cwd` as is.

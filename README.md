@@ -11,7 +11,7 @@ The product is the compiled `hearth` binary (`go/cmd/hearth`). It runs from any 
 ```
  your CLI  ─┐
  your MCP  ─┼──HTTP + SSE (loopback)──►  daemon (hearth)
- macOS app ─┘                                  │
+ window   ─┘                                  │
                                         ProcessSupervisor (spawns/probes/tails)
 ```
 

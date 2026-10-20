@@ -8,7 +8,7 @@ architecture, and sharp edges. Add durable notes here as real work discovers the
 The product is the compiled `hearth` binary — `go/cmd/hearth` in module
 `github.com/ngosangns/hearth/go`, packages under `go/internal/`. The Rust workspace (`rust/`) is
 gone and the TUI was not ported: `hearth tui` is an unknown command and a bare `hearth` prints
-help; the SwiftUI macOS app is the workspace UI. 0.18.0 renamed the command from `hearthd`; do not
+help. The workspace window is `hearth-gpui` in the sibling repo `ns-gpui`. This repo has no UI. 0.18.0 renamed the command from `hearthd`; do not
 install or publish `hearthd`. A project authors `hearth.yaml`
 (`.yml` / `.json`); TypeScript catalogs are not accepted.
 
@@ -127,25 +127,6 @@ from any dev box here, with the same username.
 - Homebrew's bin dir carries `go` and `gh`; `~/.cargo/bin` is still prepended for any leftover
   rustup tooling on that machine.
 
-### SwiftUI app (`apps/macos-swiftui`)
-
-How the window, the kit, and the Go binary sit on each other is `ARCHITECTURE.md`
-(Zed's composition root / workspace shell / headless core, without GPUI or Rust).
-Structured like `../synca/macos`: `HearthKit` (CLI runner, bearer client, wire models, `WorkspaceStore`,
-`ServiceBoard`, `LogBuffer`; unit-tested, no UI imports) and `hearth-app` (`Model`, `Design`, `Features`).
-`task app:build` bundles it with the installed `hearth` in `Contents/extras/`; `task app:test` runs its tests.
-`task app:install` quits a running copy, then `rsync -a --delete`s the bundle into `/Applications`, the same
-install `../synca/macos` uses. `task go:test` / `task go:build` cover the Go binary (`go/cmd/hearth`).
-It is a pure HTTP client of the project daemon (tokens live in memory only) and spawns `hearth` with an argv
-array. It owns `workspaces.json`
-(`~/Library/Application Support/HearthApp/workspaces.json`, rows `{ id, path, trusted, addedAt }` with
-ISO-8601 `addedAt` and no fractional seconds — keep that shape; it predates the app). A file that
-exists but does not decode is quarantined on open rather than overwritten; a `Reload` must not
-quarantine. `HEARTH_WORKSPACE_FILE` overrides it for a scratch session.
-Confirmations use `confirmationDialog`; `killUnowned` is sent only from the "Kill and Start" confirmation.
-Launch the built bundle with `open -n`; running the inner binary directly never gets a window.
-`hearth update` refuses when the current executable is inside `*.app/Contents/` before it downloads anything. Updates replace the whole `.app`.
-
 ## Sharp edges
 
 **Process supervision**
@@ -222,8 +203,8 @@ Launch the built bundle with `open -n`; running the inner binary directly never 
 - **`killUnowned` is the only path that signals an arbitrary process holding a service port.** It is a
   client-supplied flag on `POST /v1/operations` (`action: start` only — every surface rejects it
   otherwise) that must only ever be set after an explicit user confirmation: CLI `--kill-unowned`
-  or its TTY `[y/N]` prompt (non-TTY always answers no), the app's "Kill and Start"
-  `confirmationDialog`, and
+  or its TTY `[y/N]` prompt (non-TTY always answers no), the window's "Kill and Start"
+  confirmation, and
   MCP's `killUnowned` argument. `ProcessSupervisor.reclaimPort`
   resolves listeners via `ProbeAdapter.PortHolders` (lsof) and signals **individual pids** via
   `ProcessAdapter.SignalPID` — SIGTERM, poll, then a re-resolved SIGKILL pass. Never `killpg` an
@@ -442,15 +423,16 @@ Launch the built bundle with `open -n`; running the inner binary directly never 
 - `hearth mcp install --key <name>` exists because infra's registry uses `servers`, not the standard
   `mcpServers`. The merge only ever touches `command`/`args`.
 
-**Workspace UI contract (the SwiftUI app; `hearth tui` was removed)**
+**Workspace UI contract (`hearth-gpui` in `ns-gpui`; `hearth tui` was removed)**
 
 - A bare `hearth` prints help whether or not it's on a terminal — there is no interactive shell
-  in the binary. `tui` is an unknown command (exit 2). The app is the only workspace UI.
-- The app is an HTTP+SSE client (`internal/client` semantics apply): selecting a workspace only
+  in the binary. `tui` is an unknown command (exit 2). The window is the only workspace UI, and it is not in this repo.
+- The window is an HTTP+SSE client (`internal/client` semantics apply): selecting a workspace only
   `discover`s; opening a trusted workspace with no live daemon `ensure`s; an untrusted folder needs
   a second confirmation before anything is spawned. A daemon the user stopped stays stopped until
   the workspace is opened again; refresh never `ensure`s.
-- Destructive actions take an explicit confirmation (`confirmationDialog`): trust, forget
+- The folder list is `~/Library/Application Support/HearthApp/workspaces.json` (`{ id, path, trusted, addedAt }`). `HEARTH_WORKSPACE_FILE` overrides it.
+- Destructive actions take an explicit confirmation: trust, forget
   (services keep running), stop daemon, restart daemon (services stay up), kill-unowned reclaim,
   and shared remove (`force` when attachments > 0). Stop/restart/remove of a shared instance, and
   stop or restart of a project `shared:` row (including group and stop-all), also confirm when

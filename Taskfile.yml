@@ -64,37 +64,6 @@ tasks:
         fi
         echo "installed $("$link" --version) at $link -> $dest"
 
-  app:build:
-    desc: Build the macOS Hearth.app bundle (SwiftUI + bundled release hearth) into apps/macos-swiftui/.build
-    deps: [install]
-    cmds:
-      - sh apps/macos-swiftui/scripts/bundle.sh
-
-  app:test:
-    desc: Run the SwiftUI app tests (apps/macos-swiftui), same role as synca's `make test`
-    dir: apps/macos-swiftui
-    cmds:
-      - swift test
-
-  app:clean:
-    desc: Remove the SwiftPM build and any Hearth.app next to the package
-    dir: apps/macos-swiftui
-    cmds:
-      - rm -rf .build Hearth.app
-
-  app:install:
-    desc: Build Hearth.app and rsync it into /Applications (quits a running copy first)
-    deps: [app:build]
-    cmds:
-      - osascript -e 'quit app "Hearth"' 2>/dev/null || true
-      - |
-        set -eu
-        app="apps/macos-swiftui/.build/Hearth.app"
-        test -d "$app"
-        mkdir -p /Applications/Hearth.app
-        rsync -a --delete "$app"/ /Applications/Hearth.app/
-        echo "installed: $app -> /Applications/Hearth.app"
-
   go:build:
     desc: Build the Go module and the hearth binary into go/hearth
     dir: go
