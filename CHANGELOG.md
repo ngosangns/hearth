@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.27.3
+
+- Maintenance release: remove no runtime behavior; companion UI cleanup ships in `ns-gpui`.
+
+## 0.27.2
+
+- Release metadata and updater refresh.
+
 ## 0.27.1
 
 - Audited the repo: docs, comments, and strings are English only. No functional change.
