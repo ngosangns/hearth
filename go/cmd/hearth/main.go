@@ -188,12 +188,12 @@ func printHelp() {
 	fmt.Println(`hearth — local dev services daemon, CLI, and MCP server
 
 usage: hearth [--root <path>] <command> [options]
-
   status [target] [--json]              current state of one service, a group, or all
+  events --follow --json                stream daemon changes as newline-delimited JSON
   start|stop|restart <target> [--wait]  lifecycle actions
   logs <service> [--tail N] [--follow]  read a service's log
   urls [target] [--json]                where each service can be reached (live URLs)
-  operation get|watch <id> [--json]     inspect one operation
+  operation get|watch <id> [--json]    inspect one operation
   doctor [--json]                       environment and catalog diagnostics
   cleanup                               remove stale runtime state
   manager ensure|status|stop|restart|reload
@@ -214,6 +214,7 @@ The workspace window is hearth-gpui, not this binary.
 mcp install records this process path. A binary inside Hearth.app makes those configs point into the bundle.
 Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json.`)
+
 }
 
 func stdinIsTerminal() bool {

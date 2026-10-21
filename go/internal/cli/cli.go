@@ -654,6 +654,8 @@ func mainInner(ctx context.Context, options *Options, root string, argv []string
 		return statusCommand(ctx, root, options, rest, io)
 	case "urls":
 		return urlsCommand(ctx, root, options, rest, io)
+	case "events":
+		return eventsCommand(ctx, root, options, rest, io)
 	case "start", "stop", "restart":
 		return startStopRestartCommand(ctx, root, options, command, rest, io)
 	case "operation":
@@ -667,6 +669,38 @@ func mainInner(ctx context.Context, options *Options, root string, argv []string
 	default:
 		return 0, usageErr("unknown command: " + command)
 	}
+}
+
+func eventsCommand(ctx context.Context, root string, options *Options, rest []string, io *Io) (int, error) {
+	flags, err := ParseCommandFlags(rest, []Flag{FlagFollow, FlagJSON})
+	if err != nil {
+		return 0, err
+	}
+	if len(flags.Positionals) != 0 || !flags.Follow || !flags.JSON {
+		return 0, usageErr("usage: hearth events --follow --json")
+	}
+	managerClient := client.NewManagerClient(root, &options.Catalog)
+	for event := range managerClient.Watch(ctx, nil, nil) {
+		switch event.Kind {
+		case client.EventKindBeginConnection:
+			out(io, printValue(map[string]any{"kind": "connection"}, true))
+		case client.EventKindSnapshot:
+			out(io, printValue(map[string]any{
+				"kind":     "snapshot",
+				"services": event.Snapshot,
+			}, true))
+		case client.EventKindManagerEvent:
+			if event.Manager != nil {
+				out(io, printValue(event.Manager, true))
+			}
+		case client.EventKindUnavailable:
+			out(io, printValue(map[string]any{
+				"kind":    "unavailable",
+				"message": event.Message,
+			}, true))
+		}
+	}
+	return 0, nil
 }
 
 func doctorCommand(options *Options, rest []string, io *Io) (int, error) {
