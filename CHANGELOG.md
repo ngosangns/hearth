@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.27.1
+
+- Audited the repo: docs, comments, and strings are English only. No functional change.
+
 ## 0.27.0
 
 - The SwiftUI app is gone from this repo. The window is `hearth-gpui` in `ns-gpui`. `task app:build`, `task app:test`, and `task app:install` are removed. `hearth update` is unchanged.
