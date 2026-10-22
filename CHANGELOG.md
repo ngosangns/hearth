@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.27.4
+
+- Internal cleanup: shared helpers (context sleep, string deref, JSON array access) are defined once. No behavior change.
+- Docs: README and `docs/shared-services.md` refreshed against the current CLI, with screenshots of the Hearth window.
+
 ## 0.27.3
 
 - Maintenance release: remove no runtime behavior; companion UI cleanup ships in `ns-gpui`.
