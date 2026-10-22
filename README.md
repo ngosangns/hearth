@@ -42,6 +42,16 @@ services:
       - { url: "https://{tailnetHost}:8443", label: admin, requiresRunning: false }
 ```
 
+Other top-level keys: `envFile` (a dotenv file, relative to the project root; `env:` wins on
+conflict), `runtimeDirectory` (default `.hearth/runtime-v1` under the root), and
+`privateFileGuard` (boolean, default on). Unknown keys fail the load, except keys that start
+with `x-`. A service takes `label`, `kind` (`application` | `infrastructure`), `ownership`
+(`daemon` | `external`), `disabled`, `env`, `container`, `cwd` (relative, must stay inside the
+root), `run`, `stop`, `build`, `readiness`, `readinessTimeoutMs`, `preparationCommand`, `ports`,
+`urls`, `artifact`, and `restart`. A command is `{ argv: [...] }` or `{ shell: "...", exec?: bool }`.
+A URL may contain `{tailnetHost}`, which resolves from `$HEARTH_TAILNET_HOST` or
+`tailscale status --json`.
+
 `groups:` members may also name other groups — `all: [infra, app]` expands depth-first in
 declaration order (deduplicated, cycles rejected at load). A member naming both a service and a
 group resolves as the service. Clients group the service list by direct membership and offer
@@ -65,7 +75,7 @@ running.
 ```yaml
 services:
   fe:
-    cwd: viclass
+    cwd: frontend
     run: { argv: [task, fe] }
     readiness: { kind: exit }
 ```
@@ -81,8 +91,15 @@ Readiness is a probe, not a deadline. After the process is up, hearth probes eve
 | `container` | the named container is running | docker compose services. Probed every 1.5s |
 | `process` | the process is alive | no port and no HTTP. No probe after start |
 | `tailnet` | Tailscale serve is up | tailnet tasks. Probed every 1.5s |
+| `log` | the run command's output matches a regex | `{ kind: log, pattern: "listening on" }`. Latches on the first match in the service log; a restart clears it |
 
 `http` and `tcp` with no port use the first `ports:` entry. Omitting both is a load error (`needs a port`). Do not point `http` at `/health` unless that process serves the path.
+
+`restart:` respawns a service that exits unexpectedly: `restart: { on: on-failure, maxRestarts: 5, delayMs: 2s }`.
+`on` is `never`, `on-failure` (the default when `restart:` is present), or `always`. `maxRestarts`
+counts consecutive unexpected exits; the count resets once the service is `ready` and on any manual
+start or restart. A `stop` during the delay wins. `readinessTimeoutMs`, `build.timeoutMs`, and
+`restart.delayMs` take milliseconds or a humantime string (`"30s"`, `"2m"`).
 
 A service may declare a versioned tarball to install before its first start — same download/script
 → sha256 → extract → marker machinery the shared-services catalog uses, scoped to the project's
@@ -164,13 +181,76 @@ re-adopts them from their persisted identities. `hearth manager stop` stops the 
 services: its own processes, `external` services that declare a `stop:` command (a docker compose
 unit), and `shared:` entries, which detach.
 
+## Commands
+
+`hearth [--root <path>] <command>`; `--root` defaults to the current directory and must come first.
+Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root. `--help`,
+`--version`, `shared`, and `update` work without one. A bare `hearth` prints help.
+
+| Command | What it does |
+|---|---|
+| `status [target] [--json]` | state of one service, a group, or all |
+| `start\|stop\|restart <target> [--wait] [--json]` | lifecycle for a service or group (a group start is one bulk operation; stop and restart go member by member). `start` also takes `--kill-unowned` (see AGENTS.md; asks `[y/N]` on a TTY if a port is held) |
+| `logs <service> [--tail N] [--follow] [--json]` | read a service's log (default tail 200) |
+| `urls [target] [--json]` | live URLs |
+| `events --follow --json` | stream daemon changes as newline-delimited JSON |
+| `operation get\|watch <id> [--json]` | inspect one operation |
+| `doctor [--json]` | checks the platform (macOS or Linux) and that `docker`, `tailscale`, `nc`, `ps`, `sh` resolve, then validates the catalog |
+| `cleanup` | remove a stale lock no live daemon owns |
+| `manager ensure\|status\|stop\|restart\|reload [--json]` | daemon lifecycle; `reload` re-reads the catalog |
+| `daemon --root <path>` / `smp` | run the project daemon / the machine-global shared-services daemon in the foreground (clients spawn them) |
+| `shared list\|installed\|status\|ensure` | inspect the shared registry and smp |
+| `shared install\|start\|stop <name@ver>` | manage a shared instance |
+| `shared attach\|probe <name@ver>`, `shared detach <name@ver> [--stop-if-unused]` | what generated `shared:` services run |
+| `shared remove <name@ver> [--force]` | delete an instance; `--force` is required while projects are attached |
+| `update [--check] [--json] [--force]` | install the latest GitHub release |
+| `mcp` | serve the MCP tools over stdio |
+| `mcp install [--name N] [--key K] [--json] <config-file>...` | write this binary's path into an MCP client config (`mcpServers.<name>` unless `--key`) |
+| `skill install --dest <dir>` | write `SKILL.md` and `scripts/*.sh` for coding agents |
+
+Exit codes: 2 usage, 3 daemon unavailable, 4 protocol mismatch, 5 operation failed, 7 unauthorized.
+
+## MCP server
+
+`hearth --root <project> mcp` speaks MCP over stdio. Tool names carry the prefix `local_services_`:
+`status`, `logs`, `trace` (an operation by id), `events` (since a sequence number), `manage`
+(start/stop/restart, optional `killUnowned`), `restart_daemon`, `stop_daemon`, `shared_list`,
+`shared_status`, `shared_connection`. `manage`, `restart_daemon`, and `stop_daemon` require
+`confirm: true`. The `status`, `logs`, and `manage` schemas enumerate the catalog's service ids.
+`hearth skill install` ships script equivalents of the same tools, which is what coding agents are
+pointed at instead of registering this server.
+
+## Window
+
+The workspace window is `hearth-gpui` in the sibling `ns-gpui` repo; this repo has no UI.
+It is an HTTP+SSE client of the same daemon: a folder list (Workspaces), the shared-services view
+(Shared), services grouped by `groups:`, per-service and per-group start, stop and restart, and a
+log pane with a pinned `daemon log` row. Stop, restart, forget, and kill-and-start ask for
+confirmation. `task dev:install` builds the Dev app from `../ns-gpui` into
+`~/Applications/Hearth Dev.app`; `task dev:install:all` installs the CLI first.
+
+## Screenshots
+
+![Service list and log pane for a demo project](docs/screenshots/hearth-1440.png)
+
+The window on a 1440x900 display (sidebar cropped out), showing a demo project with three services started and the `api` log open.
+
+![Log view at 390 px wide](docs/screenshots/hearth-390-log.png)
+
+The same demo project at 390 px: the log pane takes the full width.
+
 ## Build and test
 
 ```bash
 cd go
 go test ./...
 go vet ./...
+gofmt -l .    # must print nothing
 ```
+
+`task test`, `task clippy` (vet + gofmt), and `task ci` do the same from the repo root.
+`task go:build` leaves a plain `go/hearth`. Shared-service tarballs: `task catalog:package`,
+`task catalog:write`, `task catalog:smoke`.
 
 The suite needs a running `docker` daemon, `tailscale`, plus `nc`, `ps`, and `sh`.
 

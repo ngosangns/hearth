@@ -34,16 +34,16 @@ share one instance, different versions run side by side.
 └── runtime-v1/                   # manager.lock/, token, state.json, logs — same layout as projects
 ```
 
-`smp` is the same `hearth` binary: `hearth smp` runs `run_daemon` with
-`root = ~/.hearth/shared` and a **synthesized** `ServiceCatalog` (built from `registry.json`, not a
-yaml file — `HearthManagerOptions.catalog` is already consumer-authored). `catalog.runtime_directory
-= "runtime-v1"` so lock/token/state land in `~/.hearth/shared/runtime-v1` and the existing
-`discover()`/`ensure()` machinery works unchanged against `root = ~/.hearth/shared`.
+`smp` is the same `hearth` binary: `hearth smp` runs the daemon with root `~/.hearth/shared` and a
+**synthesized** catalog (`shared.SynthesizeCatalog`, built from `registry.json`, not a yaml file).
+The runtime directory is `runtime-v1` directly under that root, so lock/token/state land in
+`~/.hearth/shared/runtime-v1` and the usual `discover`/`ensure` machinery works unchanged against
+`root = ~/.hearth/shared`.
 
 Each registry instance becomes one `ServiceDefinition`:
 `id = "postgres@16.4"`, `ownership: daemon`, run/stop/readiness rendered from the recipe snapshot
 (template vars `{installDir}`, `{dataDir}`, `{port}`). New registrations enter the running daemon
-through `reload_catalog` — the old-catalog-stop rule applies unchanged.
+through a catalog reload (`ReloadCatalog`) — the old-catalog-stop rule applies unchanged.
 
 ## `catalog.json` (remote registry)
 
@@ -54,10 +54,12 @@ outside a login shell does not inherit `HEARTH_SHARED_CATALOG_URL` — write a `
 `script` artifacts (`HEARTH_CATALOG_ORIGIN` then resolves to that catalog's own directory).
 
 Tarball `sha256` lives in this file, so the file itself is trusted on TLS alone — fetching anywhere
-else is not supported. The same file is also baked into the binary (`include_str!` in `remote.rs`)
-as the last-resort fallback after the disk cache — this matters because the pinned
-`raw.githubusercontent.com` URL answers 404 for a private repo, which is otherwise an unfetchable
-catalog on a fresh machine.
+else is not supported. The same file is also baked into the binary (`//go:embed` in
+`internal/shared/remote.go`; the copy is `go/internal/shared/catalog.json`, and
+`scripts/catalog/write-catalog.py` writes both) as the last-resort fallback after the disk cache.
+This matters because the pinned `raw.githubusercontent.com` URL answers 404 for a private repo,
+which is otherwise an unfetchable catalog on a fresh machine. A stale disk cache is topped up with
+any recipe the embedded catalog has and the cache lacks.
 
 ```json
 {
@@ -136,9 +138,9 @@ Optional recipe fields beyond the example above:
   one for the console (`{port2}`); Kafka uses one for the KRaft controller.
 - `ports` — explicitly pinned ports (`ports[0]` is `{port}`, the rest `{port2}`…). Skips hash
   allocation entirely; registration only checks the set is bindable. For recipes whose port IS
-  the feature — the shared nginx pins `[80, 443]` so dev URLs need no port suffix. Mutually
-  exclusive with `additionalPorts`. macOS keeps <1024 privileged for everyone — the shared
-  nginx's public :80/:443 come from a pf rdr anchor onto its loopback pins 18080/18443.
+  the feature — the shared nginx pins `[18080, 18443]`. Mutually exclusive with `additionalPorts`.
+  macOS keeps ports below 1024 privileged for everyone, so the shared nginx's public :80/:443
+  come from a pf rdr anchor onto those loopback pins (see the README).
 - `extraPortLabels` — display labels for those ports, in order.
 
 `deprovision` runs best-effort on detach — nginx uses it to remove the project's published confs.
@@ -214,12 +216,12 @@ services: { … }
 here: the instance's ports live in the smp registry, not in this file. For the shared nginx the
 ports are pinned anyway, so project confs can hardcode 80/443.
 
-`config_file` generates, per entry, a normal `ServiceDefinition` (id = the map key):
+`internal/configfile` generates, per entry, a normal `ServiceDefinition` (id = the map key):
 
 - `kind: infrastructure`, `ownership: external`, `label: "postgres@16.4 (shared)"`
 - `run`: `argv [hearth, "shared", "attach", "postgres@16.4"]` — a **one-shot task**: ensure smp,
   install, start, attach, provision, print conninfo to stdout (→ `hearth logs postgres`).
-  `hearth` resolves to the daemon's own `current_exe` — never PATH.
+  `hearth` resolves to the daemon's own `os.Executable()` — never PATH.
 - `readiness`: `{ kind: command, command: { argv: [hearth, "shared", "probe", "postgres@16.4"] } }` —
   exit 0 iff the instance is ready **and this project is attached** (projectId = sha256 of the
   canonical project root, derived from the probe's cwd). This makes detach→release work through
@@ -232,17 +234,18 @@ ports are pinned anyway, so project confs can hardcode 80/443.
 - Joins group `all` when it exists. A `shared` key colliding with a `services` id is a validation
   error via the existing duplicate-service check.
 
-Engine change: `is_task_command` extends to `ownership: external` + `command` readiness — the run
+Engine rule: `isExternalTask` extends to `ownership: external` + `command` readiness — the run
 command is a trigger, not the process. Daemon-owned `command`-readiness services are unchanged.
 
-## `smp` HTTP surface (additive; `PROTOCOL_VERSION` unchanged)
+## `smp` HTTP surface (additive to the project daemon's routes)
 
-Mounted only when `HearthManagerOptions.shared` is set:
+Mounted only when the manager has a `SharedContext` (i.e. `hearth smp`). Every route needs the
+bearer token. `GET /healthz` and the other project routes are unchanged.
 
 - `GET  /v1/shared` — instances, ports, install state, attachments (with rendered `connection`)
 - `GET  /v1/shared/catalog` — the cached/fetched remote registry
-- `POST /v1/shared/attach` `{requestId, service, projectRoot?}` — resolve recipe → register →
-  install (state `installing` in `registry.json`) → ensure in catalog (`reload_catalog`) →
+- `POST /v1/shared/attach` `{service, projectRoot?, args?}` — resolve recipe → register →
+  install (state `installing` in `registry.json`) → ensure in catalog (catalog reload) →
   `supervisor.start` → wait ready → provision → return rendered `connection`. Serialized per
   instance, idempotent per `(service, projectId)`.
 - `POST /v1/shared/detach` `{service, projectRoot, stopIfUnused?}` — drop attachment (+
@@ -250,24 +253,34 @@ Mounted only when `HearthManagerOptions.shared` is set:
   instance is stopped when no attachment is left (checked under the instance lock, so a
   concurrent attach for another project is never cut off). The reply carries `stopped`.
 - `POST /v1/shared/install` `{service}` — install without attaching (pre-warm).
-- `POST /v1/shared/remove` `{service}` — stop, remove dirs and registry entry (manual GC).
+- `POST /v1/shared/remove` `{service, force?}` — stop, remove dirs and registry entry (manual GC).
+  Answers 409 `shared_service_attached` while projects are attached, unless `force: true`.
 
 `attach`/`probe`/`detach` on the CLI derive `projectRoot` from `--root` or cwd — no project
-catalog needed.
+catalog needed. Arguments after the instance id of `attach` are forwarded verbatim to the
+recipe's `provision` argv.
 
 ## CLI — `hearth shared …` (no project catalog required)
 
-`detach <name@ver> --stop-if-unused` also stops the instance when this was its last attachment.
-`ensure --json` (the `manager ensure --json` contract for smp — prints the `ManagerConnection`
-for `~/.hearth/shared`) · `list [--json]` (remote registry, no daemon
-needed) · `installed` · `status [--json]` · `start|stop <name@ver>` · `attach|detach|probe
-<name@ver>` · `install <name@ver>` · `remove <name@ver>`.
+- `ensure [--json]` — the `manager ensure --json` contract for smp: starts it if needed and prints
+  the connection for `~/.hearth/shared`.
+- `list [--json]` — the remote registry (no daemon needed). `installed` — installed instances.
+  `status [--json]` — instances, ports, install state, attachments.
+- `install <name@ver>` — install without attaching. `start|stop <name@ver>` — drive the instance.
+- `attach|probe <name@ver>` — what the generated `shared:` service runs. `probe` exits 0 iff the
+  instance is ready and this project is attached.
+- `detach <name@ver> [--stop-if-unused]` — `--stop-if-unused` also stops the instance when this
+  was its last attachment.
+- `remove <name@ver> [--force]` — delete the instance and its data. Without `--force` it refuses
+  an instance that still has attachments.
 
 ## MCP + skill
 
-Skill scripts / CLI cover `shared list`, `shared status`, and `scripts/shared-connection.sh` (MCP tools of the same names remain in-binary but are retired for agents) (queried against smp
-directly via its lock-dir token). The skill doc (`hearth skill install`) documents the flow:
-read `shared:` in `hearth.yaml` → attach happens on `start` → query connection info via MCP.
+`hearth mcp` still serves `local_services_shared_list`, `local_services_shared_status`, and
+`local_services_shared_connection`, but coding agents are steered to the skill scripts
+(`hearth skill install --dest <dir>` writes `SKILL.md` and `scripts/shared-list.sh`,
+`shared-status.sh`, `shared-connection.sh`) or the CLI. Flow: read `shared:` in `hearth.yaml` →
+attach happens on `start` → read connection info for the service.
 
 ## Edge cases
 
@@ -279,10 +292,11 @@ read `shared:` in `hearth.yaml` → attach happens on `start` → query connecti
 - Project moved/renamed → new `projectId` → old logical resource orphaned inside the shared
   instance; `shared remove` or manual cleanup.
 - smp dies → project service loses probe → released to `stopped`; restart via next `start`.
-- Fire-and-forget work in smp routes through `record_background_error`.
+- Fire-and-forget work in smp routes through `RecordBackgroundError`.
 
 ## Non-goals (v1)
 
-- No env injection into project services; no refcount stop; no auto-GC; no `darwin-x86_64`;
-  no per-registration config overrides beyond what the recipe templates; no signing of
-  `catalog.json` beyond HTTPS.
+- No env injection into project services; no auto-GC; no `darwin-x86_64`; no per-registration
+  config overrides beyond what the recipe templates; no signing of `catalog.json` beyond HTTPS.
+  An instance is stopped without `remove` only by `hearth shared stop`, or by
+  `--stop-if-unused` (which `hearth manager stop` passes) when the last project detaches.
