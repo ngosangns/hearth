@@ -228,7 +228,8 @@ ports are pinned anyway, so project confs can hardcode 80/443.
   plain `syncExternalServices`.
 - `stop`: `argv [hearth, "shared", "detach", "postgres@16.4"]` — releases the attachment; the
   instance keeps running. `hearth manager stop` (a `stop-services` shutdown) runs it with
-  `--stop-if-unused` appended, so smp also stops the instance once no project is attached to it.
+  `--stop-if-unused --yes` appended, so smp also stops the instance once no project is attached
+  to it. The spawned detach is not a TTY, and that flag pair requires `--yes`.
   `hearth stop`, `manager restart`, and SIGTERM never stop the instance.
 - `readinessTimeoutMs`: 49 min default. The project-side probe has to out-wait a script artifact pack (45 min) plus extract and the instance readiness budget. The instance server itself stays at 2 min.
 - Joins group `all` when it exists. A `shared` key colliding with a `services` id is a validation
@@ -264,23 +265,32 @@ recipe's `provision` argv.
 
 - `ensure [--json]` — the `manager ensure --json` contract for smp: starts it if needed and prints
   the connection for `~/.hearth/shared`.
-- `list [--json]` — the remote registry (no daemon needed). `installed` — installed instances.
-  `status [--json]` — instances, ports, install state, attachments.
+- `list [--json]` — the remote registry (no daemon needed). `installed [--json] [--mask] [--reveal]` —
+  installed instances. `status [--json] [--mask] [--reveal]` — instances, ports, install state, attachments.
+  Both lists are sorted by name, then version. Values are masked unless `--reveal` (the Hearth
+  window passes `--reveal` when a Copy button needs the real string). `--mask` is accepted and
+  changes nothing; the same redact rules still cover `recipe.env`, connection blocks, provision
+  args, `KEY=value` argv, and URL userinfo passwords. `--mask` together with `--reveal` is a usage
+  error (exit 2).
+- `connection <service|name@version> [--json] [--reveal]` — this project's provisioned connection.
+  Secrets are masked unless `--reveal`. Exit 3 when smp is down, or this project is not attached.
 - `install <name@ver>` — install without attaching. `start|stop <name@ver>` — drive the instance.
 - `attach|probe <name@ver>` — what the generated `shared:` service runs. `probe` exits 0 iff the
   instance is ready and this project is attached.
-- `detach <name@ver> [--stop-if-unused]` — `--stop-if-unused` also stops the instance when this
-  was its last attachment.
-- `remove <name@ver> [--force]` — delete the instance and its data. Without `--force` it refuses
-  an instance that still has attachments.
+- `detach <name@ver> [--stop-if-unused] [--yes]` — `--stop-if-unused` also stops the instance when this
+  was its last attachment. Off a TTY that flag requires `--yes` (exit 6).
+- `remove <name@ver> [--force] [--yes]` — delete the instance and its data. Without `--force` it refuses
+  an instance that still has attachments. Off a TTY, `--yes` is required (exit 6).
 
 ## MCP + skill
 
 `hearth mcp` still serves `local_services_shared_list`, `local_services_shared_status`, and
-`local_services_shared_connection`, but coding agents are steered to the skill scripts
-(`hearth skill install --dest <dir>` writes `SKILL.md` and `scripts/shared-list.sh`,
-`shared-status.sh`, `shared-connection.sh`) or the CLI. Flow: read `shared:` in `hearth.yaml` →
-attach happens on `start` → read connection info for the service.
+`local_services_shared_connection`. MCP `shared_status` and `shared_connection` always mask
+secret-shaped strings, including `recipe.env`. Coding agents are steered to the skill scripts
+(`hearth skill install` writes `SKILL.md` and `scripts/shared-list.sh`,
+`shared-status.sh`, `shared-connection.sh`) or the CLI. `shared-status.sh` stays masked and
+forwards `--reveal` only when the caller passed it.
+Flow: read `shared:` in `hearth.yaml` → attach happens on `start` → read connection info for the service.
 
 ## Edge cases
 

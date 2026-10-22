@@ -39,7 +39,7 @@ func TestStopServicesShutdownStopsExternalServicesWithAStopCommand(t *testing.T)
 }
 
 // A `shared:` entry's stop is `hearth shared detach <id>`; `manager stop` adds
-// `--stop-if-unused`. A plain `hearth stop` of the same service only detaches.
+// `--stop-if-unused --yes`. A plain `hearth stop` of the same service only detaches.
 func TestStopServicesShutdownDetachesSharedEntriesWithStopIfUnused(t *testing.T) {
 	service := shared.ProjectServiceEntry("postgres", "postgres@16.4", "/opt/hearth", nil, nil, nil)
 	h := buildHarness(oneServiceCatalog(service))
@@ -52,7 +52,7 @@ func TestStopServicesShutdownDetachesSharedEntriesWithStopIfUnused(t *testing.T)
 	cmds := h.process.stopCommands()
 	want := []string{
 		"/opt/hearth shared detach postgres@16.4",
-		"/opt/hearth shared detach postgres@16.4 --stop-if-unused",
+		"/opt/hearth shared detach postgres@16.4 --stop-if-unused --yes",
 	}
 	if len(cmds) != len(want) || cmds[0] != want[0] || cmds[1] != want[1] {
 		t.Fatalf("stop commands %v", cmds)

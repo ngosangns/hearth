@@ -24,6 +24,10 @@ const SharedReadinessTimeoutMs uint64 = 45*60*1000 + 120_000 + SharedInstanceRea
 // stopped too once no project is attached to it.
 const DetachStopIfUnusedFlag = "--stop-if-unused"
 
+// ConfirmYesFlag is appended with DetachStopIfUnusedFlag. The spawned detach
+// is not a TTY, and `shared detach --stop-if-unused` requires --yes off a TTY.
+const ConfirmYesFlag = "--yes"
+
 // InstanceVars — available to every field of a recipe. Extra listeners are
 // `{port2}`, `{port3}`, … in allocation order.
 func InstanceVars(instance *SharedInstance, root string) map[string]string {
@@ -154,8 +158,8 @@ func SynthesizeService(root string, instance *SharedInstance) (*catalog.ServiceD
 
 // ShutdownStopCommand is the stop command a `stop-services` shutdown
 // (`hearth manager stop`) runs for an external service: the catalog's own,
-// plus DetachStopIfUnusedFlag when it is the `hearth shared detach <id>` of a
-// `shared:` entry.
+// plus DetachStopIfUnusedFlag and ConfirmYesFlag when it is the
+// `hearth shared detach <id>` of a `shared:` entry.
 func ShutdownStopCommand(command *catalog.CommandSpec) catalog.CommandSpec {
 	if command.IsArgv() {
 		hasDetach := false
@@ -165,19 +169,27 @@ func ShutdownStopCommand(command *catalog.CommandSpec) catalog.CommandSpec {
 				break
 			}
 		}
-		hasFlag := false
-		for _, a := range command.Argv {
-			if a == DetachStopIfUnusedFlag {
-				hasFlag = true
-				break
+		if hasDetach {
+			argv := append([]string{}, command.Argv...)
+			if !containsArg(argv, DetachStopIfUnusedFlag) {
+				argv = append(argv, DetachStopIfUnusedFlag)
 			}
-		}
-		if hasDetach && !hasFlag {
-			argv := append(append([]string{}, command.Argv...), DetachStopIfUnusedFlag)
+			if !containsArg(argv, ConfirmYesFlag) {
+				argv = append(argv, ConfirmYesFlag)
+			}
 			return catalog.CommandSpec{Argv: argv}
 		}
 	}
 	return *command
+}
+
+func containsArg(argv []string, flag string) bool {
+	for _, arg := range argv {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // ProjectServiceEntry is the project-side service a `shared:` yaml entry

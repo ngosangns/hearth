@@ -1,0 +1,1 @@
+{"service":"postgres@16.4","projectId":"p1","connection":{"url":"postgres://app:••••••@127.0.0.1:5432/db","env":{"S3_BUCKET":"bucket"}}}

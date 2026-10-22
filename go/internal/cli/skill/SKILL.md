@@ -6,61 +6,80 @@ description: Operate this project's local dev services (start/stop/status/logs) 
 
 # Hearth
 
-This project's local dev services (per-container infra, docker/tailnet-adopted units, and host
-processes it runs directly) are managed by a single background daemon — the Hearth daemon, the
-`hearth` binary (0.18+; older binary name retired). Do not `kill`/`pkill`/`docker restart`/run a
-dev task raw for a unit this daemon tracks.
+This project's local dev services are managed by one background daemon, the `hearth` binary.
+Do not `kill`, `pkill`, `docker restart`, or run a dev task raw for a unit this daemon tracks.
 
-**MCP is retired for coding agents.** Do not run `hearth mcp install`, and do not register a
-Hearth MCP server in mcp.json. Canonical path = skill scripts below (or `hearth` CLI).
+**MCP is retired for coding agents.** Do not run `hearth mcp install`. Use the scripts below, or `hearth` directly.
 
-## Skill scripts
+Refresh this skill with `hearth skill install` (default `~/.agents/skills/hearth`) and confirm with `hearth skill check`. Do not hand-edit the installed copy.
 
-Installed under this skill's `scripts/` (or call `hearth` with `--root <project>`). Root resolution
-for scripts: `$HEARTH_ROOT`, else walk up from cwd for `hearth.yaml` / `.yml` / `.json`. Binary:
-`$HEARTH_BIN` or `~/.local/bin/hearth`.
+## Scripts
 
-| Former MCP tool | Script | Mutate gate |
+Root: `$HEARTH_ROOT`, else walk up from cwd for `hearth.yaml` / `.yml` / `.json`.
+Binary: `$HEARTH_BIN` or `~/.local/bin/hearth`.
+
+| Script | Mutate gate |
+| --- | --- |
+| `scripts/status.sh [service]` | free |
+| `scripts/logs.sh <service> [--tail N] [--follow]` | free |
+| `scripts/trace.sh <operationId>` | free |
+| `scripts/events.sh [--after N] [--epoch E]` | free |
+| `scripts/urls.sh [target]` | free |
+| `scripts/doctor.sh` | free |
+| `scripts/manage.sh start\|stop\|restart <target> [--wait] [--dry-run] [--kill-unowned] [--yes]` | user asked |
+| `scripts/restart-daemon.sh` | user asked |
+| `scripts/stop-daemon.sh` | user asked |
+| `scripts/shared-list.sh` | free |
+| `scripts/shared-status.sh [--json] [--reveal]` | free |
+| `scripts/shared-connection.sh <service> [--json] [--reveal]` | free |
+| `scripts/hearth.sh <any hearth subcommand>` | see below |
+
+### Mutate rule
+
+Run a command that changes a process or a file only when the user asked for that action in the current task. That includes `start`, `stop`, `restart`, `manager ensure|stop|restart|reload`, `shared ensure|attach|detach|install|start|stop|remove`, `cleanup`, `update` without `--check`, `mcp install`, and `skill install`. Never start something to see if it works.
+
+`manager ensure` and `shared ensure` can start a daemon. Prefer `manager status` and `shared status` to look.
+
+`--dry-run` on `start|stop|restart` prints the services that would change and does not contact the daemon. `manage.sh` does not add `--yes`. Pass `--yes` only after the user confirmed. `--kill-unowned` only when the user asked to kill the process holding the port; off a TTY it also needs `--yes`.
+
+`manager stop`, `shared remove`, and `shared detach --stop-if-unused` need `--yes` off a TTY. `stop-daemon.sh` passes `--yes` because running that script is the confirmation. Ordinary service stop does not need `--yes`.
+
+### `--reveal`
+
+`shared status`, `shared installed`, and `shared connection` mask secrets unless `--reveal`. `--mask` changes nothing. `--mask` with `--reveal` exits 2.
+
+`scripts/shared-status.sh` is masked by default and forwards `--reveal` only when the caller passed it. `scripts/shared-connection.sh` stays masked the same way. Never pass `--reveal`, including through `hearth.sh`, unless the user asked for the real value.
+
+## Recipes
+
+**Why is service X down?** `scripts/status.sh X`, then `scripts/logs.sh X --tail 80`. If the row is `externally-owned`, another process holds the port. Do not kill it unless the user asked (`manage.sh start X --kill-unowned --yes`).
+
+**Restart a group and wait.** `scripts/manage.sh restart <group> --wait`. Then `scripts/status.sh <group>`. Use `--dry-run` first when membership is unclear.
+
+**Find URLs.** `scripts/urls.sh` or `scripts/urls.sh <service>`. A finished one-shot can still have a URL.
+
+**Shared connection, masked.** `scripts/shared-connection.sh <service>`. Add `--reveal` only when the user asked for the password or URL. `scripts/shared-status.sh` is the instance list, also masked.
+
+**List workspaces.** `hearth workspaces list --json`. Read-only. A missing file is an empty list.
+
+## Failures
+
+With `--json`, a failure prints `{"error":{code,exit,message,hint?}}` on stdout. These stay their own document: `update --json` (its report), `skill check` drift (exit 8), `doctor --json` when checks fail (exit 5), and silent `shared probe` (exit 0 or 1).
+
+| Exit | Code | Action |
 | --- | --- | --- |
-| `local_services_status` | `scripts/status.sh [service]` | free |
-| `local_services_logs` | `scripts/logs.sh <service> [--tail N] [--follow]` | free |
-| `local_services_trace` | `scripts/trace.sh <operationId>` | free |
-| `local_services_events` | `scripts/events.sh [--after N] [--epoch E]` | free |
-| `local_services_manage` | `scripts/manage.sh start\|stop\|restart <target> [--wait] [--kill-unowned]` | user asked |
-| `local_services_restart_daemon` | `scripts/restart-daemon.sh` | user asked |
-| `local_services_stop_daemon` | `scripts/stop-daemon.sh` | user asked |
-| `local_services_shared_list` | `scripts/shared-list.sh` | free |
-| `local_services_shared_status` | `scripts/shared-status.sh` | free |
-| `local_services_shared_connection` | `scripts/shared-connection.sh <service>` | free |
+| 2 | usage | Fix the arguments. Read `hearth <command> --help`. |
+| 3 | unavailable | Daemon or smp is down. Start one only if the user asked. |
+| 4 | protocol | Binary and daemon disagree. Tell the user. Do not restart unless they asked. |
+| 5 | failed | Read logs or `hearth operation get <id>`. |
+| 6 | needs-confirm | Re-run with `--yes` only after the user confirmed. |
+| 7 | unauthorized | The token does not match. Do not delete state. Tell the user. |
+| 8 | conflict | `skill check` found drift. Reinstall only if the user asked. |
 
-Also free: `scripts/urls.sh [target]`, `scripts/doctor.sh`, `scripts/hearth.sh <any hearth subcommand>`.
+## Verify
 
-### Mutate gate
-
-Only call manage / restart-daemon / stop-daemon (or `hearth start|stop|restart|manager stop|manager restart`) when the user explicitly asked. Never speculate ("let me just start it to see"). `--kill-unowned` only when the user asked to kill the port holder.
-
-### Diagnosis (always safe)
-
-`status`, `logs`, `urls`, `doctor`, `trace`, `events`, `shared-list`, `shared-status`, `shared-connection`, `manager ensure --json`, `manager status`.
-
-## Equivalent CLI
-
-- `hearth status [service]` / `hearth logs <service> [--tail N] [--follow]`
-- `hearth urls [service]` — live URLs (prefer these over guessing ports)
-- `hearth start|stop|restart <service|group> [--wait]` — `start` also takes `--kill-unowned`
-- `hearth operation get|watch <id>`
-- `hearth doctor` / `hearth manager ensure|status|stop|restart|reload`
-- `hearth shared list|status|…`
-
-## Shared services (`shared:` in hearth.yaml)
-
-Machine-global singletons via `smp`. After a shared service is `ready`, use
-`scripts/shared-connection.sh <id>` for `url`/`env` and wire them into the app config (not injected
-into env). Detach does not delete per-project data.
-
-## Architecture
-
-One daemon per project root (HMAC lock under `.hearth/runtime/`). `hearth manager ensure --json`
-prints token/port/runtime directory. Services are daemon-owned or externally-owned per catalog.
-
-This doc is generic; see the project's own docs for its service list and ports.
+1. `scripts/status.sh` shows the service you changed.
+2. After a start or restart, the row is `ready`, `running`, or `succeeded`, or the logs say why not.
+3. `scripts/urls.sh` matches what you told the user.
+4. Shared values in the reply are masked unless the user asked to see them.
+5. After a skill install, `hearth skill check` is in sync.

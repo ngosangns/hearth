@@ -11,6 +11,7 @@ package updater
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -150,14 +151,18 @@ func runWith(
 	out, errOut io.Writer,
 	force bool,
 ) int {
-	if len(env.args) == 1 && (env.args[0] == "--help" || env.args[0] == "-h") {
-		fmt.Fprintln(out, usage)
-		return 0
+	for _, arg := range env.args {
+		if arg == "--" {
+			break
+		}
+		if arg == "--help" || arg == "-h" {
+			fmt.Fprintln(out, usage)
+			return 0
+		}
 	}
 	flags, err := parseUpdateArgs(env.args)
 	if err != nil {
-		fmt.Fprintln(errOut, err.Error())
-		return 2
+		return usageFailure(out, errOut, env.args, err)
 	}
 	if force {
 		flags.force = true
@@ -283,6 +288,32 @@ func runWith(
 		human = fmt.Sprintf("reinstalled hearth %s\n%s", latest, restartNote)
 	}
 	return succeed(out, errOut, flags.json, report, human)
+}
+
+func usageFailure(out, errOut io.Writer, args []string, err error) int {
+	for _, arg := range args {
+		if arg != "--json" {
+			continue
+		}
+		body, marshalErr := json.Marshal(struct {
+			Error struct {
+				Code    string `json:"code"`
+				Exit    int    `json:"exit"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}{Error: struct {
+			Code    string `json:"code"`
+			Exit    int    `json:"exit"`
+			Message string `json:"message"`
+		}{Code: "usage", Exit: 2, Message: err.Error()}})
+		if marshalErr != nil {
+			break
+		}
+		fmt.Fprintln(out, string(body))
+		return 2
+	}
+	fmt.Fprintln(errOut, err.Error())
+	return 2
 }
 
 func parseUpdateArgs(args []string) (updateFlags, error) {

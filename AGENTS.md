@@ -167,7 +167,7 @@ from any dev box here, with the same username.
 - `ProcessSupervisor.Shutdown` (only `stop-services`, i.e. `hearth manager stop`) does three
   passes: an "active state" stop pass for daemon-owned services, then the project's
   `ownership: external` services that are up and declare a `stop:` command (a `shared:` entry's
-  `hearth shared detach` gets `--stop-if-unused`, so smp stops the instance only when no other
+  `hearth shared detach` gets `--stop-if-unused --yes`, so smp stops the instance only when no other
   project is attached — `shared.ShutdownStopCommand`), then a reap pass for daemon-owned services
   holding a stale POSIX identity in a non-active state (e.g. `externally-owned` after a port
   conflict). Don't collapse these into one, and keep the external pass after the first so apps
@@ -203,8 +203,9 @@ from any dev box here, with the same username.
 - **`killUnowned` is the only path that signals an arbitrary process holding a service port.** It is a
   client-supplied flag on `POST /v1/operations` (`action: start` only — every surface rejects it
   otherwise) that must only ever be set after an explicit user confirmation: CLI `--kill-unowned`
-  or its TTY `[y/N]` prompt (non-TTY always answers no), the window's "Kill and Start"
-  confirmation, and
+  (on a TTY the flag is the confirmation; off a TTY it also requires `--yes`, exit 6) or its TTY
+  `[y/N]` prompt when the flag is absent and the row is externally owned (non-TTY always answers
+  no), the window's "Kill and Start" confirmation, and
   MCP's `killUnowned` argument. `ProcessSupervisor.reclaimPort`
   resolves listeners via `ProbeAdapter.PortHolders` (lsof) and signals **individual pids** via
   `ProcessAdapter.SignalPID` — SIGTERM, poll, then a re-resolved SIGKILL pass. Never `killpg` an
@@ -359,6 +360,17 @@ from any dev box here, with the same username.
 - **`smp` = `hearth smp`** — the same binary, rooted at `~/.hearth/shared`, catalog *synthesized*
   from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
+- CLI `shared status` and `shared installed` mask the whole payload unless `--reveal`.
+  hearth-gpui Copy buttons must pass `--reveal`. `--mask` is accepted and changes nothing.
+  `--mask` with `--reveal` is a usage error (exit 2). Masking is `internal/redact.Values`: a
+  string whose upper-case key contains SECRET, PASSWORD, PASSWD, TOKEN, API_KEY, ACCESS_KEY, or
+  PRIVATE_KEY (`-` counts as `_`), a URL userinfo password, and `KEY=value` / `--password` argv
+  elements. That includes `recipe.env`, attachment maps, and provision args. Instances print in
+  name-then-version order. `shared connection` stays masked unless `--reveal`. MCP
+  `shared_status` and `shared_connection` always mask the same way and have no reveal option;
+  credential keys outside that rule (`authorization`, ownership proof, `apiKey`) are still
+  dropped. `shared attach` JSON is not masked (`scripts/catalog/smoke.sh` reads it). The skill's
+  `shared-status.sh` stays masked and forwards `--reveal` only when the caller passed it.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
   `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance — the one
   sanctioned exception is a recipe's `ports: […]` **pinned** field (the shared nginx's `[18080, 18443]`),
@@ -403,7 +415,8 @@ from any dev box here, with the same username.
 - `POST /v1/shared/remove` refuses (409) an instance that still has project attachments unless
   `force: true` — it deletes every attached project's data. `hearth shared remove --force` and the
   app's confirmation dialog (when attachments > 0) are the sanctioned confirmations, same contract as
-  `killUnowned`. `POST /v1/manager/reload` likewise fails with 409 `stop_failed` and keeps the old
+  `killUnowned`. Off a TTY, `shared remove` and `shared detach --stop-if-unused` also require
+  `--yes` (exit 6); the daemon's shutdown detach appends `--yes` itself. `POST /v1/manager/reload` likewise fails with 409 `stop_failed` and keeps the old
   catalog when a removed-but-active service can't be stopped. `hearth shared stop`/`start` exit
   non-zero when the operation fails. `hearth doctor` checks the suite's host tools (docker,
   tailscale, nc, ps, sh) on top of platform + catalog validation.
@@ -431,7 +444,7 @@ from any dev box here, with the same username.
   `discover`s; opening a trusted workspace with no live daemon `ensure`s; an untrusted folder needs
   a second confirmation before anything is spawned. A daemon the user stopped stays stopped until
   the workspace is opened again; refresh never `ensure`s.
-- The folder list is `~/Library/Application Support/HearthApp/workspaces.json` (`{ id, path, trusted, addedAt }`). `HEARTH_WORKSPACE_FILE` overrides it.
+- The folder list is `~/Library/Application Support/HearthApp/workspaces.json` (`{ id, path, trusted, addedAt }`). `HEARTH_WORKSPACE_FILE` overrides it. `hearth workspaces list` reads that file and does not create it; a missing file is an empty list.
 - Destructive actions take an explicit confirmation: trust, forget
   (services keep running), stop daemon, restart daemon (services stay up), kill-unowned reclaim,
   and shared remove (`force` when attachments > 0). Stop/restart/remove of a shared instance, and
@@ -481,9 +494,11 @@ from any dev box here, with the same username.
 - **`internal/mcpserver` hand-implements the JSON-RPC tool surface**: tool names carry a
   runtime-configurable prefix and schemas embed the caller's `knownServiceIds`.
 - **`hearth mcp`, `hearth daemon`, and `hearth smp` are intercepted in `cmd/hearth/main.go`**, not
-  in `internal/cli` — cli cannot import mcpserver without a cycle. `hearth shared` and
-  `hearth update` are dispatched before catalog load too (update lives in `internal/updater`).
-  `hearth mcp install` / `hearth skill install` live in `internal/cli`.
+  in `internal/cli` — cli cannot import mcpserver without a cycle. `hearth shared`, `hearth update`,
+  `hearth version`, `hearth schema`, `hearth skill`, and `hearth workspaces` are dispatched before catalog load
+  (update lives in `internal/updater`). `hearth mcp install` / `hearth skill install` live in `internal/cli`.
+- **With `--json`, a command failure prints `{"error":{code,exit,message,hint?}}` on stdout.** Exit 6 is needs-confirm. `update --json` keeps its report, `skill check` drift keeps the check document (exit 8), `doctor --json` keeps the report when checks fail (exit 5), and `shared probe` stays silent.
+- **Stdin is a terminal only when ioctl succeeds** (`go/cmd/hearth/terminal_darwin.go` `TIOCGETA`, `terminal_linux.go` `TCGETS`, `syscall.Termios` out param; other platforms false). `ModeCharDevice` is true for `/dev/null`. That check wires `Io.Confirm` and the exit-6 `--yes` gates together; a GUI or `</dev/null` must leave Confirm nil.
 - **The remote shared catalog is embedded** as `internal/shared/catalog.json` (`//go:embed`);
   `scripts/catalog/write-catalog.py` regenerates it together with the repo-root `catalog.json`.
 - **`state.json` timestamp validation is a non-empty-string check.**

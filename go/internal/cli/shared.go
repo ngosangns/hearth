@@ -29,10 +29,72 @@ import (
 func RunShared(ctx context.Context, root string, argv []string, io *Io, spawnSMP func(root string)) int {
 	code, err := runSharedInner(ctx, root, argv, io, spawnSMP)
 	if err != nil {
-		errOut(io, err.Error())
-		return exitCodeOf(err)
+		if !hasFlag(argv, "--json") && isSharedConnection(argv) {
+			code, _ = finishNew(io, false, err)
+			return code
+		}
+		return emitFailure(io, hasFlag(argv, "--json"), err)
 	}
 	return code
+}
+
+// loadSharedInstances is GET /v1/shared. Tests replace it so a read-only
+// command never discovers a real smp.
+var loadSharedInstances = defaultLoadSharedInstances
+
+// SetSharedInstanceLoader replaces the smp status loader used by
+// `shared status` and `shared connection`. The returned function restores it.
+func SetSharedInstanceLoader(fn func(context.Context) (map[string]any, error)) func() {
+	prev := loadSharedInstances
+	if fn == nil {
+		loadSharedInstances = defaultLoadSharedInstances
+	} else {
+		loadSharedInstances = fn
+	}
+	return func() { loadSharedInstances = prev }
+}
+
+func defaultLoadSharedInstances(ctx context.Context) (map[string]any, error) {
+	c := liveSMPClient(client.DiscoverSMP(ctx))
+	if c == nil {
+		return nil, failErrHint(ExitUnavailable, "smp is not running", "run: hearth shared ensure")
+	}
+	body, err := client.SMPRequest(ctx, c, "/v1/shared", "GET", nil)
+	if err != nil {
+		return nil, failErr(ExitUnavailable, err.Error())
+	}
+	return body, nil
+}
+
+func isSharedConnection(argv []string) bool {
+	for _, arg := range argv {
+		if arg == "--" {
+			return false
+		}
+		if arg == "connection" {
+			return true
+		}
+	}
+	return false
+}
+
+func sharedConnectionHelp(args []string) bool {
+	sawConnection := false
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if !sawConnection {
+			if arg == "connection" {
+				sawConnection = true
+			}
+			continue
+		}
+		if arg == "--help" || arg == "-h" || arg == "help" {
+			return true
+		}
+	}
+	return false
 }
 
 // splitPassthrough splits args into the part flags are parsed from and verbatim
@@ -87,13 +149,17 @@ func liveSMPClient(discovery client.Discovery) *client.Client {
 }
 
 func runSharedInner(ctx context.Context, root string, args []string, io *Io, spawnSMP func(root string)) (int, error) {
+	if text, ok := HelpFor(append([]string{"shared"}, args...)); ok {
+		out(io, text)
+		return 0, nil
+	}
 	parsed, passthrough := splitPassthrough(args)
-	flags, err := ParseCommandFlags(parsed, []Flag{FlagJSON, FlagForce, FlagStopIfUnused})
+	flags, err := ParseCommandFlags(parsed, []Flag{FlagJSON, FlagForce, FlagStopIfUnused, FlagReveal, FlagMask, FlagYes})
 	if err != nil {
 		return 0, err
 	}
 	if len(flags.Positionals) == 0 {
-		return 0, usageErr("usage: hearth shared ensure|list|installed|status|attach|detach|probe|install|start|stop|remove [--json] [--force] [<name>@<version>] [attach-args...]")
+		return 0, usageErr(sharedUsage)
 	}
 	subcommand := flags.Positionals[0]
 	if flags.Force && subcommand != "remove" {
@@ -101,6 +167,20 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 	}
 	if flags.StopIfUnused && subcommand != "detach" {
 		return 0, usageErr("--stop-if-unused is only supported by `shared detach`")
+	}
+	if flags.Yes && subcommand != "remove" && subcommand != "detach" {
+		return 0, usageErr("--yes is only supported by `shared remove` and `shared detach`")
+	}
+	if flags.Mask && subcommand != "status" && subcommand != "installed" {
+		return 0, usageErr("--mask is only supported by `shared status` and `shared installed`")
+	}
+	if flags.Reveal && subcommand != "status" && subcommand != "installed" && subcommand != "connection" {
+		return 0, usageErr("--reveal is only supported by `shared status`, `shared installed`, and `shared connection`")
+	}
+	// --mask is an explicit no-op: status and installed mask unless --reveal.
+	// Together the two flags are a usage error.
+	if flags.Mask && flags.Reveal {
+		return 0, usageErr("--mask and --reveal cannot be used together")
 	}
 	rest := append([]string{}, flags.Positionals[1:]...)
 	// `attach <id> -- ...`: the split for attach happens AT the id, so a `--`
@@ -148,9 +228,14 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 			return 0, failErr(ExitUnavailable, err.Error())
 		}
 		instances := registry.List()
+		sort.Slice(instances, func(i, j int) bool {
+			if instances[i].Name != instances[j].Name {
+				return instances[i].Name < instances[j].Name
+			}
+			return instances[i].Version < instances[j].Version
+		})
 		if flags.JSON {
-			payload := map[string]any{"instances": instances}
-			out(io, prettyJSON(jsonValue(payload)))
+			emitSharedJSON(io, map[string]any{"instances": instances}, !flags.Reveal)
 		} else {
 			for _, instance := range instances {
 				out(io, fmt.Sprintf("%s  port %d  %s  (%d project(s) attached)",
@@ -159,17 +244,15 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 		}
 		return 0, nil
 	case "status":
-		c := liveSMPClient(client.DiscoverSMP(ctx))
-		if c == nil {
-			errOut(io, "smp is not running")
-			return ExitUnavailable, nil
-		}
-		body, err := client.SMPRequest(ctx, c, "/v1/shared", "GET", nil)
+		body, err := loadSharedInstances(ctx)
 		if err != nil {
-			return 0, failErr(ExitUnavailable, err.Error())
+			return 0, err
 		}
+		sortSharedStatusInstances(body)
+		// Text is id, state, and port — no secret values. JSON masks secrets
+		// unless --reveal. --mask is accepted and changes nothing.
 		if flags.JSON {
-			out(io, prettyJSON(jsonValue(body)))
+			emitSharedJSON(io, body, !flags.Reveal)
 		} else {
 			for _, entry := range omap.AsArray(body["instances"]) {
 				instance, ok := entry.(map[string]any)
@@ -187,6 +270,20 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 				out(io, fmt.Sprintf("%s  %s  port %v  %s", id, actualState, instance["port"], installState))
 			}
 		}
+		return 0, nil
+	case "connection":
+		if len(rest) != 1 {
+			return 0, usageErr(connectionUsage)
+		}
+		body, err := loadSharedInstances(ctx)
+		if err != nil {
+			return 0, err
+		}
+		doc, err := selectConnection(body, rest[0], shared.ProjectID(root))
+		if err != nil {
+			return 0, err
+		}
+		writeConnection(io, doc, flags.JSON, flags.Reveal)
 		return 0, nil
 	case "attach":
 		id, err := parseSharedID(firstOrNil(rest))
@@ -229,6 +326,11 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 		id, err := parseSharedID(firstOrNil(rest))
 		if err != nil {
 			return 0, err
+		}
+		if flags.StopIfUnused {
+			if err := requireYes(io, flags.Yes, "stopping a shared instance when unused needs confirmation"); err != nil {
+				return 0, err
+			}
 		}
 		c := liveSMPClient(client.DiscoverSMP(ctx))
 		if c == nil {
@@ -296,7 +398,7 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 		if _, err := client.SharedInstall(ctx, c, id); err != nil {
 			return 0, failErr(ExitFailed, err.Error())
 		}
-		return runOperation(ctx, c, state.OpStart, id, io)
+		return runOperation(ctx, c, state.OpStart, id, io, flags.JSON)
 	case "stop":
 		id, err := parseSharedID(firstOrNil(rest))
 		if err != nil {
@@ -307,10 +409,13 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 			return 0, failErr(ExitUnavailable, "smp is not running")
 		}
 		// A failed stop must fail the command: the instance may still be running.
-		return runOperation(ctx, c, state.OpStop, id, io)
+		return runOperation(ctx, c, state.OpStop, id, io, flags.JSON)
 	case "remove":
 		id, err := parseSharedID(firstOrNil(rest))
 		if err != nil {
+			return 0, err
+		}
+		if err := requireYes(io, flags.Yes, "removing a shared instance needs confirmation"); err != nil {
 			return 0, err
 		}
 		c := liveSMPClient(client.DiscoverSMP(ctx))
@@ -331,9 +436,141 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 	}
 }
 
+// sharedInstanceMatches is the skill script's lookup: the instance id, the
+// service name, or a prefix of name@version.
+func sharedInstanceMatches(id, svc string) bool {
+	if id == svc {
+		return true
+	}
+	name := id
+	if index := strings.Index(id, "@"); index >= 0 {
+		name = id[:index]
+	}
+	return name == svc || strings.HasPrefix(svc, name+"@")
+}
+
+func selectConnection(body map[string]any, svc, projectID string) (*omap.OMap, error) {
+	var chosen map[string]any
+	chosenID := ""
+	for _, entry := range omap.AsArray(body["instances"]) {
+		instance, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := instance["id"].(string)
+		if sharedInstanceMatches(id, svc) {
+			chosen = instance
+			chosenID = id
+			break
+		}
+	}
+	if chosen == nil {
+		return nil, failErr(ExitUnavailable, svc+" is not a registered shared instance")
+	}
+	var attachment map[string]any
+	for _, entry := range omap.AsArray(chosen["attachments"]) {
+		item, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		pid, _ := item["projectId"].(string)
+		if pid == "" {
+			pid, _ = item["project_id"].(string)
+		}
+		if pid == projectID {
+			attachment = item
+			break
+		}
+	}
+	if attachment == nil {
+		return nil, failErrHint(ExitUnavailable, "this project has not attached "+chosenID+" — start the service first", "start the service first")
+	}
+	provisioned, _ := attachment["provisioned"].(bool)
+	if !provisioned {
+		return nil, failErr(ExitUnavailable, chosenID+" is attached but not yet provisioned")
+	}
+	doc := omap.New()
+	doc.Set("service", chosenID)
+	doc.Set("projectId", projectID)
+	doc.Set("connection", connectionValue(attachment["connection"]))
+	return doc, nil
+}
+
+func connectionValue(raw any) any {
+	object, ok := raw.(map[string]any)
+	if !ok {
+		return jsonValue(raw)
+	}
+	out := omap.New()
+	if url, ok := object["url"]; ok {
+		out.Set("url", url)
+	}
+	if env, ok := object["env"]; ok {
+		out.Set("env", jsonValue(env))
+	}
+	for key, value := range object {
+		if key == "url" || key == "env" {
+			continue
+		}
+		out.Set(key, jsonValue(value))
+	}
+	return out
+}
+
+func writeConnection(io *Io, doc *omap.OMap, jsonMode, reveal bool) {
+	value := jsonValue(doc)
+	if !reveal {
+		value = maskOrdered(value)
+	}
+	if jsonMode {
+		out(io, compactJSON(value))
+		return
+	}
+	conn := omap.AsObject(value)
+	var connection *omap.OMap
+	if conn != nil {
+		if raw, ok := conn.Get("connection"); ok {
+			connection = omap.AsObject(raw)
+		}
+	}
+	url := ""
+	env := map[string]string{}
+	if connection != nil {
+		if raw, ok := connection.Get("url"); ok {
+			if text, ok := raw.(string); ok {
+				url = text
+			}
+		}
+		if raw, ok := connection.Get("env"); ok {
+			if object := omap.AsObject(raw); object != nil {
+				object.Each(func(key string, entry any) {
+					if text, ok := entry.(string); ok {
+						env[key] = text
+					}
+				})
+			}
+		}
+	}
+	if url == "" && len(env) == 0 {
+		out(io, prettyJSON(value))
+		return
+	}
+	if url != "" {
+		out(io, url)
+	}
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		out(io, key+"="+env[key])
+	}
+}
+
 // runOperation submits one operation to smp, waits for it, prints its outcome,
 // and fails when it failed.
-func runOperation(ctx context.Context, c *client.Client, action state.ServiceOperationKind, id string, io *Io) (int, error) {
+func runOperation(ctx context.Context, c *client.Client, action state.ServiceOperationKind, id string, io *Io, jsonMode bool) (int, error) {
 	accepted, err := c.Submit(ctx, action, id, false, client.NewRequestID())
 	if err != nil {
 		return 0, failErr(ExitFailed, err.Error())
@@ -342,11 +579,50 @@ func runOperation(ctx context.Context, c *client.Client, action state.ServiceOpe
 	if err != nil {
 		return 0, err
 	}
-	out(io, fmt.Sprintf("%s %s %s", operation.Status, id, operation.ID))
 	if operation.Status == state.OpStatusFailed {
+		if !jsonMode {
+			out(io, fmt.Sprintf("%s %s %s", operation.Status, id, operation.ID))
+		}
 		return 0, failErr(ExitFailed, "service operation failed")
 	}
+	out(io, fmt.Sprintf("%s %s %s", operation.Status, id, operation.ID))
 	return 0, nil
+}
+
+// sortSharedStatusInstances orders instances by name, then version. String
+// order, not semver. A row with no name falls back to splitting id on the
+// first '@'.
+func sortSharedStatusInstances(body map[string]any) {
+	raw := omap.AsArray(body["instances"])
+	if len(raw) < 2 {
+		return
+	}
+	sort.SliceStable(raw, func(i, j int) bool {
+		leftName, leftVersion := sharedInstanceSortKey(raw[i])
+		rightName, rightVersion := sharedInstanceSortKey(raw[j])
+		if leftName != rightName {
+			return leftName < rightName
+		}
+		return leftVersion < rightVersion
+	})
+	body["instances"] = raw
+}
+
+func sharedInstanceSortKey(entry any) (string, string) {
+	instance, ok := entry.(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	name, _ := instance["name"].(string)
+	version, _ := instance["version"].(string)
+	if name != "" || version != "" {
+		return name, version
+	}
+	id, _ := instance["id"].(string)
+	if index := strings.Index(id, "@"); index >= 0 {
+		return id[:index], id[index+1:]
+	}
+	return id, ""
 }
 
 // envOrNil reads an environment variable, returning nil when it is unset.

@@ -40,6 +40,27 @@ func reportConfigError(root string, errors []string) {
 	}
 }
 
+func stdio() *cli.Io {
+	return &cli.Io{
+		Out: func(s string) { fmt.Println(s) },
+		Err: func(s string) { fmt.Fprintln(os.Stderr, s) },
+	}
+}
+
+func catalogFailed(root string, args []string, err error) int {
+	errs := []string{err.Error()}
+	if le, ok := err.(*configfile.LoadError); ok {
+		errs = le.Errors
+	}
+	if cli.JSONRequested(args) {
+		message := fmt.Sprintf("could not load a service catalog for %s: %s", root, strings.Join(errs, "; "))
+		fmt.Println(cli.JSONError(1, message, ""))
+		return 1
+	}
+	reportConfigError(root, errs)
+	return 1
+}
+
 // Runs one manager in the foreground until it shuts down. A bootstrap failure
 // exits non-zero: the daemon is spawned by `Ensure()`, and exiting 0 after
 // failing to start would make a broken daemon indistinguishable from a healthy
@@ -68,18 +89,16 @@ func runManager(root, runtimeDirectory string, cat catalog.ServiceCatalog, share
 }
 
 func runDaemonSubcommand(root string, rest []string) int {
+	if text, ok := cli.HelpFor(append([]string{"daemon"}, rest...)); ok {
+		fmt.Println(text)
+		return 0
+	}
 	if len(rest) != 0 {
-		fmt.Fprintln(os.Stderr, "usage: hearth daemon --root <path>")
-		return 2
+		return cli.ReportFailure(stdio(), rest, &cli.LocalctlError{ExitCode: cli.ExitUsage, Message: "usage: hearth daemon --root <path>"})
 	}
 	loaded, err := configfile.LoadCatalog(root)
 	if err != nil {
-		if le, ok := err.(*configfile.LoadError); ok {
-			reportConfigError(root, le.Errors)
-		} else {
-			reportConfigError(root, []string{err.Error()})
-		}
-		return 1
+		return catalogFailed(root, rest, err)
 	}
 	runtimeDirectory := paths.ResolveRuntimeDirectory(root, catalogRuntimeDir(loaded.Catalog))
 	return runManager(root, runtimeDirectory, *loaded.Catalog, nil)
@@ -97,9 +116,12 @@ func catalogRuntimeDir(cat *catalog.ServiceCatalog) string {
 // Everything else (lock, token, state.json, HTTP+SSE surface, `ensure`/
 // `discover`) is identical to a project daemon.
 func runSmpSubcommand(rest []string) int {
+	if text, ok := cli.HelpFor(append([]string{"smp"}, rest...)); ok {
+		fmt.Println(text)
+		return 0
+	}
 	if len(rest) != 0 {
-		fmt.Fprintln(os.Stderr, "usage: hearth smp")
-		return 2
+		return cli.ReportFailure(stdio(), rest, &cli.LocalctlError{ExitCode: cli.ExitUsage, Message: "usage: hearth smp"})
 	}
 	root := shared.SharedRoot()
 	// Dev/test escape hatch: point smp at a local registry file instead of the
@@ -157,6 +179,11 @@ func spawnSMP(_root string) {
 	spawnDetached([]string{"smp"}, "")
 }
 
+// spawnProjectDaemon and spawnSharedDaemon are what the CLI is given. Tests
+// replace them so a confirm-gate regression cannot start a daemon.
+var spawnProjectDaemon = spawnDaemon
+var spawnSharedDaemon = spawnSMP
+
 // Runs an MCP server over stdio for root's catalog. RequireConfirm stays at its
 // safe default (true); ToolPrefix is fixed at `local_services_`, the name
 // consumers' skill docs use.
@@ -185,70 +212,73 @@ func runMcpSubcommand(root string, cat catalog.ServiceCatalog) int {
 // no config file here" is a bad first experience for someone who just installed
 // the binary.
 func printHelp() {
-	fmt.Println(`hearth — local dev services daemon, CLI, and MCP server
-
-usage: hearth [--root <path>] <command> [options]
-  status [target] [--json]              current state of one service, a group, or all
-  events --follow --json                stream daemon changes as newline-delimited JSON
-  start|stop|restart <target> [--wait]  lifecycle actions
-  logs <service> [--tail N] [--follow]  read a service's log
-  urls [target] [--json]                where each service can be reached (live URLs)
-  operation get|watch <id> [--json]    inspect one operation
-  doctor [--json]                       environment and catalog diagnostics
-  cleanup                               remove stale runtime state
-  manager ensure|status|stop|restart|reload
-                                        daemon lifecycle (restart keeps services running)
-  daemon --root <path>                  run the daemon in the foreground (spawned internally)
-  smp                                   run the machine-global shared-services daemon
-  shared list|installed|status          inspect the shared service registry and smp
-  shared attach|detach|probe <id>       attach this project to a shared service (used by hearth.yaml ` + "`shared:`" + `)
-  shared install|start|stop|remove <id> manage a shared service instance
-  update [--check] [--json] [--force]   install the latest stable GitHub release
-  mcp                                   serve the MCP tool surface over stdio
-  mcp install [--name N] [--key K] <config-file>...
-                                        register this binary in an MCP client config
-  skill install --dest <skill-dir>      install SKILL.md + scripts (MCP retired for agents)
-
-shared and update do not need a hearth.yaml in the current directory.
-The workspace window is hearth-gpui, not this binary.
-mcp install records this process path. A binary inside Hearth.app makes those configs point into the bundle.
-Every other command resolves a catalog from --root (default: cwd):
-hearth.yaml, .yml, or .json.`)
-
+	fmt.Println(cli.HelpText())
 }
 
+// stdinIsTerminal reports whether stdin is a real terminal. The exit-6 --yes
+// gates and the interactive confirm both follow this: a character device such
+// as /dev/null is not a terminal.
 func stdinIsTerminal() bool {
-	info, err := os.Stdin.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return isTerminal(os.Stdin)
+}
+
+// commandIO is one user-facing CLI surface. Confirm is wired only for a real
+// terminal. requireYes treats a non-nil Confirm as that same decision, so a
+// non-interactive stdin keeps the exit-6 gates closed and gets no prompt.
+func commandIO() *cli.Io {
+	io := &cli.Io{
+		Out: func(s string) { fmt.Println(s) },
+		Err: func(s string) { fmt.Fprintln(os.Stderr, s) },
+	}
+	if stdinIsTerminal() {
+		io.Confirm = confirmStdin
+	}
+	return io
+}
+
+func confirmStdin(prompt string) bool {
+	fmt.Fprint(os.Stderr, prompt)
+	var line string
+	if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
 }
 
 func runCLI(root string, rest []string) int {
 	if len(rest) > 0 {
 		switch rest[0] {
-		case "--help", "-h", "help":
-			printHelp()
-			return 0
 		case "--version", "-V":
 			fmt.Printf("hearth %s\n", version)
 			return 0
 		}
 	}
 	// No TUI: a bare `hearth` prints help whether or not it's on a terminal.
+	// --help on any command exits 0 before a catalog is loaded.
 	if len(rest) == 0 {
 		printHelp()
+		return 0
+	}
+	if text, ok := cli.HelpFor(rest); ok {
+		fmt.Println(text)
 		return 0
 	}
 	// `shared` manages the machine-global smp daemon — it deliberately does NOT
 	// require a project `hearth.yaml` (the project root, when a command needs one
 	// for attach/probe identity, is just the cwd).
 	if rest[0] == "shared" {
-		return cli.RunShared(context.Background(), root, rest[1:], &cli.Io{
-			Out: func(s string) { fmt.Println(s) },
-			Err: func(s string) { fmt.Fprintln(os.Stderr, s) },
-		}, spawnSMP)
+		return cli.RunShared(context.Background(), root, rest[1:], commandIO(), spawnSharedDaemon)
 	}
 	// Self-update talks to GitHub, not to a project daemon, and must work in a
-	// directory that has no hearth.yaml.
+	// directory that has no hearth.yaml. version, schema, and skill are the
+	// same: they describe or install the binary, not a project catalog.
+	if rest[0] == "version" || rest[0] == "schema" || rest[0] == "skill" || rest[0] == "workspaces" {
+		return cli.Main(context.Background(), &cli.Options{}, root, rest, commandIO())
+	}
 	if rest[0] == "update" {
 		err := updater.Run(context.Background(), updater.Options{
 			Args:    rest[1:],
@@ -268,12 +298,7 @@ func runCLI(root string, rest []string) int {
 	}
 	loaded, err := configfile.LoadCatalog(root)
 	if err != nil {
-		if le, ok := err.(*configfile.LoadError); ok {
-			reportConfigError(root, le.Errors)
-		} else {
-			reportConfigError(root, []string{err.Error()})
-		}
-		return 1
+		return catalogFailed(root, rest, err)
 	}
 	// Only the bare `mcp` (serve over stdio) needs the MCP server; `mcp install`
 	// is plain file editing and falls through to cli.Main.
@@ -282,33 +307,16 @@ func runCLI(root string, rest []string) int {
 	}
 	options := &cli.Options{
 		Catalog:     *loaded.Catalog,
-		SpawnDaemon: spawnDaemon,
+		SpawnDaemon: spawnProjectDaemon,
 	}
-	io := &cli.Io{
-		Out: func(s string) { fmt.Println(s) },
-		Err: func(s string) { fmt.Fprintln(os.Stderr, s) },
-	}
-	// The port-conflict "kill the holder?" prompt is wired only on an interactive
-	// stdin. Scripts, agents and piped calls get no prompt at all (Confirm nil),
-	// so they never kill an unowned process and a plain start still goes through.
-	if stdinIsTerminal() {
-		io.Confirm = func(prompt string) bool {
-			fmt.Fprint(os.Stderr, prompt)
-			var line string
-			if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
-				return false
-			}
-			switch strings.ToLower(strings.TrimSpace(line)) {
-			case "y", "yes":
-				return true
-			}
-			return false
-		}
-	}
-	return cli.Main(context.Background(), options, root, rest, io)
+	// commandIO wires the port-conflict prompt and the exit-6 gates from the
+	// same terminal check. A non-terminal stdin leaves Confirm nil, so a plain
+	// start still goes through and nothing is killed without --yes.
+	return cli.Main(context.Background(), options, root, rest, commandIO())
 }
 
 func main() {
+	cli.Version = version
 	// Before anything else spawns a helper. A GUI-spawned `hearth` (and the
 	// daemon it spawns) inherits launchd's bare PATH, under which `docker`,
 	// `tailscale` and `bun` cannot be found — see env.WithKnownToolDirectories.
@@ -328,9 +336,12 @@ func main() {
 	}
 	root, rest, err := cli.ParseRoot(argv)
 	if err != nil {
-		if le, ok := err.(*cli.LocalctlError); ok {
-			fmt.Fprintln(os.Stderr, le.Message)
-			os.Exit(le.ExitCode)
+		if _, ok := err.(*cli.LocalctlError); ok {
+			os.Exit(cli.ReportFailure(stdio(), argv, err))
+		}
+		if cli.JSONRequested(argv) {
+			fmt.Println(cli.JSONError(1, err.Error(), ""))
+			os.Exit(1)
 		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

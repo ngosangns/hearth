@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["service", "port"],
+  "properties": {
+    "service": {"type": "string"},
+    "port": {"type": "integer"},
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectId", "projectRoot", "connection"],
+      "properties": {
+        "projectId": {"type": "string"},
+        "projectRoot": {"type": "string"},
+        "connection": {"type": ["object", "null"]}
+      }
+    }
+  }
+}

@@ -17,6 +17,8 @@ Hearth is a process supervisor. The product in this repo is the Go binary at `go
 | `internal/paths` | `crates/paths` | Runtime, data, and install directories. |
 | `internal/updater` | `crates/auto_update` | GitHub release into the versioned bin dir. |
 | `internal/shared` | a second `project` root | The machine-global `smp` daemon at `~/.hearth/shared`. |
+| `internal/redact` | — | Masks secret-shaped strings anywhere in a JSON tree. |
+| `internal/schema` | — | Embedded JSON Schemas for CLI output, schemaVersion 1. |
 
 One binary hosts the daemon, the CLI, and MCP. The long-lived process is the daemon. A supervisor cannot live inside a window that the user can quit.
 

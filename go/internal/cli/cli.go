@@ -10,8 +10,9 @@
 //
 // The binary calls ParseRoot once, then Main (or RunShared for the `shared`
 // subcommand). Io carries the output/error sinks and the optional interactive
-// confirmation prompt; a nil Confirm means non-interactive, which never
-// prompts and never kills an unowned process.
+// confirmation prompt; a nil Confirm means non-interactive. Off a TTY,
+// --kill-unowned, `manager stop`, `shared remove`, and
+// `shared detach --stop-if-unused` require --yes (exit 6 otherwise).
 package cli
 
 import (
@@ -46,8 +47,14 @@ const (
 	ExitUnavailable  = 3
 	ExitProtocol     = 4
 	ExitFailed       = 5
+	ExitNeedsConfirm = 6
 	ExitUnauthorized = 7
+	ExitConflict     = 8
 )
+
+// Version is the stamped binary version (`-X main.version`). The binary sets
+// it from main.version; tests see the dev default.
+var Version = "0.0.0-dev"
 
 // managerStopTimeout is how long `manager stop` waits for the daemon to finish
 // stopping every service and exit.
@@ -76,6 +83,7 @@ type Options struct {
 type LocalctlError struct {
 	ExitCode int
 	Message  string
+	Hint     string
 }
 
 func (e *LocalctlError) Error() string { return e.Message }
@@ -86,6 +94,10 @@ func usageErr(message string) error {
 
 func failErr(exitCode int, message string) error {
 	return &LocalctlError{ExitCode: exitCode, Message: message}
+}
+
+func failErrHint(exitCode int, message, hint string) error {
+	return &LocalctlError{ExitCode: exitCode, Message: message, Hint: hint}
 }
 
 func unavailableErr(err error) error {
@@ -136,6 +148,10 @@ const (
 	FlagKillUnowned
 	FlagForce
 	FlagStopIfUnused
+	FlagReveal
+	FlagMask
+	FlagYes
+	FlagDryRun
 )
 
 // Flags is the parsed result of ParseCommandFlags.
@@ -151,6 +167,10 @@ type Flags struct {
 	KillUnowned  bool
 	Force        bool
 	StopIfUnused bool
+	Reveal       bool
+	Mask         bool
+	Yes          bool
+	DryRun       bool
 }
 
 func containsFlag(allowed []Flag, flag Flag) bool {
@@ -200,6 +220,14 @@ func ParseCommandFlags(arguments []string, allowed []Flag) (*Flags, error) {
 			flag, canonical = FlagForce, "force"
 		case "stop-if-unused":
 			flag, canonical = FlagStopIfUnused, "stop-if-unused"
+		case "reveal":
+			flag, canonical = FlagReveal, "reveal"
+		case "mask":
+			flag, canonical = FlagMask, "mask"
+		case "yes":
+			flag, canonical = FlagYes, "yes"
+		case "dry-run":
+			flag, canonical = FlagDryRun, "dry-run"
 		default:
 			return nil, usageErr("unknown flag: " + argument)
 		}
@@ -260,6 +288,14 @@ func ParseCommandFlags(arguments []string, allowed []Flag) (*Flags, error) {
 			result.Force = true
 		case FlagStopIfUnused:
 			result.StopIfUnused = true
+		case FlagReveal:
+			result.Reveal = true
+		case FlagMask:
+			result.Mask = true
+		case FlagYes:
+			result.Yes = true
+		case FlagDryRun:
+			result.DryRun = true
 		}
 		index++
 	}
@@ -610,13 +646,16 @@ func ParseRoot(argv []string) (string, []string, error) {
 func Main(ctx context.Context, options *Options, root string, argv []string, io *Io) int {
 	code, err := mainInner(ctx, options, root, argv, io)
 	if err != nil {
-		errOut(io, err.Error())
-		return exitCodeOf(err)
+		return emitFailure(io, hasFlag(argv, "--json"), err)
 	}
 	return code
 }
 
 func mainInner(ctx context.Context, options *Options, root string, argv []string, io *Io) (int, error) {
+	if text, ok := HelpFor(argv); ok {
+		out(io, text)
+		return 0, nil
+	}
 	if len(argv) == 0 {
 		return 0, usageErr("usage: hearth <command>")
 	}
@@ -656,6 +695,12 @@ func mainInner(ctx context.Context, options *Options, root string, argv []string
 		return mcpCommand(root, rest, io)
 	case "skill":
 		return skillCommand(root, rest, io)
+	case "version":
+		return versionCommand(rest, io)
+	case "schema":
+		return schemaCommand(rest, io)
+	case "workspaces":
+		return workspacesCommand(rest, io)
 	default:
 		return 0, usageErr("unknown command: " + command)
 	}
@@ -718,6 +763,9 @@ func doctorCommand(options *Options, rest []string, io *Io) (int, error) {
 		}
 	}
 	if !report.OK {
+		if flags.JSON {
+			return ExitFailed, nil
+		}
 		return 0, failErr(ExitFailed, "doctor checks failed")
 	}
 	return 0, nil
@@ -860,7 +908,7 @@ func logsCommand(ctx context.Context, root string, options *Options, rest []stri
 }
 
 func managerCommand(ctx context.Context, root string, options *Options, rest []string, io *Io) (int, error) {
-	flags, err := ParseCommandFlags(rest, []Flag{FlagJSON})
+	flags, err := ParseCommandFlags(rest, []Flag{FlagJSON, FlagYes})
 	if err != nil {
 		return 0, err
 	}
@@ -868,7 +916,10 @@ func managerCommand(ctx context.Context, root string, options *Options, rest []s
 	valid := subcommand != nil && (*subcommand == "ensure" || *subcommand == "status" ||
 		*subcommand == "stop" || *subcommand == "restart" || *subcommand == "reload")
 	if len(flags.Positionals) != 1 || !valid {
-		return 0, usageErr("usage: hearth manager ensure|status|stop|restart|reload [--json]")
+		return 0, usageErr("usage: hearth manager ensure|status|stop|restart|reload [--json] [--yes]")
+	}
+	if flags.Yes && *subcommand != "stop" {
+		return 0, usageErr("--yes is only supported by `hearth manager stop`")
 	}
 	switch *subcommand {
 	case "reload":
@@ -916,6 +967,9 @@ func managerCommand(ctx context.Context, root string, options *Options, rest []s
 		out(io, printValue(result, flags.JSON))
 		return 0, nil
 	default: // "stop"
+		if err := requireYes(io, flags.Yes, "stopping the daemon needs confirmation"); err != nil {
+			return 0, err
+		}
 		operation, err := StopManager(ctx, root, options)
 		if err != nil {
 			return 0, err
@@ -1185,7 +1239,7 @@ func promptKillUnowned(serviceID string, row *state.ServiceLifecycleState, flags
 }
 
 func startStopRestartCommand(ctx context.Context, root string, options *Options, command string, rest []string, io *Io) (int, error) {
-	flags, err := ParseCommandFlags(rest, []Flag{FlagWait, FlagJSON, FlagKillUnowned})
+	flags, err := ParseCommandFlags(rest, []Flag{FlagWait, FlagJSON, FlagKillUnowned, FlagDryRun, FlagYes})
 	if err != nil {
 		return 0, err
 	}
@@ -1193,16 +1247,32 @@ func startStopRestartCommand(ctx context.Context, root string, options *Options,
 		return 0, usageErr("--kill-unowned only applies to `hearth start`")
 	}
 	if len(flags.Positionals) != 1 {
-		flagHint := ""
-		if command == "start" {
-			flagHint = " [--kill-unowned]"
-		}
-		return 0, usageErr(fmt.Sprintf("usage: hearth %s <service|group> [--wait] [--json]%s", command, flagHint))
+		return 0, usageErr(usageFor([]string{command}))
 	}
 	target := flags.Positionals[0]
 	selected, err := RunnableTargets(&options.Catalog, &target)
 	if err != nil {
 		return 0, err
+	}
+	// The daemon starts the resolved ids concurrently. It does not add dependencies.
+	// Dry-run prints that list and does not call Ensure.
+	if flags.DryRun {
+		services := make([]any, len(selected))
+		for i, id := range selected {
+			services[i] = id
+		}
+		doc := omap.New()
+		doc.Set("dryRun", true)
+		doc.Set("action", command)
+		doc.Set("target", target)
+		doc.Set("services", services)
+		out(io, compactJSON(doc))
+		return 0, nil
+	}
+	if flags.KillUnowned {
+		if err := requireYes(io, flags.Yes, "killing an unowned process holding the port needs confirmation"); err != nil {
+			return 0, err
+		}
 	}
 	isSingleService := false
 	for _, s := range options.Catalog.Services {
@@ -1232,6 +1302,10 @@ func startStopRestartCommand(ctx context.Context, root string, options *Options,
 		if err != nil {
 			return 0, err
 		}
+		failed := operation.Status == state.OpStatusFailed
+		if flags.JSON && failed {
+			return 0, operationFailure(ctx, c, []*state.Operation{operation}, target)
+		}
 		if flags.JSON {
 			payload := omap.New()
 			payload.Set("operation", operation)
@@ -1239,7 +1313,7 @@ func startStopRestartCommand(ctx context.Context, root string, options *Options,
 		} else {
 			out(io, fmt.Sprintf("%s bulk-start %s", operation.Status, operation.ID))
 		}
-		if operation.Status == state.OpStatusFailed {
+		if failed {
 			return 0, operationFailure(ctx, c, []*state.Operation{operation}, target)
 		}
 		return 0, nil
@@ -1322,6 +1396,15 @@ func startStopRestartCommand(ctx context.Context, root string, options *Options,
 			break
 		}
 	}
+	var failed []*state.Operation
+	for _, operation := range operations {
+		if operation.Status == state.OpStatusFailed {
+			failed = append(failed, operation)
+		}
+	}
+	if flags.JSON && len(failed) > 0 {
+		return 0, operationFailure(ctx, c, failed, target)
+	}
 	if flags.JSON {
 		payload := omap.New()
 		payload.Set("operations", operations)
@@ -1333,12 +1416,6 @@ func startStopRestartCommand(ctx context.Context, root string, options *Options,
 				serviceID = *operation.ServiceID
 			}
 			out(io, fmt.Sprintf("%s %s %s", operation.Status, serviceID, operation.ID))
-		}
-	}
-	var failed []*state.Operation
-	for _, operation := range operations {
-		if operation.Status == state.OpStatusFailed {
-			failed = append(failed, operation)
 		}
 	}
 	if len(failed) > 0 {
@@ -1392,7 +1469,7 @@ func operationFailure(ctx context.Context, c *client.Client, failed []*state.Ope
 		}
 	}
 	if portHeld {
-		lines = append(lines, fmt.Sprintf("hint: `hearth start %s --kill-unowned` stops the process holding the port and starts the service", target))
+		lines = append(lines, fmt.Sprintf("hint: `hearth start %s --kill-unowned --yes` stops the process holding the port and starts the service", target))
 	}
 	message := "service operation failed"
 	if len(lines) > 0 {
@@ -1605,11 +1682,25 @@ var skillScripts = []struct {
 
 func skillCommand(root string, rest []string, io *Io) (int, error) {
 	if len(rest) == 0 {
-		return 0, usageErr("usage: hearth skill install --dest <skill-dir>")
+		return 0, usageErr(skillUsage)
+	}
+	if rest[0] == "--help" || rest[0] == "-h" || rest[0] == "help" {
+		out(io, skillUsage)
+		return 0, nil
 	}
 	switch rest[0] {
 	case "install":
+		if isHelp(rest[1:]) {
+			out(io, skillUsage)
+			return 0, nil
+		}
 		return skillInstallCommand(root, rest[1:], io)
+	case "check":
+		if isHelp(rest[1:]) {
+			out(io, skillUsage)
+			return 0, nil
+		}
+		return skillCheckCommand(root, rest[1:], io)
 	default:
 		return 0, usageErr("unknown skill subcommand: " + rest[0])
 	}
@@ -1623,19 +1714,12 @@ func skillInstallCommand(root string, rest []string, io *Io) (int, error) {
 	if len(flags.Positionals) > 0 {
 		return 0, usageErr("skill install takes no positional arguments")
 	}
-	if flags.Dest == nil {
-		return 0, usageErr("usage: hearth skill install --dest <skill-dir>")
-	}
-	dest := *flags.Dest
-	// `--dest` is the skill directory (e.g. ~/.agents/skills/hearth). A trailing
-	// SKILL.md path is accepted and normalized to its parent so older one-file
-	// installs still work.
-	resolved := dest
-	if !filepath.IsAbs(dest) {
-		resolved = filepath.Join(root, dest)
-	}
-	if filepath.Base(resolved) == "SKILL.md" {
-		resolved = filepath.Dir(resolved)
+	// `--dest` is the skill directory. A trailing SKILL.md path is accepted and
+	// normalized to its parent so older one-file installs still work. Omitted,
+	// it is ~/.agents/skills/hearth.
+	resolved, err := resolveSkillDest(root, flags.Dest)
+	if err != nil {
+		return 0, err
 	}
 	scriptsDir := filepath.Join(resolved, "scripts")
 	if err := os.MkdirAll(scriptsDir, 0o755); err != nil {

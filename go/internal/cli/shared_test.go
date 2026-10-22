@@ -18,20 +18,23 @@ func TestAttachArgsAfterTheIDPassThroughVerbatimEvenWhenTheyLookLikeFlags(t *tes
 }
 
 // `manager stop` runs the synthesized `shared detach <id>` with
-// `--stop-if-unused` appended after the id; it must parse as this command's
-// flag, not pass through.
+// `--stop-if-unused --yes` appended after the id; both must parse as this
+// command's flags, not pass through.
 func TestDetachParsesStopIfUnusedAfterTheID(t *testing.T) {
-	argv := []string{"detach", "postgres@16.4", "--stop-if-unused"}
+	argv := []string{"detach", "postgres@16.4", "--stop-if-unused", "--yes"}
 	parsed, passthrough := splitPassthrough(argv)
 	if len(passthrough) != 0 {
 		t.Fatalf("unexpected passthrough: %v", passthrough)
 	}
-	flags, err := ParseCommandFlags(parsed, []Flag{FlagJSON, FlagForce, FlagStopIfUnused})
+	flags, err := ParseCommandFlags(parsed, []Flag{FlagJSON, FlagForce, FlagStopIfUnused, FlagYes})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !flags.StopIfUnused {
 		t.Fatal("expected stop-if-unused")
+	}
+	if !flags.Yes {
+		t.Fatal("expected --yes")
 	}
 	if len(flags.Positionals) != 2 || flags.Positionals[0] != "detach" || flags.Positionals[1] != "postgres@16.4" {
 		t.Fatalf("unexpected positionals: %v", flags.Positionals)

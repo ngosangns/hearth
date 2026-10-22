@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["instances"],
+  "properties": {
+    "instances": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "version", "port", "installState", "recipe", "attachments"],
+        "properties": {
+          "name": {"type": "string"},
+          "version": {"type": "string"},
+          "port": {"type": "integer"},
+          "extraPorts": {"type": "array", "items": {"type": "integer"}},
+          "installState": {"enum": ["pending", "installing", "installed", "failed"]},
+          "installError": {"type": "string"},
+          "recipe": {"type": "object"},
+          "attachments": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["projectRoot", "provisioned", "attachedAt"],
+              "properties": {
+                "projectRoot": {"type": "string"},
+                "provisioned": {"type": "boolean"},
+                "attachedAt": {"type": "string"},
+                "error": {"type": "string"},
+                "connection": {
+                  "type": "object",
+                  "properties": {
+                    "url": {"type": "string"},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

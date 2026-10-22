@@ -29,6 +29,8 @@ import (
 	"sync"
 
 	"github.com/ngosangns/hearth/go/internal/state"
+
+	secretx "github.com/ngosangns/hearth/go/internal/redact"
 )
 
 // secretKeyPattern matches any object key that looks like a credential; a
@@ -882,12 +884,12 @@ func (s *Server) toolDefinitions() []any {
 			"properties":           map[string]any{},
 			"additionalProperties": false,
 		}),
-		toolDefinition(prefix+"shared_status", "Read-only: shared service instances on this machine — ports, install state, and which projects are attached. No approval needed.", map[string]any{
+		toolDefinition(prefix+"shared_status", "Read-only: shared service instances on this machine — ports, install state, and which projects are attached. Secret values are masked, including recipe.env. No approval needed.", map[string]any{
 			"type":                 "object",
 			"properties":           map[string]any{},
 			"additionalProperties": false,
 		}),
-		toolDefinition(prefix+"shared_connection", "Read-only: this project's connection info (url/env) for a shared service it has attached via `shared:` in hearth.yaml. Pass the service id (e.g. \"postgres\") or the instance id (\"postgres@16.4\"). No approval needed.", map[string]any{
+		toolDefinition(prefix+"shared_connection", "Read-only: this project's connection info (url/env) for a shared service it has attached via `shared:` in hearth.yaml. Pass the service id (e.g. \"postgres\") or the instance id (\"postgres@16.4\"). Secret values are masked. No approval needed.", map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"service": map[string]any{"type": "string"},
@@ -922,28 +924,52 @@ func redact(value any) any {
 	return redactAtDepth(value, 0)
 }
 
-// redactToolResult is redact, except for `shared_connection`'s `connection`
-// subtree: handing the agent a shared service's env values
-// (`AWS_SECRET_ACCESS_KEY`, a `DATABASE_URL` password) is that tool's whole
-// purpose, and they are local-dev constants from the shared catalog, not real
-// credentials.
+// redactToolResult drops secret-looking keys. shared_status and
+// shared_connection mask secret-rule values everywhere (recipe.env, connection,
+// argv) and still drop credential keys outside that rule.
 func redactToolResult(tool string, value any) any {
-	redacted := redact(value)
-	if tool != "shared_connection" {
-		return redacted
+	if tool == "shared_status" || tool == "shared_connection" {
+		return redactKeepingConnection(value, 0)
 	}
-	object, ok := redacted.(map[string]any)
-	if !ok {
-		return redacted
+	return redact(value)
+}
+
+func redactKeepingConnection(value any, depth int) any {
+	if depth > redactDepthCap {
+		return "[truncated]"
 	}
-	original, ok := value.(map[string]any)
-	if !ok {
-		return redacted
+	if depth == 0 {
+		value = secretx.Values(value)
 	}
-	if connection, ok := original["connection"]; ok {
-		object["connection"] = connection
+	return dropOtherCredentials(value, depth)
+}
+
+// dropOtherCredentials removes keys the general redact drops (authorization,
+// ownership proof, apiKey) after secret-rule values are already masked.
+// Secret-rule keys stay so the shape is visible with the value replaced.
+func dropOtherCredentials(value any, depth int) any {
+	if depth > redactDepthCap {
+		return "[truncated]"
 	}
-	return redacted
+	switch v := value.(type) {
+	case []any:
+		out := make([]any, len(v))
+		for i, entry := range v {
+			out[i] = dropOtherCredentials(entry, depth+1)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, entry := range v {
+			if key != "connection" && !secretx.IsSecretKey(key) && secretKeyPattern.MatchString(key) {
+				continue
+			}
+			out[key] = dropOtherCredentials(entry, depth+1)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 // redactAtDepth recurses through value, truncating past redactDepthCap.

@@ -1,0 +1,1 @@
+{"urls":[{"serviceId":"api","label":"app","url":"http://127.0.0.1:8080","requiresRunning":true,"running":true}],"unresolved":[{"serviceId":"web","url":"http://{port}","placeholder":"{port}"}]}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "schemaVersion", "commands", "error"],
+  "properties": {
+    "name": {"const": "hearth"},
+    "schemaVersion": {"const": 1},
+    "commands": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "mutates", "destructive", "flags", "output"],
+        "properties": {
+          "summary": {"type": "string"},
+          "mutates": {"type": "boolean"},
+          "destructive": {"type": "boolean"},
+          "flags": {"type": "array", "items": {"type": "string"}},
+          "output": {}
+        }
+      }
+    },
+    "error": {"type": "object"}
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["current", "latest", "updateAvailable", "asset", "installPath"],
+  "properties": {
+    "current": {"type": "string"},
+    "latest": {"type": ["string", "null"]},
+    "updateAvailable": {"type": "boolean"},
+    "asset": {"type": ["string", "null"]},
+    "installPath": {"type": "string"},
+    "error": {"type": "string"}
+  }
+}

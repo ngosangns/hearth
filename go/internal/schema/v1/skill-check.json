@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dest", "inSync", "missing", "different", "extra"],
+  "properties": {
+    "dest": {"type": "string"},
+    "inSync": {"type": "boolean"},
+    "missing": {"type": "array", "items": {"type": "string"}},
+    "different": {"type": "array", "items": {"type": "string"}},
+    "extra": {"type": "array", "items": {"type": "string"}}
+  }
+}

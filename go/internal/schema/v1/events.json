@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {"kind": {"const": "connection"}}
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "services"],
+      "properties": {
+        "kind": {"const": "snapshot"},
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["serviceId", "desiredState", "actualState", "readiness", "generation", "createdAt", "updatedAt"],
+            "properties": {
+              "serviceId": {"type": "string"},
+              "desiredState": {"enum": ["stopped", "running"]},
+              "actualState": {"type": "string"},
+              "readiness": {"type": "string"},
+              "generation": {"type": "integer"},
+              "identity": {"type": "object"},
+              "readinessKind": {"type": "string"},
+              "readinessDetail": {"type": "string"},
+              "createdAt": {"type": "string"},
+              "updatedAt": {"type": "string"},
+              "exitedAt": {"type": "string"},
+              "exitCode": {"type": "integer"},
+              "error": {"type": "string"},
+              "currentOperationId": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": {"const": "unavailable"},
+        "message": {"type": "string"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "at", "type", "data"],
+      "properties": {
+        "sequence": {"type": "integer"},
+        "at": {"type": "string"},
+        "type": {"type": "string"},
+        "data": {"type": "object"}
+      }
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"id":"op1","requestId":"req1","kind":"service","serviceId":"api","action":"start","status":"succeeded","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:01Z","trace":[{"at":"2026-01-01T00:00:00Z","message":"started"}]}

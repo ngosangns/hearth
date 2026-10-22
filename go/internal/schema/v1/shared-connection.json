@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["service", "projectId", "connection"],
+  "properties": {
+    "service": {"type": "string"},
+    "projectId": {"type": "string"},
+    "connection": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string"},
+            "env": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        }
+      ]
+    }
+  }
+}

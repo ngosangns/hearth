@@ -127,8 +127,8 @@ under `~/.hearth/shared` and run by a separate global daemon (`hearth smp`). Eve
 registers the same `name@version` shares one instance; different versions run side by side.
 Shared entries show up as ordinary `infrastructure` services — `start` attaches this project
 (first start installs the service), `stop` only detaches (`manager stop` also stops an instance
-no other project is attached to), and connection info is read via the
-`local_services_shared_*` MCP tools or `hearth shared status`. See `docs/shared-services.md`.
+no other project is attached to), and connection info is on `hearth shared status` and
+`hearth shared connection` (both masked unless `--reveal`). See `docs/shared-services.md`.
 
 ```yaml
 shared:
@@ -179,36 +179,42 @@ root}`. `hearth manager restart --json` prints the same payload for a freshly st
 replacing the old one *without* stopping its services — they are detached, and the new daemon
 re-adopts them from their persisted identities. `hearth manager stop` stops the daemon and its
 services: its own processes, `external` services that declare a `stop:` command (a docker compose
-unit), and `shared:` entries, which detach.
+unit), and `shared:` entries, which detach. Off a TTY, `hearth manager stop` requires `--yes`.
 
 ## Commands
 
 `hearth [--root <path>] <command>`; `--root` defaults to the current directory and must come first.
 Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root. `--help`,
-`--version`, `shared`, and `update` work without one. A bare `hearth` prints help.
+`--version`, `version`, `schema`, `skill`, `shared`, `workspaces`, and `update` work without one. A bare `hearth` prints help. Every command's `--help` exits 0.
 
 | Command | What it does |
 |---|---|
 | `status [target] [--json]` | state of one service, a group, or all |
-| `start\|stop\|restart <target> [--wait] [--json]` | lifecycle for a service or group (a group start is one bulk operation; stop and restart go member by member). `start` also takes `--kill-unowned` (see AGENTS.md; asks `[y/N]` on a TTY if a port is held) |
+| `start\|stop\|restart <target> [--wait] [--json] [--dry-run] [--yes]` | lifecycle for a service or group (a group start is one bulk operation; stop and restart go member by member). `--dry-run` prints the resolved service ids and does not contact the daemon. `start --kill-unowned` asks `[y/N]` on a TTY when a port is held; off a TTY the flag requires `--yes` (exit 6) |
 | `logs <service> [--tail N] [--follow] [--json]` | read a service's log (default tail 200) |
 | `urls [target] [--json]` | live URLs |
 | `events --follow --json` | stream daemon changes as newline-delimited JSON |
 | `operation get\|watch <id> [--json]` | inspect one operation |
 | `doctor [--json]` | checks the platform (macOS or Linux) and that `docker`, `tailscale`, `nc`, `ps`, `sh` resolve, then validates the catalog |
 | `cleanup` | remove a stale lock no live daemon owns |
-| `manager ensure\|status\|stop\|restart\|reload [--json]` | daemon lifecycle; `reload` re-reads the catalog |
+| `manager ensure\|status\|stop\|restart\|reload [--json] [--yes]` | daemon lifecycle; `ensure` can start a daemon. `reload` re-reads the catalog. `stop` needs `--yes` off a TTY |
 | `daemon --root <path>` / `smp` | run the project daemon / the machine-global shared-services daemon in the foreground (clients spawn them) |
-| `shared list\|installed\|status\|ensure` | inspect the shared registry and smp |
+| `shared list [--json]` | remote shared-service recipes |
+| `shared installed\|status [--json] [--mask] [--reveal]` | installed instances and live smp status, sorted by name then version. Secrets are masked unless `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error |
+| `shared connection <service\|name@version> [--json] [--reveal]` | this project's connection. Secrets are masked unless `--reveal` |
 | `shared install\|start\|stop <name@ver>` | manage a shared instance |
-| `shared attach\|probe <name@ver>`, `shared detach <name@ver> [--stop-if-unused]` | what generated `shared:` services run |
-| `shared remove <name@ver> [--force]` | delete an instance; `--force` is required while projects are attached |
+| `shared attach\|probe <name@ver>`, `shared detach <name@ver> [--stop-if-unused] [--yes]` | what generated `shared:` services run. `detach --stop-if-unused` needs `--yes` off a TTY |
+| `shared remove <name@ver> [--force] [--yes]` | delete an instance; `--force` is required while projects are attached. `--yes` is required off a TTY |
 | `update [--check] [--json] [--force]` | install the latest GitHub release |
 | `mcp` | serve the MCP tools over stdio |
 | `mcp install [--name N] [--key K] [--json] <config-file>...` | write this binary's path into an MCP client config (`mcpServers.<name>` unless `--key`) |
-| `skill install --dest <dir>` | write `SKILL.md` and `scripts/*.sh` for coding agents |
+| `skill install [--dest DIR]` | write `SKILL.md` and `scripts/*.sh` (default `~/.agents/skills/hearth`) |
+| `skill check [--dest DIR] [--json]` | compare that directory with the copy embedded in this binary |
+| `version [--json]` | name, version, schemaVersion, commit |
+| `schema [--json] [<command>]` | command list and JSON Schemas. `mutates` marks a command that can change a process or a file. `manager ensure` and `shared ensure` are mutating |
+| `workspaces list [--json]` | workspace folders the Hearth window knows (`~/Library/Application Support/HearthApp/workspaces.json`, or `HEARTH_WORKSPACE_FILE`). Read-only. A missing file is an empty list |
 
-Exit codes: 2 usage, 3 daemon unavailable, 4 protocol mismatch, 5 operation failed, 7 unauthorized.
+Exit codes: 2 usage, 3 unavailable, 4 protocol mismatch, 5 operation failed, 6 needs confirmation (`--yes`), 7 unauthorized, 8 drift or conflict. With `--json`, a failure prints `{"error":{code,exit,message,hint?}}` on stdout. `hearth update --json` keeps its report, `skill check` drift keeps the check document, `doctor --json` keeps the report when checks fail, and `shared probe` stays silent.
 
 ## MCP server
 
@@ -233,7 +239,7 @@ confirmation. `task dev:install` builds the Dev app from `../ns-gpui` into
 
 ![Service list and log pane for a demo project](docs/screenshots/hearth-1440.png)
 
-The window on a 1440x900 display (sidebar cropped out), showing a demo project with three services started and the `api` log open.
+The window at 1440x900 with a throwaway demo project (`/tmp/hearth-demo/acme-shop`) as its only workspace: the sidebar's Workspaces tab (Shared is the other tab), the Daemon row with its round status badge (hover it for the state and daemon note), three started services grouped by `groups:`, and the `api` log open.
 
 ![Log view at 390 px wide](docs/screenshots/hearth-390-log.png)
 

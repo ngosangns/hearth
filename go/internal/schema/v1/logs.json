@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["serviceId", "generation", "cursor", "nextCursor", "data", "reset", "truncated"],
+  "properties": {
+    "serviceId": {"type": "string"},
+    "generation": {"type": "integer"},
+    "cursor": {"type": "integer"},
+    "nextCursor": {"type": "integer"},
+    "data": {"type": "string"},
+    "reset": {"type": "boolean"},
+    "truncated": {"type": "boolean"}
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["key", "server", "command", "args", "files"],
+  "properties": {
+    "key": {"type": "string"},
+    "server": {"type": "string"},
+    "command": {"type": "string"},
+    "args": {"type": "array", "items": {"type": "string"}},
+    "files": {"type": "array", "items": {"type": "string"}}
+  }
+}

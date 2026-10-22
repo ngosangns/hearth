@@ -598,13 +598,21 @@ func TestSkillInstallNormalizesASkillMdDestToItsParentDirectory(t *testing.T) {
 	}
 }
 
-func TestSkillInstallRequiresADestFlag(t *testing.T) {
-	code, _, errLines := runCLI(t, t.TempDir(), "skill", "install")
-	if code != ExitUsage {
-		t.Fatalf("expected exit %d, got %d", ExitUsage, code)
+func TestSkillInstallDefaultsDestUnderHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	code, outLines, errLines := runCLI(t, t.TempDir(), "skill", "install")
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (%v)", code, errLines)
 	}
-	if len(errLines) == 0 || !strings.Contains(errLines[0], "usage: hearth skill install") {
-		t.Fatalf("unexpected stderr: %v", errLines)
+	if len(outLines) == 0 || !strings.Contains(outLines[0], "installed hearth skill") {
+		t.Fatalf("unexpected stdout: %v", outLines)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".agents", "skills", "hearth", "SKILL.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".agents", "skills", "hearth", "scripts", "hearth.sh")); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "services"],
+  "properties": {
+    "version": {"type": "integer"},
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["versions"],
+        "properties": {
+          "versions": {
+            "type": "object",
+            "additionalProperties": {"type": "object"}
+          }
+        }
+      }
+    }
+  }
+}

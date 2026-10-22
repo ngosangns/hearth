@@ -1,0 +1,1 @@
+{"instances":[{"name":"minio","version":"1","port":43100,"installState":"installed","recipe":{"run":{"argv":["minio"]}},"attachments":{"p1":{"projectRoot":"/tmp/app","provisioned":true,"attachedAt":"2026-01-01T00:00:00Z","connection":{"url":"http://127.0.0.1:9000","env":{"S3_BUCKET":"photos","AWS_SECRET_ACCESS_KEY":"••••••"}}}}}]}

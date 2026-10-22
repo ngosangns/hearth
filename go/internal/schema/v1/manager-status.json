@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "instanceId", "pid", "port", "startedAt", "metadataVersion", "runtimeDirectory"],
+  "properties": {
+    "protocolVersion": {"type": "integer"},
+    "instanceId": {"type": "string"},
+    "pid": {"type": "integer"},
+    "port": {"type": "integer"},
+    "startedAt": {"type": "string"},
+    "metadataVersion": {"type": "integer"},
+    "runtimeDirectory": {"type": "string"}
+  }
+}

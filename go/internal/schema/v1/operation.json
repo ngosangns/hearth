@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "requestId", "kind", "status", "createdAt", "updatedAt", "trace"],
+  "properties": {
+    "id": {"type": "string"},
+    "requestId": {"type": "string"},
+    "kind": {"enum": ["service", "bulk-start", "manager-shutdown"]},
+    "serviceId": {"type": "string"},
+    "targetServiceIds": {"type": "array", "items": {"type": "string"}},
+    "action": {"enum": ["start", "stop", "restart", "status"]},
+    "status": {"enum": ["queued", "running", "succeeded", "failed"]},
+    "createdAt": {"type": "string"},
+    "updatedAt": {"type": "string"},
+    "trace": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "message"],
+        "properties": {
+          "at": {"type": "string"},
+          "message": {"type": "string"}
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"}
+      }
+    }
+  }
+}

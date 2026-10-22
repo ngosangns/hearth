@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- `hearth version --json` prints name, version, schemaVersion 1, and commit. `hearth schema [--json]` lists every command with its JSON Schema.
+- `hearth skill check` compares the installed skill with the copy in the binary. `hearth skill install` defaults to `~/.agents/skills/hearth`.
+- `hearth shared connection` prints this project's connection and masks secrets unless `--reveal`. `shared status` and `shared installed` mask the same way. `--reveal` prints the real values. `--mask` is accepted and changes nothing. `--mask` together with `--reveal` is a usage error. Instances are listed by name, then version. MCP `shared_status` and `shared_connection` always mask.
+- With `--json`, a command failure prints `{"error":{code,exit,message,hint?}}` on stdout and exits with that code. Exit 6 is needs-confirm: off a TTY, `start --kill-unowned`, `manager stop`, `shared remove`, and `shared detach --stop-if-unused` require `--yes`. On a TTY, `--kill-unowned` remains the confirmation. A terminal is an ioctl (`TIOCGETA` / `TCGETS`), so `/dev/null` and a GUI launch stay off a TTY. `hearth update --json` keeps its report, `skill check` drift keeps the check document (exit 8), `doctor --json` keeps the report when checks fail (exit 5), and `shared probe` stays silent.
+- `start|stop|restart <target> --dry-run` prints the services that command would submit and does not contact the daemon.
+- `hearth workspaces list [--json]` reads the Hearth window's workspace file. A missing file is an empty list.
+- `manager ensure` is marked mutating in `hearth schema`, matching `shared ensure`. Every `--help` exits 0.
+
 ## 0.27.4
 
 - Internal cleanup: shared helpers (context sleep, string deref, JSON array access) are defined once. No behavior change.

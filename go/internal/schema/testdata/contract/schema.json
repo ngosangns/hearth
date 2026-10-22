@@ -1,0 +1,1 @@
+{"name":"hearth","schemaVersion":1,"commands":{"version":{"summary":"name, version, schemaVersion, and commit","mutates":false,"destructive":false,"flags":["--json"],"output":{"type":"object"}}},"error":{"type":"object"}}

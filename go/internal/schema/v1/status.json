@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["services"],
+  "properties": {
+    "services": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["serviceId", "state", "actualState"],
+        "properties": {
+          "serviceId": {"type": "string"},
+          "state": {
+            "type": "string",
+            "enum": ["stopped", "running", "ready", "succeeded", "queued-start", "stopping", "failed", "orphaned", "externally-owned"]
+          },
+          "actualState": {
+            "type": "string",
+            "enum": ["stopped", "queued-start", "preparing", "starting", "running", "running-unready", "ready", "succeeded", "stopping", "failed", "orphaned", "externally-owned"]
+          },
+          "pid": {"type": "integer"}
+        }
+      }
+    }
+  }
+}

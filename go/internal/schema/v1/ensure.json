@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["instanceId", "port", "token", "protocolVersion", "runtimeDirectory", "root"],
+  "properties": {
+    "instanceId": {"type": "string"},
+    "port": {"type": "integer"},
+    "token": {"type": "string"},
+    "protocolVersion": {"type": "integer"},
+    "runtimeDirectory": {"type": "string"},
+    "root": {"type": "string"}
+  }
+}

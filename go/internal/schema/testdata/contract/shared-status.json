@@ -1,0 +1,1 @@
+{"instances":[{"id":"minio@1","name":"minio","version":"1","port":43100,"extraPorts":[],"installState":"installed","installError":null,"state":{"actualState":"ready","readiness":"ready"},"attachments":[{"projectId":"p1","projectRoot":"/tmp/app","provisioned":true,"connection":{"url":"http://user:••••••@127.0.0.1:9000","env":{"S3_BUCKET":"photos"}}}]}]}

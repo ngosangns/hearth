@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operations"],
+      "properties": {
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "requestId", "kind", "status", "createdAt", "updatedAt", "trace"]
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation"],
+      "properties": {
+        "operation": {
+          "type": "object",
+          "required": ["id", "requestId", "kind", "status", "createdAt", "updatedAt", "trace"]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dryRun", "action", "target", "services"],
+      "properties": {
+        "dryRun": {"const": true},
+        "action": {"enum": ["start", "stop", "restart"]},
+        "target": {"type": "string"},
+        "services": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  ]
+}
