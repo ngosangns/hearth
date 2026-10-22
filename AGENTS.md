@@ -37,7 +37,7 @@ shutdown — not for ordinary multi-service start/restart.
 ## Build, test, release
 
 From `go/`: `go test ./...`, `go vet ./...`, and `gofmt -l .` (must be empty).
-Also `task test` / `task clippy` / `task ci` from the repo root.
+Also `task test` / `task clippy` (vet + gofmt) / `task ci` from the repo root.
 
 The suite needs a running `docker` daemon and `tailscale`, plus `nc`, `ps`, `sh`.
 
@@ -131,10 +131,10 @@ from any dev box here, with the same username.
 
 **Process supervision**
 
-- `normalizeCommandFingerprint` must hash the *logical* command text (argv joined, or the bare
+- `NormalizeCommandFingerprint` must hash the *logical* command text (argv joined, or the bare
   `shell` string) — never the physical `sh -c` spawn wrapper — so it matches
-  `normalizeObservedCommandFingerprint`'s prefix-stripped `ps` output. A future refactor of
-  `commandArgv` should re-check this pairing.
+  `NormalizeObservedCommandFingerprint`'s prefix-stripped `ps` output. A future refactor of
+  `CommandArgv` should re-check this pairing.
 - Stopping a service signals its **whole process tree**, snapshotted from `ps` before the first
   signal. `air` runs the built server in its **own** process group, so signalling only the tracked
   pgid leaves the real server alive holding its port, and the next start fails with `Port N is held
@@ -159,7 +159,7 @@ from any dev box here, with the same username.
 - An adopted process that is still alive is kept. A failing probe leaves it `running-unready`
   and the 1.5s loop keeps checking; start does not kill it. Restart replaces it. A process that
   is already gone is spawned again.
-- `ProcessAdapter::inspect` is tri-state (`Inspection::Observed|Gone|Unknown`) — a probe that fails
+- `ProcessAdapter.Inspect` is tri-state (`Inspection` kind `Observed|Gone|Unknown`) — a probe that fails
   to spawn or times out is `Unknown`, and callers must never read it as "gone": a wedged `docker`
   or `ps` would otherwise let `stop` record `stopped` over a running container and `reconcile` mark
   a live service `Failed` (spawning a duplicate). Unknown ⇒ stop/terminate fail loudly, `status`
@@ -168,7 +168,7 @@ from any dev box here, with the same username.
   passes: an "active state" stop pass for daemon-owned services, then the project's
   `ownership: external` services that are up and declare a `stop:` command (a `shared:` entry's
   `hearth shared detach` gets `--stop-if-unused`, so smp stops the instance only when no other
-  project is attached — `shutdownStopCommand`), then a reap pass for daemon-owned services
+  project is attached — `shared.ShutdownStopCommand`), then a reap pass for daemon-owned services
   holding a stale POSIX identity in a non-active state (e.g. `externally-owned` after a port
   conflict). Don't collapse these into one, and keep the external pass after the first so apps
   release a shared database before it goes. `manager restart` and SIGTERM never run it.
@@ -248,7 +248,7 @@ from any dev box here, with the same username.
   that is this service — the `exec` target running in this service's directory, or a command line
   that still contains the `cd && exec build/install/.../bin/...` install directory — is adopted and
   probed. A different program stays `externally-owned` until a confirmed `killUnowned` start.
-  `None` from the port probe leaves the row unchanged. `sync_external_services` still only polls
+  `None` from the port probe leaves the row unchanged. `SyncExternalServices` still only polls
   `ownership: external` units.
   A **renamed-ownership id** is a separate blind spot: removing a `shared:` key and re-adding it as
   a `services:` entry keeps the old row (`adopted from external state`, `command` readiness) across
@@ -277,13 +277,13 @@ from any dev box here, with the same username.
 - The log `generation` clients echo is `lifecycle * 1_000_000 + rotation`, not the lifecycle alone.
   A rotation resets a follower the same way a restart does. Generation 0 is valid (no state row).
 - `GET /v1/logs/:id` with no `limit` stays the 16 KiB tail. An explicit `limit` is honored up to
-  the current file cap (`max_bytes`, 256 KiB) so a pane can page earlier bytes. Do not clamp that
+  the current file cap (`DefaultLogMaxBytes`, 256 KiB) so a pane can page earlier bytes. Do not clamp that
   request back to the default tail — the next page then returns the same window forever.
 
 **Catalog**
 
 - `{ kind: "command" }` readiness is the JSON-serializable stand-in for a custom probe. Exit 0 means
-  ready; anything else is `running-unready`. The probe repeats every 1.5s (`readiness_backoff_ms`)
+  ready; anything else is `running-unready`. The probe repeats every 1.5s (`ReadinessBackoffMs`)
   until stop, restart, process exit, or daemon shutdown. It does not fail the service.
   `readinessTimeoutMs` is still parsed. It no longer ends a long-lived start. It bounds one
   command probe, and the one-shot shared-attach wait. `hearth start --wait`, bulk start, and MCP
@@ -315,11 +315,11 @@ from any dev box here, with the same username.
   `/v1/catalog`, `hearth status`, and the app.
 - `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
   into `ServiceCatalog.groups` for target resolution; the declared membership stays in
-  `group_tree` (`groupTree` on the wire) so a client can group by *direct* membership instead of
+  `GroupTree` (`groupTree` on the wire) so a client can group by *direct* membership instead of
   showing a giant `all` section. A member naming both a service and a group resolves as the
   service. Cycles are a load error, not truncation.
 - `disabled: true` rejects direct start/stop/restart (`service_disabled`, `status` still works) and
-  is stripped from flattened `groups` — group ops skip it silently; `group_tree` still lists it for
+  is stripped from flattened `groups` — group ops skip it silently; `groupTree` still lists it for
   display. The daemon lifecycle check (`StopDisabledServices`, from the post-listen reconcile,
   catalog reload, and the 2s tick) stops its processes: the tracked tree, a port holder that is this
   service, and other host processes of that service — the same command, the program a `shell` +
@@ -464,8 +464,7 @@ from any dev box here, with the same username.
   inherits the test harness's pgid and the test's `killpg` calls signal the whole test run.
 - `nc -l <port>` without `-k` exits after accepting one connection — and the TCP readiness probe's
   own `connect()` **is** that connection, so the service goes ready then immediately failed.
-- `HearthManager.ShutdownCompletion()` is a channel **closed** on shutdown — unlike Rust's
-  `watch::Sender`, a late reader still sees a completed shutdown.
+- `HearthManager.ShutdownCompletion()` is a channel **closed** on shutdown — so a late reader still sees a completed shutdown.
 
 **Rejected approaches (don't re-litigate)**
 

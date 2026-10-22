@@ -130,7 +130,7 @@ func (c *Client) Watch(ctx context.Context, after *uint64, epoch *string) <-chan
 			if ctx.Err() != nil {
 				return
 			}
-			if err := sleepCtx(ctx, reconnectDelay); err != nil {
+			if err := SleepContext(ctx, reconnectDelay); err != nil {
 				return
 			}
 		}

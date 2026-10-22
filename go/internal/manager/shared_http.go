@@ -842,7 +842,7 @@ func (m *HearthManager) sharedDetach(r *http.Request) (map[string]any, *ManagerH
 func (m *HearthManager) stopUnusedInstance(id string) (bool, *ManagerHttpError) {
 	running := false
 	if st := m.ServiceState(id); st != nil {
-		running = isActiveState(st.ActualState)
+		running = supervisor.IsActiveState(st.ActualState)
 	}
 	if !running {
 		return false, nil

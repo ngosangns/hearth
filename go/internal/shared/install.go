@@ -83,11 +83,11 @@ func InstallServiceArtifact(projectRoot, runtimeDirectory string, service *catal
 	if service == nil || artifact == nil {
 		return Errorf("artifact install: missing service or artifact")
 	}
-	installDir := strings.TrimSpace(derefString(artifact.InstallDir))
+	installDir := strings.TrimSpace(DerefString(artifact.InstallDir))
 	if installDir == "" {
 		installDir = paths.InstallDir(runtimeDirectory, service.ID, artifact.Version)
 	}
-	dataDir := strings.TrimSpace(derefString(artifact.DataDir))
+	dataDir := strings.TrimSpace(DerefString(artifact.DataDir))
 	if dataDir == "" {
 		dataDir = paths.ServiceDataDir(runtimeDirectory, service.ID)
 	}
@@ -96,13 +96,6 @@ func InstallServiceArtifact(projectRoot, runtimeDirectory string, service *catal
 	}
 	_, err := ProjectInstaller(projectRoot, paths.DownloadsDir(runtimeDirectory)).Install(service.ID, installDir, artifactFromService(artifact), onProgress)
 	return err
-}
-
-func derefString(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }
 
 // Install is idempotent: a present marker returns the install dir immediately.
@@ -544,4 +537,12 @@ func killGroup(pgid int) {
 	if pgid > 1 {
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	}
+}
+
+// DerefString returns *s, or "" when s is nil.
+func DerefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

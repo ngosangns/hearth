@@ -19,6 +19,7 @@ import (
 
 	"github.com/ngosangns/hearth/go/internal/client"
 	"github.com/ngosangns/hearth/go/internal/fileio"
+	"github.com/ngosangns/hearth/go/internal/omap"
 	"github.com/ngosangns/hearth/go/internal/shared"
 	"github.com/ngosangns/hearth/go/internal/state"
 )
@@ -170,7 +171,7 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 		if flags.JSON {
 			out(io, prettyJSON(jsonValue(body)))
 		} else {
-			for _, entry := range asArray(body["instances"]) {
+			for _, entry := range omap.AsArray(body["instances"]) {
 				instance, ok := entry.(map[string]any)
 				if !ok {
 					continue
@@ -355,10 +356,4 @@ func envOrNil(name string) *string {
 		return nil
 	}
 	return &value
-}
-
-// asArray returns value as a slice, or nil.
-func asArray(value any) []any {
-	array, _ := value.([]any)
-	return array
 }

@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
@@ -34,7 +35,7 @@ func (s *ProcessSupervisor) startLocked(serviceID string, operationID *string, o
 	if hasActive {
 		s.finalize(serviceID, true)
 	}
-	if current != nil && current.Identity != nil && isActiveState(current.ActualState) {
+	if current != nil && current.Identity != nil && IsActiveState(current.ActualState) {
 		if owned := s.owns(current); owned != nil && *owned {
 			return nil
 		}
@@ -315,7 +316,7 @@ func (s *ProcessSupervisor) disabledQueries(serviceID string) []serviceProcessQu
 	execFingerprints := execTargetFingerprints(&profile.Command)
 	if lived == cwd || pathsEqual(lived, cwd) {
 		for _, fp := range execFingerprints {
-			if !containsStr(fingerprints, fp) {
+			if !slices.Contains(fingerprints, fp) {
 				fingerprints = append(fingerprints, fp)
 			}
 		}
@@ -325,7 +326,7 @@ func (s *ProcessSupervisor) disabledQueries(serviceID string) []serviceProcessQu
 	}
 	livedFingerprints := append([]string{}, execFingerprints...)
 	for _, fp := range fingerprints {
-		if !containsStr(livedFingerprints, fp) {
+		if !slices.Contains(livedFingerprints, fp) {
 			livedFingerprints = append(livedFingerprints, fp)
 		}
 	}
@@ -399,7 +400,7 @@ func (s *ProcessSupervisor) duplicateFingerprints(serviceID string) []string {
 	fingerprints := []string{NormalizeCommandFingerprint(&profile.Command)}
 	if st := s.state(serviceID); st != nil && st.Identity != nil && st.Identity.CommandFingerprint != "" {
 		extra := st.Identity.CommandFingerprint
-		if !containsStr(fingerprints, extra) {
+		if !slices.Contains(fingerprints, extra) {
 			fingerprints = append(fingerprints, extra)
 		}
 	}

@@ -5,7 +5,6 @@ package shared
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"sync"
 
@@ -151,13 +150,4 @@ func (r *SharedRegistry) Remove(id string) (*SharedInstance, error) {
 		return nil
 	})
 	return removed, err
-}
-
-// For tests: persist directly.
-func SaveRegistryFile(root string, data *SharedRegistryData) error {
-	text, err := json.MarshalIndent(&registryFile{registryVersion, *data}, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(root, registryFileName), text, 0o644)
 }

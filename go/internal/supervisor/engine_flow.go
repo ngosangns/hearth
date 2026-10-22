@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1392,15 +1393,6 @@ func asSupervisor(err error) error {
 // (unverifiable) answer is never "not ours".
 func ownsFalse(v *bool) bool { return v != nil && !*v }
 
-func containsStr(list []string, want string) bool {
-	for _, v := range list {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
-
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 func cloneStr(s *string) *string {
@@ -1590,7 +1582,7 @@ func execTargetFingerprints(command *catalog.ServiceCommand) []string {
 	}
 	if program, ok := execProgram(command.Command.Shell); ok {
 		observed := NormalizeObservedCommandFingerprint(program)
-		if !containsStr(fingerprints, observed) {
+		if !slices.Contains(fingerprints, observed) {
 			fingerprints = append(fingerprints, observed)
 		}
 	}

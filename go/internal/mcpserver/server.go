@@ -24,6 +24,7 @@ import (
 	"io"
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 
@@ -377,20 +378,10 @@ func isLegacyVersion(version string) bool {
 // legacy version the server supports, else fall back to the server's newest
 // legacy version.
 func negotiateProtocolVersion(requested string) string {
-	if isLegacyVersion(requested) && containsString(knownProtocolVersions, requested) {
+	if isLegacyVersion(requested) && slices.Contains(knownProtocolVersions, requested) {
 		return requested
 	}
 	return serverFallbackProtocolVersion
-}
-
-// containsString reports whether values contains target.
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +444,7 @@ func decodeArguments(raw json.RawMessage) (arguments, error) {
 func requireOnlyKeys(value arguments, allowed ...string) error {
 	var unexpected []string
 	for _, key := range value.keys {
-		if !containsString(allowed, key) {
+		if !slices.Contains(allowed, key) {
 			unexpected = append(unexpected, key)
 		}
 	}

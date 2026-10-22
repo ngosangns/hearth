@@ -35,6 +35,7 @@ import (
 	"github.com/ngosangns/hearth/go/internal/omap"
 	"github.com/ngosangns/hearth/go/internal/paths"
 	"github.com/ngosangns/hearth/go/internal/platform"
+	"github.com/ngosangns/hearth/go/internal/shared"
 	"github.com/ngosangns/hearth/go/internal/state"
 	"github.com/ngosangns/hearth/go/internal/supervisor"
 )
@@ -442,7 +443,7 @@ func Cleanup(ctx context.Context, root string, options *Options) error {
 		guarded = *options.Catalog.PrivateFileGuard
 	}
 	ioFiles := fileio.New(guarded)
-	runtimeDirectory := paths.ResolveRuntimeDirectory(root, derefString(options.Catalog.RuntimeDirectory))
+	runtimeDirectory := paths.ResolveRuntimeDirectory(root, shared.DerefString(options.Catalog.RuntimeDirectory))
 	discovered := client.Discover(ctx, root, &options.Catalog)
 	if discovered.Kind == client.DiscoveryLive || !ioFiles.IsPrivateDirectory(runtimeDirectory) {
 		return nil
@@ -545,7 +546,7 @@ func Logs(ctx context.Context, c *client.Client, serviceID string, tail uint64, 
 			if !follow {
 				return nil
 			}
-			if err := sleepCtx(ctx, 500*time.Millisecond); err != nil {
+			if err := client.SleepContext(ctx, 500*time.Millisecond); err != nil {
 				return err
 			}
 			continue
@@ -554,7 +555,7 @@ func Logs(ctx context.Context, c *client.Client, serviceID string, tail uint64, 
 		if !follow || reconnects > 3 {
 			return failErr(ExitUnavailable, "log follow lost manager connection")
 		}
-		if err := sleepCtx(ctx, 200*time.Millisecond); err != nil {
+		if err := client.SleepContext(ctx, 200*time.Millisecond); err != nil {
 			return err
 		}
 		c, err = RequireClient(ctx, c.Root, options)
@@ -581,17 +582,6 @@ func rustLines(s string) []string {
 		out = append(out, strings.TrimSuffix(line, "\r"))
 	}
 	return out
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1053,7 +1043,7 @@ func waitForDaemonExit(ctx context.Context, pid int64, timeout time.Duration, al
 		if !time.Now().Before(deadline) {
 			return failErr(ExitFailed, fmt.Sprintf("hearth manager (pid %d) did not exit within %ds", pid, int(timeout.Seconds())))
 		}
-		if err := sleepCtx(ctx, 200*time.Millisecond); err != nil {
+		if err := client.SleepContext(ctx, 200*time.Millisecond); err != nil {
 			return err
 		}
 	}
@@ -1677,13 +1667,6 @@ func firstOrNil(items []string) *string {
 		return nil
 	}
 	return &items[0]
-}
-
-func derefString(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }
 
 func findRow(rows []state.ServiceLifecycleState, serviceID string) *state.ServiceLifecycleState {

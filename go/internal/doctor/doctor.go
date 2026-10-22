@@ -6,12 +6,10 @@ package doctor
 import (
 	"bytes"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
 	"github.com/ngosangns/hearth/go/internal/env"
@@ -49,15 +47,6 @@ type PlatformAdapter interface {
 	Platform() string
 }
 
-func tcpProbe(port uint16) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 250*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
 type DefaultDoctorAdapter struct{}
 
 func (DefaultDoctorAdapter) Command(command string, args []string) CommandResult {
@@ -87,7 +76,7 @@ func (DefaultDoctorAdapter) Path(path string) bool {
 	return err == nil
 }
 
-func (DefaultDoctorAdapter) Port(port uint16) bool { return tcpProbe(port) }
+func (DefaultDoctorAdapter) Port(port uint16) bool { return platform.TCPPortOpen(port) }
 
 // lookPathIn resolves name against path, mirroring exec.LookPath but using the
 // child's PATH (Rust searches the child's environment for the program). A name

@@ -169,18 +169,6 @@ func (s *OperationScheduler) Get(id string) *state.Operation {
 	return &snap
 }
 
-func (s *OperationScheduler) IsQueued(op *state.Operation) bool {
-	targets := targetsOf(op)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, target := range targets {
-		if s.activeTargets[target] == op.ID {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *OperationScheduler) CloseMutations() { s.closing.Store(true) }
 
 // DrainServices waits for every currently in-flight service-targeted

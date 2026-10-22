@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -306,19 +307,10 @@ func pruneOldVersions(dir string, keep []string) {
 		if !ok {
 			continue
 		}
-		if _, ok := parseSemver(version); ok && !containsString(keep, version) {
+		if _, ok := parseSemver(version); ok && !slices.Contains(keep, version) {
 			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}
-}
-
-func containsString(items []string, want string) bool {
-	for _, item := range items {
-		if item == want {
-			return true
-		}
-	}
-	return false
 }
 
 type updateLock struct {

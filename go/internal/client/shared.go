@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
+	"github.com/ngosangns/hearth/go/internal/omap"
 	"github.com/ngosangns/hearth/go/internal/shared"
 )
 
@@ -57,7 +58,7 @@ func SharedInstance(ctx context.Context, client *Client, id string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range asArray(body["instances"]) {
+	for _, entry := range omap.AsArray(body["instances"]) {
 		instance, ok := entry.(map[string]any)
 		if !ok {
 			continue
@@ -118,7 +119,7 @@ func SharedProbe(ctx context.Context, client *Client, id, projectRoot string) bo
 		return false
 	}
 	projectID := shared.ProjectID(projectRoot)
-	for _, entry := range asArray(instance["attachments"]) {
+	for _, entry := range omap.AsArray(instance["attachments"]) {
 		attachment, ok := entry.(map[string]any)
 		if !ok {
 			continue
@@ -160,7 +161,7 @@ func SharedConnection(ctx context.Context, client *Client, id, projectRoot strin
 		return nil, sharedError(id + " is not a registered shared instance")
 	}
 	projectID := shared.ProjectID(projectRoot)
-	for _, entry := range asArray(instance["attachments"]) {
+	for _, entry := range omap.AsArray(instance["attachments"]) {
 		attachment, ok := entry.(map[string]any)
 		if !ok {
 			continue
@@ -182,9 +183,4 @@ func SharedConnection(ctx context.Context, client *Client, id, projectRoot strin
 
 func sharedError(message string) *Error {
 	return &Error{Kind: KindHTTP, Message: message, ExitCode: ExitFailed}
-}
-
-func asArray(value any) []any {
-	array, _ := value.([]any)
-	return array
 }

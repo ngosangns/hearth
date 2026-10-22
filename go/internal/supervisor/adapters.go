@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,6 +30,7 @@ import (
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
 	"github.com/ngosangns/hearth/go/internal/paths"
+	"github.com/ngosangns/hearth/go/internal/platform"
 	"github.com/ngosangns/hearth/go/internal/shared"
 	"github.com/ngosangns/hearth/go/internal/state"
 )
@@ -423,15 +423,6 @@ func tailnetServing() bool {
 	}
 	web, ok := v["Web"].(map[string]any)
 	return ok && len(web) > 0
-}
-
-func tcpProbe(port uint16) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 250*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
 }
 
 // portHolders resolves the pids listening on `port` per `lsof`, each resolved
@@ -1185,7 +1176,7 @@ func NewDefaultProbeAdapter(root string, baseEnv map[string]string) *DefaultProb
 	return &DefaultProbeAdapter{Root: root, BaseEnvironment: baseEnv, HTTPClient: &http.Client{}}
 }
 
-func (a *DefaultProbeAdapter) TCP(port uint16) bool { return tcpProbe(port) }
+func (a *DefaultProbeAdapter) TCP(port uint16) bool { return platform.TCPPortOpen(port) }
 
 func (a *DefaultProbeAdapter) HTTP(url string) bool {
 	client := &http.Client{Timeout: 250 * time.Millisecond}
@@ -1205,7 +1196,7 @@ func (a *DefaultProbeAdapter) Container(containerName string) bool {
 func (a *DefaultProbeAdapter) Tailnet() bool { return tailnetServing() }
 
 func (a *DefaultProbeAdapter) PortInUse(port uint16) *bool {
-	v := tcpProbe(port)
+	v := platform.TCPPortOpen(port)
 	return &v
 }
 

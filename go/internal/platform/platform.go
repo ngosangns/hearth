@@ -4,7 +4,9 @@
 package platform
 
 import (
+	"net"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -109,4 +111,14 @@ func zombieStatus(pid int) zombieStatusT {
 // caller keeps the pid alive rather than stealing a lock.
 func psZombieStatus(pid int) zombieStatusT {
 	return runPsZombieProbe(pid, time.Second)
+}
+
+// TCPPortOpen reports whether something accepts TCP connections on 127.0.0.1:port.
+func TCPPortOpen(port uint16) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))), 250*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }

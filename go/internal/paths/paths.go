@@ -44,10 +44,6 @@ func LogsDir(runtimeDirectory string) string {
 	return filepath.Join(runtimeDirectory, "logs")
 }
 
-func LogPath(runtimeDirectory, serviceID string) string {
-	return filepath.Join(LogsDir(runtimeDirectory), serviceID+".log")
-}
-
 func RawLogPath(runtimeDirectory, serviceID string) string {
 	return filepath.Join(LogsDir(runtimeDirectory), serviceID+".raw")
 }

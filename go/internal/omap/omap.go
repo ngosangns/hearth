@@ -49,11 +49,6 @@ func (o *OMap) Each(fn func(string, any)) {
 	}
 }
 
-// ---- generic value accessors (any = nil | bool | string | int64 | float64 | []any | *OMap) ----
-
-func IsObject(v any) bool { _, ok := v.(*OMap); return ok }
-func IsArray(v any) bool  { _, ok := v.([]any); return ok }
-
 func AsObject(v any) *OMap {
 	if o, ok := v.(*OMap); ok {
 		return o

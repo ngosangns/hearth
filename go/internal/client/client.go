@@ -293,7 +293,7 @@ func Ensure(ctx context.Context, root string, options *Options) (*Client, error)
 	started := time.Now()
 	var lastBootstrapping *int64
 	for {
-		if err := sleepCtx(ctx, 50*time.Millisecond); err != nil {
+		if err := SleepContext(ctx, 50*time.Millisecond); err != nil {
 			return nil, err
 		}
 		discovered := discoverWith(ctx, io, doer, root, options.Catalog)
@@ -333,17 +333,6 @@ func Ensure(ctx context.Context, root string, options *Options) (*Client, error)
 func discoverWith(ctx context.Context, io fileio.FileIO, doer HTTPDoer, root string, cat *catalog.ServiceCatalog) Discovery {
 	d, _ := discoverProbed(ctx, io, doer, root, cat)
 	return d
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +652,7 @@ func (c *Client) Wait(ctx context.Context, id string, deadline *time.Time) (*sta
 		if deadline != nil && !time.Now().Before(*deadline) {
 			return operation, nil
 		}
-		if err := sleepCtx(ctx, operationPollInterval); err != nil {
+		if err := SleepContext(ctx, operationPollInterval); err != nil {
 			return nil, err
 		}
 	}
@@ -697,4 +686,16 @@ func logQuery(cursor, generation, limit *uint64) string {
 		return ""
 	}
 	return "?" + strings.Join(parts, "&")
+}
+
+// SleepContext waits d or until ctx is done, returning ctx.Err() in that case.
+func SleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

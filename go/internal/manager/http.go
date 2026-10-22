@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -217,7 +218,7 @@ func strictBody(r *http.Request, allowed, required []string) (map[string]any, *M
 		return nil, newHTTPError(http.StatusBadRequest, "invalid_request", "Request schema is invalid")
 	}
 	for k := range obj {
-		if !containsString(allowed, k) {
+		if !slices.Contains(allowed, k) {
 			return nil, newHTTPError(http.StatusBadRequest, "invalid_request", "Request schema is invalid")
 		}
 	}
@@ -227,15 +228,6 @@ func strictBody(r *http.Request, allowed, required []string) (map[string]any, *M
 		}
 	}
 	return obj, nil
-}
-
-func containsString(list []string, v string) bool {
-	for _, s := range list {
-		if s == v {
-			return true
-		}
-	}
-	return false
 }
 
 // requireRequestID validates `requestId`: a non-empty string of at most 128

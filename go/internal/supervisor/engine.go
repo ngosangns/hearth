@@ -7,6 +7,7 @@ package supervisor
 
 import (
 	"regexp"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,14 +29,8 @@ var ActiveStates = []state.ActualServiceState{
 	state.ActualStopping,
 }
 
-func isActiveState(s state.ActualServiceState) bool {
-	for _, v := range ActiveStates {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
+// IsActiveState reports whether s is one of ActiveStates.
+func IsActiveState(s state.ActualServiceState) bool { return slices.Contains(ActiveStates, s) }
 
 const (
 	externalLogBacklogLines = uint64(200)
@@ -312,7 +307,7 @@ func (s *ProcessSupervisor) Shutdown() {
 		if _, ok := daemonOwned[st.ServiceID]; !ok {
 			continue
 		}
-		if isActiveState(st.ActualState) || (st.ActualState == state.ActualOrphaned && st.Identity != nil) {
+		if IsActiveState(st.ActualState) || (st.ActualState == state.ActualOrphaned && st.Identity != nil) {
 			toStop = append(toStop, st.ServiceID)
 		}
 	}
@@ -322,7 +317,7 @@ func (s *ProcessSupervisor) Shutdown() {
 
 	var external []string
 	for _, st := range s.host.ServiceStates() {
-		if !isActiveState(st.ActualState) {
+		if !IsActiveState(st.ActualState) {
 			continue
 		}
 		for _, def := range cat.Services {
@@ -355,7 +350,7 @@ func (s *ProcessSupervisor) stopExternalOnShutdown(serviceID string) error {
 	s.abortBuild(serviceID)
 	return s.withQueue(serviceID, func() error {
 		st := s.state(serviceID)
-		if st == nil || !isActiveState(st.ActualState) {
+		if st == nil || !IsActiveState(st.ActualState) {
 			return nil
 		}
 		if st.Identity != nil {
@@ -391,7 +386,7 @@ func (s *ProcessSupervisor) DetachAllOutput() {
 func (s *ProcessSupervisor) Status(serviceID string) error {
 	return s.withQueue(serviceID, func() error {
 		st := s.state(serviceID)
-		if st == nil || st.Identity == nil || !isActiveState(st.ActualState) {
+		if st == nil || st.Identity == nil || !IsActiveState(st.ActualState) {
 			return nil
 		}
 		if owned := s.owns(st); owned != nil && !*owned {
@@ -422,7 +417,7 @@ func (s *ProcessSupervisor) Reconcile() {
 			})
 			continue
 		}
-		if snap.Identity == nil || !isActiveState(snap.ActualState) {
+		if snap.Identity == nil || !IsActiveState(snap.ActualState) {
 			continue
 		}
 		s.queues.Run(snap.ServiceID, func() {

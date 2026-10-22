@@ -93,15 +93,6 @@ func defaultStateOr(existing *state.ServiceLifecycleState, serviceID, timestamp 
 	}
 }
 
-func isActiveState(s state.ActualServiceState) bool {
-	for _, v := range supervisor.ActiveStates {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
-
 func derefOrEmpty(s *string) string {
 	if s == nil {
 		return ""
@@ -376,7 +367,7 @@ func (m *HearthManager) ReloadCatalog(next catalog.ServiceCatalog) (*ReloadOutco
 		m.stateMu.Lock()
 		st := m.state.Services[serviceID]
 		m.stateMu.Unlock()
-		if st == nil || !isActiveState(st.ActualState) {
+		if st == nil || !supervisor.IsActiveState(st.ActualState) {
 			continue
 		}
 		if err := m.supervisor.Stop(serviceID, nil); err != nil {

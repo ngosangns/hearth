@@ -939,12 +939,6 @@ func (h *fakeHost) RecordBackgroundError(scope, err string) {
 	h.bgErrors = append(h.bgErrors, scope+":"+err)
 }
 
-func (h *fakeHost) logLines() []logEntry {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]logEntry{}, h.logs...)
-}
-
 func (h *fakeHost) publishedEvents() []eventEntry {
 	h.mu.Lock()
 	defer h.mu.Unlock()
