@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.27.5
 
 - `hearth shared list` masks recipe secrets unless `--reveal`, including `env` and `connection.env`. `--mask` is accepted and changes nothing. `--mask` with `--reveal` is a usage error. `shared attach` masks the printed connection the same way. `scripts/catalog/smoke.sh` reads non-secret fields and does not pass `--reveal`. MCP `shared_list` always masks. `scripts/shared-list.sh` stays masked and forwards `--reveal` only when the caller passed it.
 - `hearth version --json` prints name, version, schemaVersion 1, and commit. `hearth schema [--json]` lists every command with its JSON Schema.
