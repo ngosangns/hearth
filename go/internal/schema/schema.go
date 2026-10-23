@@ -4,10 +4,10 @@
 // v1 is the JSON each command printed on 2026-10-23, plus the additive
 // commands from the agent CLI contract (version, schema, skill check,
 // shared connection, workspaces list). Connection objects keep the same keys
-// and types. `shared status` and `shared installed` mask every secret-shaped
-// string unless `--reveal`. `--mask` is accepted and changes nothing.
-// `shared connection` masks unless `--reveal`. `manager ensure` and
-// `shared ensure` mutate: they can start a daemon.
+// and types. `shared list`, `shared status`, and `shared installed` mask every
+// secret-shaped string unless `--reveal`. `--mask` is accepted and changes
+// nothing. `shared connection` and `shared attach` mask unless `--reveal`.
+// `manager ensure` and `shared ensure` mutate: they can start a daemon.
 package schema
 
 import (
@@ -72,12 +72,12 @@ func init() {
 		mutate("manager reload", "reload the project catalog", false, "reload.json", "--json"),
 		mutate("daemon", "run the project daemon in the foreground", false, "text.json"),
 		mutate("smp", "run the machine-global shared-services daemon", false, "text.json"),
-		read("shared list", "remote shared-service recipes", "shared-list.json", "--json"),
+		read("shared list", "remote shared-service recipes (secrets masked unless --reveal; --mask is accepted and changes nothing)", "shared-list.json", "--json", "--mask", "--reveal"),
 		read("shared installed", "installed shared instances (secrets masked unless --reveal; --mask is accepted and changes nothing)", "shared-installed.json", "--json", "--mask", "--reveal"),
 		read("shared status", "live shared instances (secrets masked unless --reveal; --mask is accepted and changes nothing)", "shared-status.json", "--json", "--mask", "--reveal"),
 		read("shared connection", "this project's connection for an attached shared service (secrets masked unless --reveal)", "shared-connection.json", "--json", "--reveal"),
 		mutate("shared ensure", "find or start smp and print its connection", false, "ensure.json", "--json"),
-		mutate("shared attach", "attach this project to a shared instance", false, "attach.json", "--json"),
+		mutate("shared attach", "attach this project to a shared instance (connection secrets masked unless --reveal)", false, "attach.json", "--json", "--reveal"),
 		mutate("shared detach", "detach this project; --stop-if-unused stops the instance when nothing else is attached", true, "text.json", "--json", "--stop-if-unused", "--yes"),
 		read("shared probe", "exit 0 when the instance is ready and this project is attached", "text.json"),
 		mutate("shared install", "download and install a shared instance", false, "text.json"),

@@ -265,18 +265,24 @@ recipe's `provision` argv.
 
 - `ensure [--json]` — the `manager ensure --json` contract for smp: starts it if needed and prints
   the connection for `~/.hearth/shared`.
-- `list [--json]` — the remote registry (no daemon needed). `installed [--json] [--mask] [--reveal]` —
-  installed instances. `status [--json] [--mask] [--reveal]` — instances, ports, install state, attachments.
-  Both lists are sorted by name, then version. Values are masked unless `--reveal` (the Hearth
-  window passes `--reveal` when a Copy button needs the real string). `--mask` is accepted and
-  changes nothing; the same redact rules still cover `recipe.env`, connection blocks, provision
-  args, `KEY=value` argv, and URL userinfo passwords. `--mask` together with `--reveal` is a usage
-  error (exit 2).
+- `list [--json] [--mask] [--reveal]` — the remote registry (no daemon needed). Secrets in the
+  recipe document (`env`, `connection.env`, `KEY=value` argv, URL userinfo passwords) are masked
+  unless `--reveal`. The Hearth window passes `--reveal` (`load_shared_board`). `--mask` is accepted
+  and changes nothing. `--mask` together with `--reveal` is a usage error (exit 2). Text output is
+  the service name and versions.
+  `installed [--json] [--mask] [--reveal]` — installed instances. `status [--json] [--mask] [--reveal]` —
+  instances, ports, install state, attachments. Both lists are sorted by name, then version. Values
+  are masked unless `--reveal` (the Hearth window passes `--reveal` when a Copy button needs the
+  real string). `--mask` is accepted and changes nothing; the same redact rules still cover
+  `recipe.env`, connection blocks, provision args, `KEY=value` argv, and URL userinfo passwords.
+  `--mask` together with `--reveal` is a usage error (exit 2).
 - `connection <service|name@version> [--json] [--reveal]` — this project's provisioned connection.
   Secrets are masked unless `--reveal`. Exit 3 when smp is down, or this project is not attached.
 - `install <name@ver>` — install without attaching. `start|stop <name@ver>` — drive the instance.
-- `attach|probe <name@ver>` — what the generated `shared:` service runs. `probe` exits 0 iff the
-  instance is ready and this project is attached.
+- `attach <name@ver> [--json] [--reveal]` — what the generated `shared:` service runs. The printed
+  connection is masked unless `--reveal`. `probe <name@ver>` exits 0 iff the instance is ready and
+  this project is attached. `scripts/catalog/smoke.sh` reads `port`, `url`, `S3_BUCKET`, and
+  `KAFKA_TOPIC` from `attach --json` and does not pass `--reveal`.
 - `detach <name@ver> [--stop-if-unused] [--yes]` — `--stop-if-unused` also stops the instance when this
   was its last attachment. Off a TTY that flag requires `--yes` (exit 6).
 - `remove <name@ver> [--force] [--yes]` — delete the instance and its data. Without `--force` it refuses
@@ -285,11 +291,11 @@ recipe's `provision` argv.
 ## MCP + skill
 
 `hearth mcp` still serves `local_services_shared_list`, `local_services_shared_status`, and
-`local_services_shared_connection`. MCP `shared_status` and `shared_connection` always mask
-secret-shaped strings, including `recipe.env`. Coding agents are steered to the skill scripts
-(`hearth skill install` writes `SKILL.md` and `scripts/shared-list.sh`,
-`shared-status.sh`, `shared-connection.sh`) or the CLI. `shared-status.sh` stays masked and
-forwards `--reveal` only when the caller passed it.
+`local_services_shared_connection`. MCP `shared_list`, `shared_status`, and `shared_connection`
+always mask secret-shaped strings, including `recipe.env` and `connection.env`. Coding agents are
+steered to the skill scripts (`hearth skill install` writes `SKILL.md` and `scripts/shared-list.sh`,
+`shared-status.sh`, `shared-connection.sh`) or the CLI. `shared-list.sh` and `shared-status.sh`
+stay masked and forward `--reveal` only when the caller passed it.
 Flow: read `shared:` in `hearth.yaml` → attach happens on `start` → read connection info for the service.
 
 ## Edge cases

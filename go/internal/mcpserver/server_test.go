@@ -227,6 +227,41 @@ func (f *fakeClient) StopDaemon(context.Context) (any, error) {
 	return map[string]any{"operation": "accepted"}, nil
 }
 
+func (f *fakeClient) SharedList(context.Context) (any, error) {
+	return map[string]any{
+		"catalog": map[string]any{
+			"version": 1,
+			"services": map[string]any{
+				"minio": map[string]any{
+					"versions": map[string]any{
+						"1": map[string]any{
+							"env": map[string]any{
+								"MINIO_ROOT_PASSWORD": "fake-root-pass-123",
+								"MINIO_ROOT_USER":     "hearth",
+							},
+							"run": map[string]any{"argv": []any{
+								"minio",
+								"MINIO_ROOT_PASSWORD=fake-root-pass-123",
+								"--password", "fake-root-pass-123",
+								"--user", "hearth",
+							}},
+							"connection": map[string]any{
+								"url": "http://user:fake-secret-123@127.0.0.1:9000",
+								"env": map[string]any{
+									"AWS_ACCESS_KEY_ID":     "fake-access-key-123",
+									"AWS_SECRET_ACCESS_KEY": "fake-secret-123",
+									"S3_BUCKET":             "photos",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"authorization": "must-not-leak",
+	}, nil
+}
+
 func (f *fakeClient) SharedStatus(context.Context) (any, error) {
 	return map[string]any{
 		"instances": []any{
@@ -657,6 +692,40 @@ func TestSharedConnectionKeepsItsConnectionEnvButRedactsEverythingElse(t *testin
 	}
 	if contains(text, "fake-secret-123") || contains(text, "must-not-leak") {
 		t.Errorf("text = %q, want secrets masked", text)
+	}
+}
+
+func TestSharedListMasksSecretsEverywhere(t *testing.T) {
+	fake := &fakeClient{}
+	client := startServer(t, New(fake, baseOptions()))
+	result := client.callTool("local_services_shared_list", map[string]any{})
+	if isError(result) {
+		t.Fatalf("unexpected error: %s", toolText(t, result))
+	}
+	text := toolText(t, result)
+	decoded := decodeToolJSON(t, text)
+	recipe := decoded["catalog"].(map[string]any)["services"].(map[string]any)["minio"].(map[string]any)["versions"].(map[string]any)["1"].(map[string]any)
+	env := recipe["env"].(map[string]any)
+	if env["MINIO_ROOT_PASSWORD"] != "••••••" || env["MINIO_ROOT_USER"] != "hearth" {
+		t.Errorf("env = %#v", env)
+	}
+	argv := recipe["run"].(map[string]any)["argv"].([]any)
+	if argv[1] != "MINIO_ROOT_PASSWORD=••••••" || argv[3] != "••••••" || argv[5] != "hearth" {
+		t.Errorf("argv = %#v", argv)
+	}
+	conn := recipe["connection"].(map[string]any)
+	cenv := conn["env"].(map[string]any)
+	if cenv["AWS_ACCESS_KEY_ID"] != "••••••" || cenv["AWS_SECRET_ACCESS_KEY"] != "••••••" || cenv["S3_BUCKET"] != "photos" {
+		t.Errorf("connection.env = %#v", cenv)
+	}
+	if conn["url"] != "http://user:••••••@127.0.0.1:9000" {
+		t.Errorf("url = %#v", conn["url"])
+	}
+	if _, ok := decoded["authorization"]; ok {
+		t.Errorf("authorization key leaked")
+	}
+	if contains(text, "fake-root-pass-123") || contains(text, "fake-secret-123") || contains(text, "fake-access-key-123") || contains(text, "must-not-leak") {
+		t.Errorf("text leaked a secret")
 	}
 }
 

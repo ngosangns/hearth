@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `hearth shared list` masks recipe secrets unless `--reveal`, including `env` and `connection.env`. `--mask` is accepted and changes nothing. `--mask` with `--reveal` is a usage error. `shared attach` masks the printed connection the same way. `scripts/catalog/smoke.sh` reads non-secret fields and does not pass `--reveal`. MCP `shared_list` always masks. `scripts/shared-list.sh` stays masked and forwards `--reveal` only when the caller passed it.
 - `hearth version --json` prints name, version, schemaVersion 1, and commit. `hearth schema [--json]` lists every command with its JSON Schema.
 - `hearth skill check` compares the installed skill with the copy in the binary. `hearth skill install` defaults to `~/.agents/skills/hearth`.
 - `hearth shared connection` prints this project's connection and masks secrets unless `--reveal`. `shared status` and `shared installed` mask the same way. `--reveal` prints the real values. `--mask` is accepted and changes nothing. `--mask` together with `--reveal` is a usage error. Instances are listed by name, then version. MCP `shared_status` and `shared_connection` always mask.

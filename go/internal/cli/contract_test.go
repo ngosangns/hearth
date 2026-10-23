@@ -292,13 +292,9 @@ func TestSharedInstalledMasksSecretsEverywhere(t *testing.T) {
 		t.Fatalf("status mask+reveal: %d out=%v err=%v", code, outLines, errLines)
 	}
 
-	code, _, errLines = runSharedCLI(t, root, "list", "--reveal")
-	if code != ExitUsage || len(errLines) == 0 || strings.HasPrefix(errLines[0], "hearth:") {
-		t.Fatalf("reveal on list: %d %v", code, errLines)
-	}
-	code, _, errLines = runSharedCLI(t, root, "list", "--mask")
-	if code != ExitUsage || len(errLines) == 0 || !strings.Contains(errLines[0], "--mask") {
-		t.Fatalf("mask on list: %d %v", code, errLines)
+	code, outLines, errLines = runSharedCLI(t, root, "list", "--mask", "--reveal")
+	if code != ExitUsage || len(outLines) != 0 || len(errLines) != 1 || !strings.Contains(errLines[0], "cannot be used together") || strings.HasPrefix(errLines[0], "hearth:") {
+		t.Fatalf("list mask+reveal: %d out=%v err=%v", code, outLines, errLines)
 	}
 	code, _, errLines = runSharedCLI(t, root, "connection", "minio", "--mask")
 	if code != ExitUsage || len(errLines) == 0 || !strings.Contains(errLines[0], "--mask") {
@@ -325,6 +321,155 @@ func assertInstalledReal(t *testing.T, body string) {
 	}
 	if !strings.Contains(body, "fake-root-pass-123") || !strings.Contains(body, "fake-secret-123") {
 		t.Fatal("installed json hid a secret")
+	}
+}
+
+func TestSharedListMasksSecrets(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	catalogPath := filepath.Join(t.TempDir(), "catalog.json")
+	const fixture = `{
+	  "version": 1,
+	  "services": {
+	    "minio": {
+	      "versions": {
+	        "1": {
+	          "env": {
+	            "MINIO_ROOT_PASSWORD": "fake-root-pass-123",
+	            "MINIO_ROOT_USER": "hearth"
+	          },
+	          "run": {"argv": ["minio", "MINIO_ROOT_PASSWORD=fake-root-pass-123", "--password", "fake-root-pass-123", "--user", "hearth"]},
+	          "connection": {
+	            "url": "http://user:fake-secret-123@127.0.0.1:9000",
+	            "env": {
+	              "AWS_ACCESS_KEY_ID": "fake-access-key-123",
+	              "AWS_SECRET_ACCESS_KEY": "fake-secret-123",
+	              "S3_BUCKET": "photos"
+	            }
+	          }
+	        }
+	      }
+	    }
+	  }
+	}`
+	if err := os.WriteFile(catalogPath, []byte(fixture), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HEARTH_SHARED_CATALOG_URL", "file://"+catalogPath)
+
+	code, outLines, errLines := runSharedCLI(t, root, "list", "--json")
+	if code != 0 {
+		t.Fatalf("list: %d %v", code, errLines)
+	}
+	masked := strings.Join(outLines, "\n")
+	if strings.Contains(masked, "fake-root-pass-123") || strings.Contains(masked, "fake-secret-123") || strings.Contains(masked, "fake-access-key-123") {
+		t.Fatal("default list json leaked a secret")
+	}
+	assertListMasked(t, masked)
+
+	code, outLines, errLines = runSharedCLI(t, root, "list", "--json", "--mask")
+	if code != 0 || strings.Join(outLines, "\n") != masked {
+		t.Fatalf("mask changed default list json: %d %v", code, errLines)
+	}
+
+	code, outLines, errLines = runSharedCLI(t, root, "list", "--json", "--reveal")
+	if code != 0 {
+		t.Fatalf("reveal: %d %v", code, errLines)
+	}
+	revealed := strings.Join(outLines, "\n")
+	if !strings.Contains(revealed, "fake-root-pass-123") || !strings.Contains(revealed, "fake-secret-123") || !strings.Contains(revealed, "fake-access-key-123") {
+		t.Fatal("list --reveal hid a fixture secret")
+	}
+	if strings.Contains(revealed, "hearth-local-dev") {
+		t.Fatal("list --reveal included the embedded catalog")
+	}
+
+	for _, args := range [][]string{{"list"}, {"list", "--mask"}, {"list", "--reveal"}} {
+		code, got, errLines := runSharedCLI(t, root, args...)
+		if code != 0 || len(got) != 1 || got[0] != "minio  1" {
+			t.Fatalf("%v text: %d %#v %v", args, code, got, errLines)
+		}
+		if strings.Contains(got[0], "fake-root-pass-123") || strings.Contains(got[0], "fake-secret-123") || strings.Contains(got[0], "fake-access-key-123") {
+			t.Fatalf("%v text leaked a secret", args)
+		}
+	}
+
+	code, outLines, errLines = runSharedCLI(t, root, "list", "--json", "--mask", "--reveal")
+	if code != ExitUsage || len(errLines) != 0 || len(outLines) != 1 || !strings.Contains(outLines[0], "cannot be used together") {
+		t.Fatalf("mask+reveal: %d out=%v err=%v", code, outLines, errLines)
+	}
+	if decodeObject(t, outLines[0])["error"].(map[string]any)["code"] != "usage" {
+		t.Fatalf("mask+reveal json = %v", outLines)
+	}
+}
+
+func assertListMasked(t *testing.T, body string) {
+	t.Helper()
+	decoded := decodeObject(t, body)
+	recipe := decoded["services"].(map[string]any)["minio"].(map[string]any)["versions"].(map[string]any)["1"].(map[string]any)
+	env := recipe["env"].(map[string]any)
+	if env["MINIO_ROOT_PASSWORD"] != "••••••" || env["MINIO_ROOT_USER"] != "hearth" {
+		t.Fatalf("env = %#v", env)
+	}
+	runArgv := recipe["run"].(map[string]any)["argv"].([]any)
+	if runArgv[1] != "MINIO_ROOT_PASSWORD=••••••" || runArgv[3] != "••••••" || runArgv[5] != "hearth" {
+		t.Fatalf("argv = %#v", runArgv)
+	}
+	conn := recipe["connection"].(map[string]any)
+	if conn["url"] != "http://user:••••••@127.0.0.1:9000" {
+		t.Fatalf("url = %#v", conn["url"])
+	}
+	cenv := conn["env"].(map[string]any)
+	if cenv["AWS_ACCESS_KEY_ID"] != "••••••" || cenv["AWS_SECRET_ACCESS_KEY"] != "••••••" || cenv["S3_BUCKET"] != "photos" {
+		t.Fatalf("connection.env = %#v", cenv)
+	}
+}
+
+func TestSharedAttachMasksConnection(t *testing.T) {
+	result := map[string]any{
+		"service": "minio@1",
+		"port":    9000,
+		"attachment": map[string]any{
+			"projectId":   "p",
+			"projectRoot": "/tmp/app",
+			"connection": map[string]any{
+				"url": "http://user:fake-secret-123@127.0.0.1:9000",
+				"env": map[string]any{
+					"AWS_ACCESS_KEY_ID":     "fake-access-key-123",
+					"AWS_SECRET_ACCESS_KEY": "fake-secret-123",
+					"MINIO_ROOT_PASSWORD":   "fake-root-pass-123",
+					"S3_BUCKET":             "photos",
+				},
+			},
+		},
+	}
+	lines := []string{}
+	io := &Io{Out: func(s string) { lines = append(lines, s) }}
+	writeAttachResult(io, result, true, false)
+	masked := strings.Join(lines, "\n")
+	if strings.Contains(masked, "fake-secret-123") || strings.Contains(masked, "fake-access-key-123") || strings.Contains(masked, "fake-root-pass-123") {
+		t.Fatal("attach json leaked a secret")
+	}
+	env := decodeObject(t, masked)["attachment"].(map[string]any)["connection"].(map[string]any)["env"].(map[string]any)
+	if env["AWS_SECRET_ACCESS_KEY"] != "••••••" || env["AWS_ACCESS_KEY_ID"] != "••••••" || env["MINIO_ROOT_PASSWORD"] != "••••••" || env["S3_BUCKET"] != "photos" {
+		t.Fatalf("env = %#v", env)
+	}
+
+	lines = nil
+	writeAttachResult(io, result, true, true)
+	if !strings.Contains(strings.Join(lines, "\n"), "fake-secret-123") || !strings.Contains(strings.Join(lines, "\n"), "fake-access-key-123") {
+		t.Fatal("attach --reveal hid a fixture secret")
+	}
+
+	lines = nil
+	writeAttachResult(io, result, false, false)
+	text := strings.Join(lines, "\n")
+	if strings.Contains(text, "fake-secret-123") || strings.Contains(text, "fake-access-key-123") || strings.Contains(text, "fake-root-pass-123") {
+		t.Fatal("attach text leaked a secret")
+	}
+	if !strings.Contains(text, "http://user:••••••@127.0.0.1:9000") || !strings.Contains(text, "attached minio@1") {
+		t.Fatalf("attach text = %q", text)
 	}
 }
 
@@ -535,6 +680,37 @@ func TestSharedConnectionScript(t *testing.T) {
 	_, errLines, code = runScript(t, "missing", "--json")
 	if code != 3 {
 		t.Fatalf("missing instance: %d %s", code, errLines)
+	}
+}
+
+func TestSharedListScriptMasksByDefault(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "hearth")
+	writeExe(t, bin, "#!/bin/bash\necho \"$*\"\n")
+	t.Setenv("HEARTH_BIN", bin)
+	t.Setenv("HEARTH_ROOT", root)
+
+	out, errLines, code := runSkillScript(t, "shared-list.sh", "--json")
+	if code != 0 {
+		t.Fatalf("default: %d %s %s", code, out, errLines)
+	}
+	if !strings.Contains(out, "shared list --json") || strings.Contains(out, "--mask") || strings.Contains(out, "--reveal") {
+		t.Fatalf("stdout = %q", out)
+	}
+
+	out, _, code = runSkillScript(t, "shared-list.sh", "--json", "--reveal")
+	if code != 0 || !strings.Contains(out, "shared list --json --reveal") || strings.Contains(out, "--mask") {
+		t.Fatalf("reveal: %d %q", code, out)
+	}
+
+	out, _, code = runSkillScript(t, "shared-list.sh")
+	if code != 0 || !strings.Contains(out, "shared list") || strings.Contains(out, "--mask") || strings.Contains(out, "--reveal") {
+		t.Fatalf("text: %d %q", code, out)
+	}
+
+	_, errLines, code = runSkillScript(t, "shared-list.sh", "--mask", "--reveal")
+	if code != 2 || !strings.Contains(errLines, "cannot be used together") {
+		t.Fatalf("both: %d %s", code, errLines)
 	}
 }
 

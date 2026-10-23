@@ -29,7 +29,7 @@ Binary: `$HEARTH_BIN` or `~/.local/bin/hearth`.
 | `scripts/manage.sh start\|stop\|restart <target> [--wait] [--dry-run] [--kill-unowned] [--yes]` | user asked |
 | `scripts/restart-daemon.sh` | user asked |
 | `scripts/stop-daemon.sh` | user asked |
-| `scripts/shared-list.sh` | free |
+| `scripts/shared-list.sh [--json] [--reveal]` | free |
 | `scripts/shared-status.sh [--json] [--reveal]` | free |
 | `scripts/shared-connection.sh <service> [--json] [--reveal]` | free |
 | `scripts/hearth.sh <any hearth subcommand>` | see below |
@@ -46,9 +46,9 @@ Run a command that changes a process or a file only when the user asked for that
 
 ### `--reveal`
 
-`shared status`, `shared installed`, and `shared connection` mask secrets unless `--reveal`. `--mask` changes nothing. `--mask` with `--reveal` exits 2.
+`shared list`, `shared status`, `shared installed`, `shared connection`, and `shared attach` mask secrets unless `--reveal`. `--mask` on `shared list`, `shared status`, and `shared installed` changes nothing. `--mask` with `--reveal` exits 2.
 
-`scripts/shared-status.sh` is masked by default and forwards `--reveal` only when the caller passed it. `scripts/shared-connection.sh` stays masked the same way. Never pass `--reveal`, including through `hearth.sh`, unless the user asked for the real value.
+`scripts/shared-list.sh` and `scripts/shared-status.sh` are masked by default and forward `--reveal` only when the caller passed it. `scripts/shared-connection.sh` stays masked the same way. Never pass `--reveal`, including through `hearth.sh`, unless the user asked for the real value.
 
 ## Recipes
 
@@ -58,7 +58,7 @@ Run a command that changes a process or a file only when the user asked for that
 
 **Find URLs.** `scripts/urls.sh` or `scripts/urls.sh <service>`. A finished one-shot can still have a URL.
 
-**Shared connection, masked.** `scripts/shared-connection.sh <service>`. Add `--reveal` only when the user asked for the password or URL. `scripts/shared-status.sh` is the instance list, also masked.
+**Shared recipes and connection, masked.** `scripts/shared-list.sh` is the remote catalog. `scripts/shared-connection.sh <service>` is this project's connection. `scripts/shared-status.sh` is the instance list. Add `--reveal` only when the user asked for the password or URL.
 
 **List workspaces.** `hearth workspaces list --json`. Read-only. A missing file is an empty list.
 

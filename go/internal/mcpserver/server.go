@@ -879,7 +879,7 @@ func (s *Server) toolDefinitions() []any {
 			"required":             stopDaemonRequired,
 			"additionalProperties": false,
 		}),
-		toolDefinition(prefix+"shared_list", "Read-only: services and versions available from the shared-services registry (installed on this machine by smp on demand, shared across projects). No approval needed.", map[string]any{
+		toolDefinition(prefix+"shared_list", "Read-only: services and versions available from the shared-services registry (installed on this machine by smp on demand, shared across projects). Secret values are masked, including recipe env and connection env. No approval needed.", map[string]any{
 			"type":                 "object",
 			"properties":           map[string]any{},
 			"additionalProperties": false,
@@ -924,11 +924,11 @@ func redact(value any) any {
 	return redactAtDepth(value, 0)
 }
 
-// redactToolResult drops secret-looking keys. shared_status and
+// redactToolResult drops secret-looking keys. shared_list, shared_status, and
 // shared_connection mask secret-rule values everywhere (recipe.env, connection,
 // argv) and still drop credential keys outside that rule.
 func redactToolResult(tool string, value any) any {
-	if tool == "shared_status" || tool == "shared_connection" {
+	if tool == "shared_list" || tool == "shared_status" || tool == "shared_connection" {
 		return redactKeepingConnection(value, 0)
 	}
 	return redact(value)

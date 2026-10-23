@@ -46,14 +46,15 @@ usage: hearth [--root <path>] <command> [options]
                                         daemon lifecycle (stop needs --yes off a TTY; restart keeps services running)
   daemon --root <path>                  run the daemon in the foreground (spawned internally)
   smp                                   run the machine-global shared-services daemon
-  shared list [--json]                  remote shared-service recipes
+  shared list [--json] [--mask] [--reveal]
+                                        remote recipes (secrets masked unless --reveal; --mask changes nothing)
   shared installed|status [--json] [--mask] [--reveal]
                                         secrets masked unless --reveal (--mask changes nothing)
   shared connection <service|name@version> [--json] [--reveal]
                                         this project's connection (secrets masked unless --reveal)
   shared ensure [--json]                find or start smp
-  shared attach|detach|probe <id> [--yes] [--stop-if-unused]
-                                        attach, detach, or probe (detach --stop-if-unused needs --yes off a TTY)
+  shared attach|detach|probe <id> [--json] [--reveal] [--yes] [--stop-if-unused]
+                                        attach masks connection secrets unless --reveal (detach --stop-if-unused needs --yes off a TTY)
   shared install|start|stop|remove <id> [--json] [--force] [--yes]
                                         manage a shared instance (remove needs --yes off a TTY)
   update [--check] [--json] [--force]   install the latest stable GitHub release
@@ -555,8 +556,8 @@ func stringList(items []string) []any {
 }
 
 // emitSharedJSON prints payload as pretty JSON. mask runs the redact helper
-// over the whole tree. `shared status` and `shared installed` mask unless
-// --reveal; --mask is accepted and changes nothing.
+// over the whole tree. `shared list`, `shared status`, and `shared installed`
+// mask unless --reveal; --mask is accepted and changes nothing.
 func emitSharedJSON(io *Io, payload any, mask bool) {
 	value := jsonValue(payload)
 	if mask {

@@ -360,17 +360,20 @@ from any dev box here, with the same username.
 - **`smp` = `hearth smp`** — the same binary, rooted at `~/.hearth/shared`, catalog *synthesized*
   from `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir is
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged against that root.
-- CLI `shared status` and `shared installed` mask the whole payload unless `--reveal`.
-  hearth-gpui Copy buttons must pass `--reveal`. `--mask` is accepted and changes nothing.
-  `--mask` with `--reveal` is a usage error (exit 2). Masking is `internal/redact.Values`: a
-  string whose upper-case key contains SECRET, PASSWORD, PASSWD, TOKEN, API_KEY, ACCESS_KEY, or
-  PRIVATE_KEY (`-` counts as `_`), a URL userinfo password, and `KEY=value` / `--password` argv
-  elements. That includes `recipe.env`, attachment maps, and provision args. Instances print in
-  name-then-version order. `shared connection` stays masked unless `--reveal`. MCP
-  `shared_status` and `shared_connection` always mask the same way and have no reveal option;
-  credential keys outside that rule (`authorization`, ownership proof, `apiKey`) are still
-  dropped. `shared attach` JSON is not masked (`scripts/catalog/smoke.sh` reads it). The skill's
-  `shared-status.sh` stays masked and forwards `--reveal` only when the caller passed it.
+- CLI `shared list`, `shared status`, and `shared installed` mask the whole payload unless `--reveal`.
+  hearth-gpui Copy buttons, and `load_shared_board`'s `shared list --json`, must pass `--reveal`.
+  `--mask` is accepted and changes nothing. `--mask` with `--reveal` is a usage error (exit 2).
+  Masking is `internal/redact.Values`: a string whose upper-case key contains SECRET, PASSWORD,
+  PASSWD, TOKEN, API_KEY, ACCESS_KEY, or PRIVATE_KEY (`-` counts as `_`), a URL userinfo password,
+  and `KEY=value` / `--password` argv elements. That includes `recipe.env`, attachment maps, and
+  provision args. Instances print in name-then-version order. `shared connection` and the printed
+  `shared attach` connection stay masked unless `--reveal`. `scripts/catalog/smoke.sh` reads
+  non-secret attach fields (`port`, `url`, `S3_BUCKET`, `KAFKA_TOPIC`) and does not pass `--reveal`.
+  MCP `shared_list`, `shared_status`, and `shared_connection` always mask the same way and have no
+  reveal option; credential keys outside that rule (`authorization`, ownership proof, `apiKey`) are
+  still dropped. The skill's `shared-list.sh` and `shared-status.sh` stay masked and forward
+  `--reveal` only when the caller passed it. `manager ensure` / `shared ensure` still print the
+  daemon bearer `token`: that document is the client connection, not a recipe.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
   `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance — the one
   sanctioned exception is a recipe's `ports: […]` **pinned** field (the shared nginx's `[18080, 18443]`),

@@ -171,14 +171,14 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 	if flags.Yes && subcommand != "remove" && subcommand != "detach" {
 		return 0, usageErr("--yes is only supported by `shared remove` and `shared detach`")
 	}
-	if flags.Mask && subcommand != "status" && subcommand != "installed" {
-		return 0, usageErr("--mask is only supported by `shared status` and `shared installed`")
+	if flags.Mask && subcommand != "status" && subcommand != "installed" && subcommand != "list" {
+		return 0, usageErr("--mask is only supported by `shared list`, `shared status`, and `shared installed`")
 	}
-	if flags.Reveal && subcommand != "status" && subcommand != "installed" && subcommand != "connection" {
-		return 0, usageErr("--reveal is only supported by `shared status`, `shared installed`, and `shared connection`")
+	if flags.Reveal && subcommand != "status" && subcommand != "installed" && subcommand != "connection" && subcommand != "list" && subcommand != "attach" {
+		return 0, usageErr("--reveal is only supported by `shared list`, `shared status`, `shared installed`, `shared connection`, and `shared attach`")
 	}
-	// --mask is an explicit no-op: status and installed mask unless --reveal.
-	// Together the two flags are a usage error.
+	// --mask is an explicit no-op: list, status, and installed mask unless
+	// --reveal. Together the two flags are a usage error.
 	if flags.Mask && flags.Reveal {
 		return 0, usageErr("--mask and --reveal cannot be used together")
 	}
@@ -208,8 +208,10 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 		if err != nil {
 			return 0, failErr(ExitUnavailable, err.Error())
 		}
+		// Text is name and versions — no secret values. JSON masks the whole
+		// recipe document unless --reveal. --mask is accepted and changes nothing.
 		if flags.JSON {
-			out(io, prettyJSON(jsonValue(doc)))
+			emitSharedJSON(io, doc, !flags.Reveal)
 		} else {
 			for name, family := range doc.Services {
 				versions := make([]string, 0, len(family.Versions))
@@ -301,26 +303,7 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 		if err != nil {
 			return 0, failErr(ExitFailed, err.Error())
 		}
-		if flags.JSON {
-			out(io, prettyJSON(jsonValue(result)))
-		} else {
-			service, _ := result["service"].(string)
-			if service == "" {
-				service = id
-			}
-			out(io, "attached "+service)
-			if attachment, ok := result["attachment"].(map[string]any); ok {
-				if conn, ok := attachment["connection"].(map[string]any); ok {
-					for k, v := range conn {
-						text, ok := v.(string)
-						if !ok {
-							text = fmt.Sprintf("%v", v)
-						}
-						out(io, fmt.Sprintf("  %s: %s", k, text))
-					}
-				}
-			}
-		}
+		writeAttachResult(io, result, flags.JSON, flags.Reveal)
 		return 0, nil
 	case "detach":
 		id, err := parseSharedID(firstOrNil(rest))
@@ -566,6 +549,56 @@ func writeConnection(io *Io, doc *omap.OMap, jsonMode, reveal bool) {
 	for _, key := range keys {
 		out(io, key+"="+env[key])
 	}
+}
+
+// writeAttachResult prints the attach reply. The connection document is masked
+// unless reveal. Text is the service id plus connection fields.
+func writeAttachResult(io *Io, result map[string]any, jsonMode, reveal bool) {
+	value := jsonValue(result)
+	if !reveal {
+		value = maskOrdered(value)
+	}
+	if jsonMode {
+		out(io, prettyJSON(value))
+		return
+	}
+	service := ""
+	doc := omap.AsObject(value)
+	if doc != nil {
+		if raw, ok := doc.Get("service"); ok {
+			service, _ = raw.(string)
+		}
+	}
+	if service == "" {
+		service, _ = result["service"].(string)
+	}
+	out(io, "attached "+service)
+	if doc == nil {
+		return
+	}
+	rawAttachment, ok := doc.Get("attachment")
+	if !ok {
+		return
+	}
+	attachment := omap.AsObject(rawAttachment)
+	if attachment == nil {
+		return
+	}
+	rawConn, ok := attachment.Get("connection")
+	if !ok {
+		return
+	}
+	conn := omap.AsObject(rawConn)
+	if conn == nil {
+		return
+	}
+	conn.Each(func(key string, entry any) {
+		text, ok := entry.(string)
+		if !ok {
+			text = fmt.Sprintf("%v", entry)
+		}
+		out(io, fmt.Sprintf("  %s: %s", key, text))
+	})
 }
 
 // runOperation submits one operation to smp, waits for it, prints its outcome,

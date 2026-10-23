@@ -127,8 +127,8 @@ under `~/.hearth/shared` and run by a separate global daemon (`hearth smp`). Eve
 registers the same `name@version` shares one instance; different versions run side by side.
 Shared entries show up as ordinary `infrastructure` services — `start` attaches this project
 (first start installs the service), `stop` only detaches (`manager stop` also stops an instance
-no other project is attached to), and connection info is on `hearth shared status` and
-`hearth shared connection` (both masked unless `--reveal`). See `docs/shared-services.md`.
+no other project is attached to). `hearth shared list`, `hearth shared status`, and
+`hearth shared connection` mask secrets unless `--reveal`. See `docs/shared-services.md`.
 
 ```yaml
 shared:
@@ -199,11 +199,11 @@ Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root
 | `cleanup` | remove a stale lock no live daemon owns |
 | `manager ensure\|status\|stop\|restart\|reload [--json] [--yes]` | daemon lifecycle; `ensure` can start a daemon. `reload` re-reads the catalog. `stop` needs `--yes` off a TTY |
 | `daemon --root <path>` / `smp` | run the project daemon / the machine-global shared-services daemon in the foreground (clients spawn them) |
-| `shared list [--json]` | remote shared-service recipes |
+| `shared list [--json] [--mask] [--reveal]` | remote shared-service recipes. Secrets are masked unless `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error |
 | `shared installed\|status [--json] [--mask] [--reveal]` | installed instances and live smp status, sorted by name then version. Secrets are masked unless `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error |
 | `shared connection <service\|name@version> [--json] [--reveal]` | this project's connection. Secrets are masked unless `--reveal` |
 | `shared install\|start\|stop <name@ver>` | manage a shared instance |
-| `shared attach\|probe <name@ver>`, `shared detach <name@ver> [--stop-if-unused] [--yes]` | what generated `shared:` services run. `detach --stop-if-unused` needs `--yes` off a TTY |
+| `shared attach <name@ver> [--json] [--reveal]`, `shared probe <name@ver>`, `shared detach <name@ver> [--stop-if-unused] [--yes]` | what generated `shared:` services run. `attach` masks connection secrets unless `--reveal`. `detach --stop-if-unused` needs `--yes` off a TTY |
 | `shared remove <name@ver> [--force] [--yes]` | delete an instance; `--force` is required while projects are attached. `--yes` is required off a TTY |
 | `update [--check] [--json] [--force]` | install the latest GitHub release |
 | `mcp` | serve the MCP tools over stdio |

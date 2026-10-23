@@ -413,7 +413,7 @@ func TestHelpCoversEverySchemaCommand(t *testing.T) {
 	if !strings.Contains(start.Summary, "--kill-unowned") {
 		t.Fatal("start summary should mention --kill-unowned")
 	}
-	for _, path := range []string{"shared status", "shared installed"} {
+	for _, path := range []string{"shared list", "shared status", "shared installed"} {
 		command, ok := schema.Lookup(path)
 		if !ok {
 			t.Fatal(path)

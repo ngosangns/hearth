@@ -1,1 +1,1 @@
-{"version":1,"services":{"postgres":{"versions":{"16.4":{"run":{"argv":["postgres"]}}}}}}
+{"version":1,"services":{"minio":{"versions":{"1":{"env":{"MINIO_ROOT_USER":"hearth","MINIO_ROOT_PASSWORD":"••••••"},"connection":{"env":{"AWS_ACCESS_KEY_ID":"••••••","AWS_SECRET_ACCESS_KEY":"••••••","S3_BUCKET":"photos"}}}}},"postgres":{"versions":{"16.4":{"run":{"argv":["postgres"]}}}}}}
