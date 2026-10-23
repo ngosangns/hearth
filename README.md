@@ -175,11 +175,15 @@ hearth --root /path/to/project mcp
 
 `hearth manager ensure --json` is the connection contract for another client: it ensures a daemon
 is running for `--root` and prints `{instanceId, port, token, protocolVersion, runtimeDirectory,
-root}`. `hearth manager restart --json` prints the same payload for a freshly started daemon,
-replacing the old one *without* stopping its services — they are detached, and the new daemon
-re-adopts them from their persisted identities. `hearth manager stop` stops the daemon and its
-services: its own processes, `external` services that declare a `stop:` command (a docker compose
-unit), and `shared:` entries, which detach. Off a TTY, `hearth manager stop` requires `--yes`.
+root}`. The bearer `token` is masked unless `--reveal`. A client that needs the token for direct
+HTTP+SSE must pass `--reveal`. `--mask` is accepted and changes nothing. `--mask` together with
+`--reveal` is a usage error. `hearth shared ensure --json` prints the same document for smp, with
+the same masking. `hearth manager restart --json` prints the same payload for a freshly started
+daemon, with the same masking, replacing the old one *without* stopping its services — they are
+detached, and the new daemon re-adopts them from their persisted identities. `hearth manager stop`
+stops the daemon and its services: its own processes, `external` services that declare a `stop:`
+command (a docker compose unit), and `shared:` entries, which detach. Off a TTY, `hearth manager stop`
+requires `--yes`.
 
 ## Commands
 
@@ -197,8 +201,10 @@ Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root
 | `operation get\|watch <id> [--json]` | inspect one operation |
 | `doctor [--json]` | checks the platform (macOS or Linux) and that `docker`, `tailscale`, `nc`, `ps`, `sh` resolve, then validates the catalog |
 | `cleanup` | remove a stale lock no live daemon owns |
-| `manager ensure\|status\|stop\|restart\|reload [--json] [--yes]` | daemon lifecycle; `ensure` can start a daemon. `reload` re-reads the catalog. `stop` needs `--yes` off a TTY |
+| `manager ensure\|restart [--json] [--mask] [--reveal]` | find or start the daemon and print its connection. The bearer token is masked unless `--reveal`. A client that needs the token for direct HTTP+SSE must pass `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error. `restart` leaves services running |
+| `manager status\|stop\|reload [--json] [--yes]` | daemon lifecycle. `reload` re-reads the catalog. `stop` needs `--yes` off a TTY. `--reveal` and `--mask` are usage errors |
 | `daemon --root <path>` / `smp` | run the project daemon / the machine-global shared-services daemon in the foreground (clients spawn them) |
+| `shared ensure [--json] [--mask] [--reveal]` | find or start smp and print its connection. The bearer token is masked unless `--reveal`. A client that needs the token for direct HTTP+SSE must pass `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error |
 | `shared list [--json] [--mask] [--reveal]` | remote shared-service recipes. Secrets are masked unless `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error |
 | `shared installed\|status [--json] [--mask] [--reveal]` | installed instances and live smp status, sorted by name then version. Secrets are masked unless `--reveal`. `--mask` is accepted and changes nothing. Together with `--reveal` it is a usage error |
 | `shared connection <service\|name@version> [--json] [--reveal]` | this project's connection. Secrets are masked unless `--reveal` |

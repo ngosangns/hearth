@@ -263,8 +263,10 @@ recipe's `provision` argv.
 
 ## CLI — `hearth shared …` (no project catalog required)
 
-- `ensure [--json]` — the `manager ensure --json` contract for smp: starts it if needed and prints
-  the connection for `~/.hearth/shared`.
+- `ensure [--json] [--mask] [--reveal]` — the `manager ensure --json` contract for smp: starts it
+  if needed and prints the connection for `~/.hearth/shared`. The bearer `token` is masked unless
+  `--reveal`. A client that needs the token for direct HTTP+SSE must pass `--reveal`. `--mask` is
+  accepted and changes nothing. `--mask` together with `--reveal` is a usage error (exit 2).
 - `list [--json] [--mask] [--reveal]` — the remote registry (no daemon needed). Secrets in the
   recipe document (`env`, `connection.env`, `KEY=value` argv, URL userinfo passwords) are masked
   unless `--reveal`. The Hearth window passes `--reveal` (`load_shared_board`). `--mask` is accepted

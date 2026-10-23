@@ -12,7 +12,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ENSURE_JSON="$("$HERE/hearth.sh" manager ensure --json)"
+# --reveal: this script calls the loopback API and needs the real bearer token.
+ENSURE_JSON="$("$HERE/hearth.sh" manager ensure --json --reveal)"
 python3 - "$ENSURE_JSON" "$AFTER" "$EPOCH" <<'PY'
 import json, sys, urllib.parse, urllib.request
 

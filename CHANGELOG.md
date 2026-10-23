@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `hearth manager ensure`, `hearth manager restart`, and `hearth shared ensure` mask the daemon bearer `token` unless `--reveal`. `--mask` is accepted and changes nothing. `--mask` together with `--reveal` is a usage error. `--reveal` on `manager status`, `stop`, or `reload` is a usage error. The JSON shape is unchanged (`token` stays a string). `Client.EnsurePayload()` and in-process callers still receive the real token. A client that needs the token for direct HTTP+SSE must pass `--reveal`. `scripts/events.sh` passes `--reveal`.
+
 ## 0.27.5
 
 - `hearth shared list` masks recipe secrets unless `--reveal`, including `env` and `connection.env`. `--mask` is accepted and changes nothing. `--mask` with `--reveal` is a usage error. `shared attach` masks the printed connection the same way. `scripts/catalog/smoke.sh` reads non-secret fields and does not pass `--reveal`. MCP `shared_list` always masks. `scripts/shared-list.sh` stays masked and forwards `--reveal` only when the caller passed it.

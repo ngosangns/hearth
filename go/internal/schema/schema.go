@@ -7,7 +7,9 @@
 // and types. `shared list`, `shared status`, and `shared installed` mask every
 // secret-shaped string unless `--reveal`. `--mask` is accepted and changes
 // nothing. `shared connection` and `shared attach` mask unless `--reveal`.
-// `manager ensure` and `shared ensure` mutate: they can start a daemon.
+// `manager ensure`, `manager restart`, and `shared ensure` mask the bearer
+// token unless `--reveal` (`token` stays a string). They mutate: ensure can
+// start a daemon.
 package schema
 
 import (
@@ -65,10 +67,10 @@ func init() {
 		read("operation watch", "wait for one operation and print it", "operation.json", "--json"),
 		read("doctor", "environment and catalog diagnostics", "doctor.json", "--json"),
 		mutate("cleanup", "remove stale runtime state no live daemon owns", false, "text.json"),
-		mutate("manager ensure", "find or start the project daemon and print its connection", false, "ensure.json", "--json"),
+		mutate("manager ensure", "find or start the project daemon and print its connection (token masked unless --reveal; --mask is accepted and changes nothing)", false, "ensure.json", "--json", "--mask", "--reveal"),
 		read("manager status", "daemon pid, port, and version", "manager-status.json", "--json"),
 		mutate("manager stop", "stop the daemon, its services, and detach shared services", true, "operation.json", "--json", "--yes"),
-		mutate("manager restart", "restart the daemon and leave services running", false, "ensure.json", "--json"),
+		mutate("manager restart", "restart the daemon and leave services running (token masked unless --reveal; --mask is accepted and changes nothing)", false, "ensure.json", "--json", "--mask", "--reveal"),
 		mutate("manager reload", "reload the project catalog", false, "reload.json", "--json"),
 		mutate("daemon", "run the project daemon in the foreground", false, "text.json"),
 		mutate("smp", "run the machine-global shared-services daemon", false, "text.json"),
@@ -76,7 +78,7 @@ func init() {
 		read("shared installed", "installed shared instances (secrets masked unless --reveal; --mask is accepted and changes nothing)", "shared-installed.json", "--json", "--mask", "--reveal"),
 		read("shared status", "live shared instances (secrets masked unless --reveal; --mask is accepted and changes nothing)", "shared-status.json", "--json", "--mask", "--reveal"),
 		read("shared connection", "this project's connection for an attached shared service (secrets masked unless --reveal)", "shared-connection.json", "--json", "--reveal"),
-		mutate("shared ensure", "find or start smp and print its connection", false, "ensure.json", "--json"),
+		mutate("shared ensure", "find or start smp and print its connection (token masked unless --reveal; --mask is accepted and changes nothing)", false, "ensure.json", "--json", "--mask", "--reveal"),
 		mutate("shared attach", "attach this project to a shared instance (connection secrets masked unless --reveal)", false, "attach.json", "--json", "--reveal"),
 		mutate("shared detach", "detach this project; --stop-if-unused stops the instance when nothing else is attached", true, "text.json", "--json", "--stop-if-unused", "--yes"),
 		read("shared probe", "exit 0 when the instance is ready and this project is attached", "text.json"),

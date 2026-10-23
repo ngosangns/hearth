@@ -25,6 +25,8 @@ const connectionUsage = "usage: hearth shared connection <service|name@version> 
 
 const workspacesUsage = "usage: hearth workspaces list [--json]"
 
+const managerUsage = "usage: hearth manager ensure|status|stop|restart|reload [--json] [--mask] [--reveal] [--yes]"
+
 const sharedUsage = "usage: hearth shared ensure|list|installed|status|connection|attach|detach|probe|install|start|stop|remove [--json] [--mask] [--reveal] [--force] [--yes] [--stop-if-unused] [<name>@<version>] [attach-args...]"
 
 // HelpText is the top-level `hearth --help` page. `version`, `schema`, `skill`,
@@ -42,8 +44,8 @@ usage: hearth [--root <path>] <command> [options]
   operation get|watch <id> [--json]     inspect one operation
   doctor [--json]                       environment and catalog diagnostics
   cleanup                               remove stale runtime state
-  manager ensure|status|stop|restart|reload [--json] [--yes]
-                                        daemon lifecycle (stop needs --yes off a TTY; restart keeps services running)
+  manager ensure|status|stop|restart|reload [--json] [--mask] [--reveal] [--yes]
+                                        daemon lifecycle (ensure and restart mask the token unless --reveal; --mask changes nothing; stop needs --yes off a TTY)
   daemon --root <path>                  run the daemon in the foreground (spawned internally)
   smp                                   run the machine-global shared-services daemon
   shared list [--json] [--mask] [--reveal]
@@ -52,7 +54,8 @@ usage: hearth [--root <path>] <command> [options]
                                         secrets masked unless --reveal (--mask changes nothing)
   shared connection <service|name@version> [--json] [--reveal]
                                         this project's connection (secrets masked unless --reveal)
-  shared ensure [--json]                find or start smp
+  shared ensure [--json] [--mask] [--reveal]
+                                        find or start smp (token masked unless --reveal; --mask changes nothing)
   shared attach|detach|probe <id> [--json] [--reveal] [--yes] [--stop-if-unused]
                                         attach masks connection secrets unless --reveal (detach --stop-if-unused needs --yes off a TTY)
   shared install|start|stop|remove <id> [--json] [--force] [--yes]
@@ -163,7 +166,7 @@ func usageFor(args []string) string {
 	case "cleanup":
 		return "usage: hearth cleanup"
 	case "manager":
-		return "usage: hearth manager ensure|status|stop|restart|reload [--json] [--yes]"
+		return managerUsage
 	case "daemon":
 		return "usage: hearth daemon --root <path>"
 	case "smp":
@@ -564,6 +567,16 @@ func emitSharedJSON(io *Io, payload any, mask bool) {
 		value = maskOrdered(value)
 	}
 	out(io, prettyJSON(value))
+}
+
+// printConnection prints an ensure payload. The bearer token is masked unless
+// reveal. --mask is accepted by the caller and does not change this output.
+// The JSON shape stays the same: `token` remains a string.
+func printConnection(io *Io, payload any, jsonOutput, reveal bool) {
+	if !reveal {
+		payload = maskOrdered(payload)
+	}
+	out(io, printValue(payload, jsonOutput))
 }
 
 // maskOrdered applies redact.Values. jsonValue's *omap.OMap keeps key order.

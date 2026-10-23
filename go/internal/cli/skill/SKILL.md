@@ -48,7 +48,9 @@ Run a command that changes a process or a file only when the user asked for that
 
 `shared list`, `shared status`, `shared installed`, `shared connection`, and `shared attach` mask secrets unless `--reveal`. `--mask` on `shared list`, `shared status`, and `shared installed` changes nothing. `--mask` with `--reveal` exits 2.
 
-`scripts/shared-list.sh` and `scripts/shared-status.sh` are masked by default and forward `--reveal` only when the caller passed it. `scripts/shared-connection.sh` stays masked the same way. Never pass `--reveal`, including through `hearth.sh`, unless the user asked for the real value.
+`manager ensure`, `manager restart`, and `shared ensure` mask the daemon bearer token unless `--reveal`. `--mask` on those commands changes nothing. `--mask` with `--reveal` exits 2. A client that calls the daemon over HTTP+SSE must pass `--reveal`. `scripts/events.sh` passes `--reveal` because it calls `127.0.0.1` itself.
+
+`scripts/shared-list.sh` and `scripts/shared-status.sh` are masked by default and forward `--reveal` only when the caller passed it. `scripts/shared-connection.sh` stays masked the same way. Never pass `--reveal`, including through `hearth.sh`, unless the user asked for the real value or the script is calling the daemon's HTTP API.
 
 ## Recipes
 

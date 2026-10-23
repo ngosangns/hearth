@@ -908,7 +908,7 @@ func logsCommand(ctx context.Context, root string, options *Options, rest []stri
 }
 
 func managerCommand(ctx context.Context, root string, options *Options, rest []string, io *Io) (int, error) {
-	flags, err := ParseCommandFlags(rest, []Flag{FlagJSON, FlagYes})
+	flags, err := ParseCommandFlags(rest, []Flag{FlagJSON, FlagYes, FlagReveal, FlagMask})
 	if err != nil {
 		return 0, err
 	}
@@ -916,10 +916,21 @@ func managerCommand(ctx context.Context, root string, options *Options, rest []s
 	valid := subcommand != nil && (*subcommand == "ensure" || *subcommand == "status" ||
 		*subcommand == "stop" || *subcommand == "restart" || *subcommand == "reload")
 	if len(flags.Positionals) != 1 || !valid {
-		return 0, usageErr("usage: hearth manager ensure|status|stop|restart|reload [--json] [--yes]")
+		return 0, usageErr(managerUsage)
 	}
 	if flags.Yes && *subcommand != "stop" {
 		return 0, usageErr("--yes is only supported by `hearth manager stop`")
+	}
+	// ensure and restart print the bearer token. It is masked unless --reveal.
+	// --mask is accepted and changes nothing. The other subcommands reject both.
+	if flags.Reveal && *subcommand != "ensure" && *subcommand != "restart" {
+		return 0, usageErr("--reveal is only supported by `hearth manager ensure` and `hearth manager restart`")
+	}
+	if flags.Mask && *subcommand != "ensure" && *subcommand != "restart" {
+		return 0, usageErr("--mask is only supported by `hearth manager ensure` and `hearth manager restart`")
+	}
+	if flags.Mask && flags.Reveal {
+		return 0, usageErr("--mask and --reveal cannot be used together")
 	}
 	switch *subcommand {
 	case "reload":
@@ -942,14 +953,14 @@ func managerCommand(ctx context.Context, root string, options *Options, rest []s
 		if err != nil {
 			return 0, err
 		}
-		out(io, printValue(c.EnsurePayload(), flags.JSON))
+		printConnection(io, c.EnsurePayload(), flags.JSON, flags.Reveal)
 		return 0, nil
 	case "restart":
 		payload, err := RestartManager(ctx, root, options)
 		if err != nil {
 			return 0, err
 		}
-		out(io, printValue(payload, flags.JSON))
+		printConnection(io, payload, flags.JSON, flags.Reveal)
 		return 0, nil
 	case "status":
 		discovered := client.Discover(ctx, root, &options.Catalog)
@@ -983,8 +994,8 @@ func managerCommand(ctx context.Context, root string, options *Options, rest []s
 // without stopping its services (leave-services — daemon-owned processes are
 // detached and outlive the daemon, and the next one re-adopts them from their
 // persisted identities), kills any other daemon process for this same root,
-// then ensures a fresh daemon. Returns the same payload `manager ensure --json`
-// prints.
+// then ensures a fresh daemon. Returns the real ensure payload, bearer token
+// included. The CLI masks `token` when it prints that payload, unless --reveal.
 func RestartManager(ctx context.Context, root string, options *Options) (any, error) {
 	var recordedPid *int64
 	var shutdownErr error

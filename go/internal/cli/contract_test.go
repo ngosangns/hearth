@@ -9,9 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
+	"github.com/ngosangns/hearth/go/internal/client"
 	"github.com/ngosangns/hearth/go/internal/fileio"
+	"github.com/ngosangns/hearth/go/internal/manager"
+	"github.com/ngosangns/hearth/go/internal/redact"
 	"github.com/ngosangns/hearth/go/internal/shared"
 )
 
@@ -836,4 +840,288 @@ func decodeObject(t *testing.T, text string) map[string]any {
 		t.Fatalf("json: %v\n%s", err, text)
 	}
 	return decoded
+}
+
+// decodeEnsure decodes a connection document. Failure text stays free of the
+// body so a revealed bearer token is never printed.
+func decodeEnsure(t *testing.T, text string) map[string]any {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		t.Fatal("ensure output was not JSON")
+	}
+	return decoded
+}
+
+func bootManager(t *testing.T, root string, cat catalog.ServiceCatalog) *manager.HearthManager {
+	t.Helper()
+	mgr, err := manager.Bootstrap(manager.HearthManagerOptions{
+		Root:    &root,
+		Catalog: cat,
+	})
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	t.Cleanup(func() { (&manager.StopServicesOnDrop{Manager: mgr}).Stop() })
+	return mgr
+}
+
+func waitUntilLive(t *testing.T, root string, cat *catalog.ServiceCatalog) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if client.Discover(context.Background(), root, cat).Kind == client.DiscoveryLive {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("daemon did not become live")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func runManager(t *testing.T, root string, cat catalog.ServiceCatalog, args ...string) (int, []string, []string) {
+	t.Helper()
+	var outLines, errLines []string
+	code := Main(context.Background(), &Options{
+		Catalog:     cat,
+		SpawnDaemon: func(string) { t.Fatal("manager command spawned a daemon") },
+	}, root, append([]string{"manager"}, args...), &Io{
+		Out: func(s string) { outLines = append(outLines, s) },
+		Err: func(s string) { errLines = append(errLines, s) },
+	})
+	return code, outLines, errLines
+}
+
+func assertEnsureDocument(t *testing.T, body string, mgr *manager.HearthManager, root string, reveal bool) {
+	t.Helper()
+	decoded := decodeEnsure(t, body)
+	info := mgr.Info()
+	if decoded["instanceId"] != info.InstanceID {
+		t.Fatalf("instanceId = %#v", decoded["instanceId"])
+	}
+	if decoded["port"] != float64(info.Port) {
+		t.Fatalf("port = %#v", decoded["port"])
+	}
+	if decoded["protocolVersion"] != float64(info.ProtocolVersion) {
+		t.Fatalf("protocolVersion = %#v", decoded["protocolVersion"])
+	}
+	if decoded["runtimeDirectory"] != mgr.RuntimeDirectory() {
+		t.Fatalf("runtimeDirectory = %#v", decoded["runtimeDirectory"])
+	}
+	if decoded["root"] != root {
+		t.Fatalf("root = %#v", decoded["root"])
+	}
+	if len(decoded) != 6 {
+		t.Fatalf("connection has %d keys", len(decoded))
+	}
+	token, _ := decoded["token"].(string)
+	if token == "" {
+		t.Fatal("token missing")
+	}
+	real := mgr.BearerToken()
+	if reveal {
+		if token != real {
+			t.Fatal("reveal did not print the bearer token")
+		}
+		return
+	}
+	if token != redact.Mask {
+		t.Fatal("token was not masked")
+	}
+	if strings.Contains(body, real) {
+		t.Fatal("output contained the bearer token")
+	}
+}
+
+func TestManagerEnsureMasksTokenUnlessReveal(t *testing.T) {
+	root := t.TempDir()
+	cat := testCatalog(nil)
+	mgr := bootManager(t, root, cat)
+	waitUntilLive(t, root, &cat)
+
+	connected, err := Ensure(context.Background(), root, &Options{Catalog: cat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connected.EnsurePayload()["token"] != mgr.BearerToken() {
+		t.Fatal("EnsurePayload masked the token")
+	}
+
+	code, outLines, errLines := runManager(t, root, cat, "ensure", "--json")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 || strings.Contains(outLines[0], "\n") {
+		t.Fatalf("json: %d outLines=%d err=%v", code, len(outLines), errLines)
+	}
+	assertEnsureDocument(t, outLines[0], mgr, root, false)
+	masked := outLines[0]
+
+	code, outLines, errLines = runManager(t, root, cat, "ensure", "--json", "--mask")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 || outLines[0] != masked {
+		t.Fatal("--mask changed ensure --json")
+	}
+
+	code, outLines, errLines = runManager(t, root, cat, "ensure")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 || !strings.Contains(outLines[0], "\n") {
+		t.Fatalf("text: %d outLines=%d err=%v", code, len(outLines), errLines)
+	}
+	assertEnsureDocument(t, outLines[0], mgr, root, false)
+	if !strings.Contains(outLines[0], `"token": "`+redact.Mask+`"`) {
+		t.Fatal("text output did not mask token")
+	}
+
+	code, outLines, errLines = runManager(t, root, cat, "ensure", "--json", "--reveal")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 {
+		t.Fatalf("reveal: %d err=%v", code, errLines)
+	}
+	assertEnsureDocument(t, outLines[0], mgr, root, true)
+}
+
+func TestManagerRestartMasksTokenUnlessReveal(t *testing.T) {
+	run := func(t *testing.T, args ...string) (string, *manager.HearthManager, string) {
+		t.Helper()
+		root := t.TempDir()
+		cat := testCatalog(nil)
+		var current *manager.HearthManager
+		t.Cleanup(func() {
+			if current != nil {
+				(&manager.StopServicesOnDrop{Manager: current}).Stop()
+			}
+		})
+		var outLines, errLines []string
+		code := Main(context.Background(), &Options{
+			Catalog: cat,
+			SpawnDaemon: func(spawned string) {
+				if spawned != root {
+					t.Fatal("restart spawned a different root")
+				}
+				if current != nil {
+					t.Fatal("restart spawned twice")
+				}
+				booted, err := manager.Bootstrap(manager.HearthManagerOptions{Root: &root, Catalog: cat})
+				if err != nil {
+					t.Fatalf("bootstrap: %v", err)
+				}
+				current = booted
+			},
+		}, root, append([]string{"manager", "restart"}, args...), &Io{
+			Out: func(s string) { outLines = append(outLines, s) },
+			Err: func(s string) { errLines = append(errLines, s) },
+		})
+		if code != 0 || len(errLines) != 0 || len(outLines) != 1 || current == nil {
+			t.Fatalf("restart %v: %d outLines=%d err=%v", args, code, len(outLines), errLines)
+		}
+		return outLines[0], current, root
+	}
+
+	body, mgr, root := run(t, "--json")
+	if strings.Contains(body, "\n") {
+		t.Fatal("restart --json was not compact")
+	}
+	assertEnsureDocument(t, body, mgr, root, false)
+	masked := body
+
+	body, mgr, root = run(t, "--json", "--mask")
+	assertEnsureDocument(t, body, mgr, root, false)
+	if strings.Contains(body, mgr.BearerToken()) {
+		t.Fatal("--mask left the bearer token in restart output")
+	}
+	// A fresh daemon has a different token, so compare the masked shape only.
+	if !strings.Contains(body, `"token":"`+redact.Mask+`"`) || !strings.Contains(masked, `"token":"`+redact.Mask+`"`) {
+		t.Fatal("--mask did not match the default restart mask")
+	}
+
+	body, mgr, root = run(t)
+	if !strings.Contains(body, "\n") {
+		t.Fatal("restart text was compact JSON")
+	}
+	assertEnsureDocument(t, body, mgr, root, false)
+
+	body, mgr, root = run(t, "--json", "--reveal")
+	assertEnsureDocument(t, body, mgr, root, true)
+}
+
+func TestSharedEnsureMasksTokenUnlessReveal(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := shared.SharedRoot()
+	cat := *client.SMPCatalog()
+	mgr := bootManager(t, root, cat)
+	waitUntilLive(t, root, &cat)
+
+	run := func(t *testing.T, args ...string) (int, []string, []string) {
+		t.Helper()
+		return runSharedCLI(t, t.TempDir(), args...)
+	}
+
+	code, outLines, errLines := run(t, "ensure", "--json")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 || strings.Contains(outLines[0], "\n") {
+		t.Fatalf("json: %d outLines=%d err=%v", code, len(outLines), errLines)
+	}
+	assertEnsureDocument(t, outLines[0], mgr, root, false)
+	masked := outLines[0]
+
+	code, outLines, errLines = run(t, "ensure", "--json", "--mask")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 || outLines[0] != masked {
+		t.Fatal("--mask changed shared ensure --json")
+	}
+
+	code, outLines, errLines = run(t, "ensure")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 || !strings.Contains(outLines[0], "\n") {
+		t.Fatalf("text: %d outLines=%d err=%v", code, len(outLines), errLines)
+	}
+	assertEnsureDocument(t, outLines[0], mgr, root, false)
+
+	code, outLines, errLines = run(t, "ensure", "--json", "--reveal")
+	if code != 0 || len(errLines) != 0 || len(outLines) != 1 {
+		t.Fatalf("reveal: %d err=%v", code, errLines)
+	}
+	assertEnsureDocument(t, outLines[0], mgr, root, true)
+}
+
+func TestEnsureMaskAndRevealUsage(t *testing.T) {
+	root := t.TempDir()
+	cases := []struct {
+		args []string
+		json bool
+		want string
+	}{
+		{[]string{"manager", "status", "--reveal"}, false, "--reveal is only supported"},
+		{[]string{"manager", "stop", "--reveal"}, false, "--reveal is only supported"},
+		{[]string{"manager", "reload", "--reveal"}, false, "--reveal is only supported"},
+		{[]string{"manager", "status", "--mask"}, false, "--mask is only supported"},
+		{[]string{"manager", "stop", "--mask", "--yes"}, false, "--mask is only supported"},
+		{[]string{"manager", "reload", "--mask"}, false, "--mask is only supported"},
+		{[]string{"manager", "ensure", "--mask", "--reveal"}, false, "cannot be used together"},
+		{[]string{"manager", "restart", "--reveal", "--mask"}, false, "cannot be used together"},
+		{[]string{"manager", "ensure", "--json", "--mask", "--reveal"}, true, "cannot be used together"},
+		{[]string{"manager", "restart", "--json", "--reveal", "--mask"}, true, "cannot be used together"},
+	}
+	for _, tc := range cases {
+		code, outLines, errLines := runCLI(t, root, tc.args...)
+		lines := errLines
+		if tc.json {
+			lines = outLines
+		}
+		if code != ExitUsage || len(lines) != 1 || !strings.Contains(lines[0], tc.want) {
+			t.Fatalf("%v: %d out=%v err=%v", tc.args, code, outLines, errLines)
+		}
+		if tc.json {
+			errObj, _ := decodeObject(t, outLines[0])["error"].(map[string]any)
+			if errObj["code"] != "usage" || errObj["exit"] != float64(ExitUsage) {
+				t.Fatalf("%v error = %#v", tc.args, errObj)
+			}
+		}
+	}
+
+	code, outLines, errLines := runSharedCLI(t, root, "ensure", "--mask", "--reveal")
+	if code != ExitUsage || len(outLines) != 0 || len(errLines) != 1 || !strings.Contains(errLines[0], "cannot be used together") {
+		t.Fatalf("shared ensure mask+reveal: %d out=%v err=%v", code, outLines, errLines)
+	}
+	code, outLines, errLines = runSharedCLI(t, root, "ensure", "--json", "--reveal", "--mask")
+	if code != ExitUsage || len(errLines) != 0 || len(outLines) != 1 || !strings.Contains(outLines[0], "cannot be used together") {
+		t.Fatalf("shared ensure json mask+reveal: %d out=%v err=%v", code, outLines, errLines)
+	}
+	if decodeObject(t, outLines[0])["error"].(map[string]any)["code"] != "usage" {
+		t.Fatal("shared ensure json mask+reveal was not a usage error")
+	}
 }

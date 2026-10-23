@@ -171,14 +171,14 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 	if flags.Yes && subcommand != "remove" && subcommand != "detach" {
 		return 0, usageErr("--yes is only supported by `shared remove` and `shared detach`")
 	}
-	if flags.Mask && subcommand != "status" && subcommand != "installed" && subcommand != "list" {
-		return 0, usageErr("--mask is only supported by `shared list`, `shared status`, and `shared installed`")
+	if flags.Mask && subcommand != "status" && subcommand != "installed" && subcommand != "list" && subcommand != "ensure" {
+		return 0, usageErr("--mask is only supported by `shared list`, `shared status`, `shared installed`, and `shared ensure`")
 	}
-	if flags.Reveal && subcommand != "status" && subcommand != "installed" && subcommand != "connection" && subcommand != "list" && subcommand != "attach" {
-		return 0, usageErr("--reveal is only supported by `shared list`, `shared status`, `shared installed`, `shared connection`, and `shared attach`")
+	if flags.Reveal && subcommand != "status" && subcommand != "installed" && subcommand != "connection" && subcommand != "list" && subcommand != "attach" && subcommand != "ensure" {
+		return 0, usageErr("--reveal is only supported by `shared list`, `shared status`, `shared installed`, `shared connection`, `shared attach`, and `shared ensure`")
 	}
-	// --mask is an explicit no-op: list, status, and installed mask unless
-	// --reveal. Together the two flags are a usage error.
+	// --mask is an explicit no-op: list, status, installed, and ensure mask
+	// unless --reveal. Together the two flags are a usage error.
 	if flags.Mask && flags.Reveal {
 		return 0, usageErr("--mask and --reveal cannot be used together")
 	}
@@ -194,12 +194,13 @@ func runSharedInner(ctx context.Context, root string, args []string, io *Io, spa
 	switch subcommand {
 	// The `manager ensure --json` contract for smp — find-or-start the shared
 	// daemon and print the connection a client needs to talk to it directly.
+	// The bearer token is masked unless --reveal. EnsureSMP's payload is not.
 	case "ensure":
 		c, err := client.EnsureSMP(ctx, spawnSMP)
 		if err != nil {
 			return 0, err
 		}
-		out(io, printValue(c.EnsurePayload(), flags.JSON))
+		printConnection(io, c.EnsurePayload(), flags.JSON, flags.Reveal)
 		return 0, nil
 	// The remote registry — readable without smp running.
 	case "list":

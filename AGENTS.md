@@ -14,8 +14,8 @@ install or publish `hearthd`. A project authors `hearth.yaml`
 
 Consumers (`infra`, `viclass`) spawn `hearth` from `~/.local/bin/hearth` after `task install`.
 
-`hearth manager ensure --json` prints everything (`token`, `port`, `runtimeDirectory`, …) a generic
-HTTP+SSE client needs. `internal/env` resolves the daemon's own base environment (login shell +
+`hearth manager ensure --json` prints the connection (`token`, `port`, `runtimeDirectory`, …) a generic
+HTTP+SSE client needs. The bearer `token` is masked unless `--reveal`; a client that needs it must pass `--reveal`. `internal/env` resolves the daemon's own base environment (login shell +
 `.env`) because a process started outside a login shell inherits launchd's bare `PATH`.
 
 The manager HTTP surface lives under `go/internal/manager/`:
@@ -372,8 +372,10 @@ from any dev box here, with the same username.
   MCP `shared_list`, `shared_status`, and `shared_connection` always mask the same way and have no
   reveal option; credential keys outside that rule (`authorization`, ownership proof, `apiKey`) are
   still dropped. The skill's `shared-list.sh` and `shared-status.sh` stay masked and forward
-  `--reveal` only when the caller passed it. `manager ensure` / `shared ensure` still print the
-  daemon bearer `token`: that document is the client connection, not a recipe.
+  `--reveal` only when the caller passed it. `manager ensure`, `manager restart`, and `shared ensure`
+  mask the daemon bearer `token` the same way unless `--reveal`. `--mask` is accepted and changes
+  nothing. A client that needs the token for direct HTTP+SSE must pass `--reveal`. `Client.EnsurePayload()`
+  and in-process callers keep the real token; masking is only at the CLI print boundary.
 - Ports: `sha256(name@version)` into `43100–43999`, collision probes forward and persists into
   `registry.json`. Never hand out a well-known port (5432/6379) to a shared instance — the one
   sanctioned exception is a recipe's `ports: […]` **pinned** field (the shared nginx's `[18080, 18443]`),
