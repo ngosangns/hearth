@@ -1,5 +1,5 @@
-// Package client is the unified HTTP+SSE client a Go CLI, MCP server or app
-// uses to talk to a hearth daemon.
+// Package client is the unified HTTP+SSE client a Go CLI or app uses to talk
+// to a hearth daemon.
 //
 // Ported from rust/crates/hearth-cli/src/client.rs (the typed per-endpoint
 // `Client` and the caching `ManagerClient`), rust/crates/hearth-cli/src/lib.rs

@@ -32,7 +32,7 @@ const sharedUsage = "usage: hearth shared ensure|list|installed|status|connectio
 // HelpText is the top-level `hearth --help` page. `version`, `schema`, `skill`,
 // `workspaces`, `shared`, and `update` are on it because they run without a project catalog.
 func HelpText() string {
-	return `hearth — local dev services daemon, CLI, and MCP server
+	return `hearth — local dev services daemon and CLI
 
 usage: hearth [--root <path>] <command> [options]
   status [target] [--json]              current state of one service, a group, or all
@@ -61,9 +61,6 @@ usage: hearth [--root <path>] <command> [options]
   shared install|start|stop|remove <id> [--json] [--force] [--yes]
                                         manage a shared instance (remove needs --yes off a TTY)
   update [--check] [--json] [--force]   install the latest stable GitHub release
-  mcp                                   serve the MCP tool surface over stdio
-  mcp install [--name N] [--key K] <config-file>...
-                                        register this binary in an MCP client config
   skill install [--dest DIR]            install SKILL.md + scripts (default ~/.agents/skills/hearth)
   skill check [--dest DIR] [--json]     compare the installed skill with this binary
   version [--json]                      name, version, schemaVersion, commit
@@ -72,7 +69,6 @@ usage: hearth [--root <path>] <command> [options]
 
 shared, update, version, schema, skill, and workspaces do not need a hearth.yaml in the current directory.
 The workspace window is hearth-gpui, not this binary.
-mcp install records this process path. A binary inside Hearth.app makes those configs point into the bundle.
 Every other command resolves a catalog from --root (default: cwd):
 hearth.yaml, .yml, or .json.
 With --json, a failure prints {"error":{code,exit,message}} on stdout. Exit 6 is needs-confirm: pass --yes.`
@@ -178,13 +174,6 @@ func usageFor(args []string) string {
 		return sharedUsage
 	case "update":
 		return "usage: hearth update [--check] [--json] [--force]"
-	case "mcp":
-		for _, arg := range args[1:] {
-			if arg == "install" {
-				return "usage: hearth mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>..."
-			}
-		}
-		return "usage: hearth mcp"
 	case "skill":
 		return skillUsage
 	case "version":

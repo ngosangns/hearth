@@ -290,14 +290,12 @@ recipe's `provision` argv.
 - `remove <name@ver> [--force] [--yes]` — delete the instance and its data. Without `--force` it refuses
   an instance that still has attachments. Off a TTY, `--yes` is required (exit 6).
 
-## MCP + skill
+## Skill
 
-`hearth mcp` still serves `local_services_shared_list`, `local_services_shared_status`, and
-`local_services_shared_connection`. MCP `shared_list`, `shared_status`, and `shared_connection`
-always mask secret-shaped strings, including `recipe.env` and `connection.env`. Coding agents are
-steered to the skill scripts (`hearth skill install` writes `SKILL.md` and `scripts/shared-list.sh`,
-`shared-status.sh`, `shared-connection.sh`) or the CLI. `shared-list.sh` and `shared-status.sh`
-stay masked and forward `--reveal` only when the caller passed it.
+Coding agents use the skill scripts (`hearth skill install` writes `SKILL.md` and
+`scripts/shared-list.sh`, `shared-status.sh`, `shared-connection.sh`) or the CLI. The scripts mask
+secret-shaped strings, including `recipe.env` and `connection.env`; `shared-list.sh` and
+`shared-status.sh` stay masked and forward `--reveal` only when the caller passed it.
 Flow: read `shared:` in `hearth.yaml` → attach happens on `start` → read connection info for the service.
 
 ## Edge cases

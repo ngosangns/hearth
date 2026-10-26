@@ -1,7 +1,7 @@
 ---
 name: hearth
 kind: playbook
-description: Operate this project's local dev services (start/stop/status/logs) through hearth CLI skill scripts instead of raw kill/pkill/docker/task. MCP retired for agents — use scripts/ or `hearth` directly.
+description: Operate this project's local dev services (start/stop/status/logs) through hearth CLI skill scripts instead of raw kill/pkill/docker/task. No MCP surface — use scripts/ or `hearth` directly.
 ---
 
 # Hearth
@@ -9,7 +9,7 @@ description: Operate this project's local dev services (start/stop/status/logs) 
 This project's local dev services are managed by one background daemon, the `hearth` binary.
 Do not `kill`, `pkill`, `docker restart`, or run a dev task raw for a unit this daemon tracks.
 
-**MCP is retired for coding agents.** Do not run `hearth mcp install`. Use the scripts below, or `hearth` directly.
+**There is no MCP server.** Use the scripts below, or `hearth` directly.
 
 Refresh this skill with `hearth skill install` (default `~/.agents/skills/hearth`) and confirm with `hearth skill check`. Do not hand-edit the installed copy.
 
@@ -36,7 +36,7 @@ Binary: `$HEARTH_BIN` or `~/.local/bin/hearth`.
 
 ### Mutate rule
 
-Run a command that changes a process or a file only when the user asked for that action in the current task. That includes `start`, `stop`, `restart`, `manager ensure|stop|restart|reload`, `shared ensure|attach|detach|install|start|stop|remove`, `cleanup`, `update` without `--check`, `mcp install`, and `skill install`. Never start something to see if it works.
+Run a command that changes a process or a file only when the user asked for that action in the current task. That includes `start`, `stop`, `restart`, `manager ensure|stop|restart|reload`, `shared ensure|attach|detach|install|start|stop|remove`, `cleanup`, `update` without `--check`, and `skill install`. Never start something to see if it works.
 
 `manager ensure` and `shared ensure` can start a daemon. Prefer `manager status` and `shared status` to look.
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The MCP surface is gone. `hearth mcp`, `hearth mcp install`, the `internal/mcpserver` package, and the `mcp`/`mcp install` schema entries are removed. The bundled agent skill (`hearth skill install`) is the only agent surface, and its scripts already covered every MCP tool. A config that registered `hearth --root <project> mcp` must drop that entry and use the skill scripts instead.
+
 ## 0.27.7
 
 - `manager ensure` and `shared ensure` spawn the daemon through a short `_spawn1` → `_spawn2` hop so the long-lived process is not in the macOS app coalition. Quitting the Hearth window no longer stops the project daemon or `smp`.

@@ -1,9 +1,8 @@
-// `hearth`: the daemon, the CLI, and the MCP server in one binary.
-// `hearth daemon` and `hearth smp` run a manager in the foreground (and are what
-// `ensure` spawns detached); bare `mcp` is intercepted here because internal/cli
-// cannot depend on internal/mcpserver; every other subcommand delegates to
-// cli.Main. Ported from rust/bin/hearth/src/main.rs — the TUI is gone, so a bare
-// `hearth` always prints help and `tui` is an unknown command.
+// `hearth`: the daemon and the CLI in one binary. `hearth daemon` and
+// `hearth smp` run a manager in the foreground (and are what `ensure` spawns
+// detached); every other subcommand delegates to cli.Main. Ported from
+// rust/bin/hearth/src/main.rs — the TUI is gone, so a bare `hearth` always
+// prints help and `tui` is an unknown command.
 package main
 
 import (
@@ -18,7 +17,6 @@ import (
 	"github.com/ngosangns/hearth/go/internal/daemon"
 	"github.com/ngosangns/hearth/go/internal/env"
 	"github.com/ngosangns/hearth/go/internal/manager"
-	"github.com/ngosangns/hearth/go/internal/mcpserver"
 	"github.com/ngosangns/hearth/go/internal/paths"
 	"github.com/ngosangns/hearth/go/internal/platform"
 	"github.com/ngosangns/hearth/go/internal/shared"
@@ -201,29 +199,6 @@ func spawnSMP(_root string) {
 var spawnProjectDaemon = spawnDaemon
 var spawnSharedDaemon = spawnSMP
 
-// Runs an MCP server over stdio for root's catalog. RequireConfirm stays at its
-// safe default (true); ToolPrefix is fixed at `local_services_`, the name
-// consumers' skill docs use.
-func runMcpSubcommand(root string, cat catalog.ServiceCatalog) int {
-	known := make([]string, 0, len(cat.Services))
-	for _, s := range cat.Services {
-		known = append(known, s.ID)
-	}
-	apiClient := mcpserver.NewManagerApiClient(root, mcpserver.ClientOptions{
-		Catalog:     cat,
-		SpawnDaemon: spawnDaemon,
-	})
-	opts := mcpserver.DefaultOptions()
-	opts.ToolPrefix = "local_services_"
-	opts.KnownServiceIDs = known
-	server := mcpserver.New(apiClient, opts)
-	if err := server.Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "hearth mcp: %v\n", err)
-		return 1
-	}
-	return 0
-}
-
 // `--help`/`--version` must work from ANY directory. `shared` and `update` also
 // run without a project catalog. Answering "how do I use this?" with "there is
 // no config file here" is a bad first experience for someone who just installed
@@ -316,11 +291,6 @@ func runCLI(root string, rest []string) int {
 	loaded, err := configfile.LoadCatalog(root)
 	if err != nil {
 		return catalogFailed(root, rest, err)
-	}
-	// Only the bare `mcp` (serve over stdio) needs the MCP server; `mcp install`
-	// is plain file editing and falls through to cli.Main.
-	if rest[0] == "mcp" && len(rest) == 1 {
-		return runMcpSubcommand(root, *loaded.Catalog)
 	}
 	options := &cli.Options{
 		Catalog:     *loaded.Catalog,

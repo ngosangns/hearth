@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Thin wrapper: hearth --root <project> …  (canonical skill path; MCP retired for agents)
+# Thin wrapper: hearth --root <project> …  (the only agent surface; there is no MCP server)
 set -euo pipefail
 
 HEARTH_BIN="${HEARTH_BIN:-$HOME/.local/bin/hearth}"

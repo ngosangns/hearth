@@ -229,8 +229,7 @@ func normalizeLexical(path string) string {
 }
 
 // IsHearthBinaryName matches `hearth` or the versioned install name
-// `hearth-<digits>.<digits>...`. `hearthd` and `hearth-mcp` are different
-// programs.
+// `hearth-<digits>.<digits>...`. `hearthd` is a different program.
 func isHearthBinaryName(name string) bool {
 	if name == "hearth" {
 		return true

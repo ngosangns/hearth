@@ -4,7 +4,7 @@
 //
 // Ported from rust/crates/hearth-cli/src/lib.rs (the whole CLI: discovery
 // handling, flag parsing, `status`/`urls`/`logs`/`cleanup`/`manager`/`start`/
-// `stop`/`restart`/`operation`/`doctor`/`mcp install`/`skill install`, and the
+// `stop`/`restart`/`operation`/`doctor`/`skill install`, and the
 // `main` dispatch) plus the `hearth shared …` subcommand set from
 // rust/crates/hearth-cli/src/shared.rs (see shared.go).
 //
@@ -142,9 +142,7 @@ const (
 	FlagWait
 	FlagFollow
 	FlagTail
-	FlagName
 	FlagDest
-	FlagKey
 	FlagKillUnowned
 	FlagForce
 	FlagStopIfUnused
@@ -161,9 +159,7 @@ type Flags struct {
 	Wait         bool
 	Follow       bool
 	Tail         *uint64
-	Name         *string
 	Dest         *string
-	Key          *string
 	KillUnowned  bool
 	Force        bool
 	StopIfUnused bool
@@ -208,12 +204,8 @@ func ParseCommandFlags(arguments []string, allowed []Flag) (*Flags, error) {
 			flag, canonical = FlagFollow, "follow"
 		case "tail":
 			flag, canonical = FlagTail, "tail"
-		case "name":
-			flag, canonical = FlagName, "name"
 		case "dest":
 			flag, canonical = FlagDest, "dest"
-		case "key":
-			flag, canonical = FlagKey, "key"
 		case "kill-unowned":
 			flag, canonical = FlagKillUnowned, "kill-unowned"
 		case "force":
@@ -258,14 +250,6 @@ func ParseCommandFlags(arguments []string, allowed []Flag) (*Flags, error) {
 			}
 			u := uint64(*value)
 			result.Tail = &u
-		case FlagName:
-			index++
-			if index < len(arguments) && arguments[index] != "" {
-				v := arguments[index]
-				result.Name = &v
-			} else {
-				return nil, usageErr("--name requires a value")
-			}
 		case FlagDest:
 			index++
 			if index < len(arguments) && arguments[index] != "" {
@@ -273,14 +257,6 @@ func ParseCommandFlags(arguments []string, allowed []Flag) (*Flags, error) {
 				result.Dest = &v
 			} else {
 				return nil, usageErr("--dest requires a value")
-			}
-		case FlagKey:
-			index++
-			if index < len(arguments) && arguments[index] != "" {
-				v := arguments[index]
-				result.Key = &v
-			} else {
-				return nil, usageErr("--key requires a value")
 			}
 		case FlagKillUnowned:
 			result.KillUnowned = true
@@ -691,8 +667,6 @@ func mainInner(ctx context.Context, options *Options, root string, argv []string
 		return operationCommand(ctx, root, options, rest, io)
 	case "logs":
 		return logsCommand(ctx, root, options, rest, io)
-	case "mcp":
-		return mcpCommand(root, rest, io)
 	case "skill":
 		return skillCommand(root, rest, io)
 	case "version":
@@ -1487,142 +1461,6 @@ func operationFailure(ctx context.Context, c *client.Client, failed []*state.Ope
 		message = strings.Join(lines, "\n")
 	}
 	return &LocalctlError{ExitCode: ExitFailed, Message: message}
-}
-
-// ---------------------------------------------------------------------------------------------
-// mcp install / skill install
-//
-// `mcp install` registers the *running* `hearth` binary's absolute path
-// directly in an MCP host's JSON config — no wrapper script — merging only
-// `{command, args}`.
-// ---------------------------------------------------------------------------------------------
-
-func mcpCommand(root string, rest []string, io *Io) (int, error) {
-	if len(rest) == 0 {
-		return 0, usageErr("usage: hearth mcp install [--name <name>] [--json] <config-file>...")
-	}
-	switch rest[0] {
-	case "install":
-		return mcpInstallCommand(root, rest[1:], io)
-	default:
-		return 0, usageErr("unknown mcp subcommand: " + rest[0])
-	}
-}
-
-// mcpInstallCommand merges `mcpServers.<name>` into each given JSON file,
-// setting only `command`/`args` and preserving every other field already on
-// that entry and every other entry in the file. Creates the file (as `{}`) if
-// it doesn't exist yet.
-func mcpInstallCommand(root string, rest []string, io *Io) (int, error) {
-	flags, err := ParseCommandFlags(rest, []Flag{FlagName, FlagKey, FlagJSON})
-	if err != nil {
-		return 0, err
-	}
-	if len(flags.Positionals) == 0 {
-		return 0, usageErr("usage: hearth mcp install [--name <name>] [--key <topLevelKey>] [--json] <config-file>...")
-	}
-	name := "hearth"
-	if flags.Name != nil {
-		name = *flags.Name
-	}
-	key := "mcpServers"
-	if flags.Key != nil {
-		key = *flags.Key
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return 0, failErr(ExitFailed, "could not resolve the running hearth binary's own path: "+err.Error())
-	}
-	resolvedRoot := canonicalize(root)
-	command := exe
-	args := []string{"--root", resolvedRoot, "mcp"}
-	for _, configFile := range flags.Positionals {
-		if err := installMcpEntry(configFile, key, name, command, args); err != nil {
-			return 0, err
-		}
-	}
-	if flags.JSON {
-		files := make([]any, 0, len(flags.Positionals))
-		for _, f := range flags.Positionals {
-			files = append(files, f)
-		}
-		argList := make([]any, 0, len(args))
-		for _, a := range args {
-			argList = append(argList, a)
-		}
-		payload := omap.New()
-		payload.Set("key", key)
-		payload.Set("server", name)
-		payload.Set("command", command)
-		payload.Set("args", argList)
-		payload.Set("files", files)
-		out(io, printValue(payload, true))
-	} else {
-		for _, configFile := range flags.Positionals {
-			out(io, fmt.Sprintf("installed mcp server %q into %s", name, configFile))
-		}
-	}
-	return 0, nil
-}
-
-// installMcpEntry merges `<key>.<name>` (default key: `mcpServers`, the shape
-// every standard MCP host config shares) into path, touching only
-// `command`/`args` on that entry. Insertion order is preserved so a
-// one-entry change never turns into a huge, unreviewable diff.
-func installMcpEntry(path, key, name, command string, args []string) error {
-	var document any
-	if fileExists(path) {
-		text, err := os.ReadFile(path)
-		if err != nil {
-			return failErr(ExitFailed, fmt.Sprintf("could not read %s: %v", path, err))
-		}
-		parsed, err := omap.ParseJSON(string(text))
-		if err != nil {
-			return failErr(ExitFailed, fmt.Sprintf("could not parse %s as JSON: %v", path, err))
-		}
-		document = parsed
-	} else {
-		document = omap.New()
-	}
-	rootObject, ok := document.(*omap.OMap)
-	if !ok {
-		return failErr(ExitFailed, fmt.Sprintf("%s's top level is not a JSON object", path))
-	}
-	serversValue, ok := rootObject.Get(key)
-	if !ok {
-		serversValue = omap.New()
-		rootObject.Set(key, serversValue)
-	}
-	serversObject, ok := serversValue.(*omap.OMap)
-	if !ok {
-		return failErr(ExitFailed, fmt.Sprintf("%s's %q is not a JSON object", path, key))
-	}
-	entryValue, ok := serversObject.Get(name)
-	if !ok {
-		entryValue = omap.New()
-		serversObject.Set(name, entryValue)
-	}
-	entryObject, ok := entryValue.(*omap.OMap)
-	if !ok {
-		return failErr(ExitFailed, fmt.Sprintf("%s's %q is not a JSON object", path, key+"."+name))
-	}
-	entryObject.Set("command", command)
-	argList := make([]any, 0, len(args))
-	for _, a := range args {
-		argList = append(argList, a)
-	}
-	entryObject.Set("args", argList)
-	parent := filepath.Dir(path)
-	if parent != "" && parent != "." {
-		if err := os.MkdirAll(parent, 0o755); err != nil {
-			return failErr(ExitFailed, fmt.Sprintf("could not create %s: %v", parent, err))
-		}
-	}
-	serialized := prettyJSON(document) + "\n"
-	if err := os.WriteFile(path, []byte(serialized), 0o644); err != nil {
-		return failErr(ExitFailed, fmt.Sprintf("could not write %s: %v", path, err))
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -198,8 +198,8 @@ func (m *HearthManager) runServiceOperation(handle *OperationHandle, serviceID s
 	switch action {
 	case state.OpStart:
 		// `startServices` is `[serviceID]` for a `start` action — routed through
-		// the same startSelectedDag as bulk-start so `hearth start <id>`, the
-		// app's Start button and MCP `manage start` all land on one code path.
+		// the same startSelectedDag as bulk-start so `hearth start <id>` and the
+		// app's Start button land on one code path.
 		err = m.startSelectedDag(startServices, handle, killUnowned)
 	case state.OpStop:
 		err = m.supervisor.Stop(serviceID, nil)

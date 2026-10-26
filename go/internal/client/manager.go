@@ -5,8 +5,8 @@
 // spawns a daemon — callers that may need one Ensure first. A failure that
 // says the connection itself is gone (dead port, stale token after an outside
 // `manager restart`) invalidates the cache and retries ONCE on a freshly
-// discovered connection, so a long-lived MCP session does not hand its agent a
-// spurious error for every first call after a restart.
+// discovered connection, so a long-lived client does not surface a spurious
+// error for every first call after a restart.
 package client
 
 import (

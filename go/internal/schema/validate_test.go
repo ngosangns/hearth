@@ -346,7 +346,6 @@ func TestGoldensMatchEmbeddedSchemas(t *testing.T) {
 		"update.json":               "update",
 		"skill-check.json":          "skill check",
 		"version.json":              "version",
-		"mcp-install.json":          "mcp install",
 		"text.json":                 "cleanup",
 		"schema.json":               "schema",
 	}
@@ -684,7 +683,7 @@ func TestMutatesAudit(t *testing.T) {
 		"manager reload": true, "daemon": true, "smp": true, "shared ensure": true,
 		"shared attach": true, "shared detach": true, "shared install": true, "shared start": true,
 		"shared stop": true, "shared remove": true, "start": true, "stop": true, "restart": true,
-		"update": true, "mcp install": true, "skill install": true,
+		"update": true, "skill install": true,
 	}
 	destructive := map[string]bool{
 		"manager stop": true, "shared detach": true, "shared remove": true,

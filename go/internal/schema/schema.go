@@ -90,8 +90,6 @@ func init() {
 		mutate("stop", "stop a service or group", false, "lifecycle.json", "--json", "--wait", "--dry-run", "--yes"),
 		mutate("restart", "restart a service or group", false, "lifecycle.json", "--json", "--wait", "--dry-run", "--yes"),
 		mutate("update", "download and install a GitHub release; --check only reads", false, "update.json", "--json", "--check", "--force"),
-		read("mcp", "serve the MCP tool surface over stdio", "text.json"),
-		mutate("mcp install", "register this binary in an MCP client config", false, "mcp-install.json", "--json", "--name", "--key"),
 		mutate("skill install", "write the embedded skill into a directory", false, "text.json", "--dest"),
 		read("skill check", "compare the installed skill with the embedded copy", "skill-check.json", "--json", "--dest"),
 		read("version", "name, version, schemaVersion, and commit", "version.json", "--json"),

@@ -2,18 +2,18 @@
 
 # hearth
 
-Local dev services manager: one long-lived daemon per project folder, a CLI, bundled **skill
-scripts** for coding agents, and an optional MCP server over stdio.
+Local dev services manager: one long-lived daemon per project folder, a CLI, and bundled **skill
+scripts** for coding agents.
 Clients talk to the daemon over loopback HTTP+SSE. The daemon owns every managed process; nothing
 else starts or stops one directly. **Coding agents** should use `hearth skill install` and those
-scripts, not `hearth mcp install` (MCP stays for human-driven clients and legacy configs).
+scripts.
 
 The product is the compiled `hearth` binary (`go/cmd/hearth`). It runs from any directory.
 
 ```
  your CLI  ─┐
- your MCP  ─┼──HTTP + SSE (loopback)──►  daemon (hearth)
- window   ─┘                                  │
+ window   ─┼──HTTP + SSE (loopback)──►  daemon (hearth)
+            ┘                                  │
                                         ProcessSupervisor (spawns/probes/tails)
 ```
 
@@ -172,7 +172,6 @@ task install          # versioned binary + symlink at ~/.local/bin/hearth
 hearth update --check
 hearth update
 hearth --root /path/to/project status
-hearth --root /path/to/project mcp
 ```
 
 `hearth manager ensure --json` is the connection contract for another client: it ensures a daemon
@@ -214,8 +213,6 @@ Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root
 | `shared attach <name@ver> [--json] [--reveal]`, `shared probe <name@ver>`, `shared detach <name@ver> [--stop-if-unused] [--yes]` | what generated `shared:` services run. `attach` masks connection secrets unless `--reveal`. `detach --stop-if-unused` needs `--yes` off a TTY |
 | `shared remove <name@ver> [--force] [--yes]` | delete an instance; `--force` is required while projects are attached. `--yes` is required off a TTY |
 | `update [--check] [--json] [--force]` | install the latest GitHub release |
-| `mcp` | serve the MCP tools over stdio |
-| `mcp install [--name N] [--key K] [--json] <config-file>...` | write this binary's path into an MCP client config (`mcpServers.<name>` unless `--key`) |
 | `skill install [--dest DIR]` | write `SKILL.md` and `scripts/*.sh` (default `~/.agents/skills/hearth`) |
 | `skill check [--dest DIR] [--json]` | compare that directory with the copy embedded in this binary |
 | `version [--json]` | name, version, schemaVersion, commit |
@@ -223,18 +220,6 @@ Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root
 | `workspaces list [--json]` | workspace folders the Hearth window knows (`~/Library/Application Support/HearthApp/workspaces.json`, or `HEARTH_WORKSPACE_FILE`). Read-only. A missing file is an empty list |
 
 Exit codes: 2 usage, 3 unavailable, 4 protocol mismatch, 5 operation failed, 6 needs confirmation (`--yes`), 7 unauthorized, 8 drift or conflict. With `--json`, a failure prints `{"error":{code,exit,message,hint?}}` on stdout. `hearth update --json` keeps its report, `skill check` drift keeps the check document, `doctor --json` keeps the report when checks fail, and `shared probe` stays silent.
-
-## MCP server
-
-Optional. Prefer the bundled skill scripts for coding agents (`hearth skill install`).
-
-`hearth --root <project> mcp` speaks MCP over stdio. Tool names carry the prefix `local_services_`:
-`status`, `logs`, `trace` (an operation by id), `events` (since a sequence number), `manage`
-(start/stop/restart, optional `killUnowned`), `restart_daemon`, `stop_daemon`, `shared_list`,
-`shared_status`, `shared_connection`. `manage`, `restart_daemon`, and `stop_daemon` require
-`confirm: true`. The `status`, `logs`, and `manage` schemas enumerate the catalog's service ids.
-`hearth skill install` ships script equivalents of the same tools, which is what coding agents are
-pointed at instead of registering this server.
 
 ## Window
 
