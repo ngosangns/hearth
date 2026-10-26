@@ -24,7 +24,7 @@ One binary hosts the daemon, the CLI, and MCP. The long-lived process is the dae
 
 ## Scope
 
-In scope: one daemon per project root, one `smp` daemon per machine, and a CLI and an MCP server on the same protocol.
+In scope: one daemon per project root, one `smp` daemon per machine, a CLI, bundled skill scripts for coding agents, and an optional MCP server on the same protocol.
 
 Out of scope: a UI in this repo, a command palette, an extension host, collaboration, a language server, and a second implementation of start/stop. The window is `hearth-gpui` in `ns-gpui`. Do not add a UI target or a Rust module here.
 

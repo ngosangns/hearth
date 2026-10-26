@@ -2,9 +2,11 @@
 
 # hearth
 
-Local dev services manager: one long-lived daemon per project folder, plus a CLI and MCP server.
-All of them talk to the daemon over loopback HTTP+SSE. The daemon owns every managed process;
-nothing else starts or stops one directly.
+Local dev services manager: one long-lived daemon per project folder, a CLI, bundled **skill
+scripts** for coding agents, and an optional MCP server over stdio.
+Clients talk to the daemon over loopback HTTP+SSE. The daemon owns every managed process; nothing
+else starts or stops one directly. **Coding agents** should use `hearth skill install` and those
+scripts, not `hearth mcp install` (MCP stays for human-driven clients and legacy configs).
 
 The product is the compiled `hearth` binary (`go/cmd/hearth`). It runs from any directory.
 
@@ -223,6 +225,8 @@ Commands that need a catalog read `hearth.yaml` / `.yml` / `.json` from the root
 Exit codes: 2 usage, 3 unavailable, 4 protocol mismatch, 5 operation failed, 6 needs confirmation (`--yes`), 7 unauthorized, 8 drift or conflict. With `--json`, a failure prints `{"error":{code,exit,message,hint?}}` on stdout. `hearth update --json` keeps its report, `skill check` drift keeps the check document, `doctor --json` keeps the report when checks fail, and `shared probe` stays silent.
 
 ## MCP server
+
+Optional. Prefer the bundled skill scripts for coding agents (`hearth skill install`).
 
 `hearth --root <project> mcp` speaks MCP over stdio. Tool names carry the prefix `local_services_`:
 `status`, `logs`, `trace` (an operation by id), `events` (since a sequence number), `manage`
