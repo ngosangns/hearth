@@ -226,12 +226,13 @@ from any dev box here, with the same username.
   command stays on the settled fingerprint (`shell` + `exec`). Each match's ppid tree is
   signalled per pid. A process that only shares the port stays on `killUnowned`. If `ps` cannot
   be read, restart fails closed; a start skips the adopt and continues.
-- A daemon spawned by `ensure` stays a child of that process (`Setpgid` does not reparent).
-  `kill(pid, 0)` is true for the zombie left when that child exits. `platform.IsPIDAlive` must reap an
-  exited child and treat any other zombie as dead — otherwise `manager restart` sits on
-  "restarting daemon…" for the 300s stop timeout, and `ClaimLock` spins. The spawn path also
-  waits the child in a goroutine (`spawnDetached`) so it does not linger as a zombie. Do not weaken a *running*
-  pid into "dead" because a health check timed out.
+- `spawnDetached` starts `_spawn1`, which starts `_spawn2` and exits; `_spawn2` runs the manager in
+  the foreground. That double hop keeps the long-lived daemon out of a GUI client's macOS coalition
+  so quitting the window does not stop it. Each hop still uses `Setpgid` and a background `Wait` so
+  an exited intermediate does not linger as a zombie — `platform.IsPIDAlive` must reap our exited
+  children and treat any other zombie as dead, or `manager restart` sits on "restarting daemon…"
+  for the 300s stop timeout and `ClaimLock` spins. Do not weaken a *running* pid into "dead"
+  because a health check timed out.
 
 **Daemon / state**
 

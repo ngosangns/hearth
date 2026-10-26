@@ -10,9 +10,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"syscall"
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
 	"github.com/ngosangns/hearth/go/internal/cli"
@@ -22,6 +20,7 @@ import (
 	"github.com/ngosangns/hearth/go/internal/manager"
 	"github.com/ngosangns/hearth/go/internal/mcpserver"
 	"github.com/ngosangns/hearth/go/internal/paths"
+	"github.com/ngosangns/hearth/go/internal/platform"
 	"github.com/ngosangns/hearth/go/internal/shared"
 	"github.com/ngosangns/hearth/go/internal/supervisor"
 	"github.com/ngosangns/hearth/go/internal/updater"
@@ -145,27 +144,45 @@ func runSmpSubcommand(rest []string) int {
 }
 
 // Re-invokes this binary with args, detached: its own process group, stdio
-// discarded, never waited on — the child outlives this process.
+// discarded, never waited on — the child outlives this process. On Unix the
+// first hop is `_spawn1`, which starts `_spawn2` and exits so the long-lived
+// daemon is not in the same macOS coalition as a GUI client.
 func spawnDetached(args []string, cwd string) {
-	exe, err := os.Executable()
+	exe := platform.Executable()
+	hop := append([]string{"_spawn1"}, args...)
+	_ = platform.SpawnDetached(exe, hop, cwd)
+}
+
+// `_spawn1`: start `_spawn2` with the real daemon argv and exit at once.
+func runSpawn1(payload []string) int {
+	exe := platform.Executable()
+	leaf := append([]string{"_spawn2"}, payload...)
+	if err := platform.SpawnDetached(exe, leaf, ""); err != nil {
+		return 1
+	}
+	return 0
+}
+
+// `_spawn2`: run the manager in the foreground (this process becomes the daemon).
+func runSpawn2(payload []string) int {
+	if len(payload) > 0 && payload[0] == "smp" {
+		return runSmpSubcommand(payload[1:])
+	}
+	if len(payload) == 0 || payload[0] != "daemon" {
+		return cli.ReportFailure(stdio(), payload, &cli.LocalctlError{
+			ExitCode: cli.ExitUsage,
+			Message:  "usage: hearth _spawn2 daemon --root <path> | hearth _spawn2 smp",
+		})
+	}
+	root, rest, err := cli.ParseRoot(payload[1:])
 	if err != nil {
-		exe = "hearth"
+		if _, ok := err.(*cli.LocalctlError); ok {
+			return cli.ReportFailure(stdio(), payload, err)
+		}
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
-	command := exec.Command(exe, args...)
-	command.Stdin = nil
-	command.Stdout = nil
-	command.Stderr = nil
-	if cwd != "" {
-		command.Dir = cwd
-	}
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Setpgid does not reparent. Not waiting on the child leaves it a zombie of
-	// this process when the daemon exits, and `kill(pid, 0)` is still true for
-	// that zombie — `manager restart` would then wait out the whole stop
-	// timeout on "restarting daemon…". Reap it in the background.
-	if err := command.Start(); err == nil {
-		go func() { _ = command.Wait() }()
-	}
+	return runDaemonSubcommand(root, rest)
 }
 
 // `hearth daemon --root <root>`, detached.
@@ -323,6 +340,12 @@ func main() {
 	os.Setenv("PATH", env.WithKnownToolDirectories(os.Getenv("PATH"), os.Getenv("HOME")))
 
 	argv := os.Args[1:]
+	if len(argv) > 0 && argv[0] == "_spawn1" {
+		os.Exit(runSpawn1(argv[1:]))
+	}
+	if len(argv) > 0 && argv[0] == "_spawn2" {
+		os.Exit(runSpawn2(argv[1:]))
+	}
 	// `smp` has its own fixed root, so it is dispatched before --root is parsed.
 	if len(argv) > 0 && argv[0] == "smp" {
 		os.Exit(runSmpSubcommand(argv[1:]))
