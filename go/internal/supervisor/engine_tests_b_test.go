@@ -10,7 +10,7 @@ import (
 )
 
 func TestANeverReadyServiceStaysRunningUnreadyAndKeepsProbing(t *testing.T) {
-	h := buildHarnessWithTimeout(oneServiceCatalog(argvVerified("api", catalog.ReadinessSpec{Kind: "tcp", Port: port(8080)})), 30)
+	h := buildHarness(oneServiceCatalog(argvVerified("api", catalog.ReadinessSpec{Kind: "tcp", Port: port(8080)})))
 	// tcp never reports ready — setTCPReady is never called for 8080.
 	if err := h.supervisor.Start("api", nil); err != nil {
 		t.Fatal(err)

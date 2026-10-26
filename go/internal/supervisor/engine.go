@@ -36,6 +36,7 @@ const (
 	externalLogBacklogLines = uint64(200)
 	treeSampleInterval      = 200 * time.Millisecond
 	taskExitSettleMs        = int64(5_000)
+	commandProbeTimeoutMs   = int64(10_000)
 	logForwardCapacity      = 1024
 	logMatchWindow          = 64 * 1024
 	restartDelayMs          = uint64(1_000)
@@ -45,7 +46,6 @@ const (
 type VerifiedProfile struct {
 	Command            catalog.ServiceCommand
 	Readiness          catalog.ReadinessSpec
-	ReadinessTimeoutMs *uint64
 	Preparation        []string
 	PreparationCommand *catalog.PreparationCommand
 }

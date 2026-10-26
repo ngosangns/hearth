@@ -1329,7 +1329,6 @@ func DefaultSupervisorOptions(root, runtimeDirectory string, baseEnvironment map
 		Probes:             NewDefaultProbeAdapter(root, baseEnvironment),
 		Preparation:        nil,
 		Clock:              SystemClock{},
-		ReadinessTimeoutMs: 10_000,
 		ReadinessBackoffMs: 1_500,
 		TerminationGraceMs: 5_000,
 		IsClosing:          func() bool { return false },

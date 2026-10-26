@@ -92,43 +92,18 @@ var readinessKinds = []string{"process", "tcp", "http", "container", "tailnet", 
 var serviceKinds = []string{"application", "infrastructure"}
 var ownerships = []string{"daemon", "external"}
 
-// expandGroupMembers expands group members depth-first; visiting is the chain
-// currently being expanded — re-entering one is a cycle and a load error.
-func expandGroupMembers(group string, members []string, declared map[string][]string, serviceIDs map[string]bool, visiting []string, out *[]string, errors *[]string) {
-	for _, member := range members {
-		// Service ids win over same-named groups, matching target resolution.
-		if serviceIDs[member] {
-			found := false
-			for _, s := range *out {
-				if s == member {
-					found = true
-					break
-				}
-			}
-			if !found {
-				*out = append(*out, member)
-			}
-			continue
-		}
-		sub, ok := declared[member]
-		if !ok {
-			*errors = append(*errors, fmt.Sprintf("group %s references unknown service or group %s", group, member))
-			continue
-		}
-		cycle := false
-		for _, v := range visiting {
-			if v == member {
-				cycle = true
-				break
-			}
-		}
-		if cycle {
-			chain := append(append([]string{}, visiting...), member)
-			*errors = append(*errors, "group cycle: "+strings.Join(chain, " -> "))
-			continue
-		}
-		expandGroupMembers(member, sub, declared, serviceIDs, append(visiting, member), out, errors)
+// readGroup reads an optional `group:` name; the empty string means ungrouped.
+func readGroup(value any, path string, errors *[]string) string {
+	s, isStr := omap.AsString(value)
+	if !isStr || strings.TrimSpace(s) == "" || strings.ContainsAny(s, " \t") {
+		*errors = append(*errors, fmt.Sprintf("%s.group must be a non-empty string without spaces", path))
+		return ""
 	}
+	if s == "all" {
+		*errors = append(*errors, fmt.Sprintf("%s.group must not be %q: all always means every service", path, s))
+		return ""
+	}
+	return s
 }
 
 type readCommand struct{ spec catalog.CommandSpec }
@@ -496,11 +471,12 @@ func resolveServiceCwd(cwd *string, path string, errors *[]string) *string {
 }
 
 var topLevelKeys = []string{"version", "env", "envFile", "runtimeDirectory", "privateFileGuard", "groups", "services", "shared"}
-var serviceKeys = []string{"label", "kind", "ownership", "disabled", "env", "container", "cwd", "run", "stop", "build", "readiness", "readinessTimeoutMs", "preparationCommand", "ports", "urls", "artifact", "restart"}
+var serviceKeys = []string{"label", "group", "kind", "ownership", "disabled", "env", "container", "cwd", "run", "stop", "build", "readiness", "preparationCommand", "ports", "urls", "artifact", "restart"}
+var buildKeys = []string{"argv", "shell", "exec", "serializationKey"}
 var restartKeys = []string{"on", "maxRestarts", "delayMs"}
 var restartTriggers = []string{"never", "on-failure", "always"}
 var artifactKeys = []string{"version", "url", "script", "scriptArgs", "sha256"}
-var sharedEntryKeys = []string{"version", "preparationCommand", "attachArgs", "urls"}
+var sharedEntryKeys = []string{"version", "group", "preparationCommand", "attachArgs", "urls"}
 
 func readRestartPolicy(value any, path string, errors *[]string) *catalog.ServiceRestartPolicy {
 	obj := omap.AsObject(value)
@@ -854,19 +830,10 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 	if v, ok := top.Get("privateFileGuard"); ok && !omap.IsBool(v) {
 		errors = append(errors, "privateFileGuard must be a boolean")
 	}
-	if v, ok := top.Get("groups"); ok {
-		groupsObj := omap.AsObject(v)
-		ok := groupsObj != nil
-		if ok {
-			groupsObj.Each(func(_ string, e any) {
-				if !omap.IsStringArray(e) {
-					ok = false
-				}
-			})
-		}
-		if !ok {
-			errors = append(errors, "groups must be a map of string to string[]")
-		}
+	// Kept in topLevelKeys only so the generic unknown-key error does not also
+	// fire; the block was replaced by the per-service field.
+	if _, ok := top.Get("groups"); ok {
+		errors = append(errors, "groups is no longer a top-level key: set `group:` on each service instead")
 	}
 	sharedNotObject := false
 	if sv, ok := top.Get("shared"); ok {
@@ -892,7 +859,7 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 							}
 						}
 						if !found {
-							errors = append(errors, fmt.Sprintf("%s has unknown key %q (known: version, preparationCommand, attachArgs, urls)", path, key))
+							errors = append(errors, fmt.Sprintf("%s has unknown key %q (known: version, group, preparationCommand, attachArgs, urls)", path, key))
 						}
 					})
 					verV, hasVer := v.Get("version")
@@ -959,6 +926,9 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 	}
 
 	var services []catalog.ServiceDefinition
+	// groupOf holds each service's declared `group:`; groups themselves are
+	// derived from it after every service (and shared entry) is known.
+	groupOf := map[string]string{}
 	if servicesRaw != nil {
 		servicesRaw.Each(func(id string, value any) {
 			svcPath := "services." + id
@@ -969,6 +939,11 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 			}
 			checkKnownKeys(obj, serviceKeys, svcPath, &errors)
 
+			if gv, ok := obj.Get("group"); ok {
+				if group := readGroup(gv, svcPath, &errors); group != "" {
+					groupOf[id] = group
+				}
+			}
 			var kind *catalog.ServiceKind
 			if kv, ok := obj.Get("kind"); ok {
 				s, isStr := omap.AsString(kv)
@@ -1050,7 +1025,6 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 				urlsRaw, urlsPresent = uv, true
 			}
 			urls := readURLs(urlsRaw, urlsPresent, svcPath+".urls", &errors)
-			readinessTimeoutMs := readDurationMs(func() (any, bool) { return obj.Get("readinessTimeoutMs") }, svcPath+".readinessTimeoutMs", &errors)
 			var prepCmd *catalog.PreparationCommand
 			if pv, ok := obj.Get("preparationCommand"); ok {
 				prepCmd = readPreparationCommand(pv, svcPath+".preparationCommand", &errors)
@@ -1063,7 +1037,6 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 					profileRun = &catalog.ServiceRunProfile{
 						CommandStatus:      "unresolved",
 						Readiness:          *readiness,
-						ReadinessTimeoutMs: readinessTimeoutMs,
 						PreparationCommand: prepCmd,
 					}
 				}
@@ -1101,7 +1074,6 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 							DockerStopCommand: stop,
 						},
 						Readiness:          *readiness,
-						ReadinessTimeoutMs: readinessTimeoutMs,
 						PreparationCommand: prepCmd,
 					}
 				}
@@ -1110,8 +1082,8 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 			var profileBuild *catalog.ServiceBuildProfile
 			if bv, ok := obj.Get("build"); ok {
 				if buildObj := omap.AsObject(bv); buildObj != nil {
+					checkKnownKeys(buildObj, buildKeys, svcPath+".build", &errors)
 					build := readCommandSpec(bv, svcPath+".build", &errors)
-					timeoutMs := readDurationMs(func() (any, bool) { return buildObj.Get("timeoutMs") }, svcPath+".build.timeoutMs", &errors)
 					var serKey *string
 					if sk, ok := buildObj.Get("serializationKey"); ok {
 						if s, isStr := omap.AsString(sk); isStr {
@@ -1123,7 +1095,6 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 					if build != nil && cwd != nil {
 						profileBuild = &catalog.ServiceBuildProfile{
 							Command:          catalog.ServiceCommand{Command: build.spec, Cwd: *cwd},
-							TimeoutMs:        timeoutMs,
 							SerializationKey: serKey,
 						}
 					}
@@ -1177,7 +1148,6 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 
 	// `shared:` entries expand into generated external services, in document
 	// order after the project's own services.
-	var sharedIDs []string
 	if sharedRaw != nil {
 		exe, err := os.Executable()
 		if err != nil {
@@ -1207,6 +1177,11 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 			var attachArgs []string
 			if o, isObj := value.(*omap.OMap); isObj {
 				svcPath := "shared." + name
+				if gv, ok := o.Get("group"); ok {
+					if group := readGroup(gv, svcPath, &errors); group != "" {
+						groupOf[name] = group
+					}
+				}
 				if pv, ok := o.Get("preparationCommand"); ok {
 					if prep := readPreparationCommand(pv, svcPath+".preparationCommand", &errors); prep != nil {
 						prep.Command = render.RenderCommand(&prep.Command, sharedVars)
@@ -1234,61 +1209,47 @@ func mapConfigFile(raw any, root string) (*catalog.ServiceCatalog, []string) {
 			}
 			instance := shared.InstanceID(name, version)
 			services = append(services, shared.ProjectServiceEntry(name, instance, exe, preparationCommand, attachArgs, urls))
-			sharedIDs = append(sharedIDs, name)
 		})
 	}
 
+	// Groups are derived from each service's optional `group:` in document
+	// order, so declaration order is membership order. `all` is always every
+	// service, so `hearth start all` works without declaring it; it stays out
+	// of groupTree, which carries only the groups a user named.
+	groupIndex := map[string]int{}
 	var declaredGroups []catalog.CatalogGroup
-	if gv, ok := top.Get("groups"); ok {
-		if gobj := omap.AsObject(gv); gobj != nil {
-			gobj.Each(func(name string, members any) {
-				declaredGroups = append(declaredGroups, catalog.CatalogGroup{Name: name, Members: omap.StringArray(members)})
-			})
-		}
-	}
-	declaredMap := map[string][]string{}
-	for _, g := range declaredGroups {
-		declaredMap[g.Name] = g.Members
-	}
-	serviceIDs := map[string]bool{}
 	for _, s := range services {
-		serviceIDs[s.ID] = true
+		name, ok := groupOf[s.ID]
+		if !ok {
+			continue
+		}
+		if i, seen := groupIndex[name]; seen {
+			declaredGroups[i].Members = append(declaredGroups[i].Members, s.ID)
+		} else {
+			groupIndex[name] = len(declaredGroups)
+			declaredGroups = append(declaredGroups, catalog.CatalogGroup{Name: name, Members: []string{s.ID}})
+		}
 	}
 	groups := map[string][]string{}
-	for _, g := range declaredGroups {
-		var resolved []string
-		expandGroupMembers(g.Name, g.Members, declaredMap, serviceIDs, []string{g.Name}, &resolved, &errors)
-		groups[g.Name] = resolved
-	}
-	if all, ok := groups["all"]; ok {
-		for _, id := range sharedIDs {
-			found := false
-			for _, m := range all {
-				if m == id {
-					found = true
-					break
-				}
-			}
-			if !found {
-				groups["all"] = append(all, id)
-			}
-		}
-	}
 	disabledIDs := map[string]bool{}
+	all := make([]string, 0, len(services))
 	for _, s := range services {
 		if s.Disabled {
 			disabledIDs[s.ID] = true
+			continue
 		}
+		all = append(all, s.ID)
 	}
-	for name, members := range groups {
+	for _, g := range declaredGroups {
 		var kept []string
-		for _, id := range members {
+		for _, id := range g.Members {
 			if !disabledIDs[id] {
 				kept = append(kept, id)
 			}
 		}
-		groups[name] = kept
+		groups[g.Name] = kept
 	}
+	groups["all"] = all
 	if len(errors) > 0 {
 		return nil, errors
 	}

@@ -168,7 +168,7 @@ func TestBuildSerializationByKeyRunsOneAtATime(t *testing.T) {
 
 func TestCommandReadinessWithNoAdapterStaysRunningUnready(t *testing.T) {
 	readiness := catalog.ReadinessSpec{Kind: "command", Command: &catalog.CommandSpec{Argv: []string{"check"}}}
-	h := buildHarnessWithTimeout(oneServiceCatalog(argvVerified("api", readiness)), 20)
+	h := buildHarness(oneServiceCatalog(argvVerified("api", readiness)))
 	if err := h.supervisor.Start("api", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,6 @@ func TestCommandReadinessSucceedsWhenTheAdapterReportsReady(t *testing.T) {
 		Probes:             probes,
 		Preparation:        noPreparation{},
 		Clock:              newFakeClock(),
-		ReadinessTimeoutMs: 200,
 		ReadinessBackoffMs: 5,
 		TerminationGraceMs: 50,
 		IsClosing:          func() bool { return false },

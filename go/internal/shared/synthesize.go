@@ -9,16 +9,6 @@ import (
 	"github.com/ngosangns/hearth/go/internal/render"
 )
 
-// First boot of a JVM or WiredTiger can outlast the supervisor's 10s default.
-// Install itself happens before `start`, so this bound is only the process
-// becoming ready.
-const SharedInstanceReadinessTimeoutMs uint64 = 120_000
-
-// SharedReadinessTimeoutMs is the project-side `hearth shared probe` budget.
-// Must out-wait a script artifact pack (45 min) plus extract (120s) plus the
-// instance readiness budget.
-const SharedReadinessTimeoutMs uint64 = 45*60*1000 + 120_000 + SharedInstanceReadinessTimeoutMs
-
 // DetachStopIfUnusedFlag — the flag `manager stop` appends to a `shared:`
 // service's `hearth shared detach` stop command, so the smp instance is
 // stopped too once no project is attached to it.
@@ -125,11 +115,6 @@ func SynthesizeService(root string, instance *SharedInstance) (*catalog.ServiceD
 		}
 		ports = append(ports, catalog.ServicePort{Port: port, Label: label})
 	}
-	var readinessTimeout *uint64
-	if readiness.Kind != "exit" {
-		t := SharedInstanceReadinessTimeoutMs
-		readinessTimeout = &t
-	}
 	kind := catalog.KindInfrastructure
 	ownership := catalog.OwnershipDaemon
 	label := fmt.Sprintf("%s@%s (shared)", instance.Name, instance.Version)
@@ -148,7 +133,6 @@ func SynthesizeService(root string, instance *SharedInstance) (*catalog.ServiceD
 					DockerStopCommand: dockerStop,
 				},
 				Readiness:          readiness,
-				ReadinessTimeoutMs: readinessTimeout,
 				PreparationCommand: preparationCommand,
 			},
 		},
@@ -204,7 +188,6 @@ func ProjectServiceEntry(id, instance, exe string, preparation *catalog.Preparat
 	label := fmt.Sprintf("%s (shared)", instance)
 	kind := catalog.KindInfrastructure
 	ownership := catalog.OwnershipExternal
-	timeout := SharedReadinessTimeoutMs
 	return catalog.ServiceDefinition{
 		Label:     &label,
 		ID:        id,
@@ -224,7 +207,6 @@ func ProjectServiceEntry(id, instance, exe string, preparation *catalog.Preparat
 					Kind:    "command",
 					Command: &catalog.CommandSpec{Argv: []string{exe, "shared", "probe", instance}},
 				},
-				ReadinessTimeoutMs: &timeout,
 				PreparationCommand: preparation,
 			},
 		},

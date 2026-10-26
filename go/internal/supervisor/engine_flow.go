@@ -5,7 +5,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -33,14 +32,17 @@ func (s *ProcessSupervisor) awaitExternalTask(serviceID string, profile *Verifie
 		return nil
 	}
 	stop := make(chan struct{})
-	done := make(chan error, 1)
-	go func() { done <- s.awaitTaskProbe(serviceID, profile, generation, token, operationID, stop) }()
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		s.awaitTaskProbe(serviceID, profile, generation, token, stop)
+	}()
 	select {
-	case err := <-done:
-		return err
+	case <-probeDone:
+		return nil
 	case code, ok := <-exited:
 		close(stop)
-		<-done
+		<-probeDone
 		if !ok {
 			code = -1
 		}
@@ -53,38 +55,28 @@ func (s *ProcessSupervisor) awaitExternalTask(serviceID string, profile *Verifie
 	}
 }
 
-func (s *ProcessSupervisor) awaitTaskProbe(serviceID string, profile *VerifiedProfile, generation, token uint64, operationID *string, stop <-chan struct{}) error {
-	timeout := s.options.ReadinessTimeoutMs
-	if profile.ReadinessTimeoutMs != nil {
-		timeout = int64(*profile.ReadinessTimeoutMs)
-	}
-	deadline := s.nowMillis() + timeout
-	for s.nowMillis() <= deadline {
+// awaitTaskProbe polls until readiness passes or the caller closes stop. A
+// one-shot task such as `hearth shared attach` may legitimately run for a long
+// time, so readiness has no deadline: the task exiting is what ends the wait.
+func (s *ProcessSupervisor) awaitTaskProbe(serviceID string, profile *VerifiedProfile, generation, token uint64, stop <-chan struct{}) {
+	for {
 		if stopped(stop) || !s.valid(serviceID, generation, token) || s.closing() {
-			return nil
+			return
 		}
 		if s.probe(&profile.Readiness, serviceID) {
 			if stopped(stop) {
-				return nil
+				return
 			}
 			kind := readinessKindOf(&profile.Readiness)
 			s.transitionIfCurrent(serviceID, generation, token, state.ActualReady, state.ReadinessReady, Changes{
 				ReadinessKind: setv(kind), ReadinessDetail: setv("readiness verified"), Error: clear[string](),
 			})
-			return nil
+			return
 		}
 		if s.sleepUnless(s.options.ReadinessBackoffMs, stop) {
-			return nil
+			return
 		}
 	}
-	if stopped(stop) {
-		return nil
-	}
-	message := "Readiness timed out"
-	kind := readinessKindOf(&profile.Readiness)
-	detail := "Readiness " + string(kind) + " probe timed out after " + itoa(timeout) + "ms"
-	s.fail(serviceID, generation, token, nil, message, operationID, &kind, detail)
-	return NewError(message)
 }
 
 func stopped(stop <-chan struct{}) bool {
@@ -118,14 +110,7 @@ func (s *ProcessSupervisor) sleepUnless(ms int64, stop <-chan struct{}) bool {
 }
 
 func (s *ProcessSupervisor) probeSettledTask(serviceID string, profile *VerifiedProfile, generation, token uint64, operationID *string) error {
-	budget := taskExitSettleMs
-	if t := s.readinessTimeoutMs(serviceID); t < budget {
-		budget = t
-	}
-	if budget < 0 {
-		budget = 0
-	}
-	deadline := s.nowMillis() + budget
+	deadline := s.nowMillis() + taskExitSettleMs
 	for {
 		if !s.valid(serviceID, generation, token) || s.closing() {
 			return nil
@@ -800,16 +785,6 @@ func (s *ProcessSupervisor) build(serviceID string, definition *catalog.ServiceD
 		delete(s.aborts, serviceID)
 		s.buildAborts.Unlock()
 	}()
-	timeout := uint64(15 * 60_000)
-	if build.TimeoutMs != nil {
-		timeout = *build.TimeoutMs
-	}
-	var timedOut atomic.Bool
-	timer := time.AfterFunc(time.Duration(timeout)*time.Millisecond, func() {
-		timedOut.Store(true)
-		abort.cancel()
-	})
-	defer timer.Stop()
 	onOutput := func(data string) {
 		if s.valid(serviceID, generation, token) {
 			s.appendOutput(serviceID, data)
@@ -838,9 +813,7 @@ func (s *ProcessSupervisor) build(serviceID string, definition *catalog.ServiceD
 		return nil
 	}
 	message := "Build failed"
-	if timedOut.Load() {
-		message = "Build timed out"
-	} else if abort.Cancelled() {
+	if abort.Cancelled() {
 		message = "Build cancelled"
 	}
 	s.transitionIfCurrent(serviceID, generation, token, state.ActualFailed, state.ReadinessFailed, Changes{
@@ -901,10 +874,7 @@ func (s *ProcessSupervisor) probeCommand(serviceID string, command *catalog.Comm
 	if command == nil {
 		return false
 	}
-	budget := s.readinessTimeoutMs(serviceID)
-	if budget < 1 {
-		budget = 1
-	}
+	budget := commandProbeTimeoutMs
 	cancel := make(chan struct{})
 	type result struct{ v *bool }
 	ch := make(chan result, 1)
@@ -925,14 +895,6 @@ func (s *ProcessSupervisor) probeCommand(serviceID string, command *catalog.Comm
 type doneCtx struct{ ch <-chan struct{} }
 
 func (d doneCtx) Done() <-chan struct{} { return d.ch }
-
-func (s *ProcessSupervisor) readinessTimeoutMs(serviceID string) int64 {
-	profile, err := profileFor(s.host.Catalog(), serviceID)
-	if err == nil && profile.ReadinessTimeoutMs != nil {
-		return int64(*profile.ReadinessTimeoutMs)
-	}
-	return s.options.ReadinessTimeoutMs
-}
 
 func (s *ProcessSupervisor) attachOutput(serviceID string, source OutputSource) {
 	s.detachOutput(serviceID)
@@ -1309,7 +1271,6 @@ func profileFor(cat *catalog.ServiceCatalog, serviceID string) (VerifiedProfile,
 		return VerifiedProfile{
 			Command:            *run.Command,
 			Readiness:          run.Readiness,
-			ReadinessTimeoutMs: run.ReadinessTimeoutMs,
 			Preparation:        run.Preparation,
 			PreparationCommand: run.PreparationCommand,
 		}, nil

@@ -90,8 +90,7 @@ any recipe the embedded catalog has and the cache lacks.
 
 A recipe may use `readiness: { kind: exit }` when the command is a job that runs and stops
 rather than a server. While it runs the state is `running`, not `ready`. Exit 0 settles
-`succeeded`. That recipe ignores `readinessTimeoutMs` and does not inherit the two-minute
-readiness deadline applied to shared servers, so a long job is not killed for still running.
+`succeeded`. A command is never failed for still running, so a long job is not killed.
 A port is still allocated; a command that does not listen can ignore `{port}`.
 
 Recipe readiness uses the same shorthand as `hearth.yaml`, resolved when the instance port is
@@ -231,8 +230,11 @@ ports are pinned anyway, so project confs can hardcode 80/443.
   `--stop-if-unused --yes` appended, so smp also stops the instance once no project is attached
   to it. The spawned detach is not a TTY, and that flag pair requires `--yes`.
   `hearth stop`, `manager restart`, and SIGTERM never stop the instance.
-- `readinessTimeoutMs`: 49 min default. The project-side probe has to out-wait a script artifact pack (45 min) plus extract and the instance readiness budget. The instance server itself stays at 2 min.
-- Joins group `all` when it exists. A `shared` key colliding with a `services` id is a validation
+- Awaiting the task: no readiness deadline. The attach task is awaited until it exits (a script
+  artifact pack can take ~45 min); a non-zero exit fails the row at once, and a zero exit gets a
+  short settle window of `hearth shared probe` polls.
+- Joins group `all`, which always contains every enabled service. The object form also takes
+  `group:` to join a named group. A `shared` key colliding with a `services` id is a validation
   error via the existing duplicate-service check.
 
 Engine rule: `isExternalTask` extends to `ownership: external` + `command` readiness — the run

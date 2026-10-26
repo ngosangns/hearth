@@ -11,7 +11,7 @@ import (
 	"github.com/ngosangns/hearth/go/internal/state"
 )
 
-func harnessWithProbes(cat catalog.ServiceCatalog, probes ProbeAdapter, timeoutMs int64) (*ProcessSupervisor, *fakeHost) {
+func harnessWithProbes(cat catalog.ServiceCatalog, probes ProbeAdapter) (*ProcessSupervisor, *fakeHost) {
 	host := newFakeHost(cat)
 	process := newFakeProcAdapter()
 	sup := NewProcessSupervisor(host, SupervisorOptions{
@@ -20,7 +20,6 @@ func harnessWithProbes(cat catalog.ServiceCatalog, probes ProbeAdapter, timeoutM
 		Probes:             probes,
 		Preparation:        noPreparation{},
 		Clock:              newFakeClock(),
-		ReadinessTimeoutMs: timeoutMs,
 		ReadinessBackoffMs: 5,
 		TerminationGraceMs: 50,
 		IsClosing:          func() bool { return false },
@@ -80,7 +79,7 @@ func TestPreparationCommandRunsBeforeStartAndSucceedsWhenTheProbeReportsReady(t 
 	inner.setTCPReady(8080, true)
 	yes := true
 	probes := newCommandCapableProbeAdapter(inner, &yes, 0)
-	sup, host := harnessWithProbes(preparationCatalog(), probes, 200)
+	sup, host := harnessWithProbes(preparationCatalog(), probes)
 	if err := sup.Start("api", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +92,7 @@ func TestPreparationCommandFailureFailsTheStartNotJustReadiness(t *testing.T) {
 	inner := newFakeProbeAdapter()
 	no := false
 	probes := newCommandCapableProbeAdapter(inner, &no, 0)
-	sup, host := harnessWithProbes(preparationCatalog(), probes, 200)
+	sup, host := harnessWithProbes(preparationCatalog(), probes)
 	err := sup.Start("api", nil)
 	if err == nil || err.Error() != "Preparation failed for api" {
 		t.Fatalf("err %v", err)
@@ -110,7 +109,7 @@ func TestPreparationCommandFailureFailsTheStartNotJustReadiness(t *testing.T) {
 func TestPreparationCommandWithNoCommandProbeConfiguredFailsTheStartImmediately(t *testing.T) {
 	// Unlike command readiness (which stays `running-unready` and keeps probing), a preparation
 	// command with no way to run it can never succeed by waiting longer.
-	h := buildHarnessWithTimeout(preparationCatalog(), 20)
+	h := buildHarness(preparationCatalog())
 	err := h.supervisor.Start("api", nil)
 	if err == nil || err.Error() != "Preparation failed for api" {
 		t.Fatalf("err %v", err)
@@ -135,7 +134,7 @@ func TestPreparationCommandSerializationByKeyRunsOneAtATime(t *testing.T) {
 	}
 	yes := true
 	probes := newCommandCapableProbeAdapter(nil, &yes, 5)
-	sup, _ := harnessWithProbes(cat, probes, 200)
+	sup, _ := harnessWithProbes(cat, probes)
 	var wg sync.WaitGroup
 	var errA, errB error
 	wg.Add(2)

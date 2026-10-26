@@ -266,7 +266,6 @@ type SupervisorOptions struct {
 	Preparation        PreparationAdapter // may be nil
 	ArtifactInstaller  ArtifactInstaller  // may be nil
 	Clock              SupervisorClock
-	ReadinessTimeoutMs int64
 	ReadinessBackoffMs int64
 	TerminationGraceMs int64
 	IsClosing          func() bool

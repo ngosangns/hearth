@@ -135,7 +135,6 @@ type ServiceRunProfile struct {
 	CommandStatus      string              `json:"commandStatus"`
 	Command            *ServiceCommand     `json:"command,omitempty"`
 	Readiness          ReadinessSpec       `json:"readiness"`
-	ReadinessTimeoutMs *uint64             `json:"readinessTimeoutMs,omitempty"`
 	Preparation        []string            `json:"preparation,omitempty"`
 	PreparationCommand *PreparationCommand `json:"preparationCommand,omitempty"`
 }
@@ -144,7 +143,6 @@ func (p *ServiceRunProfile) IsVerified() bool { return p.CommandStatus == "verif
 
 type ServiceBuildProfile struct {
 	Command          ServiceCommand `json:"command"`
-	TimeoutMs        *uint64        `json:"timeoutMs,omitempty"`
 	SerializationKey *string        `json:"serializationKey,omitempty"`
 }
 
@@ -394,11 +392,6 @@ func ValidateCatalog(catalog *ServiceCatalog) CatalogValidation {
 		profile := &service.Profiles.Run
 		if !profile.IsVerified() {
 			warnings = append(warnings, service.ID+":run command is unresolved")
-		}
-		if build := service.Profiles.Build; build != nil {
-			if build.TimeoutMs != nil && *build.TimeoutMs == 0 {
-				errors = append(errors, service.ID+":build has an invalid timeout")
-			}
 		}
 		for index, entry := range service.URLs {
 			place := fmt.Sprintf("%s:urls[%d]", service.ID, index)

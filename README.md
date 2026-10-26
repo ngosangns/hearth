@@ -23,21 +23,20 @@ start them, and how to tell when they are ready. TypeScript catalogs are not acc
 ```yaml
 version: 1
 env: { NODE_ENV: development }
-groups:
-  all: [redis, api]
 services:
   redis:
+    group: backend
     kind: infrastructure
     ownership: external
     container: myapp-redis
     run: { argv: [docker, compose, up, -d, redis] }
     readiness: { kind: container }
   api:
+    group: backend
     cwd: apps/api
-    build: { argv: [go, build, ./...], timeoutMs: 120000, serializationKey: go }
+    build: { argv: [go, build, ./...], serializationKey: go }
     run: { shell: "air -c .air.toml", exec: true }
     readiness: { kind: tcp, port: 8080 }
-    readinessTimeoutMs: 30000 # accepted; does not fail the service
     ports: [{ port: 6060, label: pprof }]
     urls:
       - http://127.0.0.1:8080
@@ -47,17 +46,19 @@ services:
 Other top-level keys: `envFile` (a dotenv file, relative to the project root; `env:` wins on
 conflict), `runtimeDirectory` (default `.hearth/runtime-v1` under the root), and
 `privateFileGuard` (boolean, default on). Unknown keys fail the load, except keys that start
-with `x-`. A service takes `label`, `kind` (`application` | `infrastructure`), `ownership`
-(`daemon` | `external`), `disabled`, `env`, `container`, `cwd` (relative, must stay inside the
-root), `run`, `stop`, `build`, `readiness`, `readinessTimeoutMs`, `preparationCommand`, `ports`,
-`urls`, `artifact`, and `restart`. A command is `{ argv: [...] }` or `{ shell: "...", exec?: bool }`.
-A URL may contain `{tailnetHost}`, which resolves from `$HEARTH_TAILNET_HOST` or
-`tailscale status --json`.
+with `x-`. A service takes `label`, `group`, `kind` (`application` | `infrastructure`),
+`ownership` (`daemon` | `external`), `disabled`, `env`, `container`, `cwd` (relative, must stay
+inside the root), `run`, `stop`, `build`, `readiness`, `preparationCommand`,
+`ports`, `urls`, `artifact`, and `restart`. A command is `{ argv: [...] }` or
+`{ shell: "...", exec?: bool }`. A URL may contain `{tailnetHost}`, which resolves from
+`$HEARTH_TAILNET_HOST` or `tailscale status --json`.
 
-`groups:` members may also name other groups — `all: [infra, app]` expands depth-first in
-declaration order (deduplicated, cycles rejected at load). A member naming both a service and a
-group resolves as the service. Clients group the service list by direct membership and offer
-per-group start and stop.
+A service may name one optional `group`. Groups are built from those fields in document order —
+there is no separate `groups:` block, and a group cannot contain another group. Clients group the
+service list by membership and offer per-group start and stop. `all` is always every enabled
+service, so `hearth start all` needs no declaration and a service cannot join it. A `shared:`
+entry's object form takes `group` too. A service id wins over a group of the same name when a
+target is resolved.
 
 `disabled: true` on a service keeps it in the catalog but out of every client lifecycle action:
 direct start/stop/restart is rejected (`service_disabled`) and group targets expand past it. The
@@ -71,8 +72,7 @@ port is not signalled.
 A command that runs and then exits — a one-shot build, not a server — uses
 `readiness: { kind: exit }`. The row stays `running` until the process exits. It does not
 become `ready`. Exit 0 becomes `succeeded` and is not run again until you start it; any other
-exit is `failed`. `readinessTimeoutMs` does not apply: the command is not failed for still
-running.
+exit is `failed`. There is no deadline: the command is never failed for still running.
 
 ```yaml
 services:
@@ -82,13 +82,13 @@ services:
     readiness: { kind: exit }
 ```
 
-Readiness is a probe, not a deadline. After the process is up, hearth probes every 1.5s until the service is stopped or restarted, the process exits, or the daemon shuts down. A passing probe is `ready`. A failing probe is `running-unready` and leaves the process running. `hearth start --wait` returns once the process is up, whether or not the probe has passed yet. `readinessTimeoutMs` is still accepted. It does not fail a long-lived service. It bounds a single `command` probe, and a one-shot shared attach.
+Readiness is a probe, not a deadline. After the process is up, hearth probes every 1.5s until the service is stopped or restarted, the process exits, or the daemon shuts down. A passing probe is `ready`. A failing probe is `running-unready` and leaves the process running. `hearth start --wait` returns once the process is up, whether or not the probe has passed yet. No readiness deadline fails a long-lived service. A single `command` probe is bounded at 10s internally.
 
 | Kind | Ready when | Write it |
 |---|---|---|
 | `http` | `GET` returns 2xx | `{ kind: http }` is `http://127.0.0.1:<port>/health`. Set `path` for any other path (`/metrics`, `/minio/health/live`). Set `url` when the host or port is not that default. `url` cannot be combined with `path` or `port`. Probed every 1.5s |
 | `tcp` | the port accepts a connection | `{ kind: tcp, port: 4222 }`, or `{ kind: tcp }` when `ports:` already names the port. Probed every 1.5s |
-| `command` | the command exits 0 | a real protocol check (`redis-cli ping`, `pg_isready`). Probed every 1.5s. One probe is bounded by `readinessTimeoutMs` |
+| `command` | the command exits 0 | a real protocol check (`redis-cli ping`, `pg_isready`). Probed every 1.5s. One probe is bounded at 10s |
 | `exit` | the run command itself exits | one-shot builds. The row is `running` until exit. Exit 0 is `succeeded`. No readiness probe and no deadline. The wait polls every 1.5s |
 | `container` | the named container is running | docker compose services. Probed every 1.5s |
 | `process` | the process is alive | no port and no HTTP. No probe after start |
@@ -100,8 +100,8 @@ Readiness is a probe, not a deadline. After the process is up, hearth probes eve
 `restart:` respawns a service that exits unexpectedly: `restart: { on: on-failure, maxRestarts: 5, delayMs: 2s }`.
 `on` is `never`, `on-failure` (the default when `restart:` is present), or `always`. `maxRestarts`
 counts consecutive unexpected exits; the count resets once the service is `ready` and on any manual
-start or restart. A `stop` during the delay wins. `readinessTimeoutMs`, `build.timeoutMs`, and
-`restart.delayMs` take milliseconds or a humantime string (`"30s"`, `"2m"`).
+start or restart. A `stop` during the delay wins. `restart.delayMs` takes milliseconds or a
+humantime string (`"30s"`, `"2m"`).
 
 A service may declare a versioned tarball to install before its first start — same download/script
 → sha256 → extract → marker machinery the shared-services catalog uses, scoped to the project's
@@ -225,7 +225,7 @@ Exit codes: 2 usage, 3 unavailable, 4 protocol mismatch, 5 operation failed, 6 n
 
 The workspace window is `hearth-gpui` in the sibling `ns-gpui` repo; this repo has no UI.
 It is an HTTP+SSE client of the same daemon: a folder list (Workspaces), the shared-services view
-(Shared), services grouped by `groups:`, per-service and per-group start, stop and restart, and a
+(Shared), services grouped by `group:`, per-service and per-group start, stop and restart, and a
 log pane with a pinned `daemon log` row. Stop, restart, forget, and kill-and-start ask for
 confirmation. `task dev:install` builds the Dev app from `../ns-gpui` into
 `~/Applications/Hearth Dev.app`; `task dev:install:all` installs the CLI first.
@@ -234,7 +234,7 @@ confirmation. `task dev:install` builds the Dev app from `../ns-gpui` into
 
 ![Service list and log pane for a demo project](docs/screenshots/hearth-1440.png)
 
-The window at 1440x900 with a throwaway demo project (`/tmp/hearth-demo/acme-shop`) as its only workspace: the sidebar's Workspaces tab (Shared is the other tab), the Daemon row with its round status badge (hover it for the state and daemon note), three started services grouped by `groups:`, and the `api` log open.
+The window at 1440x900 with a throwaway demo project (`/tmp/hearth-demo/acme-shop`) as its only workspace: the sidebar's Workspaces tab (Shared is the other tab), the Daemon row with its round status badge (hover it for the state and daemon note), three started services grouped by `group:`, and the `api` log open.
 
 ![Log view at 390 px wide](docs/screenshots/hearth-390-log.png)
 

@@ -110,7 +110,7 @@ func TestASharedInterpreterIsNotADuplicateOfEveryService(t *testing.T) {
 	}
 }
 
-func TestAOneShotThatExitsNonzeroFailsWithoutWaitingOutReadiness(t *testing.T) {
+func TestAOneShotThatExitsNonzeroFails(t *testing.T) {
 	no := false
 	host, process, sup := oneShotSupervisor(externalCommandService("redis"), &no)
 	process.setExitOnSpawn(1)
@@ -118,23 +118,20 @@ func TestAOneShotThatExitsNonzeroFailsWithoutWaitingOutReadiness(t *testing.T) {
 	if err == nil || !contains(err.Error(), "exited with code 1") {
 		t.Fatalf("err %v", err)
 	}
-	if contains(err.Error(), "Readiness timed out") {
-		t.Fatalf("err %v", err)
-	}
 	if host.stateOf("redis").ActualState != state.ActualFailed {
 		t.Fatalf("state %s", host.stateOf("redis").ActualState)
 	}
+	if host.stateOf("redis").Identity != nil {
+		t.Fatal("a failed task must not persist the trigger process as the service identity")
+	}
 }
 
-func TestAOneShotThatExitsZeroDoesNotKeepThePackBudget(t *testing.T) {
+func TestAOneShotThatExitsZeroWithoutReadinessFails(t *testing.T) {
 	no := false
 	_, process, sup := oneShotSupervisor(externalCommandService("redis"), &no)
 	process.setExitOnSpawn(0)
 	err := sup.Start("redis", nil)
 	if err == nil || !contains(err.Error(), "not ready") {
-		t.Fatalf("err %v", err)
-	}
-	if contains(err.Error(), "Readiness timed out") {
 		t.Fatalf("err %v", err)
 	}
 }

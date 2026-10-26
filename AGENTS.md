@@ -205,18 +205,17 @@ client. It is **3** since `readiness: { kind: log }` and per-service `restart:` 
 
 - `{ kind: "command" }` readiness is the JSON-serializable custom-probe stand-in: exit 0 = ready,
   else `running-unready`; it repeats every 1.5s (`ReadinessBackoffMs`) until stop, restart, process
-  exit, or daemon shutdown, and does not fail the service. `readinessTimeoutMs` is still parsed but
-  no longer ends a long-lived start — it bounds one command probe and the one-shot shared-attach
-  wait. `hearth start --wait` and bulk start settle at `ready`/`running-unready` once the process
-  is up; `status` does not probe.
+  exit, or daemon shutdown, and does not fail the service. There is no readiness deadline; one
+  probe is bounded internally (`commandProbeTimeoutMs`, 10s). `hearth start --wait` and bulk start
+  settle at `ready`/`running-unready` once the process is up; `status` does not probe.
 - `{ kind: "exit" }` — the run command is the job. While running the state is `running` (not
   `ready`/`running-unready`). Exit 0 records `succeeded` and sets desired `stopped` (reconcile does
-  not rerun); any other exit is `failed`, desired `stopped`, no auto-restart. `readinessTimeoutMs`
-  does not apply — a deadline must not fail or stop the command. The exit code is valid only from
+  not rerun); any other exit is `failed`, desired `stopped`, no auto-restart. No deadline applies —
+  nothing may fail or stop the command for still running. The exit code is valid only from
   the in-memory spawn watcher: a daemon restart mid-run that finds the process gone records `failed`
   with an unknown code, never `succeeded`. Stop of a finished row (`succeeded`, or `failed` while
   not in flight) succeeds, leaving that state. `exit` is rejected for `ownership: external` and
-  container commands. A shared recipe with this kind skips the two-minute instance deadline.
+  container commands.
 - `preparationCommand` (with `serializationKey`) runs via the same `command` adapter; services
   sharing a key prepare one at a time. **`viclass`'s prep-dependent services must all share one
   key**: `ensure_local_certificates` is a check-then-generate race, and concurrent first-time
@@ -231,10 +230,11 @@ client. It is **3** since `readiness: { kind: log }` and per-service `restart:` 
   and a `{port}` with no declared port fails the load.
 - Service order from a config file is **document order**, not sorted — visible in `/v1/catalog`,
   `hearth status`, and the app.
-- `groups:` members may name other groups — flattened depth-first (declaration order, deduplicated)
-  into `ServiceCatalog.groups` for target resolution; declared membership stays in `GroupTree`
-  (`groupTree` on the wire) so a client can group by *direct* membership. A member naming both
-  resolves as the service. Cycles are a load error, not truncation.
+- A service names one optional `group:`; `ServiceCatalog.groups` and `GroupTree` (`groupTree` on the
+  wire) are derived from those fields in document order, so membership order is declaration order.
+  There is no top-level `groups:` block (now a load error) and no nesting. `all` is
+  always every enabled service — target resolution only, never in `groupTree`; `group: all` is a
+  load error.
 - `disabled: true` rejects direct start/stop/restart (`service_disabled`; `status` works) and is
   stripped from flattened `groups` (group ops skip silently; `groupTree` still lists it).
   `StopDisabledServices` (post-listen reconcile, catalog reload, the 2s tick) stops its processes
@@ -259,8 +259,8 @@ client. It is **3** since `readiness: { kind: log }` and per-service `restart:` 
   (the funnel all output paths share: spawn sink, `attachOutput` tails, docker followers); latches
   on the first regex match against a rolling 64 KiB tail (patterns split across writes still land),
   cleared in `spawnAndWait`/`detachOutput` so a prior incarnation's match never satisfies a new
-  process. **humantime durations** — `readinessTimeoutMs`, `build.timeoutMs`, `restart.delayMs`
-  accept `"30s"` via `readDurationMs` (`internal/configfile`) and bare ms.
+  process. **humantime durations** — `restart.delayMs` accepts `"2s"` via `readDurationMs`
+  (`internal/configfile`) and bare ms.
 
 **Shared services (`smp`)**
 
@@ -274,10 +274,10 @@ client. It is **3** since `readiness: { kind: log }` and per-service `restart:` 
   conf trees).
 - `ownership: external` + `command` readiness ⇒ the run command is a one-shot trigger, not the
   service process (`isExternalTask`); a daemon-owned `command`-readiness service stays a normal
-  long-lived process — don't widen it. The shared row's readiness budget (pack + extract + instance
-  probe, ~49 min) applies only while `hearth shared attach` runs; once it exits, a non-zero code
-  fails the row at once and exit 0 gets ≤5s of probes — don't keep polling for the pack budget; a
-  failed instance does not become ready on its own.
+  long-lived process — don't widen it. The trigger is awaited with no deadline (a script artifact
+  pack can take ~45 min); the wait ends when the task exits. A non-zero code fails the row at once,
+  and exit 0 gets ≤5s of probes (`taskExitSettleMs`) — don't keep polling; a failed instance does
+  not become ready on its own.
 - **`smp` = `hearth smp`** — same binary, rooted at `~/.hearth/shared`, catalog *synthesized* from
   `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir
   `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged.

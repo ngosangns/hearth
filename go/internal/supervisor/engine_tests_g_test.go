@@ -15,7 +15,7 @@ func startAsync(sup *ProcessSupervisor, id string) <-chan error {
 }
 
 func TestAnExitCommandThatReturnsZeroIsSucceededAndNotRestarted(t *testing.T) {
-	h := buildHarnessWithTimeout(oneServiceCatalog(argvVerified("fe", catalog.ReadinessSpec{Kind: "exit"})), 30)
+	h := buildHarness(oneServiceCatalog(argvVerified("fe", catalog.ReadinessSpec{Kind: "exit"})))
 	started := h.clock.NowMillis()
 	run := startAsync(h.supervisor, "fe")
 	pid := waitForPosixPid(t, h.host, "fe")
@@ -90,8 +90,8 @@ func TestStoppingAnExitCommandMidRunRecordsStopped(t *testing.T) {
 	}
 }
 
-func TestAnExitCommandStaysRunningPastAConfiguredDeadline(t *testing.T) {
-	h := buildHarness(oneServiceCatalog(withExitTimeout(argvVerified("fe", catalog.ReadinessSpec{Kind: "exit"}), 40)))
+func TestAnExitCommandStaysRunningUntilItExits(t *testing.T) {
+	h := buildHarness(oneServiceCatalog(argvVerified("fe", catalog.ReadinessSpec{Kind: "exit"})))
 	started := h.clock.NowMillis()
 	run := startAsync(h.supervisor, "fe")
 	pid := waitForPosixPid(t, h.host, "fe")
@@ -110,7 +110,7 @@ func TestAnExitCommandStaysRunningPastAConfiguredDeadline(t *testing.T) {
 		t.Fatalf("state %s", still.ActualState)
 	}
 	if still.ActualState == state.ActualFailed {
-		t.Fatal("must not fail past the deadline")
+		t.Fatal("must not fail while the command is still running")
 	}
 	h.process.killExternally(pid, 0)
 	if err := <-run; err != nil {

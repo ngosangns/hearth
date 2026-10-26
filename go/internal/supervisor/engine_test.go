@@ -146,7 +146,7 @@ func testSupervisor(service catalog.ServiceDefinition, proc *fakeProc, probes fa
 	}
 	sup := NewProcessSupervisor(host, SupervisorOptions{
 		Process: proc, Probes: probes, Clock: SystemClock{},
-		ReadinessBackoffMs: 1, TerminationGraceMs: 1, ReadinessTimeoutMs: 20,
+		ReadinessBackoffMs: 1, TerminationGraceMs: 1,
 		IsClosing: func() bool { return false },
 	})
 	return sup, host

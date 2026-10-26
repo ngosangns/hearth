@@ -10,14 +10,6 @@ import (
 	"github.com/ngosangns/hearth/go/internal/state"
 )
 
-func withExitTimeout(service catalog.ServiceDefinition, timeoutMs uint64) catalog.ServiceDefinition {
-	if service.Profiles.Run.Command != nil {
-		t := timeoutMs
-		service.Profiles.Run.ReadinessTimeoutMs = &t
-	}
-	return service
-}
-
 func shellService(id, cwd, shell string, port uint16) catalog.ServiceDefinition {
 	service := argvVerified(id, catalog.ReadinessSpec{Kind: "tcp", Port: &port})
 	if service.Profiles.Run.Command != nil {
@@ -107,7 +99,6 @@ func oneShotSupervisor(service catalog.ServiceDefinition, probe *bool) (*fakeHos
 		Probes:             probes,
 		Preparation:        noPreparation{},
 		Clock:              newFakeClock(),
-		ReadinessTimeoutMs: 60_000,
 		ReadinessBackoffMs: 5,
 		TerminationGraceMs: 50,
 		IsClosing:          func() bool { return false },
@@ -175,7 +166,6 @@ func artifactHarness(service catalog.ServiceDefinition, installer ArtifactInstal
 		Preparation:        noPreparation{},
 		ArtifactInstaller:  installer,
 		Clock:              newFakeClock(),
-		ReadinessTimeoutMs: 200,
 		ReadinessBackoffMs: 5,
 		TerminationGraceMs: 50,
 		IsClosing:          func() bool { return false },

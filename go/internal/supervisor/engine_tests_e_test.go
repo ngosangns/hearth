@@ -128,7 +128,6 @@ func TestAnExternalCommandReadinessServiceRunsItsCommandAsAOneShotTask(t *testin
 		Probes:             probes,
 		Preparation:        noPreparation{},
 		Clock:              newFakeClock(),
-		ReadinessTimeoutMs: 200,
 		ReadinessBackoffMs: 5,
 		TerminationGraceMs: 50,
 		IsClosing:          func() bool { return false },
@@ -222,41 +221,4 @@ func TestALeaderExitReapsAChildInItsOwnProcessGroup(t *testing.T) {
 		t.Fatal("the dead leader pgid must not be signalled")
 	}
 	waitUntilActual(t, h.host, "api", state.ActualFailed)
-}
-
-func TestAFailedOneShotTaskIsStoppedAndTheErrorIsReturned(t *testing.T) {
-	service := argvVerified("api", catalog.ReadinessSpec{
-		Kind:    "command",
-		Command: &catalog.CommandSpec{Argv: []string{"attach"}},
-	})
-	own := catalog.OwnershipExternal
-	service.Ownership = &own
-	host := newFakeHost(oneServiceCatalog(service))
-	process := newFakeProcAdapter()
-	no := false
-	probes := newCommandCapableProbeAdapter(nil, &no, 0)
-	sup := NewProcessSupervisor(host, SupervisorOptions{
-		Process:            process,
-		RunBuild:           newFakeRunBuild(),
-		Probes:             probes,
-		Preparation:        noPreparation{},
-		Clock:              newFakeClock(),
-		ReadinessTimeoutMs: 30,
-		ReadinessBackoffMs: 5,
-		TerminationGraceMs: 50,
-		IsClosing:          func() bool { return false },
-	})
-	err := sup.Start("api", nil)
-	if err == nil || !strings.Contains(err.Error(), "Readiness timed out") {
-		t.Fatalf("err %v", err)
-	}
-	process.mu.Lock()
-	alive := len(process.state.alive)
-	process.mu.Unlock()
-	if alive != 0 {
-		t.Fatal("the one-shot process must be stopped when readiness fails")
-	}
-	if host.stateOf("api").Identity != nil {
-		t.Fatal("a task failure must not persist the trigger process as the service identity")
-	}
 }

@@ -18,8 +18,7 @@ import (
 	"github.com/ngosangns/hearth/go/internal/state"
 )
 
-// --- Fake clock: sleeps advance a virtual clock instantly, so readiness-timeout tests run in
-// milliseconds instead of really waiting. ---
+// --- Fake clock: sleeps advance a virtual clock instantly, so tests never really wait. ---
 
 type fakeClock struct {
 	mu     sync.Mutex
@@ -1024,10 +1023,6 @@ type harness struct {
 }
 
 func buildHarness(cat catalog.ServiceCatalog) *harness {
-	return buildHarnessWithTimeout(cat, 200)
-}
-
-func buildHarnessWithTimeout(cat catalog.ServiceCatalog, readinessTimeoutMs int64) *harness {
 	host := newFakeHost(cat)
 	process := newFakeProcAdapter()
 	probes := newFakeProbeAdapterWithProcess(process)
@@ -1039,7 +1034,6 @@ func buildHarnessWithTimeout(cat catalog.ServiceCatalog, readinessTimeoutMs int6
 		Probes:             probes,
 		Preparation:        noPreparation{},
 		Clock:              clock,
-		ReadinessTimeoutMs: readinessTimeoutMs,
 		ReadinessBackoffMs: 5,
 		TerminationGraceMs: 50,
 		IsClosing:          func() bool { return false },
