@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.27.8
 
 - `readinessTimeoutMs` (service-level) and `build.timeoutMs` are gone from `hearth.yaml` and the catalog wire. Readiness has no deadline: a long-lived service is never failed for being unready, a `command` probe is bounded internally at 10s, a one-shot task such as `hearth shared attach` is awaited until it exits, and a build is aborted only by a stop or cancellation. A config that still sets either key now fails the load as an unknown key; remove the line.
 - Config groups are declared per service: an optional `group:` field on a `services:` entry (and on a `shared:` entry's object form) replaces the top-level `groups:` block. Group membership keeps document order, nesting is gone, and `all` always means every enabled service without being declared. A `hearth.yaml` that still has `groups:` fails to load and says to move each member's group name into its service.
