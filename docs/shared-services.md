@@ -194,6 +194,16 @@ A recipe with `ports: […]` skips all of that — the declared ports are regist
 bind check. The shared nginx pins `[18080, 18443]`. macOS keeps ports below 1024 privileged for
 every user, so a pf rdr anchor maps public `:80`/`:443` onto those loopback pins.
 
+## smp context (`internal/shared`)
+
+`shared.NewContext` opens `~/.hearth/shared`: registry, remote catalog client, per-instance locks,
+and port-allocation serialization. The smp daemon passes that context into `HearthManagerOptions.Shared`;
+orchestration stays in `internal/manager` (`shared_http.go`).
+
+Project daemons (no `Shared` context) wrap the supervisor with `supervisor.WithSharedInProcess` and
+`client.InProcessRunner`: generated `shared:` services call smp over HTTP instead of re-execing
+`hearth shared attach|detach|probe` on every start and readiness tick.
+
 ## Project side
 
 ```yaml
@@ -246,6 +256,9 @@ Mounted only when the manager has a `SharedContext` (i.e. `hearth smp`). Every r
 bearer token. `GET /healthz` and the other project routes are unchanged.
 
 - `GET  /v1/shared` — instances, ports, install state, attachments (with rendered `connection`)
+- `GET  /v1/shared/probe?service=<name@ver>&projectRoot=<path>` — `{ ready, service, projectId }`;
+  the lightweight readiness check project daemons poll (instance `ready` **and** this project's
+  attachment provisioned). Prefer this over listing every instance on each probe tick.
 - `GET  /v1/shared/catalog` — the cached/fetched remote registry
 - `POST /v1/shared/attach` `{service, projectRoot?, args?}` — resolve recipe → register →
   install (state `installing` in `registry.json`) → ensure in catalog (catalog reload) →

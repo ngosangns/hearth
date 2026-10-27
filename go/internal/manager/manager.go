@@ -46,6 +46,7 @@ import (
 	"github.com/ngosangns/hearth/go/internal/iso8601"
 	"github.com/ngosangns/hearth/go/internal/paths"
 	"github.com/ngosangns/hearth/go/internal/platform"
+	"github.com/ngosangns/hearth/go/internal/shared"
 	"github.com/ngosangns/hearth/go/internal/state"
 	"github.com/ngosangns/hearth/go/internal/supervisor"
 )
@@ -117,7 +118,7 @@ type HearthManagerOptions struct {
 	Supervisor       *supervisor.SupervisorOptions
 	// Shared is set only for the smp daemon (`hearth smp`) — it enables the
 	// /v1/shared/* route surface.
-	Shared *SharedContext
+	Shared *shared.Context
 }
 
 // HearthManager is the daemon behind the HTTP+SSE surface.
@@ -168,7 +169,7 @@ type HearthManager struct {
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 
-	shared *SharedContext
+	shared *shared.Context
 
 	routes []routeEntry
 

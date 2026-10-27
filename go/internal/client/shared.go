@@ -11,6 +11,7 @@ package client
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
@@ -107,31 +108,13 @@ func SharedDetach(ctx context.Context, client *Client, id, projectRoot string, s
 // SharedProbe is the readiness probe the generated `shared:` service polls:
 // true iff the instance is ready AND this project is attached and provisioned.
 func SharedProbe(ctx context.Context, client *Client, id, projectRoot string) bool {
-	instance, err := SharedInstance(ctx, client, id)
-	if err != nil || instance == nil {
+	path := "/v1/shared/probe?service=" + url.QueryEscape(id) + "&projectRoot=" + url.QueryEscape(projectRoot)
+	body, err := SMPRequest(ctx, client, path, http.MethodGet, nil)
+	if err != nil {
 		return false
 	}
-	stateObj, _ := instance["state"].(map[string]any)
-	if stateObj == nil {
-		return false
-	}
-	if actual, _ := stateObj["actualState"].(string); actual != "ready" {
-		return false
-	}
-	projectID := shared.ProjectID(projectRoot)
-	for _, entry := range omap.AsArray(instance["attachments"]) {
-		attachment, ok := entry.(map[string]any)
-		if !ok {
-			continue
-		}
-		if value, _ := attachment["projectId"].(string); value != projectID {
-			continue
-		}
-		if provisioned, _ := attachment["provisioned"].(bool); provisioned {
-			return true
-		}
-	}
-	return false
+	ready, _ := body["ready"].(bool)
+	return ready
 }
 
 // SharedRemove is POST /v1/shared/remove. The server refuses (409

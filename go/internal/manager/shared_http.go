@@ -1,16 +1,6 @@
-// The smp-only HTTP surface (`/v1/shared/*`) — ported from
-// rust/crates/hearth-core/src/manager/shared.rs, mounted by buildRoutes when
-// the manager was built with a SharedContext. Orchestrates register → install →
-// catalog-insert → start → provision per docs/shared-services.md. All mutations
-// serialize on a per-instance lock so two projects racing `postgres@16.4`
-// converge on one install.
-//
-// SharedContext itself is the Go port of `crate::shared::SharedContext`
-// (rust/crates/hearth-core/src/shared/mod.rs): the instance registry, the
-// remote catalog client, per-instance serialization, and one machine-wide port
-// allocation lock. It lives here because the Go shared package exposes the
-// pieces (SharedRegistry, RemoteCatalog, …) but not the context that binds
-// them; a later agent wiring cmd/hearth constructs it with NewSharedContext.
+// The smp-only HTTP surface (`/v1/shared/*`), mounted when the manager was
+// built with a shared.Context. Orchestration lives in this file; registry and
+// catalog types live in internal/shared.
 package manager
 
 import (
@@ -22,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -32,81 +21,15 @@ import (
 	"github.com/ngosangns/hearth/go/internal/shared"
 	"github.com/ngosangns/hearth/go/internal/state"
 	"github.com/ngosangns/hearth/go/internal/supervisor"
-	"github.com/ngosangns/hearth/go/internal/syncx"
 )
 
 const recipeCommandTimeout = 60 * time.Second
-
-// SharedContext is everything the smp daemon's HTTP handlers need that isn't
-// already on HearthManager: the instance registry, the remote catalog client,
-// per-instance serialization for install/attach so two projects racing the same
-// `name@version` can't double-install, and one machine-wide port allocation
-// lock so two *different* new instances can't be handed the same port.
-type SharedContext struct {
-	Root       string
-	Registry   *shared.SharedRegistry
-	Remote     *shared.RemoteCatalog
-	CatalogURL string
-
-	io             fileio.FileIO
-	instanceLocks  *syncx.KeyedLock[string]
-	portAllocation sync.Mutex
-}
-
-// NewSharedContext opens the smp context at root. Catalog URL precedence: the
-// explicit argument (HEARTH_SHARED_CATALOG_URL) first, then a `catalog-url`
-// file under the shared root, then the pinned shared.SharedCatalogURL.
-func NewSharedContext(root string, catalogURL *string) (*SharedContext, error) {
-	io := fileio.New(true)
-	if err := io.EnsureDirectory(root); err != nil {
-		return nil, &shared.SharedError{Message: err.Error()}
-	}
-	url := ""
-	if catalogURL != nil {
-		url = *catalogURL
-	}
-	if url == "" {
-		if text, err := os.ReadFile(filepath.Join(root, "catalog-url")); err == nil {
-			url = strings.TrimSpace(string(text))
-		}
-	}
-	if url == "" {
-		url = shared.SharedCatalogURL
-	}
-	registry, err := shared.LoadRegistry(io, root)
-	if err != nil {
-		return nil, err
-	}
-	return &SharedContext{
-		Root:          root,
-		Registry:      registry,
-		Remote:        shared.NewRemoteCatalog(root, &url),
-		CatalogURL:    url,
-		io:            io,
-		instanceLocks: syncx.NewKeyedLock[string](),
-	}, nil
-}
-
-// RuntimeDirectory is the smp runtime directory (`<root>/runtime-v1`).
-func (c *SharedContext) RuntimeDirectory() string {
-	return filepath.Join(c.Root, shared.SharedRuntimeDirectoryName)
-}
-
-// DownloadsDir is where installers stage archives.
-func (c *SharedContext) DownloadsDir() string { return filepath.Join(c.Root, "downloads") }
-
-// InstanceLock serializes install/start/provision for one instance across
-// concurrent attaches. The returned func releases the lock.
-func (c *SharedContext) InstanceLock(id string) func() { return c.instanceLocks.Lock(id) }
-
-// ---------------------------------------------------------------------------------------------
-// Route table
-// ---------------------------------------------------------------------------------------------
 
 func sharedRoutes(m *HearthManager) []routeEntry {
 	return []routeEntry{
 		{"GET", []string{"v1", "shared"}, true, m.getShared},
 		{"GET", []string{"v1", "shared", "catalog"}, true, m.getSharedCatalog},
+		{"GET", []string{"v1", "shared", "probe"}, true, m.getSharedProbe},
 		{"POST", []string{"v1", "shared", "attach"}, true, m.postSharedAttach},
 		{"POST", []string{"v1", "shared", "detach"}, true, m.postSharedDetach},
 		{"POST", []string{"v1", "shared", "install"}, true, m.postSharedInstall},
@@ -117,7 +40,7 @@ func sharedRoutes(m *HearthManager) []routeEntry {
 // sharedCtx returns the manager's SharedContext. buildRoutes only mounts these
 // routes when the manager has one, so this cannot fail in practice — it stays
 // an error rather than a panic all the same.
-func sharedCtx(m *HearthManager) (*SharedContext, *ManagerHttpError) {
+func sharedCtx(m *HearthManager) (*shared.Context, *ManagerHttpError) {
 	if m.shared == nil {
 		return nil, newHTTPError(http.StatusNotFound, "not_shared", "This daemon does not manage shared services")
 	}
@@ -268,6 +191,60 @@ func (m *HearthManager) getSharedCatalog(w http.ResponseWriter, _ *http.Request,
 	writeJSON(w, http.StatusOK, sharedCatalogResponse{Catalog: doc})
 }
 
+type sharedProbeResponse struct {
+	Service   string `json:"service"`
+	ProjectID string `json:"projectId"`
+	Ready     bool   `json:"ready"`
+}
+
+func (m *HearthManager) getSharedProbe(w http.ResponseWriter, r *http.Request, _ map[string]string) {
+	ctx, herr := sharedCtx(m)
+	if herr != nil {
+		writeHTTPError(w, herr)
+		return
+	}
+	q := r.URL.Query()
+	service := strings.TrimSpace(q.Get("service"))
+	projectRoot := strings.TrimSpace(q.Get("projectRoot"))
+	if service == "" || projectRoot == "" {
+		writeHTTPError(w, newHTTPError(http.StatusBadRequest, "invalid_request", "service and projectRoot query parameters are required"))
+		return
+	}
+	name, version, herr := parseInstanceID(service)
+	if herr != nil {
+		writeHTTPError(w, herr)
+		return
+	}
+	id := shared.InstanceID(name, version)
+	canonical := projectRoot
+	if resolved, err := filepath.EvalSymlinks(projectRoot); err == nil {
+		if abs, err2 := filepath.Abs(resolved); err2 == nil {
+			canonical = abs
+		} else {
+			canonical = resolved
+		}
+	}
+	pid := shared.ProjectID(canonical)
+	ready := evaluateSharedProbe(m, ctx, id, pid)
+	writeJSON(w, http.StatusOK, sharedProbeResponse{Service: id, ProjectID: pid, Ready: ready})
+}
+
+func evaluateSharedProbe(m *HearthManager, ctx *shared.Context, instanceID, projectID string) bool {
+	instance := ctx.Registry.Get(instanceID)
+	if instance == nil {
+		return false
+	}
+	attachment, ok := instance.Attachments[projectID]
+	if !ok || !attachment.Provisioned {
+		return false
+	}
+	st := m.ServiceState(instanceID)
+	if st == nil || st.ActualState != state.ActualReady {
+		return false
+	}
+	return true
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------------------------
@@ -399,7 +376,7 @@ func (m *HearthManager) postSharedRemove(w http.ResponseWriter, r *http.Request,
 // syncCatalog re-synthesizes smp's catalog from the registry and swaps it in —
 // ReloadCatalog handles stopping removed-but-active services with the old
 // catalog, so this is the only mutation path for smp's service set.
-func (m *HearthManager) syncCatalog(ctx *SharedContext) error {
+func (m *HearthManager) syncCatalog(ctx *shared.Context) error {
 	cat, err := shared.SynthesizeCatalog(ctx.Root, ctx.Registry.List())
 	if err != nil {
 		return err
@@ -414,9 +391,9 @@ func (m *HearthManager) syncCatalog(ctx *SharedContext) error {
 // Runs under the machine-wide portAllocation lock: per-instance locks don't
 // serialize two *different* new ids, and two of those whose hash slots are close
 // could otherwise both pass the bind probe and share a port.
-func registerInstance(ctx *SharedContext, id, name, version string, recipe shared.SharedRecipe) *ManagerHttpError {
-	ctx.portAllocation.Lock()
-	defer ctx.portAllocation.Unlock()
+func registerInstance(ctx *shared.Context, id, name, version string, recipe shared.SharedRecipe) *ManagerHttpError {
+	unlockPorts := ctx.PortAllocationLock()
+	defer unlockPorts()
 	var ports []uint16
 	if len(recipe.Ports) > 0 {
 		// Pinned ports: the recipe IS its ports — nothing to probe, just a free
@@ -476,7 +453,7 @@ func formatPorts(ports []uint16) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-func setInstallState(ctx *SharedContext, id string, installState shared.InstallState, installError *string) *ManagerHttpError {
+func setInstallState(ctx *shared.Context, id string, installState shared.InstallState, installError *string) *ManagerHttpError {
 	if err := ctx.Registry.Update(func(d *shared.SharedRegistryData) error {
 		if inst, ok := d.Instances[id]; ok {
 			inst.InstallState = installState
@@ -494,7 +471,7 @@ func setInstallState(ctx *SharedContext, id string, installState shared.InstallS
 // absent (fetching the remote recipe + allocating a port), ensures it is
 // installed, and makes sure the running catalog knows the service. Returns the
 // registry row; the caller holds the instance lock.
-func (m *HearthManager) ensureRegisteredAndInstalled(ctx *SharedContext, name, version string) (*shared.SharedInstance, *ManagerHttpError) {
+func (m *HearthManager) ensureRegisteredAndInstalled(ctx *shared.Context, name, version string) (*shared.SharedInstance, *ManagerHttpError) {
 	id := shared.InstanceID(name, version)
 	instance := ctx.Registry.Get(id)
 	if instance == nil {
@@ -550,7 +527,7 @@ func (m *HearthManager) ensureRegisteredAndInstalled(ctx *SharedContext, name, v
 // isInstalled: `installs/<name>/<version>` is ready — marker present. The
 // marker only exists after a fully extracted payload was renamed into place, so
 // its presence implies the payload too.
-func isInstalled(ctx *SharedContext, instance *shared.SharedInstance) bool {
+func isInstalled(ctx *shared.Context, instance *shared.SharedInstance) bool {
 	marker := filepath.Join(instance.InstallDir(ctx.Root), ".hearth-installed")
 	info, err := os.Stat(marker)
 	return err == nil && info.Mode().IsRegular()
@@ -558,7 +535,7 @@ func isInstalled(ctx *SharedContext, instance *shared.SharedInstance) bool {
 
 // ensureInstalled is the idempotent install. onProgress receives
 // human-readable lines the caller streams into an event.
-func ensureInstalled(ctx *SharedContext, instance *shared.SharedInstance, onProgress func(string)) error {
+func ensureInstalled(ctx *shared.Context, instance *shared.SharedInstance, onProgress func(string)) error {
 	if isInstalled(ctx, instance) {
 		return nil
 	}

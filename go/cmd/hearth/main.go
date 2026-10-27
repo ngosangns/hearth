@@ -13,6 +13,7 @@ import (
 
 	"github.com/ngosangns/hearth/go/internal/catalog"
 	"github.com/ngosangns/hearth/go/internal/cli"
+	"github.com/ngosangns/hearth/go/internal/client"
 	"github.com/ngosangns/hearth/go/internal/configfile"
 	"github.com/ngosangns/hearth/go/internal/daemon"
 	"github.com/ngosangns/hearth/go/internal/env"
@@ -62,9 +63,13 @@ func catalogFailed(root string, args []string, err error) int {
 // exits non-zero: the daemon is spawned by `Ensure()`, and exiting 0 after
 // failing to start would make a broken daemon indistinguishable from a healthy
 // one.
-func runManager(root, runtimeDirectory string, cat catalog.ServiceCatalog, sharedCtx *manager.SharedContext) int {
+func runManager(root, runtimeDirectory string, cat catalog.ServiceCatalog, sharedCtx *shared.Context) int {
 	baseEnvironment := env.ResolveBaseEnvironment(env.BaseEnvironmentOptions{Root: root})
 	sup := supervisor.DefaultSupervisorOptions(root, runtimeDirectory, baseEnvironment)
+	if sharedCtx == nil {
+		runner := &client.InProcessRunner{ProjectRoot: root, SpawnSMP: spawnSMP}
+		sup = supervisor.WithSharedInProcess(sup, runner)
+	}
 	outcome := daemon.RunDaemon(manager.HearthManagerOptions{
 		RuntimeDirectory: &runtimeDirectory,
 		Root:             &root,
@@ -127,7 +132,7 @@ func runSmpSubcommand(rest []string) int {
 	if v := os.Getenv("HEARTH_SHARED_CATALOG_URL"); v != "" {
 		catalogURL = &v
 	}
-	ctx, err := manager.NewSharedContext(root, catalogURL)
+	ctx, err := shared.NewContext(root, catalogURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hearth smp: cannot open %s: %v\n", root, err)
 		return 1

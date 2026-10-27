@@ -279,8 +279,11 @@ client. It is **3** since `readiness: { kind: log }` and per-service `restart:` 
   and exit 0 gets ≤5s of probes (`taskExitSettleMs`) — don't keep polling; a failed instance does
   not become ready on its own.
 - **`smp` = `hearth smp`** — same binary, rooted at `~/.hearth/shared`, catalog *synthesized* from
-  `registry.json` (single writer: the smp daemon; CLIs only read). Runtime dir
-  `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged.
+  `registry.json` (single writer: the smp daemon; CLIs only read). `shared.NewContext` holds registry +
+  catalog client + locks; runtime dir `~/.hearth/shared/runtime-v1`, so `discover`/`ensure` work unchanged.
+  `GET /v1/shared/probe` is the lightweight attach/readiness check (not full `GET /v1/shared`). Project
+  daemons use `client.InProcessRunner` + `supervisor.WithSharedInProcess` so `shared:` rows hit smp HTTP
+  instead of nested `hearth` subprocesses.
 - Masking (`internal/redact.Values`) applies unless `--reveal` to `shared list`/`status`/`installed`,
   `shared connection`, the printed `shared attach` connection, `manager ensure`/`restart`, and
   `shared ensure` (the bearer `token`) — direct HTTP+SSE clients must pass `--reveal`. hearth-gpui
