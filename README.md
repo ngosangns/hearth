@@ -223,11 +223,12 @@ Exit codes: 2 usage, 3 unavailable, 4 protocol mismatch, 5 operation failed, 6 n
 
 ## Window
 
-The workspace window is `hearth-gpui` in the sibling `ns-gpui` repo; this repo has no UI.
+The workspace window is `hearth-gpui` in `apps/hearth-gpui`. It has its own Cargo workspace and
+links the shared chrome crate `ns-ui` from the `ns-gpui` repo.
 It is an HTTP+SSE client of the same daemon: a folder list (Workspaces), the shared-services view
 (Shared), services grouped by `group:`, per-service and per-group start, stop and restart, and a
 log pane with a pinned `daemon log` row. Stop, restart, forget, and kill-and-start ask for
-confirmation. `task dev:install` builds the Dev app from `../ns-gpui` into
+confirmation. `task dev:install` builds the Dev app from `apps/hearth-gpui` into
 `~/Applications/Hearth Dev.app`; `task dev:install:all` installs the CLI first.
 
 ## Screenshots

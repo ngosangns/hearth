@@ -8,7 +8,7 @@ architecture, and sharp edges. Add durable notes here as real work discovers the
 The product is the compiled `hearth` binary — `go/cmd/hearth` in module
 `github.com/ngosangns/hearth/go`, packages under `go/internal/`. The Rust workspace (`rust/`) is
 gone and the TUI was not ported: `hearth tui` is unknown and a bare `hearth` prints help. The
-workspace window is `hearth-gpui` in sibling repo `ns-gpui`; this repo has no UI. 0.18.0 renamed
+workspace window is `hearth-gpui` in `apps/hearth-gpui` (own Cargo workspace, shared chrome from `ns-gpui`'s `ns-ui`). 0.18.0 renamed
 the command from `hearthd`; never install or publish `hearthd`. A project authors `hearth.yaml`
 (`.yml` / `.json`); TypeScript catalogs are not accepted. Consumers (`infra`, `viclass`) spawn
 `~/.local/bin/hearth` after `task install`.
@@ -343,10 +343,10 @@ client. It is **3** since `readiness: { kind: log }` and per-service `restart:` 
 - `internal/omap` (ordered map wherever key order matters) is load-bearing: without it
   `map[string]any` marshals keys alphabetically and hand-maintained JSON loses its key order.
 
-**Workspace UI contract (`hearth-gpui` in `ns-gpui`; `hearth tui` was removed)**
+**Workspace UI contract (`hearth-gpui` in `apps/hearth-gpui`; `hearth tui` was removed)**
 
 - A bare `hearth` prints help on or off a terminal — no interactive shell in the binary; `tui` is
-  unknown (exit 2). The window is the only workspace UI, and it is not in this repo.
+  unknown (exit 2). The window is the only workspace UI, and it lives in `apps/`, not in the Go module.
 - The window is an HTTP+SSE client (`internal/client` semantics): selecting a workspace only
   `discover`s; opening a trusted workspace with no live daemon `ensure`s; an untrusted folder needs
   a second confirmation. A daemon the user stopped stays stopped until the workspace is reopened;

@@ -1,6 +1,6 @@
 # How this app is built
 
-Hearth is a process supervisor. The product in this repo is the Go binary at `go/cmd/hearth`. The macOS window is `hearth-gpui` in the sibling repo `ns-gpui`. It calls this CLI. This repo has no UI.
+Hearth is a process supervisor. The product in this repo is the Go binary at `go/cmd/hearth`. The macOS window is `hearth-gpui` in `apps/hearth-gpui`. It calls this CLI and is a separate Cargo workspace.
 
 ## What each Go package is
 
@@ -25,7 +25,7 @@ One binary hosts the daemon and the CLI. The long-lived process is the daemon. A
 
 In scope: one daemon per project root, one `smp` daemon per machine, a CLI, and bundled skill scripts for coding agents.
 
-Out of scope: a UI in this repo, a command palette, an extension host, collaboration, a language server, and a second implementation of start/stop. The window is `hearth-gpui` in `ns-gpui`. Do not add a UI target or a Rust module here.
+Out of scope: a command palette, an extension host, collaboration, a language server, and a second implementation of start/stop. The window is `apps/hearth-gpui`. Do not add a UI target or a Rust module to the Go module.
 
 ## GitHub
 

@@ -105,7 +105,7 @@ tasks:
       - task: clippy
 
   dev:install:
-    desc: Build the GUI from ../ns-gpui and install "Hearth Dev.app" into ~/Applications
+    desc: Build the GUI in apps/hearth-gpui and install "Hearth Dev.app" into ~/Applications
     cmds:
       - ../ns-gpui/scripts/install-dev.sh hearth
 
